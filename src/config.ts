@@ -1,14 +1,14 @@
-'use strict';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import { c } from './ui';
+import type { AgentConfig, AskFn, ChooseFn, LlmPreset } from './types';
 
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const { c } = require('./ui');
+export const ENV_PATH = path.join(__dirname, '..', '.env');
 
-const ENV_PATH = path.join(__dirname, '..', '.env');
-
-const PRESETS = [
+export const PRESETS: LlmPreset[] = [
   {
     name: 'Kimi Coding（sk-kimi-…）',
     baseUrl: 'https://api.kimi.com/coding/v1',
@@ -41,7 +41,7 @@ const PRESETS = [
   },
 ];
 
-function currentConfig() {
+export function currentConfig(): AgentConfig {
   return {
     llmBaseUrl: process.env.LLM_BASE_URL || '',
     llmApiKey: process.env.LLM_API_KEY || '',
@@ -55,12 +55,12 @@ function currentConfig() {
   };
 }
 
-function isConfigured() {
+export function isConfigured(): boolean {
   const cfg = currentConfig();
   return Boolean(cfg.llmBaseUrl && cfg.llmApiKey && cfg.llmModel);
 }
 
-function writeEnv(cfg) {
+export function writeEnv(cfg: AgentConfig): void {
   const lines = [
     `LLM_BASE_URL=${cfg.llmBaseUrl}`,
     `LLM_API_KEY=${cfg.llmApiKey}`,
@@ -71,7 +71,7 @@ function writeEnv(cfg) {
   if (cfg.kanbanRepoId) lines.push(`HELIOS_KANBAN_REPO_ID=${cfg.kanbanRepoId}`);
   if (cfg.kanbanIteration) lines.push(`HELIOS_KANBAN_ITERATION=${cfg.kanbanIteration}`);
   fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf8');
-  // apply to current process
+
   process.env.LLM_BASE_URL = cfg.llmBaseUrl;
   process.env.LLM_API_KEY = cfg.llmApiKey;
   process.env.LLM_MODEL = cfg.llmModel;
@@ -84,20 +84,14 @@ function writeEnv(cfg) {
   else delete process.env.HELIOS_KANBAN_ITERATION;
 }
 
-/**
- * Interactive setup wizard for LLM provider + model.
- * @param {(prompt: string) => Promise<string|null>} ask  shared prompt fn (null = EOF)
- * @param {((presets: typeof PRESETS) => Promise<number>) | null} [choose]
- *        arrow-key selector used on TTY; falls back to numbered input otherwise
- */
-async function runWizard(ask, choose) {
-  const need = async (promptText) => {
+async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentConfig> {
+  const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
     if (ans === null) throw new Error('输入已结束');
     return ans.trim();
   };
 
-  let idx;
+  let idx: number;
   if (choose && process.stdin.isTTY) {
     idx = await choose(PRESETS);
   } else {
@@ -108,7 +102,7 @@ async function runWizard(ask, choose) {
     const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
     idx = Math.min(Math.max(parseInt(pick || '1', 10) || 1, 1), PRESETS.length) - 1;
   }
-  const preset = PRESETS[idx];
+  const preset = PRESETS[idx]!;
   console.log(c.gray(`已选择 ${preset.name}`));
 
   const old = currentConfig();
@@ -132,7 +126,7 @@ async function runWizard(ask, choose) {
     (await need(`默认迭代（可选，如 260717，回车跳过${old.kanbanIteration ? `，当前 ${old.kanbanIteration}` : ''}）: `)) ||
     old.kanbanIteration;
 
-  const cfg = {
+  const cfg: AgentConfig = {
     ...old,
     llmBaseUrl: baseUrl,
     llmApiKey: apiKey,
@@ -147,10 +141,10 @@ async function runWizard(ask, choose) {
   return cfg;
 }
 
-/** Ensure config exists; run wizard if not. */
-async function ensureConfig(ask, { force = false, choose = null } = {}) {
+export async function ensureConfig(
+  ask: AskFn,
+  { force = false, choose = null }: { force?: boolean; choose?: ChooseFn | null } = {},
+): Promise<AgentConfig> {
   if (!force && isConfigured()) return currentConfig();
   return runWizard(ask, choose);
 }
-
-module.exports = { currentConfig, isConfigured, ensureConfig, ENV_PATH, PRESETS };

@@ -2,15 +2,24 @@
   "name": "helios-task-agent",
   "version": "1.0.0",
   "description": "Terminal agent that turns Lark/Feishu content into helios-kanban tasks",
-  "main": "src/cli.js",
+  "main": "dist/cli.js",
   "bin": {
     "helios-task-agent": "bin/helios-task-agent.js"
   },
   "scripts": {
-    "start": "node bin/helios-task-agent.js",
-    "smoke": "node scripts/smoke.js",
-    "test:e2e": "node scripts/e2e-mock.js"
+    "start": "tsx src/cli.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "test:e2e": "tsx scripts/e2e-mock.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build"
   },
+  "files": [
+    "dist",
+    "bin",
+    "skills",
+    ".env.example"
+  ],
   "keywords": [
     "helios-kanban",
     "lark",
@@ -28,5 +37,10 @@
     "@modelcontextprotocol/sdk": "^1.17.0",
     "dotenv": "^16.4.5",
     "openai": "^4.77.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.8.3"
   }
 }

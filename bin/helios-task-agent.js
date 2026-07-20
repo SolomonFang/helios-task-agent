@@ -1,2 +1,3 @@
 #!/usr/bin/env node
-require('../src/cli').main();
+'use strict';
+require('../dist/cli').main();

@@ -1,26 +1,19 @@
-'use strict';
-
 // E2E test with a local mock OpenAI server — verifies the full agent loop
-// against the REAL helios-kanban MCP:
-//   1) mock LLM 要求 kanban_list_projects
-//   2) mock LLM 用真实 project_id 要求 kanban_create_task
-//   3) mock LLM 用返回的 task_id 要求 kanban_delete_task（清理现场）
-//   4) mock LLM 输出最终回复
-// 同时验证 lark_cli 工具可被调用。无需真实 LLM API。Run: node scripts/e2e-mock.js
+// against the REAL helios-kanban MCP. Run: npm run test:e2e
 
-const http = require('http');
-const { spawn } = require('child_process');
-const path = require('path');
+import http from 'http';
+import { spawn } from 'child_process';
+import path from 'path';
 
 const TEST_TITLE = '【测试】Helios Task Agent 冒烟任务（自动删除）';
 const FINAL_REPLY = '模拟回复：任务已创建并清理，链路正常。';
 
-function extractUuid(text) {
+function extractUuid(text: string | undefined): string | null {
   const m = String(text).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   return m ? m[0] : null;
 }
 
-function toolCall(name, args) {
+function toolCall(name: string, args: Record<string, unknown>) {
   return {
     id: 'chatcmpl-mock',
     object: 'chat.completion',
@@ -46,8 +39,18 @@ function finalReply() {
   };
 }
 
-function startMockServer() {
-  const state = {
+interface MockState {
+  calls: number;
+  projectId: string | null;
+  taskId: string | null;
+  createdOk: boolean;
+  deletedOk: boolean;
+  larkOk: boolean;
+  error: string | null;
+}
+
+function startMockServer(): Promise<{ server: http.Server; state: MockState; port: number }> {
+  const state: MockState = {
     calls: 0,
     projectId: null,
     taskId: null,
@@ -61,41 +64,41 @@ function startMockServer() {
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
       state.calls++;
-      const parsed = JSON.parse(body);
+      const parsed = JSON.parse(body) as { messages?: Array<{ role: string; content?: string }> };
       const lastTool = (parsed.messages || []).filter((m) => m.role === 'tool').pop();
 
-      let payload;
+      let payload: unknown;
       try {
         if (state.calls === 1) {
           payload = toolCall('kanban_list_projects', {});
         } else if (state.calls === 2) {
-          state.projectId = extractUuid(lastTool && lastTool.content);
-          if (!state.projectId) throw new Error('list_projects 结果中未找到 project_id: ' + (lastTool || {}).content);
+          state.projectId = extractUuid(lastTool?.content);
+          if (!state.projectId) throw new Error('list_projects 结果中未找到 project_id: ' + lastTool?.content);
           payload = toolCall('kanban_create_task', {
             project_id: state.projectId,
             title: TEST_TITLE,
-            description: '由 scripts/e2e-mock.js 自动创建，验证后会自动删除。',
+            description: '由 scripts/e2e-mock.ts 自动创建，验证后会自动删除。',
           });
         } else if (state.calls === 3) {
-          const content = (lastTool && lastTool.content) || '';
+          const content = lastTool?.content || '';
           state.taskId = extractUuid(content);
           if (!state.taskId) throw new Error('create_task 结果中未找到 task_id: ' + content);
           payload = toolCall('kanban_get_task', { task_id: state.taskId });
         } else if (state.calls === 4) {
-          const content = (lastTool && lastTool.content) || '';
+          const content = lastTool?.content || '';
           state.createdOk = content.includes(TEST_TITLE);
           payload = toolCall('kanban_delete_task', { task_id: state.taskId });
         } else if (state.calls === 5) {
-          const content = (lastTool && lastTool.content) || '';
-          state.deletedOk = content.includes(state.taskId);
+          const content = lastTool?.content || '';
+          state.deletedOk = Boolean(state.taskId && content.includes(state.taskId));
           payload = toolCall('lark_cli', { args: ['--version'] });
         } else {
-          const content = (lastTool && lastTool.content) || '';
+          const content = lastTool?.content || '';
           if (/lark-cli version/.test(content)) state.larkOk = true;
           payload = finalReply();
         }
       } catch (err) {
-        state.error = err.message;
+        state.error = err instanceof Error ? err.message : String(err);
         payload = finalReply();
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -103,14 +106,19 @@ function startMockServer() {
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port }));
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') throw new Error('unexpected address');
+      resolve({ server, state, port: addr.port });
+    });
   });
 }
 
-async function main() {
+async function main(): Promise<void> {
   const { server, state, port } = await startMockServer();
-  const bin = path.join(__dirname, '..', 'bin', 'helios-task-agent.js');
-  const child = spawn(process.execPath, [bin], {
+  const bin = path.join(__dirname, '..', 'src', 'cli.ts');
+  const tsx = path.join(__dirname, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  const child = spawn(process.execPath, [tsx, bin], {
     env: {
       ...process.env,
       LLM_BASE_URL: `http://127.0.0.1:${port}/v1`,
@@ -121,14 +129,14 @@ async function main() {
   });
 
   let stdout = '';
-  child.stdout.on('data', (d) => (stdout += d));
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
   child.stdin.write('创建一个测试任务然后删掉\n/exit\n');
   child.stdin.end();
 
-  const code = await new Promise((resolve) => child.on('close', resolve));
+  const code = await new Promise<number>((resolve) => child.on('close', (c) => resolve(c ?? 1)));
   server.close();
 
-  const failures = [];
+  const failures: string[] = [];
   if (code !== 0) failures.push(`agent 退出码 ${code}`);
   if (state.error) failures.push('mock 侧错误: ' + state.error);
   if (!state.projectId) failures.push('未能从 list_projects 获取 project_id');

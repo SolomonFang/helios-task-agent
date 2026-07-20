@@ -1,37 +1,56 @@
-'use strict';
-
-// Minimal ANSI helpers — no external deps.
-
-const readline = require('readline');
+import readline from 'readline';
 
 const ESC = '\u001b';
-const codes = {
-  reset: 0, bold: 1, dim: 2,
-  red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, gray: 90, white: 37,
-};
 
-function paint(text, ...styles) {
+const codes = {
+  reset: 0,
+  bold: 1,
+  dim: 2,
+  red: 31,
+  green: 32,
+  yellow: 33,
+  blue: 34,
+  magenta: 35,
+  cyan: 36,
+  gray: 90,
+  white: 37,
+} as const;
+
+type StyleName = keyof typeof codes;
+
+function paint(text: unknown, ...styles: StyleName[]): string {
   if (!process.stdout.isTTY) return String(text);
   const seq = styles.map((s) => `${ESC}[${codes[s]}m`).join('');
   return `${seq}${text}${ESC}[${codes.reset}m`;
 }
 
-const c = {};
-for (const name of Object.keys(codes)) {
+type ColorFn = (t: unknown) => string;
+
+export const c: Record<string, ColorFn> & {
+  ok: ColorFn;
+  warn: ColorFn;
+  err: ColorFn;
+  info: ColorFn;
+  strong: ColorFn;
+} = {
+  ok: (t) => paint(t, 'green'),
+  warn: (t) => paint(t, 'yellow'),
+  err: (t) => paint(t, 'red'),
+  info: (t) => paint(t, 'cyan'),
+  strong: (t) => paint(t, 'bold'),
+};
+
+for (const name of Object.keys(codes) as StyleName[]) {
   if (name === 'reset') continue;
   c[name] = (t) => paint(t, name);
 }
-c.ok = (t) => paint(t, 'green');
-c.warn = (t) => paint(t, 'yellow');
-c.err = (t) => paint(t, 'red');
-c.info = (t) => paint(t, 'cyan');
-c.strong = (t) => paint(t, 'bold');
 
 /** East Asian Wide/Fullwidth ranges count as 2 cells; block/box-drawing chars as 1. */
-function charWidth(cp) {
+function charWidth(cp: number): number {
   if (
     (cp >= 0x1100 && cp <= 0x115f) ||
-    cp === 0x2329 || cp === 0x232a ||
+    cp === 0x2329 ||
+    cp === 0x232a ||
     (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
     (cp >= 0xac00 && cp <= 0xd7a3) ||
     (cp >= 0xf900 && cp <= 0xfaff) ||
@@ -45,14 +64,14 @@ function charWidth(cp) {
   return 1;
 }
 
-function visibleLen(s) {
+function visibleLen(s: string): number {
   const plain = String(s).replace(/\u001b\[\d+m/g, '');
   let n = 0;
-  for (const ch of plain) n += charWidth(ch.codePointAt(0));
+  for (const ch of plain) n += charWidth(ch.codePointAt(0)!);
   return n;
 }
 
-function box(lines, { width = 64 } = {}) {
+export function box(lines: string[], { width = 64 }: { width?: number } = {}): string {
   const top = '┌' + '─'.repeat(width) + '┐';
   const bottom = '└' + '─'.repeat(width) + '┘';
   const rows = lines.map((line) => {
@@ -62,18 +81,17 @@ function box(lines, { width = 64 } = {}) {
   return [top, ...rows, bottom].join('\n');
 }
 
-/**
- * Welcome screen: clear + banner + status lines.
- * @param {object} status
- * @param {string} status.model
- * @param {string} status.baseUrl
- * @param {'pending'|'ok'|'fail'} status.mcp
- * @param {number} [status.mcpToolCount]
- * @param {boolean} status.larkOk
- * @param {string} status.kanbanUrl
- * @param {string} status.version
- */
-function printBanner(status) {
+export interface BannerStatus {
+  model: string;
+  baseUrl: string;
+  mcp: 'pending' | 'ok' | 'fail';
+  mcpToolCount?: number;
+  larkOk: boolean;
+  kanbanUrl: string;
+  version: string;
+}
+
+export function printBanner(status: BannerStatus): void {
   process.stdout.write(`${ESC}[2J${ESC}[H`);
   const mcpLine =
     status.mcp === 'ok'
@@ -107,31 +125,33 @@ function printBanner(status) {
   console.log(box(lines, { width: 66 }));
 }
 
-class Spinner {
-  constructor(text) {
-    this.frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+export class Spinner {
+  private frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  private text: string;
+  private i = 0;
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(text: string) {
     this.text = text;
-    this.i = 0;
-    this.timer = null;
   }
 
-  start(text) {
+  start(text?: string): this {
     if (text) this.text = text;
     if (!process.stdout.isTTY) return this;
     this.stop();
     this.timer = setInterval(() => {
-      const frame = c.info(this.frames[this.i = (this.i + 1) % this.frames.length]);
+      const frame = c.info(this.frames[(this.i = (this.i + 1) % this.frames.length)]);
       process.stdout.write(`\r${ESC}[K ${frame} ${c.gray(this.text)}`);
     }, 80);
     return this;
   }
 
-  setText(text) {
+  setText(text: string): this {
     this.text = text;
     return this;
   }
 
-  stop() {
+  stop(): this {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -142,31 +162,32 @@ class Spinner {
 }
 
 /** Very light markdown render for terminal: code/inline-code/bold get color. */
-function renderReply(text) {
-  const out = String(text)
-    .replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => '\n' + c.gray(code.replace(/\n/g, '\n  ')) + '\n')
-    .replace(/`([^`\n]+)`/g, (_, s) => c.info(s))
-    .replace(/\*\*([^*]+)\*\*/g, (_, s) => c.strong(s));
-  return out;
+export function renderReply(text: string): string {
+  return String(text)
+    .replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang: string, code: string) => '\n' + c.gray(code.replace(/\n/g, '\n  ')) + '\n')
+    .replace(/`([^`\n]+)`/g, (_m, s: string) => c.info(s))
+    .replace(/\*\*([^*]+)\*\*/g, (_m, s: string) => c.strong(s));
 }
 
-function defaultRenderLine(opt) {
+export interface SelectOption {
+  name: string;
+  baseUrl?: string;
+}
+
+function defaultRenderLine(opt: string | SelectOption): string {
   if (typeof opt === 'string') return opt;
   return opt.name + (opt.baseUrl ? c.gray('  ' + opt.baseUrl) : '');
 }
 
-/**
- * Arrow-key single-select menu (TTY only). Returns the selected index.
- * The caller must pause any active readline interface on stdin before
- * calling this, and resume it afterwards.
- *
- * @param {object} args
- * @param {string} args.title
- * @param {Array} args.options  strings or { name, baseUrl }
- * @param {(opt: any, i: number) => string} [args.renderLine]
- * @returns {Promise<number>}
- */
-function selectList({ title, options, renderLine = defaultRenderLine }) {
+export function selectList({
+  title,
+  options,
+  renderLine = defaultRenderLine,
+}: {
+  title: string;
+  options: Array<string | SelectOption>;
+  renderLine?: (opt: string | SelectOption, i: number) => string;
+}): Promise<number> {
   return new Promise((resolve, reject) => {
     const stdin = process.stdin;
     const wasRaw = stdin.isTTY ? Boolean(stdin.isRaw) : false;
@@ -201,14 +222,14 @@ function selectList({ title, options, renderLine = defaultRenderLine }) {
       stdin.pause();
     };
 
-    const settle = (fn, value) => {
+    const settle = (fn: (v: number) => void, value: number) => {
       if (settled) return;
       settled = true;
       cleanup();
       fn(value);
     };
 
-    const onKeypress = (str, key) => {
+    const onKeypress = (str: string | undefined, key: readline.Key | undefined) => {
       key = key || {};
       if (key.name === 'up' || str === 'k') {
         current = (current - 1 + options.length) % options.length;
@@ -219,7 +240,9 @@ function selectList({ title, options, renderLine = defaultRenderLine }) {
       } else if (key.name === 'return') {
         settle(resolve, current);
       } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
-        settle(reject, new Error('已取消'));
+        settled = true;
+        cleanup();
+        reject(new Error('已取消'));
       } else if (str && /^[1-9]$/.test(str)) {
         const idx = Number(str) - 1;
         if (idx < options.length) {
@@ -235,5 +258,3 @@ function selectList({ title, options, renderLine = defaultRenderLine }) {
     stdin.on('keypress', onKeypress);
   });
 }
-
-module.exports = { c, box, printBanner, Spinner, renderReply, selectList };
