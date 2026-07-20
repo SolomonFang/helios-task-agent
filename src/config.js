@@ -25,6 +25,11 @@ const PRESETS = [
     model: 'gpt-4o',
   },
   {
+    name: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
+  },
+  {
     name: '自定义（OpenAI 兼容接口）',
     baseUrl: '',
     model: '',
@@ -68,21 +73,29 @@ function writeEnv(cfg) {
 /**
  * Interactive setup wizard for LLM provider + model.
  * @param {(prompt: string) => Promise<string|null>} ask  shared prompt fn (null = EOF)
+ * @param {((presets: typeof PRESETS) => Promise<number>) | null} [choose]
+ *        arrow-key selector used on TTY; falls back to numbered input otherwise
  */
-async function runWizard(ask) {
+async function runWizard(ask, choose) {
   const need = async (promptText) => {
     const ans = await ask(promptText);
     if (ans === null) throw new Error('输入已结束');
     return ans.trim();
   };
 
-  console.log(c.strong('\n配置模型（OpenAI 兼容协议）：\n'));
-  PRESETS.forEach((p, i) => {
-    console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
-  });
-  const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
-  const idx = Math.min(Math.max(parseInt(pick || '1', 10) || 1, 1), PRESETS.length) - 1;
+  let idx;
+  if (choose && process.stdin.isTTY) {
+    idx = await choose(PRESETS);
+  } else {
+    console.log(c.strong('\n配置模型（OpenAI 兼容协议）：\n'));
+    PRESETS.forEach((p, i) => {
+      console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
+    });
+    const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
+    idx = Math.min(Math.max(parseInt(pick || '1', 10) || 1, 1), PRESETS.length) - 1;
+  }
   const preset = PRESETS[idx];
+  console.log(c.gray(`已选择 ${preset.name}`));
 
   const old = currentConfig();
   let baseUrl = preset.baseUrl;
@@ -103,9 +116,9 @@ async function runWizard(ask) {
 }
 
 /** Ensure config exists; run wizard if not. */
-async function ensureConfig(ask, { force = false } = {}) {
+async function ensureConfig(ask, { force = false, choose = null } = {}) {
   if (!force && isConfigured()) return currentConfig();
-  return runWizard(ask);
+  return runWizard(ask, choose);
 }
 
 module.exports = { currentConfig, isConfigured, ensureConfig, ENV_PATH };

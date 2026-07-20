@@ -3,7 +3,7 @@
 const readline = require('readline');
 const { execFileSync } = require('child_process');
 
-const { c, printBanner, Spinner, renderReply } = require('./ui');
+const { c, printBanner, Spinner, renderReply, selectList } = require('./ui');
 const { ensureConfig } = require('./config');
 const { KanbanMcp } = require('./mcp');
 const { buildTools } = require('./tools');
@@ -22,7 +22,10 @@ function checkLarkCli() {
 
 /**
  * Single 'line'-event-driven reader shared by the wizard and the REPL.
- * Returns nextLine(): Promise<string|null> (null on stdin EOF).
+ * Returns nextLine(): Promise<string|null> (null on stdin EOF), with a
+ * drain() method to discard lines queued while the reader was not awaiting
+ * (e.g. the readline interface still emits 'line' for keys pressed inside
+ * the arrow-key menu).
  */
 function createLineReader(rl) {
   const queue = [];
@@ -45,12 +48,16 @@ function createLineReader(rl) {
       w(null);
     }
   });
-  return () =>
+  const nextLine = () =>
     new Promise((resolve) => {
       if (queue.length) return resolve(queue.shift());
       if (closed) return resolve(null);
       waiter = resolve;
     });
+  nextLine.drain = () => {
+    queue.length = 0;
+  };
+  return nextLine;
 }
 
 const HELP = `
@@ -81,10 +88,20 @@ async function main() {
     process.stdout.write(promptText);
     return nextLine();
   };
+  // Arrow-key preset picker for the config wizard (TTY only).
+  const choose = async (presets) => {
+    rl.pause();
+    try {
+      return await selectList({ title: '配置模型（OpenAI 兼容协议）：', options: presets });
+    } finally {
+      rl.resume();
+      nextLine.drain(); // drop 'line' events the rl still emitted for menu keys
+    }
+  };
 
   let cfg;
   try {
-    cfg = await ensureConfig(ask);
+    cfg = await ensureConfig(ask, { choose });
   } catch (err) {
     console.error(c.err(`\n配置失败: ${err.message}`));
     rl.close();
@@ -169,7 +186,7 @@ async function main() {
         }
       } else if (cmd === '/config') {
         try {
-          cfg = await ensureConfig(ask, { force: true });
+          cfg = await ensureConfig(ask, { force: true, choose });
           messages[0].content = buildSystemPrompt({
             mcpOk,
             mcpToolNames: mcpOk ? mcp.tools.map((t) => t.name) : [],

@@ -2,6 +2,8 @@
 
 // Minimal ANSI helpers — no external deps.
 
+const readline = require('readline');
+
 const ESC = '\u001b';
 const codes = {
   reset: 0, bold: 1, dim: 2,
@@ -148,4 +150,90 @@ function renderReply(text) {
   return out;
 }
 
-module.exports = { c, box, printBanner, Spinner, renderReply };
+function defaultRenderLine(opt) {
+  if (typeof opt === 'string') return opt;
+  return opt.name + (opt.baseUrl ? c.gray('  ' + opt.baseUrl) : '');
+}
+
+/**
+ * Arrow-key single-select menu (TTY only). Returns the selected index.
+ * The caller must pause any active readline interface on stdin before
+ * calling this, and resume it afterwards.
+ *
+ * @param {object} args
+ * @param {string} args.title
+ * @param {Array} args.options  strings or { name, baseUrl }
+ * @param {(opt: any, i: number) => string} [args.renderLine]
+ * @returns {Promise<number>}
+ */
+function selectList({ title, options, renderLine = defaultRenderLine }) {
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin;
+    const wasRaw = stdin.isTTY ? Boolean(stdin.isRaw) : false;
+    let current = 0;
+    let settled = false;
+
+    const draw = () => {
+      const lines = [
+        '',
+        c.strong(title),
+        ...options.map((opt, i) => {
+          const text = renderLine(opt, i);
+          return i === current ? `  ${c.info('❯')} ${c.info(text)}` : `    ${text}`;
+        }),
+        '',
+        c.gray('  ↑/↓ 选择，回车确认，数字键直选'),
+      ];
+      process.stdout.write(lines.join('\n') + '\n');
+      return lines.length;
+    };
+
+    let lineCount = draw();
+
+    const redraw = () => {
+      process.stdout.write(`${ESC}[${lineCount}A\r${ESC}[0J`);
+      lineCount = draw();
+    };
+
+    const cleanup = () => {
+      stdin.removeListener('keypress', onKeypress);
+      if (stdin.isTTY && Boolean(stdin.isRaw) !== wasRaw) stdin.setRawMode(wasRaw);
+      stdin.pause();
+    };
+
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const onKeypress = (str, key) => {
+      key = key || {};
+      if (key.name === 'up' || str === 'k') {
+        current = (current - 1 + options.length) % options.length;
+        redraw();
+      } else if (key.name === 'down' || str === 'j') {
+        current = (current + 1) % options.length;
+        redraw();
+      } else if (key.name === 'return') {
+        settle(resolve, current);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        settle(reject, new Error('已取消'));
+      } else if (str && /^[1-9]$/.test(str)) {
+        const idx = Number(str) - 1;
+        if (idx < options.length) {
+          current = idx;
+          settle(resolve, current);
+        }
+      }
+    };
+
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY && !wasRaw) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('keypress', onKeypress);
+  });
+}
+
+module.exports = { c, box, printBanner, Spinner, renderReply, selectList };
