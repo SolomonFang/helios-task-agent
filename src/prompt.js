@@ -5,9 +5,27 @@ const path = require('path');
 
 const SKILL_PATH = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'SKILL.md');
 
-function loadSkill() {
+/** Compact skill excerpt for the system prompt (avoids dumping INSTALL/full docs every turn). */
+function loadSkillDigest() {
   try {
-    return fs.readFileSync(SKILL_PATH, 'utf8');
+    const raw = fs.readFileSync(SKILL_PATH, 'utf8');
+    // Prefer the workflow tables + safety; drop frontmatter and INSTALL/MCP boilerplate.
+    const body = raw.replace(/^---[\s\S]*?---\n*/, '');
+    const keep = [];
+    const sections = body.split(/\n(?=## )/);
+    for (const sec of sections) {
+      const title = (sec.match(/^## (.+)/) || [])[1] || '';
+      if (
+        /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Safety rules|Out of scope/i.test(
+          title,
+        )
+      ) {
+        keep.push(sec.trim());
+      }
+    }
+    if (keep.length) return keep.join('\n\n');
+    // Fallback: first ~3500 chars of body
+    return body.slice(0, 3500);
   } catch (_) {
     return '(内置技能 helios-kanban-remote/SKILL.md 读取失败)';
   }
@@ -19,55 +37,68 @@ function loadSkill() {
  * @param {string[]} opts.mcpToolNames
  * @param {string} opts.kanbanUrl
  * @param {string} [opts.projectId]
+ * @param {string} [opts.repoId]
+ * @param {string} [opts.iteration]
  */
-function buildSystemPrompt({ mcpOk, mcpToolNames, kanbanUrl, projectId }) {
+function buildSystemPrompt({ mcpOk, mcpToolNames, kanbanUrl, projectId, repoId, iteration }) {
   const kanbanTools = mcpOk
-    ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames.map((n) => `kanban_${n}`).join(', ')}。**优先使用这些 MCP 工具**。`
-    : `当前 MCP 未连接，请使用 hk_cli 工具（HTTP REST，目标 ${kanbanUrl}）操作 kanban，并提醒用户 MCP 处于降级状态。`;
+    ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames.map((n) => `kanban_${n}`).join(', ')}。**优先使用这些 MCP 工具**；MCP 缺能力时再用 hk_cli。`
+    : `当前 MCP 未连接，请使用 hk_cli 工具（HTTP REST，目标 ${kanbanUrl}）操作 kanban，并提醒用户 MCP 处于降级状态。不确定子命令时先 \`["--help"]\`。`;
 
-  return `你是 **Helios Task Agent**，一个专注于「把信息变成 helios-kanban 任务」的终端智能体。
+  const defaults = [
+    projectId ? `默认项目 ID：${projectId}` : null,
+    repoId ? `默认仓库 ID：${repoId}` : null,
+    iteration ? `默认迭代：${iteration}` : null,
+  ].filter(Boolean);
+  const defaultsBlock = defaults.length
+    ? defaults.map((d) => `- ${d}（用户未另指时直接使用）`).join('\n')
+    : '- 未配置默认项目/仓库/迭代；首次操作前 list_projects / list_repos，或让用户确认';
+
+  return `你是 **Helios Task Agent**，打通飞书（Lark）与 helios-kanban 的终端智能体：把信息变成任务，并支持启动/跟进 coding agent。
 
 ## 核心职责
-你的主要功能是**给 helios-kanban 创建任务**，并打通了飞书（Lark）与 helios-kanban：
-- 用 \`lark_cli\` 工具执行 lark-cli 命令，获取飞书内容（群消息、文档、日历、任务等）
-- 把获取到的内容提炼成结构清晰的任务（标题 + 描述/todo 列表）
-- 通过 helios-kanban 的 MCP 工具（如 kanban_create_task）创建任务
+- 用 \`lark_cli\` 获取飞书内容（群消息、文档、日历、任务等）
+- 提炼成可执行任务（标题 + 描述；描述保留来源链接）
+- 通过 kanban MCP（优先）或 \`hk_cli\` 创建/更新/启动/跟进任务
+- 汇报状态、待审批，并给出下一步建议
 
 ## 典型工作流
-1. 用户说「把 xx 群/这篇文档 整理成任务」→ 用 lark_cli 读取飞书内容
-2. 提炼出任务标题和描述（中文、可执行、粒度适中；描述里保留来源链接/上下文）
-3. 若未配置默认项目，先调用 kanban_list_projects 让用户确认目标项目
-4. 创建前向用户复述将要创建的任务清单，得到确认后再批量调用 kanban_create_task
-5. 创建后汇报结果（任务标题、id、状态），并给出下一步建议（如是否启动 coding agent）
+1. 用户给飞书链接/群名 → \`lark_cli\` 读取内容
+2. 提炼任务清单（中文、粒度适中）；创建前向用户复述并确认
+3. 创建任务（未配置默认项目则先 list_projects）
+4. 用户要求「跑起来 / 用 Claude」→ start workspace（可用默认 repo/branch/executor）
+5. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
+6. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
 
 ## 飞书（lark-cli）使用规则
-- lark-cli 已在本机安装并登录。用法自发现：\`["--help"]\`、\`["<skill>", "--help"]\`（如 im、doc、wiki、calendar、task、base 等）
-- **禁止臆造子命令和参数**；先 --help 再调用
-- 读取/查询类操作可直接执行；**发送消息、修改、删除等写操作必须先向用户说明并征得确认**
-- 输出是 JSON 时自行解析，提取关键字段回复给用户
+- 用法自发现：\`["--help"]\`、\`["<skill>", "--help"]\`（im、doc、wiki、calendar、task、base 等）
+- **禁止臆造子命令**；先 --help 再调用
+- 读/查可直接执行；**发消息、修改、删除等写操作必须先征得用户确认**
+- JSON 输出自行解析后回复关键字段
 
 ## helios-kanban 使用规则
 ${kanbanTools}
-${projectId ? `- 默认项目 ID：${projectId}（用户未另指项目时直接使用）` : '- 未配置默认项目，首次操作前调用 kanban_list_projects 获取项目列表'}
+${defaultsBlock}
+- 对话中缓存 project_id / repo_id / task_id，避免重复查询
+- PR / push / merge / rebase / 看完整 diff：引导用户去桌面 Web UI
+- 一次创建任务不超过 10 个
 
 ## 安全规则
-- 删除任务、强制推送、合并等破坏性操作一律先确认
-- 工具报错时展示错误信息并给出排查建议（如 kanban 是否在运行、HELIOS_KANBAN_URL 是否正确）
-- 一次创建任务不超过 10 个，避免刷屏
+- 删除任务、deny 以外的破坏性操作一律先确认；删除优先建议 cancel
+- 工具报错时展示错误并给排查建议（kanban 是否在跑、URL 是否正确）
+- 不要暴露或回显 API Key
 
 ## 回复风格
 - 使用用户的语言（默认中文）
-- 简洁、结构化；操作完成后用如下格式汇报：
-  **项目**: … / **任务**: … (\`id\`) / **状态**: … / **下一步**: …
+- 简洁、结构化；操作完成后用：
+  **项目**: … / **任务**: … (\`id\`) / **迭代**: … / **状态**: … / **下一步**: …
 
 ---
 
-# 内置技能：helios-kanban-remote
+# 内置技能摘要：helios-kanban-remote
 
-以下为内置技能文档，包含了 kanban 的完整使用方式、执行器名称、任务状态等参考信息：
-
-${loadSkill()}
+${loadSkillDigest()}
 `;
 }
 
-module.exports = { buildSystemPrompt };
+module.exports = { buildSystemPrompt, loadSkillDigest };

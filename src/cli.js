@@ -71,9 +71,37 @@ const HELP = `
   ${c.strong('试试对我说')}
   · 有哪些项目 / 看看进行中的任务
   · 创建一个任务：修复登录页样式 bug
-  · 把 xx 群最近的聊天记录整理成任务
+  · 用 Claude 跑这个任务 / 再跟它说一句：先写测试
+  · 有没有待审批 / 把 xx 群最近的聊天整理成任务
   · 读一下这篇飞书文档 <链接>，提炼成开发任务
 `;
+
+function promptOpts(cfg, mcpOk, mcp) {
+  return {
+    mcpOk,
+    mcpToolNames: mcpOk ? mcp.tools.map((t) => t.name) : [],
+    kanbanUrl: cfg.kanbanUrl,
+    projectId: cfg.kanbanProjectId || undefined,
+    repoId: cfg.kanbanRepoId || undefined,
+    iteration: cfg.kanbanIteration || undefined,
+  };
+}
+
+function rebuildRuntime(cfg, mcp, mcpOk) {
+  const { openAiTools, handlers } = buildTools({
+    mcp: mcpOk ? mcp : null,
+    kanbanUrl: cfg.kanbanUrl,
+    kanbanProjectId: cfg.kanbanProjectId,
+    kanbanRepoId: cfg.kanbanRepoId,
+    kanbanIteration: cfg.kanbanIteration,
+  });
+  return {
+    client: createClient(cfg),
+    openAiTools,
+    handlers,
+    systemPrompt: buildSystemPrompt(promptOpts(cfg, mcpOk, mcp)),
+  };
+}
 
 async function main() {
   const isTTY = process.stdin.isTTY === true;
@@ -132,21 +160,10 @@ async function main() {
     larkOk,
   });
 
-  const { openAiTools, handlers } = buildTools({ mcp: mcpOk ? mcp : null, kanbanUrl: cfg.kanbanUrl });
-  const client = createClient(cfg);
+  let { client, openAiTools, handlers, systemPrompt } = rebuildRuntime(cfg, mcp, mcpOk);
   const spinner = new Spinner('思考中…');
 
-  let messages = [
-    {
-      role: 'system',
-      content: buildSystemPrompt({
-        mcpOk,
-        mcpToolNames: mcpOk ? mcp.tools.map((t) => t.name) : [],
-        kanbanUrl: cfg.kanbanUrl,
-        projectId: cfg.kanbanProjectId || undefined,
-      }),
-    },
-  ];
+  let messages = [{ role: 'system', content: systemPrompt }];
 
   const cleanup = async () => {
     spinner.stop();
@@ -187,12 +204,8 @@ async function main() {
       } else if (cmd === '/config') {
         try {
           cfg = await ensureConfig(ask, { force: true, choose });
-          messages[0].content = buildSystemPrompt({
-            mcpOk,
-            mcpToolNames: mcpOk ? mcp.tools.map((t) => t.name) : [],
-            kanbanUrl: cfg.kanbanUrl,
-            projectId: cfg.kanbanProjectId || undefined,
-          });
+          ({ client, openAiTools, handlers, systemPrompt } = rebuildRuntime(cfg, mcp, mcpOk));
+          messages[0].content = systemPrompt;
           console.log(c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel));
         } catch (err) {
           console.error(c.err(`配置失败: ${err.message}`));

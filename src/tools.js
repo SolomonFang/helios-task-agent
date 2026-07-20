@@ -57,8 +57,9 @@ const LOCAL_TOOLS = [
     function: {
       name: 'hk_cli',
       description:
-        '执行 helios-kanban-remote 技能的 hk.sh 脚本（HTTP REST 方式操作 kanban，作为 MCP 不可用时的降级手段）。' +
-        '例如 ["health"]、["projects"]、["tasks","create","<project_id>","标题"]。详见 ["--help"]。',
+        '执行 helios-kanban-remote 技能的 hk.sh（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
+        '例如 ["health"]、["projects"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
+        '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。',
       parameters: {
         type: 'object',
         properties: {
@@ -79,9 +80,12 @@ const LOCAL_TOOLS = [
  * @param {object} deps
  * @param {import('./mcp').KanbanMcp|null} deps.mcp  connected MCP client or null
  * @param {string} deps.kanbanUrl
+ * @param {string} [deps.kanbanProjectId]
+ * @param {string} [deps.kanbanRepoId]
+ * @param {string} [deps.kanbanIteration]
  * @returns {{ openAiTools: object[], handlers: Map<string, function> }}
  */
-function buildTools({ mcp, kanbanUrl }) {
+function buildTools({ mcp, kanbanUrl, kanbanProjectId, kanbanRepoId, kanbanIteration }) {
   const openAiTools = [];
   const handlers = new Map();
 
@@ -114,11 +118,16 @@ function buildTools({ mcp, kanbanUrl }) {
     return run('lark-cli', args);
   });
 
+  const hkEnv = { HELIOS_KANBAN_URL: kanbanUrl };
+  if (kanbanProjectId) hkEnv.HELIOS_KANBAN_PROJECT_ID = kanbanProjectId;
+  if (kanbanRepoId) hkEnv.HELIOS_KANBAN_REPO_ID = kanbanRepoId;
+  if (kanbanIteration) hkEnv.HELIOS_KANBAN_ITERATION = kanbanIteration;
+
   handlers.set('hk_cli', async ({ args }) => {
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
     }
-    return run('bash', [HK_SCRIPT, ...args], { env: { HELIOS_KANBAN_URL: kanbanUrl } });
+    return run('bash', [HK_SCRIPT, ...args], { env: hkEnv });
   });
 
   openAiTools.push(...LOCAL_TOOLS);
