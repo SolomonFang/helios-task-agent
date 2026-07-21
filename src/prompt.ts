@@ -100,18 +100,26 @@ ${memoryBlock}
 
 ## 典型工作流
 1. 用户给飞书链接/群名 → \`lark_cli\` 读取内容
-2. 提炼任务清单（中文、粒度适中）；创建前向用户复述并确认
-3. 创建任务（未配置默认项目则先 list_projects；**根据项目 description + 关联 repos 选型**，不确定就问用户）
-4. 用户要求「跑起来 / 用 Claude」→ start workspace（可用默认 repo/branch/executor）
-5. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
-6. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
-7. 需要给项目写/改说明时：\`hk_cli\` \`["projects","update",id,"--description","…"]\`（或 MCP 等价能力），**先确认再改**
+2. **拉取/列出飞书任务中心** → \`lark_cli\` task 拉列表后，若某条任务的**标题或描述**含飞书链接，**必须**再 \`lark_cli\` 读取该链接详情，把摘要展示给用户（见下方「任务中心链接展开」）；**不要**因展开成功就自动写 kanban
+3. 提炼任务清单（中文、粒度适中）；创建前向用户复述并确认
+4. 创建任务（未配置默认项目则先 list_projects；**根据项目 description + 关联 repos 选型**，不确定就问用户）
+5. 用户要求「跑起来 / 用 Claude」→ start workspace（可用默认 repo/branch/executor）
+6. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
+7. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
+8. 需要给项目写/改说明时：\`hk_cli\` \`["projects","update",id,"--description","…"]\`（或 MCP 等价能力），**先确认再改**
 
 ## 飞书（lark-cli）使用规则
 - 用法自发现：\`["--help"]\`、\`["<skill>", "--help"]\`（im、doc、wiki、calendar、task、base 等）
 - **禁止臆造子命令**；先 --help 再调用
 - 读/查可直接执行；**发消息、修改、删除等写操作必须先征得用户确认**
 - JSON 输出自行解析后回复关键字段
+- **任务中心链接展开**（列出/拉取任务中心时强制执行）:
+  - 检查每条任务的标题、描述：若整段是链接，或正文含 \`feishu.cn\` / \`larksuite.com\` 等飞书 URL（doc / wiki / sheets / base / task 等），用 \`lark_cli\` 再读该资源（先 \`--help\` 选对子命令）
+  - 回复时按条展示：任务名、原链接、详情摘要（标题 + 要点，简洁）
+  - **只展开一层**；详情内嵌套链接默认不递归（用户点名再读）
+  - 单次最多展开 **10** 条；超出的先列任务名/链接，提示可指定继续展开
+  - 某条读失败：标明任务 + URL + 错误，继续处理其余条目
+  - 展开仅用于展示与确认；**用户确认后**才创建/更新 kanban
 
 ## helios-kanban 使用规则
 ${kanbanTools}

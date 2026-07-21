@@ -1,11 +1,12 @@
 import readline from 'readline';
-import { execFileSync } from 'child_process';
+import { execFileSync, type ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { c, printBanner, Spinner, renderReply, selectList } from './ui';
 import { ensureConfig } from './config';
 import { KanbanMcp } from './mcp';
 import { AgentSession } from './session';
+import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
@@ -106,6 +107,24 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
+  let kanbanChild: ChildProcess | null = null;
+  const bootKanban = new Spinner('检查 helios-kanban…').start();
+  try {
+    const ensured = await ensureKanbanRunning(cfg.kanbanUrl, {
+      onLog: (msg) => bootKanban.setText(msg),
+    });
+    kanbanChild = ensured.child;
+    bootKanban.stop();
+    if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
+  } catch (err) {
+    bootKanban.stop();
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(c.err(`看板不可用: ${message}`));
+    console.error(c.gray('可手动: HOST=0.0.0.0 PORT=7964 npx -y helios-kanban'));
+    rl.close();
+    process.exit(1);
+  }
+
   const boot = new Spinner('正在连接 helios-kanban MCP…').start();
   const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
   let mcpOk = true;
@@ -138,6 +157,7 @@ export async function main(): Promise<void> {
   const cleanup = async () => {
     spinner.stop();
     await mcp.close();
+    await stopKanbanChild(kanbanChild);
     rl.close();
     process.exit(0);
   };

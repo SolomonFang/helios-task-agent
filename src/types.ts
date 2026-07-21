@@ -14,6 +14,14 @@ export interface AgentConfig {
   kanbanIteration: string;
 }
 
+/** Feishu bot long-connection credentials. */
+export interface FeishuBotConfig {
+  appId: string;
+  appSecret: string;
+  /** Empty = allow all DMs; otherwise only listed open_ids. */
+  allowedOpenIds: string[];
+}
+
 export interface LlmPreset {
   name: string;
   baseUrl: string;
