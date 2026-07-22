@@ -25,12 +25,16 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 命令
 /help     显示帮助
+/status   健康检查（kanban / MCP / lark-cli / 推送 / 晨报）
+/tools    列出当前可用工具
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
+/stop     中断当前正在执行的任务
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
 · 点「确认执行 / 取消」按钮，或直接回复「确认 / 取消」（120 秒超时自动拒绝）
+· 同类型写操作批准后 10 分钟内自动放行；删除/取消/停止类仍逐次确认
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
@@ -191,6 +195,9 @@ async function main(): Promise<void> {
     }
   };
 
+  /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
+  const running = new Map<string, AbortController>();
+
   // MCP 健康监督：60s 探测；掉线自动降级 hk_cli 并重连（退避至 ~5 分钟），恢复后切回
   let mcpAlive = mcpOk;
   let mcpFailures = 0;
@@ -233,8 +240,8 @@ async function main(): Promise<void> {
   const handle = async (msg: InboundMessage) => {
     const fmsg = msg as FeishuInboundMessage;
 
-    if (fmsg.messageType && fmsg.messageType !== 'text') {
-      await channel.reply(msg, '暂只支持文字消息。');
+    if (fmsg.messageType && fmsg.messageType !== 'text' && fmsg.messageType !== 'post') {
+      await channel.reply(msg, '暂只支持文字与富文本（post）消息。');
       return;
     }
 
@@ -259,6 +266,45 @@ async function main(): Promise<void> {
     const cmd = isCommand(text);
     if (cmd === '/help') {
       await channel.reply(msg, BOT_HELP);
+      return;
+    }
+
+    // 即时命令（不进串行队列，否则 /stop 会排在它要中断的任务后面）
+    if (cmd === '/stop') {
+      const ctl = running.get(msg.senderId);
+      if (ctl) {
+        ctl.abort();
+        running.delete(msg.senderId);
+        await channel.reply(msg, '⏹ 已中断当前任务。');
+      } else {
+        await channel.reply(msg, '当前没有正在执行的任务。');
+      }
+      return;
+    }
+    if (cmd === '/status') {
+      let kanbanHealth: string;
+      try {
+        const res = await fetch(`${agentCfg.kanbanUrl.replace(/\/+$/, '')}/api/health`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        kanbanHealth = res.ok ? 'ok' : `HTTP ${res.status}`;
+      } catch {
+        kanbanHealth = '不可达';
+      }
+      const lines = [
+        `模型: ${agentCfg.llmModel}`,
+        `kanban: ${kanbanHealth}（${agentCfg.kanbanUrl}）`,
+        `MCP: ${mcpAlive ? `ok（${mcp.tools.length} 个工具）` : '降级 hk_cli（自动重连中）'}`,
+        `lark-cli: ${checkLarkCli() ? 'ok' : '未安装（飞书读取不可用）'}`,
+        `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
+        `晨报: ${process.env.BOT_DAILY_REPORT || '关'}`,
+      ];
+      await channel.reply(msg, lines.join('\n'));
+      return;
+    }
+    if (cmd === '/tools') {
+      const session = router.getOrCreate(msg.senderId);
+      await channel.reply(msg, `当前工具（${session.toolNames.length} 个）\n${session.toolNames.join('、')}`);
       return;
     }
 
@@ -297,8 +343,10 @@ async function main(): Promise<void> {
         const text = info.type === 'tool' ? `⏳ 处理中…（调用工具 ${info.name}）` : '⏳ 思考中…';
         void channel.updateText(progressId, text).catch(() => {});
       };
+      const ctl = new AbortController();
+      running.set(openId, ctl);
       try {
-        const reply = await session.handleUserMessage(text, onProgress);
+        const reply = await session.handleUserMessage(text, onProgress, ctl.signal);
         const chunks = splitText(reply || '(无回复)');
         if (progressId) {
           try {
@@ -311,8 +359,14 @@ async function main(): Promise<void> {
           await channel.reply(msg, reply || '(无回复)');
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        await channel.reply(msg, `请求失败: ${message}\n请检查模型配置或稍后重试。`);
+        if (ctl.signal.aborted) {
+          await channel.reply(msg, '⏹ 已中断。');
+        } else {
+          const message = err instanceof Error ? err.message : String(err);
+          await channel.reply(msg, `请求失败: ${message}\n请检查模型配置或稍后重试。`);
+        }
+      } finally {
+        running.delete(openId);
       }
     });
   };

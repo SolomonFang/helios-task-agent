@@ -55,9 +55,13 @@ export class KanbanMcp {
     await this.connect({ timeoutMs });
   }
 
-  async callTool(name: string, args?: Record<string, unknown>): Promise<string> {
+  async callTool(name: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
     if (!this.client) throw new Error('MCP 未连接');
-    const result = await this.client.callTool({ name, arguments: args || {} });
+    const result = await this.client.callTool(
+      { name, arguments: args || {} },
+      undefined,
+      signal ? { signal } : undefined,
+    );
     const content = Array.isArray(result.content) ? result.content : [];
     const parts = content.map((block: { type: string; text?: string }) => {
       if (block.type === 'text') return block.text ?? '';

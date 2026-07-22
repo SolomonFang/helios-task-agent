@@ -12,8 +12,10 @@ import { MemoryStore } from '../src/memory';
 import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/guard';
 import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
 import { ConfirmationManager } from '../src/confirm';
-import { createAccessChecker, splitText } from '../src/channels/feishu';
+import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
 import { parseDailyTime } from '../src/scheduler';
+import { runAgentTurn } from '../src/llm';
+import type { OpenAiClient } from '../src/types';
 
 async function main(): Promise<void> {
   const cfg = currentConfig();
@@ -262,6 +264,52 @@ async function main(): Promise<void> {
       parseDailyTime('abc') === null &&
       parseDailyTime('') === null,
   );
+
+  // ---- post 富文本解析 ----
+  const postJson = JSON.stringify({
+    title: '需求文档',
+    content: [
+      [
+        { tag: 'text', text: '请看 ' },
+        { tag: 'a', text: '这个链接', href: 'https://x.feishu.cn/docx/1' },
+      ],
+      [{ tag: 'at', user_name: '张三' }, { tag: 'text', text: ' 跟进' }, { tag: 'img' }],
+    ],
+  });
+  const postText = parsePostContent(postJson);
+  check(
+    'post 富文本解析',
+    postText.includes('需求文档') &&
+      postText.includes('这个链接(https://x.feishu.cn/docx/1)') &&
+      postText.includes('@张三') &&
+      postText.includes('[图片]'),
+    postText.slice(0, 60).replace(/\n/g, ' '),
+  );
+
+  // ---- /stop 中断 ----
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          throw new Error('不应被调用');
+        },
+      },
+    },
+  } as unknown as OpenAiClient;
+  const stopCtl = new AbortController();
+  stopCtl.abort();
+  const stopOut = await runAgentTurn({
+    client: fakeClient,
+    model: 'm',
+    messages: [
+      { role: 'system', content: 's' },
+      { role: 'user', content: 'u' },
+    ],
+    tools: [],
+    handlers: new Map(),
+    signal: stopCtl.signal,
+  });
+  check('/stop：已中止信号立即返回', stopOut.includes('中断'));
 
   try {
     fs.rmSync(gateHome, { recursive: true, force: true });

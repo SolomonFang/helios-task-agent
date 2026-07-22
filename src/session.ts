@@ -148,6 +148,7 @@ export class AgentSession {
   async handleUserMessage(
     text: string,
     onProgress?: (info: ProgressInfo) => void,
+    signal?: AbortSignal,
   ): Promise<string> {
     this.messages.push({ role: 'user', content: text });
     try {
@@ -158,6 +159,7 @@ export class AgentSession {
         tools: this.openAiTools,
         handlers: this.handlers,
         onProgress,
+        signal,
       });
     } catch (err) {
       const last = this.messages[this.messages.length - 1];

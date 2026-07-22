@@ -25,13 +25,25 @@ function truncate(s: unknown): string {
   return str.length > MAX_OUTPUT ? str.slice(0, MAX_OUTPUT) + `\n…（输出过长，已截断，共 ${str.length} 字符）` : str;
 }
 
-function run(command: string, args: string[], { env }: { env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+function run(
+  command: string,
+  args: string[],
+  { env, signal }: { env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
+): Promise<string> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve('（命令已被用户中断）');
+      return;
+    }
     execFile(
       command,
       args,
-      { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, ...env } },
+      { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, ...env }, signal },
       (error, stdout, stderr) => {
+        if (signal?.aborted) {
+          resolve('（命令已被用户中断）');
+          return;
+        }
         if (error && !stdout) {
           resolve(`命令执行失败: ${error.message}\n${truncate(stderr || '')}`.trim());
         } else {
@@ -290,10 +302,10 @@ export function buildTools({
           },
         },
       });
-      handlers.set(name, async (args) => {
+      handlers.set(name, async (args, ctx) => {
         if (classifyMcp(tool.name) === 'read') {
           try {
-            return await mcp.callTool(tool.name, args);
+            return await mcp.callTool(tool.name, args, ctx?.signal);
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             return `MCP 工具 ${tool.name} 调用失败: ${message}`;
@@ -318,7 +330,7 @@ export function buildTools({
         }
         let result: string;
         try {
-          result = await mcp.callTool(tool.name, args);
+          result = await mcp.callTool(tool.name, args, ctx?.signal);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           result = `MCP 工具 ${tool.name} 调用失败: ${message}`;
@@ -334,7 +346,7 @@ export function buildTools({
     }
   }
 
-  handlers.set('lark_cli', async (raw) => {
+  handlers.set('lark_cli', async (raw, ctx) => {
     const args = raw.args;
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
@@ -348,14 +360,14 @@ export function buildTools({
         auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason }, auditHome);
         return gate.message;
       }
-      const out = await run('lark-cli', argv);
+      const out = await run('lark-cli', argv, { signal: ctx?.signal });
       auditLog(
         { user: uid, kind: 'lark', summary, detail, decision: 'approved', ok: !looksLikeFailure(out), resultSnippet: out },
         auditHome,
       );
       return wrapUntrusted(out);
     }
-    const out = await run('lark-cli', argv);
+    const out = await run('lark-cli', argv, { signal: ctx?.signal });
     return wrapUntrusted(out);
   });
 
@@ -364,14 +376,14 @@ export function buildTools({
   if (kanbanRepoId) hkEnv.HELIOS_KANBAN_REPO_ID = kanbanRepoId;
   if (kanbanIteration) hkEnv.HELIOS_KANBAN_ITERATION = kanbanIteration;
 
-  handlers.set('hk_cli', async (raw) => {
+  handlers.set('hk_cli', async (raw, ctx) => {
     const args = raw.args;
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
     }
     const argv = args as string[];
     if (classifyHk(argv) === 'read') {
-      return run('bash', [HK_SCRIPT, ...argv], { env: hkEnv });
+      return run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
     }
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const title = isCreate ? hkCreateTitle(argv) : '';
@@ -390,7 +402,7 @@ export function buildTools({
       auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
-    const out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv });
+    const out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
     const ok = !looksLikeFailure(out);
     auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
     if (ok && urls.length) recordSources(urls, out, title);

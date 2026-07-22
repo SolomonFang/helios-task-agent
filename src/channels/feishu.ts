@@ -82,6 +82,56 @@ function parseTextContent(content: string | undefined): string {
   }
 }
 
+/** Flatten a Feishu post (rich text) message into plain text. */
+export function parsePostContent(content: string | undefined): string {
+  if (!content) return '';
+  let post: { title?: string; content?: unknown };
+  try {
+    post = JSON.parse(content) as { title?: string; content?: unknown };
+  } catch {
+    return '';
+  }
+  const lines: string[] = [];
+  if (typeof post.title === 'string' && post.title.trim()) lines.push(post.title.trim());
+  if (!Array.isArray(post.content)) return lines.join('\n');
+  for (const para of post.content) {
+    if (!Array.isArray(para)) continue;
+    const segs: string[] = [];
+    for (const node of para as Array<Record<string, unknown>>) {
+      const text = typeof node.text === 'string' ? node.text : '';
+      switch (node.tag) {
+        case 'text':
+          segs.push(text);
+          break;
+        case 'a':
+          segs.push(node.href ? `${text}(${node.href})` : text);
+          break;
+        case 'at':
+          segs.push(`@${node.user_name || node.user_id || '某人'}`);
+          break;
+        case 'img':
+          segs.push('[图片]');
+          break;
+        case 'media':
+        case 'file':
+          segs.push('[文件]');
+          break;
+        case 'emotion':
+          segs.push(`[${node.emoji_type || '表情'}]`);
+          break;
+        case 'code_block':
+          segs.push(`\n${text}\n`);
+          break;
+        default:
+          if (text) segs.push(text);
+      }
+    }
+    const line = segs.join('').trim();
+    if (line) lines.push(line);
+  }
+  return lines.join('\n').trim();
+}
+
 /**
  * Feishu IM channel via official WS long connection.
  * Only p2p (DM) text messages are forwarded to the handler.
@@ -173,7 +223,12 @@ export class FeishuChannel implements AgentChannel {
           this.seenMessageIds.set(message.message_id, now);
 
           const messageType = message.message_type || 'unknown';
-          const text = messageType === 'text' ? parseTextContent(message.content) : '';
+          const text =
+            messageType === 'text'
+              ? parseTextContent(message.content)
+              : messageType === 'post'
+                ? parsePostContent(message.content)
+                : '';
 
           const inbound: FeishuInboundMessage = {
             sessionId: message.chat_id,

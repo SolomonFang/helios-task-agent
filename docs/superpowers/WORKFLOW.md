@@ -58,6 +58,7 @@ flowchart TD
 | [feishu-to-kanban-design](./specs/2026-07-21-feishu-to-kanban-design.md) | implemented |
 | [write-gate-design](./specs/2026-07-22-write-gate-design.md) | implemented |
 | [trust-batch-progress-design](./specs/2026-07-22-trust-batch-progress-design.md) | implemented |
+| [bot-experience-p1-design](./specs/2026-07-22-bot-experience-p1-design.md) | implemented |
 
 ## 审查结论（本轮）
 

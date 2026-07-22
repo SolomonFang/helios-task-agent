@@ -25,6 +25,7 @@
 - [飞书 → 看板](docs/superpowers/specs/2026-07-21-feishu-to-kanban-design.md)
 - [写操作闸门与安全边界](docs/superpowers/specs/2026-07-22-write-gate-design.md)
 - [信任基线与主动体验](docs/superpowers/specs/2026-07-22-trust-batch-progress-design.md)
+- [Bot 体验补全](docs/superpowers/specs/2026-07-22-bot-experience-p1-design.md)
 
 ## 安全机制
 
@@ -133,12 +134,15 @@ helios-task-agent-bot
 
 ## 飞书 / 终端里可以说
 
-- `/help` `/memory` `/clear`
+- 终端：`/help` `/config` `/tools` `/memory` `/clear` `/exit`
+- 飞书 bot：`/help` `/status` `/tools` `/memory` `/clear` `/stop`（中断当前任务）
 - 「以后都从这个飞书地址同步任务：\<链接\>」
 - 「同步我的任务」/「列出我的任务」（含链接则展开详情）
 - 「写进 helios-kanban」（确认标题+需求摘要后创建；**不**自动启动）
 - 「用 Claude 跑这个任务」「start」等（**你**指定何时、用谁启用）
 - 「有哪些项目」「创建一个任务：…」「跑得怎么样」「再跟它说一句…」
+
+bot 支持文字与富文本（post）消息；长回复自动拆分多条；处理期间原地更新进度（「⏳ 处理中…（调用工具 xxx）」）。
 
 记忆按飞书 `open_id`（bot）或 `local`（终端）分桶。
 

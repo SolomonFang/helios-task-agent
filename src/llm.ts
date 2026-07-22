@@ -53,6 +53,7 @@ export async function runAgentTurn({
   tools,
   handlers,
   onProgress,
+  signal,
 }: {
   client: OpenAiClient;
   model: string;
@@ -60,18 +61,24 @@ export async function runAgentTurn({
   tools: OpenAiTool[];
   handlers: ToolHandlers;
   onProgress?: (info: ProgressInfo) => void;
+  /** Aborted by /stop: checked before each round/tool call, passed to the LLM request. */
+  signal?: AbortSignal;
 }): Promise<string> {
   trimHistory(messages);
   let toolCallCount = 0;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    if (signal?.aborted) return '（已被用户中断）';
     if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
-    const resp = await client.chat.completions.create({
-      model,
-      messages,
-      tools: tools.length ? tools : undefined,
-      tool_choice: tools.length ? 'auto' : undefined,
-      temperature: 0.3,
-    });
+    const resp = await client.chat.completions.create(
+      {
+        model,
+        messages,
+        tools: tools.length ? tools : undefined,
+        tool_choice: tools.length ? 'auto' : undefined,
+        temperature: 0.3,
+      },
+      signal ? { signal } : {},
+    );
     const msg = resp.choices[0]?.message;
     if (!msg) throw new Error('模型返回为空');
 
@@ -85,6 +92,7 @@ export async function runAgentTurn({
     for (const call of toolCalls) {
       if (call.type !== 'function') continue;
       toolCallCount++;
+      if (signal?.aborted) return '（已被用户中断）';
       if (toolCallCount > MAX_TOOL_CALLS) {
         return `（工具调用次数超过上限 ${MAX_TOOL_CALLS}，已中止。请缩小任务范围或分步执行。）`;
       }
@@ -104,7 +112,7 @@ export async function runAgentTurn({
         }
         if (result === undefined) {
           try {
-            result = String(await handler(args));
+            result = String(await handler(args, { signal }));
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             result = `工具 ${name} 执行异常: ${message}`;

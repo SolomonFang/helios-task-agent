@@ -18,6 +18,7 @@ Helios Task Agent 设计与流程文档索引。用户入口仍是仓库根目�
 | [specs/2026-07-21-feishu-to-kanban-design.md](./specs/2026-07-21-feishu-to-kanban-design.md) | 写入看板（implemented） |
 | [specs/2026-07-22-write-gate-design.md](./specs/2026-07-22-write-gate-design.md) | 写操作闸门 / 防注入 / 查重 / 推送（implemented） |
 | [specs/2026-07-22-trust-batch-progress-design.md](./specs/2026-07-22-trust-batch-progress-design.md) | owner 认领 / 批量确认 / 进度反馈 / 晨报 / MCP 重连（implemented） |
+| [specs/2026-07-22-bot-experience-p1-design.md](./specs/2026-07-22-bot-experience-p1-design.md) | post 富文本 / /stop 中断 / /status（implemented） |
 | [plans/](./plans/) | 实现计划存档 |
 
 > 旧文件名 `*feishu-kanban-tech-design*` 已更名为 `*feishu-to-kanban*`（不再暗示「技术设计 / Kimi Plan」主路径）。

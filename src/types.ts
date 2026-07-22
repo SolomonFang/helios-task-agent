@@ -33,7 +33,11 @@ export type ChooseFn = (presets: LlmPreset[]) => Promise<number>;
 
 export type ChatMessage = ChatCompletionMessageParam;
 export type OpenAiTool = ChatCompletionTool;
-export type ToolHandler = (args: Record<string, unknown>) => Promise<string>;
+export interface ToolContext {
+  /** Aborted by /stop — long-running handlers should pass it to subprocess/API calls. */
+  signal?: AbortSignal;
+}
+export type ToolHandler = (args: Record<string, unknown>, ctx?: ToolContext) => Promise<string>;
 export type ToolHandlers = Map<string, ToolHandler>;
 
 export type ProgressInfo =
