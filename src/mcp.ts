@@ -43,6 +43,18 @@ export class KanbanMcp {
     return Boolean(this.client);
   }
 
+  /** Liveness probe used by the supervisor (listTools is known to be supported). */
+  async ping(): Promise<void> {
+    if (!this.client) throw new Error('MCP 未连接');
+    await this.client.listTools();
+  }
+
+  /** Drop the current client and establish a fresh stdio connection. */
+  async reconnect({ timeoutMs = 45000 }: { timeoutMs?: number } = {}): Promise<void> {
+    await this.close();
+    await this.connect({ timeoutMs });
+  }
+
   async callTool(name: string, args?: Record<string, unknown>): Promise<string> {
     if (!this.client) throw new Error('MCP 未连接');
     const result = await this.client.callTool({ name, arguments: args || {} });

@@ -1,5 +1,5 @@
 import readline from 'readline';
-import { execFileSync, type ChildProcess } from 'child_process';
+import { type ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { c, printBanner, Spinner, renderReply, selectList } from './ui';
@@ -7,21 +7,13 @@ import { ensureConfig } from './config';
 import { KanbanMcp } from './mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
+import { checkLarkCli } from './deps';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
   version: string;
 };
-
-function checkLarkCli(): boolean {
-  try {
-    execFileSync('lark-cli', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void };
 
@@ -164,6 +156,9 @@ export async function main(): Promise<void> {
     const ans = await ask(c.warn('允许执行？[y/N] '));
     const ok = Boolean(ans && /^(y|yes|确认|同意)$/i.test(ans.trim()));
     console.log(ok ? c.ok('已批准，继续执行。') : c.gray('已拒绝，操作未执行。'));
+    if (ok && req.batchKey) {
+      console.log(c.gray('（10 分钟内同类型写操作自动放行，不再重复询问；删除/取消/停止类仍会逐次确认）'));
+    }
     spinner.start('思考中…');
     return ok;
   };

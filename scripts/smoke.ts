@@ -9,9 +9,11 @@ import { buildTools } from '../src/tools';
 import { currentConfig } from '../src/config';
 import { buildSystemPrompt } from '../src/prompt';
 import { MemoryStore } from '../src/memory';
-import { classifyHk, classifyLark, classifyMcp } from '../src/guard';
+import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/guard';
 import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
 import { ConfirmationManager } from '../src/confirm';
+import { createAccessChecker, splitText } from '../src/channels/feishu';
+import { parseDailyTime } from '../src/scheduler';
 
 async function main(): Promise<void> {
   const cfg = currentConfig();
@@ -207,6 +209,59 @@ async function main(): Promise<void> {
   );
   const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30 });
   check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);
+
+  // ---- 批量确认（同类放行 / 异类与无 key 重问 / 拒绝不缓存） ----
+  let asks = 0;
+  const batchConfirm = withBatchApproval(async () => {
+    asks++;
+    return true;
+  }, 60000);
+  const mkReq = (batchKey?: string): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey });
+  const b1 = await batchConfirm(mkReq('kanban:create_task'));
+  const b2 = await batchConfirm(mkReq('kanban:create_task'));
+  const b3 = await batchConfirm(mkReq('kanban:start_task'));
+  const b4 = await batchConfirm(mkReq());
+  check('批量确认：同类放行、异类/无key重问', b1 && b2 && b3 && b4 && asks === 3, `asks=${asks}`);
+  let denyAsks = 0;
+  const denyConfirm = withBatchApproval(async () => {
+    denyAsks++;
+    return false;
+  }, 60000);
+  await denyConfirm(mkReq('k'));
+  await denyConfirm(mkReq('k'));
+  check('批量确认：拒绝不缓存', denyAsks === 2);
+
+  // ---- 飞书文本拆分 ----
+  const longText = '段落一\n\n'.repeat(1500);
+  const parts = splitText(longText, 3000);
+  check(
+    '长文本拆分：全部 ≤ 上限',
+    parts.length >= 2 && parts.every((p) => p.length <= 3000),
+    `${parts.length} 段`,
+  );
+  check('短文本不拆', splitText('短', 3000).join('') === '短');
+
+  // ---- owner 认领 ----
+  const ac = createAccessChecker([]);
+  check(
+    '白名单为空：首个用户认领 owner，其余拒绝',
+    ac.check('ou_first') === 'claim' &&
+      ac.check('ou_first') === 'allow' &&
+      ac.check('ou_second') === 'deny' &&
+      ac.list().join(',') === 'ou_first',
+  );
+  const ac2 = createAccessChecker(['ou_a']);
+  check('白名单已配：仅放行列表内用户', ac2.check('ou_a') === 'allow' && ac2.check('ou_b') === 'deny');
+
+  // ---- 晨报时间解析 ----
+  check(
+    '每日时间解析',
+    parseDailyTime('9:05')?.hh === 9 &&
+      parseDailyTime('23:59')?.mm === 59 &&
+      parseDailyTime('25:00') === null &&
+      parseDailyTime('abc') === null &&
+      parseDailyTime('') === null,
+  );
 
   try {
     fs.rmSync(gateHome, { recursive: true, force: true });

@@ -63,6 +63,18 @@ function hkCreateTitle(args: string[]): string {
   return '';
 }
 
+/** Destructive ops never batch — each requires its own confirmation. */
+const NO_BATCH_RE = /delete|cancel|stop|deny/i;
+
+function batchKeyForMcp(name: string): string | undefined {
+  return NO_BATCH_RE.test(name) ? undefined : `kanban:${name}`;
+}
+
+function batchKeyForHk(argv: string[]): string | undefined {
+  const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
+  return NO_BATCH_RE.test(sub) ? undefined : `hk:${sub}`;
+}
+
 const LOCAL_TOOLS: OpenAiTool[] = [
   {
     type: 'function',
@@ -299,7 +311,7 @@ export function buildTools({
             return dup;
           }
         }
-        const gate = await passGate({ kind: 'kanban', summary, detail }, confirm);
+        const gate = await passGate({ kind: 'kanban', summary, detail, batchKey: batchKeyForMcp(tool.name) }, confirm);
         if (!gate.allowed) {
           auditLog({ user: uid, kind: 'kanban', summary, detail, decision: gate.reason }, auditHome);
           return gate.message;
@@ -373,7 +385,7 @@ export function buildTools({
         return dup;
       }
     }
-    const gate = await passGate({ kind: 'hk', summary, detail }, confirm);
+    const gate = await passGate({ kind: 'hk', summary, detail, batchKey: batchKeyForHk(argv) }, confirm);
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;

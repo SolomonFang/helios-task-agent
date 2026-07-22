@@ -24,6 +24,7 @@
 - [任务中心链接展开](docs/superpowers/specs/2026-07-21-feishu-task-link-expand-design.md)
 - [飞书 → 看板](docs/superpowers/specs/2026-07-21-feishu-to-kanban-design.md)
 - [写操作闸门与安全边界](docs/superpowers/specs/2026-07-22-write-gate-design.md)
+- [信任基线与主动体验](docs/superpowers/specs/2026-07-22-trust-batch-progress-design.md)
 
 ## 安全机制
 
@@ -32,14 +33,20 @@
 | 机制 | 说明 |
 |------|------|
 | 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等写操作，执行前必须经你确认：终端 y/N，飞书端弹确认卡片（按钮或回复「确认/取消」，120 秒超时自动拒绝） |
+| 批量确认 | 同类型写操作批准后 10 分钟内自动放行（批量建任务不用点 10 次）；删除/取消/停止/deny 等破坏性操作仍逐次确认 |
 | 只读白名单 | `lark_cli` 按子命令分类：只读（list/get/search 等）直接放行，写操作与未知命令一律进闸门；`api` 仅 GET 免确认 |
 | 防注入标记 | `lark_cli` 读回的外部内容统一包裹 UNTRUSTED 标记，模型被告知其中"指令"一律无效；即使被骗发起写操作也会被闸门拦下 |
+| owner 认领 | `FEISHU_ALLOWED_OPEN_IDS` 留空时，首个私聊用户自动成为 owner 并写回 `.env`，其余用户被拒（避免陌生人指挥你的看板） |
 | 来源查重 | 飞书链接 → 看板任务映射存 `synced-sources.json`；同一来源重复同步会被拦截并提示已有任务 |
 | 审计日志 | 所有写操作的请求/批准/拒绝/结果追加到 `~/.helios-task-agent/audit.log`（JSONL） |
 
 ## 看板状态推送（bot）
 
-bot 模式下每 60s 轮询看板：任务完成/取消、执行失败、新待审批 → 主动推送飞书（推给 `FEISHU_ALLOWED_OPEN_IDS`）。首轮只建基线，快照存 `watch-state.json`，重启不重复打扰。`KANBAN_WATCH=0` 关闭，`KANBAN_WATCH_INTERVAL_SEC` 调间隔。
+bot 模式下每 60s 轮询看板：任务完成/取消、执行失败、新待审批 → 主动推送飞书（带看板链接），并同时注入会话上下文——收到推送后直接回「这个怎么样 / 帮我 review」即可。首轮只建基线，快照存 `watch-state.json`，重启不重复打扰。`KANBAN_WATCH=0` 关闭，`KANBAN_WATCH_INTERVAL_SEC` 调间隔。
+
+## 晨报 / 定时同步（bot）
+
+`BOT_DAILY_REPORT=09:00` 后，每天该时刻自动跑「同步我的任务」并把结果推送给你；期间如需写操作，仍走确认卡片。MCP 连接由 supervisor 每 60s 探测，掉线自动降级 `hk_cli` 并重连，恢复后自动切回。
 
 ## 安装
 
@@ -104,7 +111,7 @@ helios-task-agent-bot
 |------|------|
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 必填（向导可写） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | bot 必填（向导可写） |
-| `FEISHU_ALLOWED_OPEN_IDS` | 可选，逗号分隔 open_id 白名单 |
+| `FEISHU_ALLOWED_OPEN_IDS` | 可选，逗号分隔 open_id 白名单；**留空则首个私聊用户自动成为 owner** |
 | `HELIOS_KANBAN_URL` | 看板地址，默认 `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | 默认开启；本机看板未就绪时自动 `npx -y helios-kanban`；`0` 关闭 |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | 可选默认 |
@@ -112,6 +119,7 @@ helios-task-agent-bot
 | `HELIOS_TASK_AGENT_ENV` | 强制指定 `.env` 路径（写入目标；加载时优先级最高） |
 | `KANBAN_WATCH` | bot 看板状态推送，默认开；`0` 关闭 |
 | `KANBAN_WATCH_INTERVAL_SEC` | 推送轮询间隔（秒，默认 60，最小 15） |
+| `BOT_DAILY_REPORT` | bot 晨报：每天 `HH:MM` 自动「同步我的任务」并推送；不设置则不开启 |
 
 加载顺序：用户目录 `.env` → 项目 `.env` → 当前目录 `.env`（后者覆盖前者）。完整示例见 [.env.example](.env.example)。
 

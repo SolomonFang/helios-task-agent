@@ -12,6 +12,7 @@ interface WatchTaskState {
   status: string;
   running: boolean;
   failed: boolean;
+  projectId: string;
 }
 
 interface WatchState {
@@ -97,12 +98,13 @@ export class KanbanWatcher {
       for (const [id, cur] of Object.entries(current.tasks)) {
         const old = prev.tasks[id];
         if (!old) continue; // 新任务不打扰（创建流程本身已有反馈）
+        const url = this.taskUrl(cur.projectId, id);
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
           const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
-          events.push(`${label}：《${cur.title}》（${old.status} → ${cur.status}）`);
+          events.push(`${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}`);
         }
         if (old.running && !cur.running && cur.failed) {
-          events.push(`❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志`);
+          events.push(`❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}`);
         }
       }
       const newApprovals = current.approvals.filter((a) => !prev.approvals.includes(a));
@@ -130,6 +132,7 @@ export class KanbanWatcher {
           status: t.status || '',
           running: Boolean(t.has_in_progress_attempt),
           failed: Boolean(t.last_attempt_failed),
+          projectId: pid,
         };
       }
     }
@@ -151,6 +154,11 @@ export class KanbanWatcher {
   private async fetchProjectIds(): Promise<string[]> {
     const list = (await this.api('/projects')) as Array<{ id?: string }>;
     return Array.isArray(list) ? list.map((p) => p.id || '').filter(Boolean) : [];
+  }
+
+  private taskUrl(projectId: string, taskId: string): string {
+    const base = this.opts.kanbanUrl.replace(/\/+$/, '');
+    return `${base}/local-projects/${projectId}/tasks/${taskId}`;
   }
 
   private async api(p: string): Promise<unknown> {

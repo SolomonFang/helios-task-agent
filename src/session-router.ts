@@ -12,7 +12,7 @@ export class SessionRouter {
   private readonly queues = new Map<string, Promise<void>>();
   private readonly cfg: AgentConfig;
   private readonly mcp: KanbanMcp | null;
-  private readonly mcpOk: boolean;
+  private mcpOk: boolean;
   private readonly memory: MemoryStore;
   private readonly confirmFactory?: (openId: string) => ConfirmFn;
 
@@ -41,6 +41,13 @@ export class SessionRouter {
       this.sessions.set(openId, session);
     }
     return session;
+  }
+
+  /** Flip MCP availability across all live sessions (supervisor reconnect/degrade). */
+  setMcpOk(ok: boolean): void {
+    if (this.mcpOk === ok) return;
+    this.mcpOk = ok;
+    for (const session of this.sessions.values()) session.setMcpOk(ok);
   }
 
   /** Run work for a user strictly in order (prevents overlapping tool rounds). */

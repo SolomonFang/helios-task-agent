@@ -27,6 +27,51 @@ export interface FeishuCardAction {
   action?: { value?: { hta_confirm?: string; decision?: string } };
 }
 
+export type AccessDecision = 'allow' | 'claim' | 'deny';
+
+/**
+ * Owner-claim access control: with an empty allowlist, the FIRST user to DM
+ * the bot becomes the owner (persisted to .env by the caller); everyone else
+ * is denied. With a configured allowlist, only listed users pass.
+ */
+export function createAccessChecker(initialAllowed: string[]): {
+  check: (openId: string) => AccessDecision;
+  list: () => string[];
+} {
+  const allowed = new Set(initialAllowed.filter(Boolean));
+  let claimable = allowed.size === 0;
+  return {
+    check(openId: string): AccessDecision {
+      if (allowed.has(openId)) return 'allow';
+      if (claimable) {
+        claimable = false;
+        allowed.add(openId);
+        return 'claim';
+      }
+      return 'deny';
+    },
+    list(): string[] {
+      return [...allowed];
+    },
+  };
+}
+
+/** Split long text into ≤ limit chunks on paragraph/newline boundaries (hard cut as fallback). */
+export function splitText(text: string, limit = 3000): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n\n', limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit * 0.5) cut = limit;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n+/, '');
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
 function parseTextContent(content: string | undefined): string {
   if (!content) return '';
   try {
@@ -48,14 +93,19 @@ export class FeishuChannel implements AgentChannel {
   readonly name = 'feishu';
   private readonly cfg: FeishuBotConfig;
   private readonly client: Lark.Client;
+  private readonly access: ReturnType<typeof createAccessChecker>;
   private wsClient: Lark.WSClient | null = null;
   private seenMessageIds = new Map<string, number>();
   private readonly seenTtlMs = 10 * 60 * 1000;
+  private deniedNotified = new Set<string>();
   /** Card button callback (card.action.trigger); set by the bot layer. */
   onCardAction?: (data: FeishuCardAction) => void;
+  /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer. */
+  onOwnerClaim?: (openId: string) => void;
 
   constructor(cfg: FeishuBotConfig) {
     this.cfg = cfg;
+    this.access = createAccessChecker(cfg.allowedOpenIds);
     this.client = new Lark.Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret,
@@ -63,15 +113,15 @@ export class FeishuChannel implements AgentChannel {
     });
   }
 
+  /** Current effective allowlist (owner claimed at runtime is included). */
+  allowedOpenIds(): string[] {
+    return this.access.list();
+  }
+
   private pruneSeen(now: number): void {
     for (const [id, ts] of this.seenMessageIds) {
       if (now - ts > this.seenTtlMs) this.seenMessageIds.delete(id);
     }
-  }
-
-  private isAllowed(openId: string): boolean {
-    if (!this.cfg.allowedOpenIds.length) return true;
-    return this.cfg.allowedOpenIds.includes(openId);
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
@@ -99,9 +149,24 @@ export class FeishuChannel implements AgentChannel {
 
           const openId = sender?.sender_id?.open_id || '';
           if (!openId) return;
-          if (!this.isAllowed(openId)) {
+
+          const access = this.access.check(openId);
+          if (access === 'deny') {
             console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
+            if (!this.deniedNotified.has(openId)) {
+              this.deniedNotified.add(openId);
+              void this.notifyOpenId(openId, '抱歉，这是私人专用机器人实例，已绑定给其他用户。').catch(() => {});
+            }
             return;
+          }
+          if (access === 'claim') {
+            console.log(`[feishu] owner claimed by ${openId}`);
+            try {
+              this.onOwnerClaim?.(openId);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`[feishu] owner claim hook error: ${msg}`);
+            }
           }
 
           if (this.seenMessageIds.has(message.message_id)) return;
@@ -138,21 +203,46 @@ export class FeishuChannel implements AgentChannel {
     });
   }
 
-  async reply(msg: InboundMessage, text: string): Promise<void> {
-    const chatId = msg.sessionId;
-    if (!chatId) throw new Error('reply 缺少 chat_id (sessionId)');
-    // Feishu text messages: keep under ~4000 chars practically
-    const body = text.length > 3500 ? text.slice(0, 3500) + '\n…（已截断）' : text;
+  private async createMessage(receiveIdType: 'chat_id' | 'open_id', receiveId: string, text: string): Promise<string | undefined> {
     const res = await this.client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: receiveIdType },
       data: {
-        receive_id: chatId,
+        receive_id: receiveId,
         msg_type: 'text',
-        content: JSON.stringify({ text: body }),
+        content: JSON.stringify({ text }),
       },
     });
     if (res.code !== 0) {
       throw new Error(`飞书发消息失败: code=${res.code} msg=${res.msg}`);
+    }
+    return res.data?.message_id;
+  }
+
+  /** Send a text message to a chat; returns the message_id (for later update). */
+  async sendText(chatId: string, text: string): Promise<string | undefined> {
+    return this.createMessage('chat_id', chatId, text);
+  }
+
+  /** Replace the content of a previously sent message (progress feedback). */
+  async updateText(messageId: string, text: string): Promise<void> {
+    const res = await this.client.im.v1.message.update({
+      path: { message_id: messageId },
+      data: {
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书更新消息失败: code=${res.code} msg=${res.msg}`);
+    }
+  }
+
+  async reply(msg: InboundMessage, text: string): Promise<void> {
+    const chatId = msg.sessionId;
+    if (!chatId) throw new Error('reply 缺少 chat_id (sessionId)');
+    // Long replies are split into multiple messages instead of truncated.
+    for (const chunk of splitText(text)) {
+      await this.createMessage('chat_id', chatId, chunk);
     }
   }
 
@@ -171,18 +261,10 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
-  /** Proactive DM push to a user (used by the kanban watcher / timeout notices). */
+  /** Proactive DM push to a user (watcher / timeout notices); chunked when long. */
   async notifyOpenId(openId: string, text: string): Promise<void> {
-    const res = await this.client.im.v1.message.create({
-      params: { receive_id_type: 'open_id' },
-      data: {
-        receive_id: openId,
-        msg_type: 'text',
-        content: JSON.stringify({ text }),
-      },
-    });
-    if (res.code !== 0) {
-      throw new Error(`飞书推送失败: code=${res.code} msg=${res.msg}`);
+    for (const chunk of splitText(text)) {
+      await this.createMessage('open_id', openId, chunk);
     }
   }
 

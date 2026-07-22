@@ -7,15 +7,17 @@
 
 import readline from 'readline';
 import path from 'path';
-import { currentConfig, ensureBotConfig, feishuBotConfig, userEnvPath } from './config';
+import { currentConfig, ensureBotConfig, feishuBotConfig, userEnvPath, writeEnvFile } from './config';
 import { KanbanMcp } from './mcp';
 import { MemoryStore, defaultDataHome } from './memory';
-import { FeishuChannel, type FeishuInboundMessage } from './channels/feishu';
+import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
 import { ConfirmationManager, buildConfirmCard } from './confirm';
 import { KanbanWatcher } from './watcher';
-import type { AskFn, InboundMessage } from './types';
+import { checkLarkCli } from './deps';
+import { parseDailyTime, scheduleDaily } from './scheduler';
+import type { AskFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
 import { c } from './ui';
 
@@ -88,7 +90,10 @@ async function main(): Promise<void> {
   if (feishuCfg.allowedOpenIds.length) {
     console.log(c.gray(`允许 open_id: ${feishuCfg.allowedOpenIds.join(', ')}`));
   } else {
-    console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：所有私聊用户均可对话'));
+    console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：首个私聊用户将自动成为 owner 并写入白名单'));
+  }
+  if (!checkLarkCli()) {
+    console.log(c.warn('未检测到 lark-cli：读取飞书内容不可用（看板操作与推送不受影响）'));
   }
 
   let kanbanChild: ChildProcess | null = null;
@@ -121,6 +126,7 @@ async function main(): Promise<void> {
   const memory = new MemoryStore();
   const channel = new FeishuChannel(feishuCfg);
   let watcher: KanbanWatcher | null = null;
+  let stopDaily: (() => void) | null = null;
 
   // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；120 秒超时自动拒绝
   const confirmations = new ConfirmationManager(
@@ -156,13 +162,73 @@ async function main(): Promise<void> {
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
   };
 
+  // 白名单为空时：首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）
+  channel.onOwnerClaim = (openId) => {
+    try {
+      writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
+      console.log(c.ok(`首个私聊用户已成为 owner 并写入白名单: ${openId}`));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[owner] 白名单写入失败: ${message}`);
+    }
+    void channel
+      .notifyOpenId(openId, '👋 你已成为本机器人实例的 owner（已写入白名单），其他私聊用户将被拒绝。')
+      .catch(() => {});
+  };
+
+  // 注意：router 始终持有 mcp 对象（即使启动时降级），supervisor 重连后可热切换回来
   const router = new SessionRouter(
     agentCfg,
-    mcpOk ? mcp : null,
+    mcp,
     mcpOk,
     memory,
     (openId) => (req) => confirmations.request(openId, req),
   );
+
+  const notifyOwners = (text: string): void => {
+    for (const oid of channel.allowedOpenIds()) {
+      void channel.notifyOpenId(oid, text).catch(() => {});
+    }
+  };
+
+  // MCP 健康监督：60s 探测；掉线自动降级 hk_cli 并重连（退避至 ~5 分钟），恢复后切回
+  let mcpAlive = mcpOk;
+  let mcpFailures = 0;
+  let mcpBusy = false;
+  const mcpTimer = setInterval(() => {
+    if (mcpBusy) return;
+    mcpBusy = true;
+    void (async () => {
+      try {
+        await mcp.ping();
+        if (!mcpAlive) {
+          mcpAlive = true;
+          mcpFailures = 0;
+          router.setMcpOk(true);
+          console.log(c.ok('MCP 已恢复'));
+          notifyOwners('✅ 看板 MCP 连接已恢复');
+        }
+      } catch {
+        mcpFailures++;
+        if (mcpAlive) {
+          mcpAlive = false;
+          router.setMcpOk(false);
+          console.log(c.warn('MCP 连接丢失，降级 hk_cli，将自动重连…'));
+          notifyOwners('⚠️ 看板 MCP 连接丢失，已自动降级 hk_cli（恢复后自动切回）');
+        }
+        if (mcpFailures <= 3 || mcpFailures % 5 === 0) {
+          try {
+            await mcp.reconnect();
+          } catch {
+            /* 下一轮再试 */
+          }
+        }
+      } finally {
+        mcpBusy = false;
+      }
+    })();
+  }, 60000);
+  mcpTimer.unref();
 
   const handle = async (msg: InboundMessage) => {
     const fmsg = msg as FeishuInboundMessage;
@@ -214,10 +280,36 @@ async function main(): Promise<void> {
         return;
       }
 
-      await channel.reply(msg, '收到，处理中…');
+      // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
+      let progressId: string | undefined;
       try {
-        const reply = await session.handleUserMessage(text);
-        await channel.reply(msg, reply || '(无回复)');
+        progressId = await channel.sendText(msg.sessionId, '⏳ 处理中…');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[feishu] 占位消息发送失败: ${message}`);
+      }
+      let lastPush = 0;
+      const onProgress = (info: ProgressInfo) => {
+        if (!progressId) return;
+        const now = Date.now();
+        if (now - lastPush < 2000) return; // 飞书消息更新限流
+        lastPush = now;
+        const text = info.type === 'tool' ? `⏳ 处理中…（调用工具 ${info.name}）` : '⏳ 思考中…';
+        void channel.updateText(progressId, text).catch(() => {});
+      };
+      try {
+        const reply = await session.handleUserMessage(text, onProgress);
+        const chunks = splitText(reply || '(无回复)');
+        if (progressId) {
+          try {
+            await channel.updateText(progressId, chunks[0]!);
+          } catch {
+            await channel.sendText(msg.sessionId, chunks[0]!);
+          }
+          for (const chunk of chunks.slice(1)) await channel.sendText(msg.sessionId, chunk);
+        } else {
+          await channel.reply(msg, reply || '(无回复)');
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         await channel.reply(msg, `请求失败: ${message}\n请检查模型配置或稍后重试。`);
@@ -227,6 +319,8 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     console.log('\n' + c.gray('正在退出…'));
+    clearInterval(mcpTimer);
+    stopDaily?.();
     watcher?.stop();
     await channel.stop();
     await mcp.close();
@@ -250,32 +344,55 @@ async function main(): Promise<void> {
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
-  // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知
+  // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {
-    if (feishuCfg.allowedOpenIds.length) {
-      const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
-      watcher = new KanbanWatcher({
-        kanbanUrl: agentCfg.kanbanUrl,
-        projectId: agentCfg.kanbanProjectId || undefined,
-        intervalMs: intervalSec * 1000,
-        statePath: path.join(defaultDataHome(), 'watch-state.json'),
-        notify: async (text) => {
-          for (const oid of feishuCfg.allowedOpenIds) {
-            try {
-              await channel.notifyOpenId(oid, text);
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              console.error(`[watch] 推送失败(${oid}): ${message}`);
-            }
+    const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
+    watcher = new KanbanWatcher({
+      kanbanUrl: agentCfg.kanbanUrl,
+      projectId: agentCfg.kanbanProjectId || undefined,
+      intervalMs: intervalSec * 1000,
+      statePath: path.join(defaultDataHome(), 'watch-state.json'),
+      notify: async (text) => {
+        for (const oid of channel.allowedOpenIds()) {
+          try {
+            await channel.notifyOpenId(oid, text);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(`[watch] 推送失败(${oid}): ${message}`);
           }
-        },
-        log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
-      });
-      watcher.start();
-      console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
-    } else {
-      console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：看板状态推送已禁用（无推送目标）'));
-    }
+          // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
+          try {
+            router.getOrCreate(oid).injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${text}`);
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+      log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
+    });
+    watcher.start();
+    console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
+  }
+
+  // 晨报/定时同步：每天固定时间自动跑「同步我的任务」并推送结果（写操作仍走确认闸门）
+  const dailyTime = parseDailyTime(process.env.BOT_DAILY_REPORT || '');
+  if (dailyTime) {
+    stopDaily = scheduleDaily(dailyTime, () => {
+      for (const oid of channel.allowedOpenIds()) {
+        void router.enqueue(oid, async () => {
+          try {
+            const session = router.getOrCreate(oid);
+            await channel.notifyOpenId(oid, '🌅 每日任务同步进行中…');
+            const reply = await session.handleUserMessage('同步我的任务');
+            await channel.notifyOpenId(oid, reply || '(无内容)');
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            await channel.notifyOpenId(oid, `每日同步失败: ${message}`).catch(() => {});
+          }
+        });
+      }
+    });
+    console.log(c.gray(`每日同步已开启：每天 ${process.env.BOT_DAILY_REPORT} 自动跑「同步我的任务」`));
   }
 
   console.log(c.gray('Ctrl+C 退出'));

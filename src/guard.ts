@@ -12,9 +12,31 @@ export interface ConfirmRequest {
   summary: string;
   /** Full command / arguments for transparency. */
   detail: string;
+  /**
+   * Batch approval key: when set, an approval is remembered for a short TTL
+   * and subsequent requests with the same key skip re-asking (批量创建场景).
+   * Omitted for destructive ops (delete/cancel/stop) and lark writes.
+   */
+  batchKey?: string;
 }
 
 export type ConfirmFn = (req: ConfirmRequest) => Promise<boolean>;
+
+export const BATCH_APPROVAL_TTL_MS = 10 * 60 * 1000;
+
+/** Remember approvals per batchKey for ttlMs; destructive ops (no batchKey) always re-ask. */
+export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL_MS): ConfirmFn {
+  const approved = new Map<string, number>();
+  return async (req) => {
+    if (req.batchKey) {
+      const exp = approved.get(req.batchKey);
+      if (exp && exp > Date.now()) return true;
+    }
+    const ok = await confirm(req);
+    if (ok && req.batchKey) approved.set(req.batchKey, Date.now() + ttlMs);
+    return ok;
+  };
+}
 
 export type GateResult =
   | { allowed: true }

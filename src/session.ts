@@ -3,7 +3,7 @@ import { MemoryStore } from './memory';
 import { createClient, runAgentTurn } from './llm';
 import { buildSystemPrompt } from './prompt';
 import { buildTools } from './tools';
-import type { ConfirmFn } from './guard';
+import { withBatchApproval, type ConfirmFn } from './guard';
 import type {
   AgentConfig,
   ChatMessage,
@@ -33,6 +33,7 @@ export class AgentSession {
   private readonly userId: string;
   private readonly memory: MemoryStore;
   private readonly confirm?: ConfirmFn;
+  private batchedConfirm?: ConfirmFn;
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
@@ -89,6 +90,12 @@ export class AgentSession {
     };
   }
 
+  private getConfirm(): ConfirmFn | undefined {
+    if (!this.confirm) return undefined;
+    if (!this.batchedConfirm) this.batchedConfirm = withBatchApproval(this.confirm);
+    return this.batchedConfirm;
+  }
+
   private buildRuntime(cfg: AgentConfig) {
     const { openAiTools, handlers } = buildTools({
       mcp: this.mcpOk ? this.mcp : null,
@@ -99,7 +106,7 @@ export class AgentSession {
       memory: this.memory,
       userId: this.userId,
       onMemoryChange: () => this.refreshSystemPrompt(),
-      confirm: this.confirm,
+      confirm: this.getConfirm(),
     });
     const systemPrompt = buildSystemPrompt(this.promptOpts());
     return {
@@ -118,6 +125,18 @@ export class AgentSession {
     this.openAiTools = runtime.openAiTools;
     this.handlers = runtime.handlers;
     if (this.messages[0]) this.messages[0] = { role: 'system', content: runtime.systemPrompt };
+  }
+
+  /** Hot-swap MCP availability (supervisor reconnect/degrade): rebuild tools + prompt, keep history. */
+  setMcpOk(ok: boolean): void {
+    if (this.mcpOk === ok) return;
+    this.mcpOk = ok;
+    this.applyConfig(this.cfg);
+  }
+
+  /** Inject a background event (e.g. kanban watcher notification) into the conversation context. */
+  injectSystemNote(note: string): void {
+    this.messages.push({ role: 'system', content: note });
   }
 
   /** Clear chat history only — memory is kept. */
