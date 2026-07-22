@@ -21,6 +21,12 @@ export interface FeishuInboundMessage extends InboundMessage {
   messageType: string;
 }
 
+/** Subset of the card.action.trigger callback payload we care about. */
+export interface FeishuCardAction {
+  operator?: { open_id?: string };
+  action?: { value?: { hta_confirm?: string; decision?: string } };
+}
+
 function parseTextContent(content: string | undefined): string {
   if (!content) return '';
   try {
@@ -45,6 +51,8 @@ export class FeishuChannel implements AgentChannel {
   private wsClient: Lark.WSClient | null = null;
   private seenMessageIds = new Map<string, number>();
   private readonly seenTtlMs = 10 * 60 * 1000;
+  /** Card button callback (card.action.trigger); set by the bot layer. */
+  onCardAction?: (data: FeishuCardAction) => void;
 
   constructor(cfg: FeishuBotConfig) {
     this.cfg = cfg;
@@ -117,6 +125,15 @@ export class FeishuChannel implements AgentChannel {
             console.error(`[feishu] handler error: ${msg}`);
           });
         },
+        // 卡片按钮回传（需在开放平台「回调订阅」配置长连接 + 卡片回传交互）
+        'card.action.trigger': async (data: FeishuCardAction) => {
+          try {
+            this.onCardAction?.(data);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[feishu] card action error: ${msg}`);
+          }
+        },
       }),
     });
   }
@@ -136,6 +153,36 @@ export class FeishuChannel implements AgentChannel {
     });
     if (res.code !== 0) {
       throw new Error(`飞书发消息失败: code=${res.code} msg=${res.msg}`);
+    }
+  }
+
+  /** Send an interactive card (e.g. write-op confirmation with buttons). */
+  async sendCard(chatId: string, card: Record<string, unknown>): Promise<void> {
+    const res = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书发卡片失败: code=${res.code} msg=${res.msg}`);
+    }
+  }
+
+  /** Proactive DM push to a user (used by the kanban watcher / timeout notices). */
+  async notifyOpenId(openId: string, text: string): Promise<void> {
+    const res = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: openId,
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书推送失败: code=${res.code} msg=${res.msg}`);
     }
   }
 

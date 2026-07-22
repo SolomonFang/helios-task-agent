@@ -7,8 +7,8 @@
 | 步骤 | 行为 | 自动？ |
 |------|------|--------|
 | 列出飞书任务 | `lark_cli`；含链接则展开一层 | 是（用户要求列出时） |
-| 写进看板 | 草稿 → 确认 → create | **否**（须确认） |
-| start workspace | 听用户指定 executor | **否**（须用户说） |
+| 写进看板 | 草稿 → 确认 → create | **否**（代码闸门强制确认） |
+| start workspace | 听用户指定 executor | **否**（代码闸门强制确认） |
 
 ## 主路径
 
@@ -37,6 +37,11 @@ flowchart TD
 | 飞书长连接 bot | `src/bot.ts`, `channels/feishu.ts` | 仅 p2p；进程常驻 |
 | 终端 REPL | `src/cli.ts` | |
 | 系统规则 | `src/prompt.ts` | 展开 / 写看板 / 不擅自 start |
+| 写操作闸门 | `src/guard.ts`, `src/tools.ts` | 分类 read/write；写操作强制用户确认 |
+| 确认通道 | `src/confirm.ts`, `src/cli.ts` | CLI y/N；飞书卡片按钮 / 文本兜底 |
+| 来源查重 | `src/source-registry.ts` | 飞书 URL → 看板任务映射 |
+| 审计 | `src/audit.ts` | `~/.helios-task-agent/audit.log` |
+| 状态推送 | `src/watcher.ts` | 轮询看板 → 飞书通知（bot） |
 | 看板自动拉起 | `src/kanban-ensure.ts` | `HELIOS_KANBAN_AUTO_START` |
 | 本地读仓 | `src/repo-fs.ts` | 可选 |
 | 看板 API | MCP + `skills/.../hk.sh` | MCP 优先 |
@@ -48,6 +53,7 @@ flowchart TD
 |------|------|
 | [feishu-task-link-expand-design](./specs/2026-07-21-feishu-task-link-expand-design.md) | implemented |
 | [feishu-to-kanban-design](./specs/2026-07-21-feishu-to-kanban-design.md) | implemented |
+| [write-gate-design](./specs/2026-07-22-write-gate-design.md) | implemented |
 
 ## 审查结论（本轮）
 
@@ -60,10 +66,11 @@ flowchart TD
 
 ### 已知限制（接受）
 
-1. 展开 / 确认 / 不擅自 start **靠 prompt**，无硬状态机  
+1. ~~展开 / 确认 / 不擅自 start 靠 prompt~~ → 已有代码层写闸门（见 write-gate-design）；展开等**读流程**仍靠 prompt 约定  
 2. Bot **仅私聊**；进程退出即断长连接  
 3. 读飞书依赖本机 **lark-cli**  
 4. `hk create-and-start` 仍存在于技能表：仅当用户**明确**要求「创建并启动」时使用，默认写看板走 create-only  
+5. 卡片按钮回调需在开放平台配置「卡片回传交互」长连接；未配置时降级为文本「确认/取消」
 
 ### 本轮文档/文案修补
 

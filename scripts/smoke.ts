@@ -9,6 +9,9 @@ import { buildTools } from '../src/tools';
 import { currentConfig } from '../src/config';
 import { buildSystemPrompt } from '../src/prompt';
 import { MemoryStore } from '../src/memory';
+import { classifyHk, classifyLark, classifyMcp } from '../src/guard';
+import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
+import { ConfirmationManager } from '../src/confirm';
 
 async function main(): Promise<void> {
   const cfg = currentConfig();
@@ -108,6 +111,108 @@ async function main(): Promise<void> {
       !prompt.includes('Kimi Plan（技术设计）'),
     `${prompt.length} 字符`,
   );
+
+  // ---- 写闸门 / 安全分类（离线） ----
+  check(
+    'lark 分类：只读放行',
+    classifyLark(['--help']) === 'read' &&
+      classifyLark(['im', '+chat-list']) === 'read' &&
+      classifyLark(['im', '+messages-search', '--query', 'x']) === 'read' &&
+      classifyLark(['api', 'GET', '/open-apis/x']) === 'read' &&
+      classifyLark(['task', '+get-my-tasks']) === 'read',
+  );
+  check(
+    'lark 分类：写与未知拦截',
+    classifyLark(['im', '+messages-send', '--chat-id', 'x', '--text', 'hi']) === 'write' &&
+      classifyLark(['api', 'POST', '/open-apis/x']) === 'write' &&
+      classifyLark(['base', '+record-create']) === 'write' &&
+      classifyLark(['mystery-cmd']) === 'write',
+  );
+  check(
+    'hk 分类',
+    classifyHk(['health']) === 'read' &&
+      classifyHk(['tasks', 'list']) === 'read' &&
+      classifyHk(['projects']) === 'read' &&
+      classifyHk(['tasks', 'create', 't']) === 'write' &&
+      classifyHk(['tasks', 'delete', 'id']) === 'write' &&
+      classifyHk(['start', 'id']) === 'write' &&
+      classifyHk(['projects', 'update', 'id']) === 'write',
+  );
+  check(
+    'mcp 分类',
+    classifyMcp('list_projects') === 'read' &&
+      classifyMcp('get_task') === 'read' &&
+      classifyMcp('create_task') === 'write' &&
+      classifyMcp('delete_task') === 'write' &&
+      classifyMcp('start_workspace') === 'write' &&
+      classifyMcp('mystery_tool') === 'write',
+  );
+
+  const urls = extractSourceUrls('标题 https://xxx.feishu.cn/docx/abc123 和 https://y.larksuite.com/wiki/z9。');
+  check('来源 URL 提取', urls.length === 2 && urls[0] === 'https://xxx.feishu.cn/docx/abc123', urls.join(','));
+
+  const gateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-gate-'));
+  const reg = new SourceRegistry(gateHome);
+  let confirmCalls = 0;
+  const gated = buildTools({
+    mcp: null,
+    kanbanUrl: 'http://127.0.0.1:9', // 故意不可达
+    registry: reg,
+    auditHome: gateHome,
+    userId: 'local',
+    confirm: async () => {
+      confirmCalls++;
+      return false;
+    },
+  });
+  const denied = await gated.handlers.get('hk_cli')!({ args: ['tasks', 'create', 'x'] });
+  check('闸门拒绝时写操作不执行', confirmCalls === 1 && /拒绝了该写操作/.test(denied), denied.slice(0, 50));
+
+  reg.record('local', 'https://xxx.feishu.cn/docx/abc', {
+    taskId: 'unknown',
+    title: '旧任务',
+    createdAt: '2026-07-22T00:00:00.000Z',
+  });
+  const dupOut = await gated.handlers.get('hk_cli')!({
+    args: ['tasks', 'create', '重复', '--desc', '来源 https://xxx.feishu.cn/docx/abc'],
+  });
+  check('重复来源拦截且不进闸门', /已同步过/.test(dupOut) && confirmCalls === 1, dupOut.slice(0, 50));
+  const auditText = fs.existsSync(path.join(gateHome, 'audit.log'))
+    ? fs.readFileSync(path.join(gateHome, 'audit.log'), 'utf8')
+    : '';
+  check('审计日志写入', auditText.includes('blocked_dup') && auditText.includes('denied'));
+
+  const wrapped = await gated.handlers.get('lark_cli')!({ args: ['--version'] });
+  check('lark_cli 输出带 UNTRUSTED 标记', wrapped.includes('UNTRUSTED_FEISHU_CONTENT'));
+
+  // ---- 确认管理器（bot 通道，离线） ----
+  const cm = new ConfirmationManager(async () => {});
+  const pr1 = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  const a1 = cm.resolveFromText('u1', '确认');
+  check('文本「确认」放行闸门', a1 === 'approved' && (await pr1) === true);
+  const pr2 = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  const a2 = cm.resolveFromText('u1', '取消');
+  check('文本「取消」拒绝闸门', a2 === 'denied' && (await pr2) === false);
+  let cardId = '';
+  const cm2 = new ConfirmationManager(async (_o, _c, _r, id) => {
+    cardId = id;
+  });
+  const pr3 = cm2.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  await new Promise((r) => setImmediate(r));
+  check(
+    '卡片回调放行 + 过期卡片忽略',
+    cm2.resolveFromCard('u1', cardId, true) === 'approved' &&
+      (await pr3) === true &&
+      cm2.resolveFromCard('u1', cardId, true) === 'ignored',
+  );
+  const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30 });
+  check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);
+
+  try {
+    fs.rmSync(gateHome, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 
   await mcp.close();
   console.log(failures === 0 ? '\n全部通过 ✓' : `\n${failures} 项失败 ✗`);

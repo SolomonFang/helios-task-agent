@@ -7,6 +7,7 @@ import { ensureConfig } from './config';
 import { KanbanMcp } from './mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
+import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
@@ -152,8 +153,22 @@ export async function main(): Promise<void> {
     larkOk,
   });
 
-  const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local' });
   const spinner = new Spinner('思考中…');
+
+  // 写操作硬确认：闸门触发时暂停 spinner，终端询问 y/N，默认拒绝。
+  const confirmWrite: ConfirmFn = async (req) => {
+    spinner.stop();
+    console.log('');
+    console.log(c.warn(`⚠️ 写操作请求（${req.kind}）：${req.summary}`));
+    console.log(c.gray(req.detail));
+    const ans = await ask(c.warn('允许执行？[y/N] '));
+    const ok = Boolean(ans && /^(y|yes|确认|同意)$/i.test(ans.trim()));
+    console.log(ok ? c.ok('已批准，继续执行。') : c.gray('已拒绝，操作未执行。'));
+    spinner.start('思考中…');
+    return ok;
+  };
+
+  const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local', confirm: confirmWrite });
 
   const cleanup = async () => {
     spinner.stop();

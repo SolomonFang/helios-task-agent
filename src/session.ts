@@ -3,6 +3,7 @@ import { MemoryStore } from './memory';
 import { createClient, runAgentTurn } from './llm';
 import { buildSystemPrompt } from './prompt';
 import { buildTools } from './tools';
+import type { ConfirmFn } from './guard';
 import type {
   AgentConfig,
   ChatMessage,
@@ -17,6 +18,8 @@ export interface AgentSessionOptions {
   /** CLI 默认 local；飞书通道传 open_id。 */
   userId?: string;
   memory?: MemoryStore;
+  /** 写操作确认通道（CLI y/n 或飞书卡片）；缺省时所有写操作被闸门阻止。 */
+  confirm?: ConfirmFn;
 }
 
 /**
@@ -29,6 +32,7 @@ export class AgentSession {
   private mcpOk: boolean;
   private readonly userId: string;
   private readonly memory: MemoryStore;
+  private readonly confirm?: ConfirmFn;
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
@@ -40,6 +44,7 @@ export class AgentSession {
     this.mcpOk = mcpOk;
     this.userId = opts.userId || 'local';
     this.memory = opts.memory || new MemoryStore();
+    this.confirm = opts.confirm;
     const runtime = this.buildRuntime(cfg);
     this.client = runtime.client;
     this.openAiTools = runtime.openAiTools;
@@ -94,6 +99,7 @@ export class AgentSession {
       memory: this.memory,
       userId: this.userId,
       onMemoryChange: () => this.refreshSystemPrompt(),
+      confirm: this.confirm,
     });
     const systemPrompt = buildSystemPrompt(this.promptOpts());
     return {

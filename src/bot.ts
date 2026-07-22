@@ -6,12 +6,15 @@
  */
 
 import readline from 'readline';
+import path from 'path';
 import { currentConfig, ensureBotConfig, feishuBotConfig, userEnvPath } from './config';
 import { KanbanMcp } from './mcp';
-import { MemoryStore } from './memory';
+import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
+import { ConfirmationManager, buildConfirmCard } from './confirm';
+import { KanbanWatcher } from './watcher';
 import type { AskFn, InboundMessage } from './types';
 import type { ChildProcess } from 'child_process';
 import { c } from './ui';
@@ -22,6 +25,10 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /help     显示帮助
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
+
+写操作安全闸门
+· 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
+· 点「确认执行 / 取消」按钮，或直接回复「确认 / 取消」（120 秒超时自动拒绝）
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
@@ -112,8 +119,50 @@ async function main(): Promise<void> {
   }
 
   const memory = new MemoryStore();
-  const router = new SessionRouter(agentCfg, mcpOk ? mcp : null, mcpOk, memory);
   const channel = new FeishuChannel(feishuCfg);
+  let watcher: KanbanWatcher | null = null;
+
+  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；120 秒超时自动拒绝
+  const confirmations = new ConfirmationManager(
+    async (openId, chatId, req, id) => {
+      if (chatId) {
+        try {
+          await channel.sendCard(chatId, buildConfirmCard(req, id));
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[confirm] 卡片发送失败，降级文本: ${message}`);
+        }
+      }
+      await channel.notifyOpenId(
+        openId,
+        `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行，回复「取消」拒绝（120 秒超时自动拒绝）。`,
+      );
+    },
+    {
+      timeoutMs: 120000,
+      onTimeout: (openId, req) => {
+        void channel.notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}`).catch(() => {});
+      },
+    },
+  );
+
+  channel.onCardAction = (action) => {
+    const openId = action.operator?.open_id || '';
+    const value = action.action?.value || {};
+    if (!openId || !value.hta_confirm) return;
+    const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), value.decision === 'yes');
+    if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
+    else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
+  };
+
+  const router = new SessionRouter(
+    agentCfg,
+    mcpOk ? mcp : null,
+    mcpOk,
+    memory,
+    (openId) => (req) => confirmations.request(openId, req),
+  );
 
   const handle = async (msg: InboundMessage) => {
     const fmsg = msg as FeishuInboundMessage;
@@ -126,6 +175,18 @@ async function main(): Promise<void> {
     const text = (msg.text || '').trim();
     if (!text) {
       await channel.reply(msg, '请发送文字内容。');
+      return;
+    }
+
+    confirmations.noteChat(msg.senderId, msg.sessionId);
+    // 写操作确认应答优先处理：闸门在等答复，若进串行队列会死锁
+    const answer = confirmations.resolveFromText(msg.senderId, text);
+    if (answer === 'approved') {
+      await channel.reply(msg, '✅ 已批准，正在执行…');
+      return;
+    }
+    if (answer === 'denied') {
+      await channel.reply(msg, '已取消，操作未执行。');
       return;
     }
 
@@ -166,6 +227,7 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     console.log('\n' + c.gray('正在退出…'));
+    watcher?.stop();
     await channel.stop();
     await mcp.close();
     await stopKanbanChild(kanbanChild);
@@ -187,6 +249,35 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
+
+  // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知
+  if (process.env.KANBAN_WATCH !== '0') {
+    if (feishuCfg.allowedOpenIds.length) {
+      const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
+      watcher = new KanbanWatcher({
+        kanbanUrl: agentCfg.kanbanUrl,
+        projectId: agentCfg.kanbanProjectId || undefined,
+        intervalMs: intervalSec * 1000,
+        statePath: path.join(defaultDataHome(), 'watch-state.json'),
+        notify: async (text) => {
+          for (const oid of feishuCfg.allowedOpenIds) {
+            try {
+              await channel.notifyOpenId(oid, text);
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.error(`[watch] 推送失败(${oid}): ${message}`);
+            }
+          }
+        },
+        log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
+      });
+      watcher.start();
+      console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
+    } else {
+      console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：看板状态推送已禁用（无推送目标）'));
+    }
+  }
+
   console.log(c.gray('Ctrl+C 退出'));
 }
 

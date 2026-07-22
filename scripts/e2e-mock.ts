@@ -2,6 +2,8 @@
 // against the REAL helios-kanban MCP. Run: npm run test:e2e
 
 import http from 'http';
+import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import path from 'path';
 
@@ -118,9 +120,19 @@ async function main(): Promise<void> {
   const { server, state, port } = await startMockServer();
   const bin = path.join(__dirname, '..', 'src', 'cli.ts');
   const tsx = path.join(__dirname, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  // 隔离环境：临时 HOME + 强制 .env（最高优先级），避免用户/项目 .env 覆盖 mock 端点
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-e2e-'));
+  const forcedEnv = path.join(tmpHome, '.env');
+  fs.writeFileSync(
+    forcedEnv,
+    `LLM_BASE_URL=http://127.0.0.1:${port}/v1\nLLM_API_KEY=mock-key\nLLM_MODEL=mock-model\n`,
+    'utf8',
+  );
   const child = spawn(process.execPath, [tsx, bin], {
     env: {
       ...process.env,
+      HELIOS_TASK_AGENT_HOME: tmpHome,
+      HELIOS_TASK_AGENT_ENV: forcedEnv,
       LLM_BASE_URL: `http://127.0.0.1:${port}/v1`,
       LLM_API_KEY: 'mock-key',
       LLM_MODEL: 'mock-model',
@@ -130,11 +142,17 @@ async function main(): Promise<void> {
 
   let stdout = '';
   child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-  child.stdin.write('创建一个测试任务然后删掉\n/exit\n');
+  // 流程固定产生两次写闸门确认（create_task + delete_task），依次回答 y
+  child.stdin.write('创建一个测试任务然后删掉\ny\ny\n/exit\n');
   child.stdin.end();
 
   const code = await new Promise<number>((resolve) => child.on('close', (c) => resolve(c ?? 1)));
   server.close();
+  try {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 
   const failures: string[] = [];
   if (code !== 0) failures.push(`agent 退出码 ${code}`);
@@ -143,6 +161,7 @@ async function main(): Promise<void> {
   if (!state.createdOk) failures.push('create_task 结果未包含测试标题');
   if (!state.deletedOk) failures.push('delete_task 未确认删除');
   if (!state.larkOk) failures.push('lark_cli 工具未成功执行');
+  if (!stdout.includes('写操作请求')) failures.push('未出现写操作确认提示（闸门未触发）');
   if (!stdout.includes(FINAL_REPLY)) failures.push('agent 输出中未找到最终回复');
 
   if (failures.length) {

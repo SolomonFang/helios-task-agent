@@ -4,6 +4,17 @@ import type { KanbanMcp } from './mcp';
 import type { MemoryStore } from './memory';
 import type { OpenAiTool, ToolHandlers } from './types';
 import { runRepoFs } from './repo-fs';
+import {
+  classifyHk,
+  classifyLark,
+  classifyMcp,
+  passGate,
+  summarizeMcp,
+  wrapUntrusted,
+  type ConfirmFn,
+} from './guard';
+import { auditLog } from './audit';
+import { SourceRegistry, extractSourceUrls, kanbanTaskExists } from './source-registry';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
@@ -32,6 +43,26 @@ function run(command: string, args: string[], { env }: { env?: NodeJS.ProcessEnv
   });
 }
 
+function looksLikeFailure(s: string): boolean {
+  return /命令执行失败|调用失败|执行异常|^错误|error|HTTP \d|API error|失败|denied|not found/i.test(s.slice(0, 300));
+}
+
+function extractUuid(s: string): string | null {
+  const m = s.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  return m ? m[0] : null;
+}
+
+/** hk tasks create [project_id] <title> — title = first non-flag arg that is not a UUID. */
+function hkCreateTitle(args: string[]): string {
+  const rest = args[0] === 'create-and-start' ? args.slice(1) : args.slice(2);
+  for (const a of rest) {
+    if (a.startsWith('--')) break;
+    if (/^[0-9a-fA-F-]{36}$/.test(a)) continue;
+    return a;
+  }
+  return '';
+}
+
 const LOCAL_TOOLS: OpenAiTool[] = [
   {
     type: 'function',
@@ -40,7 +71,8 @@ const LOCAL_TOOLS: OpenAiTool[] = [
       description:
         '执行本机 lark-cli 命令以获取/操作飞书内容（消息、群聊、文档、日历、任务、多维表格等）。' +
         '用于：读取群消息、读取文档正文、搜索聊天等。参数为命令行参数数组，例如 ["im","--help"]。' +
-        '拿不准用法时先执行 ["--help"] 或 ["<skill>","--help"] 自发现，禁止臆造子命令。',
+        '拿不准用法时先执行 ["--help"] 或 ["<skill>","--help"] 自发现，禁止臆造子命令。' +
+        '只读命令直接执行；写命令（发消息、创建、修改、删除等）会触发用户确认闸门。',
       parameters: {
         type: 'object',
         properties: {
@@ -61,7 +93,7 @@ const LOCAL_TOOLS: OpenAiTool[] = [
       description:
         '执行 helios-kanban-remote 技能的 hk.sh（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
         '例如 ["health"]、["projects"]、["projects","update",id,"--description","…"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
-        '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。',
+        '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。写操作会触发用户确认闸门。',
       parameters: {
         type: 'object',
         properties: {
@@ -181,6 +213,9 @@ export function buildTools({
   memory,
   userId,
   onMemoryChange,
+  confirm,
+  registry,
+  auditHome,
 }: {
   mcp: KanbanMcp | null;
   kanbanUrl: string;
@@ -191,10 +226,43 @@ export function buildTools({
   userId?: string;
   /** Called after any successful memory write so session can refresh system prompt. */
   onMemoryChange?: () => void;
+  /** Write gate: every write op waits for explicit user approval. Omit → writes blocked. */
+  confirm?: ConfirmFn;
+  /** Dedupe store for「飞书来源 → 看板任务」；defaults to <home>/synced-sources.json. */
+  registry?: SourceRegistry;
+  /** Override audit log home (tests). */
+  auditHome?: string;
 }): { openAiTools: OpenAiTool[]; handlers: ToolHandlers } {
   const openAiTools: OpenAiTool[] = [];
   const handlers: ToolHandlers = new Map();
   const uid = userId || 'local';
+  const reg = registry || new SourceRegistry();
+
+  /** Returns a block message if any source URL was already synced; cleans stale mappings. */
+  const checkDuplicates = async (urls: string[]): Promise<string | null> => {
+    for (const url of urls) {
+      const hit = reg.lookup(uid, url);
+      if (!hit) continue;
+      const exists = hit.taskId === 'unknown' ? true : await kanbanTaskExists(kanbanUrl, hit.taskId);
+      if (exists) {
+        return (
+          `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
+          `- 已创建：${hit.createdAt} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
+          '如确需重建，请先在 kanban 中删除原任务（或告知用户该任务已存在）。'
+        );
+      }
+      reg.remove(uid, url); // 原任务已被删除 → 清理映射后放行
+    }
+    return null;
+  };
+
+  const recordSources = (urls: string[], result: string, title: string): void => {
+    if (!urls.length || looksLikeFailure(result)) return;
+    const taskId = extractUuid(result);
+    if (!taskId) return;
+    const entry = { taskId, title, createdAt: new Date().toISOString() };
+    for (const url of urls) reg.record(uid, url, entry);
+  };
 
   if (mcp && mcp.connected) {
     for (const tool of mcp.tools) {
@@ -211,12 +279,45 @@ export function buildTools({
         },
       });
       handlers.set(name, async (args) => {
+        if (classifyMcp(tool.name) === 'read') {
+          try {
+            return await mcp.callTool(tool.name, args);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+          }
+        }
+        // write path: dedupe → gate → execute → audit (+record)
+        const summary = summarizeMcp(tool.name, args);
+        const detail = `kanban_${tool.name}(${JSON.stringify(args).slice(0, 800)})`;
+        const isCreate = /create/i.test(tool.name);
+        const urls = isCreate ? extractSourceUrls(JSON.stringify(args)) : [];
+        if (urls.length) {
+          const dup = await checkDuplicates(urls);
+          if (dup) {
+            auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'blocked_dup' }, auditHome);
+            return dup;
+          }
+        }
+        const gate = await passGate({ kind: 'kanban', summary, detail }, confirm);
+        if (!gate.allowed) {
+          auditLog({ user: uid, kind: 'kanban', summary, detail, decision: gate.reason }, auditHome);
+          return gate.message;
+        }
+        let result: string;
         try {
-          return await mcp.callTool(tool.name, args);
+          result = await mcp.callTool(tool.name, args);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+          result = `MCP 工具 ${tool.name} 调用失败: ${message}`;
         }
+        const ok = !looksLikeFailure(result);
+        auditLog(
+          { user: uid, kind: 'kanban', summary, detail, decision: 'approved', ok, resultSnippet: result },
+          auditHome,
+        );
+        if (ok && urls.length) recordSources(urls, result, typeof args.title === 'string' ? args.title : '');
+        return result;
       });
     }
   }
@@ -226,7 +327,24 @@ export function buildTools({
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
     }
-    return run('lark-cli', args as string[]);
+    const argv = args as string[];
+    if (classifyLark(argv) === 'write') {
+      const summary = `飞书写操作：lark-cli ${argv.slice(0, 3).join(' ')}`;
+      const detail = `lark-cli ${argv.join(' ')}`.slice(0, 800);
+      const gate = await passGate({ kind: 'lark', summary, detail }, confirm);
+      if (!gate.allowed) {
+        auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason }, auditHome);
+        return gate.message;
+      }
+      const out = await run('lark-cli', argv);
+      auditLog(
+        { user: uid, kind: 'lark', summary, detail, decision: 'approved', ok: !looksLikeFailure(out), resultSnippet: out },
+        auditHome,
+      );
+      return wrapUntrusted(out);
+    }
+    const out = await run('lark-cli', argv);
+    return wrapUntrusted(out);
   });
 
   const hkEnv: NodeJS.ProcessEnv = { HELIOS_KANBAN_URL: kanbanUrl };
@@ -239,7 +357,32 @@ export function buildTools({
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
     }
-    return run('bash', [HK_SCRIPT, ...(args as string[])], { env: hkEnv });
+    const argv = args as string[];
+    if (classifyHk(argv) === 'read') {
+      return run('bash', [HK_SCRIPT, ...argv], { env: hkEnv });
+    }
+    const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
+    const title = isCreate ? hkCreateTitle(argv) : '';
+    const summary = isCreate ? `创建看板任务「${title}」（hk_cli）` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
+    const detail = `hk ${argv.join(' ')}`.slice(0, 800);
+    const urls = isCreate ? extractSourceUrls(argv.join(' ')) : [];
+    if (urls.length) {
+      const dup = await checkDuplicates(urls);
+      if (dup) {
+        auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'blocked_dup' }, auditHome);
+        return dup;
+      }
+    }
+    const gate = await passGate({ kind: 'hk', summary, detail }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    const out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv });
+    const ok = !looksLikeFailure(out);
+    auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
+    if (ok && urls.length) recordSources(urls, out, title);
+    return out;
   });
 
   handlers.set('repo_fs', async (raw) => {

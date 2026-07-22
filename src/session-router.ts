@@ -1,5 +1,6 @@
 import type { AgentConfig } from './types';
 import type { KanbanMcp } from './mcp';
+import type { ConfirmFn } from './guard';
 import { MemoryStore } from './memory';
 import { AgentSession } from './session';
 
@@ -13,12 +14,20 @@ export class SessionRouter {
   private readonly mcp: KanbanMcp | null;
   private readonly mcpOk: boolean;
   private readonly memory: MemoryStore;
+  private readonly confirmFactory?: (openId: string) => ConfirmFn;
 
-  constructor(cfg: AgentConfig, mcp: KanbanMcp | null, mcpOk: boolean, memory?: MemoryStore) {
+  constructor(
+    cfg: AgentConfig,
+    mcp: KanbanMcp | null,
+    mcpOk: boolean,
+    memory?: MemoryStore,
+    confirmFactory?: (openId: string) => ConfirmFn,
+  ) {
     this.cfg = cfg;
     this.mcp = mcp;
     this.mcpOk = mcpOk;
     this.memory = memory || new MemoryStore();
+    this.confirmFactory = confirmFactory;
   }
 
   getOrCreate(openId: string): AgentSession {
@@ -27,6 +36,7 @@ export class SessionRouter {
       session = new AgentSession(this.cfg, this.mcp, this.mcpOk, {
         userId: openId,
         memory: this.memory,
+        confirm: this.confirmFactory?.(openId),
       });
       this.sessions.set(openId, session);
     }

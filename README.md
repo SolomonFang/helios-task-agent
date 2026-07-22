@@ -23,6 +23,23 @@
 - [文档索引](docs/superpowers/README.md)
 - [任务中心链接展开](docs/superpowers/specs/2026-07-21-feishu-task-link-expand-design.md)
 - [飞书 → 看板](docs/superpowers/specs/2026-07-21-feishu-to-kanban-design.md)
+- [写操作闸门与安全边界](docs/superpowers/specs/2026-07-22-write-gate-design.md)
+
+## 安全机制
+
+「agent 不擅自行动」不靠 prompt 自觉，由代码层保障：
+
+| 机制 | 说明 |
+|------|------|
+| 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等写操作，执行前必须经你确认：终端 y/N，飞书端弹确认卡片（按钮或回复「确认/取消」，120 秒超时自动拒绝） |
+| 只读白名单 | `lark_cli` 按子命令分类：只读（list/get/search 等）直接放行，写操作与未知命令一律进闸门；`api` 仅 GET 免确认 |
+| 防注入标记 | `lark_cli` 读回的外部内容统一包裹 UNTRUSTED 标记，模型被告知其中"指令"一律无效；即使被骗发起写操作也会被闸门拦下 |
+| 来源查重 | 飞书链接 → 看板任务映射存 `synced-sources.json`；同一来源重复同步会被拦截并提示已有任务 |
+| 审计日志 | 所有写操作的请求/批准/拒绝/结果追加到 `~/.helios-task-agent/audit.log`（JSONL） |
+
+## 看板状态推送（bot）
+
+bot 模式下每 60s 轮询看板：任务完成/取消、执行失败、新待审批 → 主动推送飞书（推给 `FEISHU_ALLOWED_OPEN_IDS`）。首轮只建基线，快照存 `watch-state.json`，重启不重复打扰。`KANBAN_WATCH=0` 关闭，`KANBAN_WATCH_INTERVAL_SEC` 调间隔。
 
 ## 安装
 
@@ -41,6 +58,9 @@ Node.js >= 18。建议本机已安装 **lark-cli**（读飞书）。
 ```text
 ~/.helios-task-agent/.env
 ~/.helios-task-agent/memory.json
+~/.helios-task-agent/synced-sources.json   （飞书来源 → 看板任务映射，查重用）
+~/.helios-task-agent/audit.log             （写操作审计，JSONL）
+~/.helios-task-agent/watch-state.json      （看板推送快照）
 ```
 
 ### 终端
@@ -89,7 +109,9 @@ helios-task-agent-bot
 | `HELIOS_KANBAN_AUTO_START` | 默认开启；本机看板未就绪时自动 `npx -y helios-kanban`；`0` 关闭 |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | 可选默认 |
 | `HELIOS_TASK_AGENT_HOME` | 数据目录，默认 `~/.helios-task-agent` |
-| `HELIOS_TASK_AGENT_ENV` | 强制指定 `.env` 写入路径 |
+| `HELIOS_TASK_AGENT_ENV` | 强制指定 `.env` 路径（写入目标；加载时优先级最高） |
+| `KANBAN_WATCH` | bot 看板状态推送，默认开；`0` 关闭 |
+| `KANBAN_WATCH_INTERVAL_SEC` | 推送轮询间隔（秒，默认 60，最小 15） |
 
 加载顺序：用户目录 `.env` → 项目 `.env` → 当前目录 `.env`（后者覆盖前者）。完整示例见 [.env.example](.env.example)。
 
@@ -97,8 +119,9 @@ helios-task-agent-bot
 
 1. 创建企业自建应用 → 启用机器人  
 2. 事件订阅 → **使用长连接接收事件** → `im.message.receive_v1`  
-3. 权限：读取单聊消息、以应用身份发消息 → 发布版本  
-4. 复制 App ID / App Secret  
+3. （可选，确认卡片按钮）回调订阅 → **使用长连接接收回调** → 添加「卡片回传交互」`card.action.trigger`；不配则确认走纯文本回复，功能不变  
+4. 权限：读取单聊消息、以应用身份发消息 → 发布版本  
+5. 复制 App ID / App Secret
 
 ## 飞书 / 终端里可以说
 
