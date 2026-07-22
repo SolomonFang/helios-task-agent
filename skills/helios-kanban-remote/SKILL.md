@@ -36,11 +36,12 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "找登录相关任务" | `hk tasks list --query 登录` |
 | "260717 迭代" | `hk tasks list --iteration 260717` |
 | "创建任务" | `hk tasks create "标题" --desc "用 @coding-standards"` |
+| "启动任务" | `hk start <task_id> [--executor E] [--variant V]`（听用户指定） |
 | "有哪些分支" | `hk branches <repo_id> [--query develop]` |
 | "多仓启动" | `hk start <task_id> --repo <id1> --repo <id2>:develop` |
 | "有哪些 tag" | `hk tags` |
 | "基于 develop 启动" | `hk start <task_id> --branch develop` |
-| "新建并启动" | `hk create-and-start "标题"` |
+| "新建并启动" | 仅当用户明确要求「创建并启动」→ `hk create-and-start "标题"`；默认只 create |
 | "再跟它说一句…" | `hk follow-up <task_id> <prompt>`（运行中自动排队） |
 | "跑得怎么样了" | `hk status <task_id>` |
 | "有没有待审批" | `hk approvals` → `hk approve/deny … --process <ep_id>` |
@@ -117,6 +118,7 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 | Reasonix | `REASONIX` |
 | Cursor | `CURSOR_AGENT` |
 | Copilot | `COPILOT` |
+| Kimi | `KIMI_CLI` |
 
 ## Task statuses
 

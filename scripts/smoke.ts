@@ -36,9 +36,10 @@ async function main(): Promise<void> {
     userId: 'local',
   });
   check(
-    '工具注册（含 lark_cli/hk_cli/memory_*）',
+    '工具注册（含 lark_cli/hk_cli/repo_fs/memory_*）',
     handlers.has('lark_cli') &&
       handlers.has('hk_cli') &&
+      handlers.has('repo_fs') &&
       handlers.has('memory_set') &&
       handlers.has('memory_get'),
     `共 ${openAiTools.length} 个工具`,
@@ -84,6 +85,12 @@ async function main(): Promise<void> {
   const hkOut = await handlers.get('hk_cli')!({ args: ['health'] });
   check('hk_cli health', /success|OK/i.test(hkOut), hkOut.slice(0, 80).replace(/\n/g, ' '));
 
+  const repoRoot = path.join(__dirname, '..');
+  const listOut = await handlers.get('repo_fs')!({ action: 'list', root: repoRoot, path: 'src' });
+  check('repo_fs list', /prompt\.ts|tools\.ts|repo-fs\.ts/.test(listOut), listOut.slice(0, 120).replace(/\n/g, ' '));
+  const escapeOut = await handlers.get('repo_fs')!({ action: 'read', root: repoRoot, path: '../.env' });
+  check('repo_fs 拒绝路径越界', /越界|禁止/.test(escapeOut), escapeOut.slice(0, 80));
+
   const prompt = buildSystemPrompt({
     mcpOk: mcp.connected,
     mcpToolNames: mcp.tools.map((t) => t.name),
@@ -95,7 +102,10 @@ async function main(): Promise<void> {
     prompt.includes('helios-kanban-remote') &&
       prompt.includes('lark_cli') &&
       prompt.includes('用户记忆') &&
-      prompt.includes('feishu_task_source'),
+      prompt.includes('feishu_task_source') &&
+      prompt.includes('飞书→看板') &&
+      prompt.includes('不要自动 start') &&
+      !prompt.includes('Kimi Plan（技术设计）'),
     `${prompt.length} 字符`,
   );
 

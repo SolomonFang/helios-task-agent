@@ -25,9 +25,10 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
-· 同步我的任务
+· 同步/列出我的任务（含链接会展开详情）
+· 写进 helios-kanban（确认后再创建，不自动启动）
 · 有哪些项目 / 创建一个任务：…
-· 用 Claude 跑这个任务`;
+· 用 Claude 跑这个任务（是否启用、用谁跑由你决定）`;
 
 function isCommand(text: string): string | null {
   const t = text.trim();

@@ -1,11 +1,15 @@
 # Feishu Task Center link expand (display-only)
 
 Date: 2026-07-21  
-Status: approved (approach 1 — prompt rules)
+Status: **implemented** (prompt rules in `src/prompt.ts`)
 
 ## Goal
 
 When the agent lists Feishu **Task Center** tasks (`lark-cli task`), if a task’s **title** or **description** contains a Feishu URL, fetch that URL’s details via `lark_cli` and **show** them to the user. Do **not** auto-write to helios-kanban.
+
+## Position in full flow
+
+See [Feishu → Helios Kanban](./2026-07-21-feishu-to-kanban-design.md). This spec is **step 1** (list + expand only).
 
 ## Non-goals
 
@@ -19,7 +23,7 @@ When the agent lists Feishu **Task Center** tasks (`lark-cli task`), if a task�
 Any user intent that loads Task Center lists, including but not limited to:
 
 - 「拉取/列出我的任务」
-- 「同步我的任务」（先列任务中心并展开，再在用户确认后才写 kanban）
+- 「同步我的任务」（先列任务中心并展开；写看板需用户另说「写进…」并确认）
 
 ## Detection
 
@@ -37,16 +41,12 @@ Resource kinds to attempt: doc / wiki / sheets / base / task (and others discove
 4. Beyond 10: list remaining tasks without expand; offer to expand named ones next.
 5. On read failure: report task + URL + error; continue with other tasks.
 6. Expand depth: **one hop only**.
-7. Kanban: only after user confirms the presented list (existing workflow).
+7. Kanban: only after user explicitly asks to write and confirms (next spec).
 
 ## Implementation
 
-Single change surface: `src/prompt.ts`
-
-- Add a dedicated rule block under 飞书（lark-cli）使用规则 / 典型工作流
-- Optionally one sentence in README under 飞书里可以说
-
-No TypeScript API / tool schema changes.
+- `src/prompt.ts` — 「任务中心链接展开」规则 + 典型工作流第 2 步
+- `README.md` — 端到端说明
 
 ## Success criteria
 

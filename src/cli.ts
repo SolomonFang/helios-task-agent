@@ -68,9 +68,10 @@ const HELP = `
 
   ${c.strong('试试对我说')}
   · 以后都从这个飞书地址同步任务：<链接>
-  · 同步我的任务
+  · 同步/列出我的任务（含链接会展开详情）
+  · 写进 helios-kanban（确认后再创建，不自动启动）
   · 有哪些项目 / 创建一个任务：修复登录页样式 bug
-  · 用 Claude 跑这个任务 / 再跟它说一句：先写测试
+  · 用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）
   · 把 xx 群最近的聊天整理成任务
 `;
 
@@ -188,14 +189,14 @@ export async function main(): Promise<void> {
         console.log('');
       } else if (cmd === '/tools') {
         if (!mcpOk) {
-          console.log(c.warn('MCP 未连接（降级模式），本地工具：lark_cli / hk_cli / memory_*。'));
+          console.log(c.warn('MCP 未连接（降级模式），本地工具：lark_cli / hk_cli / repo_fs / memory_*。'));
         } else {
           console.log(c.strong('kanban MCP 工具:'));
           for (const t of mcp.tools) {
             console.log(`  ${c.info('kanban_' + t.name)}  ${c.gray((t.description || '').split('\n')[0])}`);
           }
           console.log(c.strong('本地工具:'));
-          for (const t of ['lark_cli', 'hk_cli', 'memory_set', 'memory_get', 'memory_delete', 'memory_note']) {
+          for (const t of ['lark_cli', 'hk_cli', 'repo_fs', 'memory_set', 'memory_get', 'memory_delete', 'memory_note']) {
             console.log(`  ${c.info(t)}`);
           }
         }

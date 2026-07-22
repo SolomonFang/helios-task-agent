@@ -3,6 +3,7 @@ import { execFile } from 'child_process';
 import type { KanbanMcp } from './mcp';
 import type { MemoryStore } from './memory';
 import type { OpenAiTool, ToolHandlers } from './types';
+import { runRepoFs } from './repo-fs';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
@@ -71,6 +72,39 @@ const LOCAL_TOOLS: OpenAiTool[] = [
           },
         },
         required: ['args'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repo_fs',
+      description:
+        '在 helios-kanban 关联仓库的本机 path 下只读浏览代码（list / read / grep）。' +
+        '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否 start 由用户决定。' +
+        '必须提供 root（绝对路径）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
+        '禁止用于写文件或访问仓库外路径。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'read', 'grep'],
+            description: 'list 列目录；read 读文件；grep 在目录内搜索正则',
+          },
+          repo_id: { type: 'string', description: 'kanban 仓库 UUID；与 root 二选一' },
+          root: { type: 'string', description: '本机仓库绝对路径；与 repo_id 二选一' },
+          path: {
+            type: 'string',
+            description: '相对仓库根的路径；list/grep 默认为 .；read 必填文件路径',
+          },
+          pattern: { type: 'string', description: 'grep 时的正则（忽略大小写）' },
+          glob: {
+            type: 'string',
+            description: '可选文件过滤，如 *.ts 或 src/',
+          },
+        },
+        required: ['action'],
       },
     },
   },
@@ -206,6 +240,18 @@ export function buildTools({
       return '参数错误：args 必须是字符串数组';
     }
     return run('bash', [HK_SCRIPT, ...(args as string[])], { env: hkEnv });
+  });
+
+  handlers.set('repo_fs', async (raw) => {
+    const action = typeof raw.action === 'string' ? raw.action : '';
+    return runRepoFs(kanbanUrl, {
+      action,
+      root: typeof raw.root === 'string' ? raw.root : undefined,
+      repo_id: typeof raw.repo_id === 'string' ? raw.repo_id : undefined,
+      path: typeof raw.path === 'string' ? raw.path : undefined,
+      pattern: typeof raw.pattern === 'string' ? raw.pattern : undefined,
+      glob: typeof raw.glob === 'string' ? raw.glob : undefined,
+    });
   });
 
   if (memory) {
