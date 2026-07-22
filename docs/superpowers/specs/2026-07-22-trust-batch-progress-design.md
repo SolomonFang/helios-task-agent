@@ -41,7 +41,7 @@ Upstream: [write-gate-design](./2026-07-22-write-gate-design.md)
 
 ### 晨报（src/scheduler.ts / bot.ts）
 
-- `BOT_DAILY_REPORT=HH:MM`：每天该时刻对每个 owner 在各自串行队列里跑「同步我的任务」并推送结果
+- `BOT_DAILY_REPORT=HH:MM`：每天该时刻对每个 owner 在各自串行队列里「只读」跑「同步我的任务」并推送结果（明确指示不写看板，避免清晨确认卡片轰炸；写闸门仍兜底，推送末尾引导用户回复「写进 helios-kanban」接续）
 - 写操作仍走确认闸门（夜间未确认则 120s 超时自动拒绝，安全语义不变）
 
 ## ③ 通知可行动化（src/watcher.ts / bot.ts）

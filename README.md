@@ -47,7 +47,7 @@ bot 模式下每 60s 轮询看板：任务完成/取消、执行失败、新待�
 
 ## 晨报 / 定时同步（bot）
 
-`BOT_DAILY_REPORT=09:00` 后，每天该时刻自动跑「同步我的任务」并把结果推送给你；期间如需写操作，仍走确认卡片。MCP 连接由 supervisor 每 60s 探测，掉线自动降级 `hk_cli` 并重连，恢复后自动切回。
+`BOT_DAILY_REPORT=09:00` 后，每天该时刻自动**只读**跑「同步我的任务」并把结果推送给你（不写看板，避免清晨一堆确认卡片）；看完回复「写进 helios-kanban」即可写入。MCP 连接由 supervisor 每 60s 探测，掉线自动降级 `hk_cli` 并重连，恢复后自动切回。
 
 ## 安装
 
@@ -120,9 +120,9 @@ helios-task-agent-bot
 | `HELIOS_TASK_AGENT_ENV` | 强制指定 `.env` 路径（写入目标；加载时优先级最高） |
 | `KANBAN_WATCH` | bot 看板状态推送，默认开；`0` 关闭 |
 | `KANBAN_WATCH_INTERVAL_SEC` | 推送轮询间隔（秒，默认 60，最小 15） |
-| `BOT_DAILY_REPORT` | bot 晨报：每天 `HH:MM` 自动「同步我的任务」并推送；不设置则不开启 |
+| `BOT_DAILY_REPORT` | bot 晨报：每天 `HH:MM` 只读跑「同步我的任务」并推送（不写看板）；不设置则不开启 |
 
-加载顺序：用户目录 `.env` → 项目 `.env` → 当前目录 `.env`（后者覆盖前者）。完整示例见 [.env.example](.env.example)。
+加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖前者；**用户目录是向导写入目标，优先生效**），`HELIOS_TASK_AGENT_ENV` 指定路径优先级最高。完整示例见 [.env.example](.env.example)。
 
 ### 开放平台清单（向导也会打印）
 

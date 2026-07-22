@@ -212,6 +212,34 @@ async function main(): Promise<void> {
   const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30 });
   check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);
 
+  // 收窄确认词：pending 期间随口应答不再误放行；明确词仍可批准
+  const prC = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  check(
+    'pending 期间随口「好」/「ok」不批准',
+    cm.resolveFromText('u1', '好') === 'ignored' && cm.resolveFromText('u1', 'ok') === 'ignored',
+  );
+  check('「确认执行」仍可批准', cm.resolveFromText('u1', '确认执行') === 'approved' && (await prC) === true);
+
+  // pending 被新请求替代：旧请求拒绝 + onSuperseded 通知；批准触发 onApprove
+  let supersededSummary = '';
+  let approvedSummary = '';
+  const cm4 = new ConfirmationManager(async () => {}, {
+    onSuperseded: (_o, req) => {
+      supersededSummary = req.summary;
+    },
+    onApprove: (_o, req) => {
+      approvedSummary = req.summary;
+    },
+  });
+  const prOld = cm4.request('u3', { kind: 'kanban', summary: 'old', detail: 'd' });
+  const prNew = cm4.request('u3', { kind: 'kanban', summary: 'new', detail: 'd' });
+  check('pending 被替代时旧请求拒绝并通知', (await prOld) === false && supersededSummary === 'old');
+  const aNew = cm4.resolveFromText('u3', '确认');
+  check(
+    '替代后新请求可确认并触发 onApprove',
+    aNew === 'approved' && (await prNew) === true && approvedSummary === 'new',
+  );
+
   // ---- 批量确认（同类放行 / 异类与无 key 重问 / 拒绝不缓存） ----
   let asks = 0;
   const batchConfirm = withBatchApproval(async () => {

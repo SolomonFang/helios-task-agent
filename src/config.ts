@@ -16,7 +16,9 @@ export function projectEnvPath(): string {
 }
 
 /**
- * Load env files: user home first, then project, then cwd (later overrides).
+ * Load env files: project first, then cwd, then user home (later overrides).
+ * 用户目录是向导/owner 认领的写入目标（resolveEnvWritePath），必须最后加载
+ * 才能保证写入的配置真实生效；HELIOS_TASK_AGENT_ENV 强制路径优先级最高。
  * Returns the path preferred for writes (existing cwd/project if present, else user home).
  */
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
@@ -25,21 +27,17 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   const project = projectEnvPath();
   const cwd = path.join(process.cwd(), '.env');
 
-  if (fs.existsSync(home)) {
-    dotenv.config({ path: home });
-    loaded.push(home);
-  }
-  if (fs.existsSync(project) && path.resolve(project) !== path.resolve(home)) {
-    dotenv.config({ path: project, override: true });
+  if (fs.existsSync(project)) {
+    dotenv.config({ path: project });
     loaded.push(project);
   }
-  if (
-    fs.existsSync(cwd) &&
-    path.resolve(cwd) !== path.resolve(home) &&
-    path.resolve(cwd) !== path.resolve(project)
-  ) {
+  if (fs.existsSync(cwd) && path.resolve(cwd) !== path.resolve(project)) {
     dotenv.config({ path: cwd, override: true });
     loaded.push(cwd);
+  }
+  if (fs.existsSync(home) && !loaded.some((p) => path.resolve(p) === path.resolve(home))) {
+    dotenv.config({ path: home, override: true });
+    loaded.push(home);
   }
 
   // HELIOS_TASK_AGENT_ENV 指定的文件具有最高优先级：即使路径与前面重复，

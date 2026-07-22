@@ -6,7 +6,7 @@ import { c, printBanner, Spinner, renderReply, selectList } from './ui';
 import { ensureConfig } from './config';
 import { KanbanMcp } from './mcp';
 import { AgentSession } from './session';
-import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
+import { ensureKanbanRunning } from './kanban-ensure';
 import { checkLarkCli } from './deps';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
@@ -56,8 +56,9 @@ const HELP = `
   ${c.info('/config')}   重新配置模型 / kanban 地址
   ${c.info('/tools')}    列出当前可用的 kanban 工具
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
+  ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
-  ${c.info('/exit')}     退出
+  ${c.info('/exit')}     退出（任务运行中按 Ctrl+C 只中断不退出）
 
   ${c.strong('试试对我说')}
   · 以后都从这个飞书地址同步任务：<链接>
@@ -165,14 +166,27 @@ export async function main(): Promise<void> {
 
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local', confirm: confirmWrite });
 
+  /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
+  let currentCtl: AbortController | null = null;
+
   const cleanup = async () => {
     spinner.stop();
     await mcp.close();
-    await stopKanbanChild(kanbanChild);
+    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可
+    if (kanbanChild && kanbanChild.exitCode === null) {
+      kanbanChild.stdout?.destroy();
+      kanbanChild.stderr?.destroy();
+      kanbanChild.unref();
+      console.log(c.gray(`看板服务保留运行（PID ${kanbanChild.pid}），停止：kill ${kanbanChild.pid}`));
+    }
     rl.close();
     process.exit(0);
   };
   process.on('SIGINT', () => {
+    if (currentCtl) {
+      currentCtl.abort();
+      return;
+    }
     console.log('\n' + c.gray('再见 👋'));
     void cleanup();
   });
@@ -210,6 +224,24 @@ export async function main(): Promise<void> {
             console.log(`  ${c.info(t)}`);
           }
         }
+      } else if (cmd === '/status') {
+        let kanbanHealth: string;
+        try {
+          const res = await fetch(`${cfg.kanbanUrl.replace(/\/+$/, '')}/api/health`, {
+            signal: AbortSignal.timeout(5000),
+          });
+          kanbanHealth = res.ok ? 'ok' : `HTTP ${res.status}`;
+        } catch {
+          kanbanHealth = '不可达';
+        }
+        console.log(c.strong('状态'));
+        console.log(`  模型: ${c.info(cfg.llmModel)}`);
+        console.log(`  kanban: ${kanbanHealth === 'ok' ? c.ok('ok') : c.warn(kanbanHealth)}（${cfg.kanbanUrl}）`);
+        console.log(
+          `  MCP: ${mcpOk ? c.ok(`ok（${mcp.tools.length} 个工具）`) : c.warn('连接失败（降级 hk_cli）')}`,
+        );
+        console.log(`  lark-cli: ${larkOk ? c.ok('ok') : c.warn('未安装（飞书读取不可用）')}`);
+        console.log('');
       } else if (cmd === '/config') {
         try {
           cfg = await ensureConfig(ask, { force: true, choose });
@@ -225,19 +257,31 @@ export async function main(): Promise<void> {
       continue;
     }
 
-    spinner.start('思考中…');
+    spinner.start('思考中…（Ctrl+C 中断）');
+    const ctl = new AbortController();
+    currentCtl = ctl;
     try {
-      const reply = await session.handleUserMessage(line, (info) => {
-        if (info.type === 'tool') spinner.setText(`调用工具 ${info.name} …`);
-        else spinner.setText('思考中…');
-      });
+      const reply = await session.handleUserMessage(
+        line,
+        (info) => {
+          if (info.type === 'tool') spinner.setText(`调用工具 ${info.name} …（Ctrl+C 中断）`);
+          else spinner.setText('思考中…（Ctrl+C 中断）');
+        },
+        ctl.signal,
+      );
       spinner.stop();
       console.log('\n' + renderReply(reply) + '\n');
     } catch (err) {
       spinner.stop();
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(c.err(`\n请求失败: ${message}`));
-      console.error(c.gray('可用 /config 检查模型配置，或稍后重试。\n'));
+      if (ctl.signal.aborted) {
+        console.log(c.gray('\n⏹ 已中断当前任务（进程未退出，可继续对话）。'));
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(c.err(`\n请求失败: ${message}`));
+        console.error(c.gray('可用 /config 检查模型配置，或稍后重试。\n'));
+      }
+    } finally {
+      currentCtl = null;
     }
   }
 }

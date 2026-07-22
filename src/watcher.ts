@@ -101,10 +101,13 @@ export class KanbanWatcher {
         const url = this.taskUrl(cur.projectId, id);
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
           const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
-          events.push(`${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}`);
+          const hint = cur.status === 'done' ? '\n回复「帮我 review」看结果，或「再跟它说一句…」继续迭代' : '';
+          events.push(`${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}${hint}`);
         }
         if (old.running && !cur.running && cur.failed) {
-          events.push(`❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}`);
+          events.push(
+            `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
+          );
         }
       }
       const newApprovals = current.approvals.filter((a) => !prev.approvals.includes(a));

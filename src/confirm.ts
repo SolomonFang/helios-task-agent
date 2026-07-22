@@ -18,7 +18,8 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
-const YES_RE = /^(确认|同意|批准|好|可以|执行|确认执行|y|yes|ok)$/i;
+// 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作
+const YES_RE = /^(确认|确认执行|同意|批准|执行|y|yes)$/i;
 const NO_RE = /^(取消|算了|不用|否|拒绝|n|no)$/i;
 
 export class ConfirmationManager {
@@ -27,7 +28,14 @@ export class ConfirmationManager {
 
   constructor(
     private sendPrompt: (openId: string, chatId: string | undefined, req: ConfirmRequest, id: string) => Promise<void>,
-    private opts: { timeoutMs?: number; onTimeout?: (openId: string, req: ConfirmRequest) => void } = {},
+    private opts: {
+      timeoutMs?: number;
+      onTimeout?: (openId: string, req: ConfirmRequest) => void;
+      /** 新写操作顶掉未应答的 pending 时通知（否则用户会以为是自己拒绝的）。 */
+      onSuperseded?: (openId: string, req: ConfirmRequest) => void;
+      /** 用户批准时回调（bot 用于批量放行窗口提示）。 */
+      onApprove?: (openId: string, req: ConfirmRequest) => void;
+    } = {},
   ) {}
 
   /** Remember the user's chat so the confirm card can be delivered later. */
@@ -46,6 +54,7 @@ export class ConfirmationManager {
       clearTimeout(prev.timer);
       prev.resolve(false);
       this.pendings.delete(openId);
+      this.opts.onSuperseded?.(openId, prev.req);
     }
     return new Promise((resolve) => {
       const id = crypto.randomBytes(4).toString('hex');
@@ -90,6 +99,7 @@ export class ConfirmationManager {
     clearTimeout(p.timer);
     this.pendings.delete(openId);
     p.resolve(ok);
+    if (ok) this.opts.onApprove?.(openId, p.req);
   }
 }
 

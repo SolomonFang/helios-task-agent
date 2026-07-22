@@ -154,6 +154,17 @@ async function main(): Promise<void> {
       onTimeout: (openId, req) => {
         void channel.notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}`).catch(() => {});
       },
+      onSuperseded: (openId, req) => {
+        void channel
+          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}`)
+          .catch(() => {});
+      },
+      onApprove: (openId, req) => {
+        if (!req.batchKey) return;
+        void channel
+          .notifyOpenId(openId, '10 分钟内同类型写操作自动放行，不再重复询问（删除/取消/停止类仍会逐次确认）。')
+          .catch(() => {});
+      },
     },
   );
 
@@ -428,7 +439,8 @@ async function main(): Promise<void> {
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
   }
 
-  // 晨报/定时同步：每天固定时间自动跑「同步我的任务」并推送结果（写操作仍走确认闸门）
+  // 晨报/定时同步：每天固定时间「只读」跑同步并推送结果（不写看板，避免用户醒来面对一堆确认卡片）；
+  // 写闸门仍在兜底：模型若仍发起写操作，确认卡片照常出现。
   const dailyTime = parseDailyTime(process.env.BOT_DAILY_REPORT || '');
   if (dailyTime) {
     stopDaily = scheduleDaily(dailyTime, () => {
@@ -437,8 +449,13 @@ async function main(): Promise<void> {
           try {
             const session = router.getOrCreate(oid);
             await channel.notifyOpenId(oid, '🌅 每日任务同步进行中…');
-            const reply = await session.handleUserMessage('同步我的任务');
-            await channel.notifyOpenId(oid, reply || '(无内容)');
+            const reply = await session.handleUserMessage(
+              '同步我的任务（晨报只读模式：只列出/展开任务，不要写入 helios-kanban；最后列出值得写入看板的候选）',
+            );
+            await channel.notifyOpenId(
+              oid,
+              `${reply || '(无内容)'}\n\n——\n要把哪些写进 helios-kanban？回复「写进 helios-kanban」或直接指定即可。`,
+            );
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             await channel.notifyOpenId(oid, `每日同步失败: ${message}`).catch(() => {});
@@ -446,7 +463,7 @@ async function main(): Promise<void> {
         });
       }
     });
-    console.log(c.gray(`每日同步已开启：每天 ${process.env.BOT_DAILY_REPORT} 自动跑「同步我的任务」`));
+    console.log(c.gray(`每日同步已开启：每天 ${process.env.BOT_DAILY_REPORT} 只读跑「同步我的任务」并推送`));
   }
 
   console.log(c.gray('Ctrl+C 退出'));
