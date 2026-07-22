@@ -42,11 +42,12 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
     loaded.push(cwd);
   }
 
-  // HELIOS_TASK_AGENT_ENV 指定的文件具有最高优先级（覆盖以上所有来源）。
+  // HELIOS_TASK_AGENT_ENV 指定的文件具有最高优先级：即使路径与前面重复，
+  // 也必须在最后重新加载一次（override），确保覆盖项目/用户 .env。
   const forced = process.env.HELIOS_TASK_AGENT_ENV;
-  if (forced && fs.existsSync(forced) && !loaded.some((p) => path.resolve(p) === path.resolve(forced))) {
+  if (forced && fs.existsSync(forced)) {
     dotenv.config({ path: forced, override: true });
-    loaded.push(forced);
+    if (!loaded.some((p) => path.resolve(p) === path.resolve(forced))) loaded.push(forced);
   }
 
   // Prefer writing to an existing local .env during repo dev; otherwise user home.
