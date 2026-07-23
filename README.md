@@ -57,7 +57,7 @@ npm i -g helios-task-agent
 npx helios-task-agent
 ```
 
-Node.js >= 18。建议本机已安装 **lark-cli**（读飞书）。
+Node.js >= 18。读取飞书内容需要 **lark-cli**：`npm i -g @larksuite/cli && lark-cli auth login`（不装则飞书读取不可用，看板功能不受影响；缺失时启动会给出同样提示）。
 
 ## 像 Hermes 一样用
 
@@ -87,7 +87,7 @@ helios-task-agent bot
 helios-task-agent-bot
 ```
 
-1. **第一次运行会自动进入向导**：打印开放平台勾选清单，并询问 `App ID` / `App Secret`（以及尚未配置时的 LLM）
+1. **第一次运行会自动进入向导**：打印开放平台勾选清单，询问 `App ID` / `App Secret`（以及尚未配置时的 LLM），并**联网校验凭证**（无效凭证/未启用机器人当场报错，可重输）
 2. 按提示在 [飞书开放平台](https://open.feishu.cn/) 建好机器人（长连接 + `im.message.receive_v1`）
 3. 向导保存后建立长连接；用手机**私聊**机器人即可（当前仅处理私聊，忽略群消息）
 

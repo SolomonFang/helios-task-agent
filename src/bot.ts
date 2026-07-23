@@ -15,7 +15,7 @@ import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
 import { ConfirmationManager, buildConfirmCard } from './confirm';
 import { KanbanWatcher } from './watcher';
-import { checkLarkCli } from './deps';
+import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { parseDailyTime, scheduleDaily } from './scheduler';
 import type { AskFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：首个私聊用户将自动成为 owner 并写入白名单'));
   }
   if (!checkLarkCli()) {
-    console.log(c.warn('未检测到 lark-cli：读取飞书内容不可用（看板操作与推送不受影响）'));
+    console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}`));
   }
 
   let kanbanChild: ChildProcess | null = null;

@@ -7,7 +7,7 @@ import { ensureConfig } from './config';
 import { KanbanMcp } from './mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban-ensure';
-import { checkLarkCli } from './deps';
+import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
@@ -145,6 +145,7 @@ export async function main(): Promise<void> {
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
     larkOk,
   });
+  if (!larkOk) console.log(c.warn(LARK_CLI_INSTALL_HINT));
 
   const spinner = new Spinner('思考中…');
 

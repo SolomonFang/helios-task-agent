@@ -3,6 +3,8 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { c } from './ui';
 import { defaultDataHome } from './memory';
+import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { verifyFeishuApp } from './feishu-verify';
 import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig, LlmPreset } from './types';
 
 /** User-level config (Hermes-style). Wizards write here. */
@@ -318,10 +320,24 @@ export async function ensureBotConfig(
   if (force || !isFeishuBotConfigured()) {
     printFeishuSetupChecklist();
     console.log(c.strong('配置飞书机器人凭证：\n'));
-    const appId = await need('FEISHU_APP_ID (cli_...): ');
-    if (!appId) throw new Error('App ID 不能为空');
-    const appSecret = await need('FEISHU_APP_SECRET: ');
-    if (!appSecret) throw new Error('App Secret 不能为空');
+    let appId = '';
+    let appSecret = '';
+    // 联网校验凭证：无效凭证/未启用机器人在此暴露，而不是等长连接失败
+    for (;;) {
+      appId = await need('FEISHU_APP_ID (cli_...): ');
+      if (!appId) throw new Error('App ID 不能为空');
+      appSecret = await need('FEISHU_APP_SECRET: ');
+      if (!appSecret) throw new Error('App Secret 不能为空');
+      console.log(c.gray('正在联网校验凭证…'));
+      const check = await verifyFeishuApp(appId, appSecret);
+      if (check.ok) {
+        console.log(c.ok(`凭证校验通过${check.botName ? `：机器人「${check.botName}」` : ''}`));
+        break;
+      }
+      console.log(c.err(`凭证校验失败：${check.message}`));
+      const retry = (await need('重新输入？[Y/n]（n = 仍然保存）: ')).toLowerCase();
+      if (retry === 'n' || retry === 'no' || retry === '否') break;
+    }
     const allowedRaw = await need(
       `允许的 open_id（可选，逗号分隔；回车=不限制${feishu.allowedOpenIds.length ? `，当前 ${feishu.allowedOpenIds.join(',')}` : ''}）: `,
     );
@@ -331,6 +347,7 @@ export async function ensureBotConfig(
     feishu = { appId, appSecret, allowedOpenIds };
     const envPath = writeEnv(agent, feishu);
     console.log(c.ok(`\n飞书配置已保存到 ${envPath}\n`));
+    if (!checkLarkCli()) console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}\n`));
     return { agent: currentConfig(), feishu: feishuBotConfig(), envPath };
   }
 
