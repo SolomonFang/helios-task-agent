@@ -37,8 +37,8 @@ flowchart TD
 | 飞书长连接 bot | `src/bot.ts`, `channels/feishu.ts` | 仅 p2p；进程常驻 |
 | 终端 REPL | `src/cli.ts` | |
 | 系统规则 | `src/prompt.ts` | 展开 / 写看板 / 不擅自 start |
-| 写操作闸门 | `src/guard.ts`, `src/tools.ts` | 分类 read/write；写操作强制用户确认；同类批量 10 分钟免重复确认 |
-| 确认通道 | `src/confirm.ts`, `src/cli.ts` | CLI y/N；飞书卡片按钮 / 文本兜底 |
+| 写操作闸门 | `src/guard.ts`, `src/tools.ts` | 分类 read/write；写操作强制用户确认；「同类免问」批量 10 分钟免重复确认（默认仅此次） |
+| 确认通道 | `src/confirm.ts`, `src/cli.ts` | CLI y/b/N；飞书三按钮卡片 / 文本兜底；破坏性操作超时 300s、其余 120s |
 | 访问控制 | `channels/feishu.ts` | 白名单为空 → 首个私聊用户认领 owner 并写回 .env |
 | 来源查重 | `src/source-registry.ts` | 飞书 URL → 看板任务映射 |
 | 审计 | `src/audit.ts` | `~/.helios-task-agent/audit.log` |
@@ -75,7 +75,7 @@ flowchart TD
 2. Bot **仅私聊**；进程退出即断长连接  
 3. 读飞书依赖本机 **lark-cli**  
 4. `hk create-and-start` 仍存在于技能表：仅当用户**明确**要求「创建并启动」时使用，默认写看板走 create-only  
-5. 卡片按钮回调需在开放平台配置「卡片回传交互」长连接；未配置时降级为文本「确认/取消」
+5. 卡片按钮回调需在开放平台配置「卡片回传交互」长连接；未配置时降级为文本「确认/都允许/取消」
 
 ### 本轮文档/文案修补
 

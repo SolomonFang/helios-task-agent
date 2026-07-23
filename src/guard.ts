@@ -20,21 +20,26 @@ export interface ConfirmRequest {
   batchKey?: string;
 }
 
-export type ConfirmFn = (req: ConfirmRequest) => Promise<boolean>;
+/**
+ * 确认裁决：'once' = 批准（仅此次）；'batch' = 批准且 TTL 内同类免问；false = 拒绝。
+ * 默认批准不再隐式开启批量免问——用户必须显式选择「同类免问」（知情权 + 发现性）。
+ */
+export type ConfirmVerdict = 'once' | 'batch' | false;
+export type ConfirmFn = (req: ConfirmRequest) => Promise<ConfirmVerdict>;
 
 export const BATCH_APPROVAL_TTL_MS = 10 * 60 * 1000;
 
-/** Remember approvals per batchKey for ttlMs; destructive ops (no batchKey) always re-ask. */
+/** Remember 'batch' approvals per batchKey for ttlMs; destructive ops (no batchKey) always re-ask. */
 export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL_MS): ConfirmFn {
   const approved = new Map<string, number>();
   return async (req) => {
     if (req.batchKey) {
       const exp = approved.get(req.batchKey);
-      if (exp && exp > Date.now()) return true;
+      if (exp && exp > Date.now()) return 'batch';
     }
-    const ok = await confirm(req);
-    if (ok && req.batchKey) approved.set(req.batchKey, Date.now() + ttlMs);
-    return ok;
+    const verdict = await confirm(req);
+    if (verdict === 'batch' && req.batchKey) approved.set(req.batchKey, Date.now() + ttlMs);
+    return verdict;
   };
 }
 
@@ -50,7 +55,7 @@ export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefin
   if (!confirm) return { allowed: false, reason: 'no_gate', message: NO_GATE_MESSAGE };
   let ok = false;
   try {
-    ok = await confirm(req);
+    ok = (await confirm(req)) !== false;
   } catch {
     ok = false;
   }

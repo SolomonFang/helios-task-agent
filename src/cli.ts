@@ -149,26 +149,49 @@ export async function main(): Promise<void> {
 
   const spinner = new Spinner('思考中…');
 
-  // 写操作硬确认：闸门触发时暂停 spinner，终端询问 y/N，默认拒绝。
+  /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
+  let currentCtl: AbortController | null = null;
+
+  /** ask 的 abort 感知版：闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）。 */
+  const askWithAbort = (promptText: string): Promise<string | null> => {
+    const ctl = currentCtl;
+    if (!ctl) return ask(promptText);
+    if (ctl.signal.aborted) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const onAbort = () => resolve(null);
+      ctl.signal.addEventListener('abort', onAbort, { once: true });
+      void ask(promptText).then((a) => {
+        ctl.signal.removeEventListener('abort', onAbort);
+        resolve(a);
+      });
+    });
+  };
+
+  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「b」开启同类免问；Ctrl+C 视为拒绝。
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
     console.log('');
     console.log(c.warn(`⚠️ 写操作请求（${req.kind}）：${req.summary}`));
     console.log(c.gray(req.detail));
-    const ans = await ask(c.warn('允许执行？[y/N] '));
-    const ok = Boolean(ans && /^(y|yes|确认|同意)$/i.test(ans.trim()));
-    console.log(ok ? c.ok('已批准，继续执行。') : c.gray('已拒绝，操作未执行。'));
-    if (ok && req.batchKey) {
-      console.log(c.gray('（10 分钟内同类型写操作自动放行，不再重复询问；删除/取消/停止类仍会逐次确认）'));
+    const batchHint = req.batchKey ? '，b=同类免问10分钟' : '';
+    const ans = await askWithAbort(c.warn(`允许执行？[y=仅此次${batchHint} / N=拒绝] `));
+    const t = (ans || '').trim().toLowerCase();
+    const batch = Boolean(req.batchKey) && /^(b|batch|都|都允许|免问)$/.test(t);
+    const once = !batch && /^(y|yes|确认|同意)$/.test(t);
+    spinner.start('思考中…（Ctrl+C 中断）');
+    if (batch) {
+      console.log(c.ok('已批准；同类写操作 10 分钟内免问。'));
+      return 'batch';
     }
-    spinner.start('思考中…');
-    return ok;
+    if (once) {
+      console.log(c.ok('已批准（仅此次），继续执行。'));
+      return 'once';
+    }
+    console.log(c.gray('已拒绝，操作未执行。'));
+    return false;
   };
 
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local', confirm: confirmWrite });
-
-  /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
-  let currentCtl: AbortController | null = null;
 
   const cleanup = async () => {
     spinner.stop();
@@ -279,7 +302,9 @@ export async function main(): Promise<void> {
       } else {
         const message = err instanceof Error ? err.message : String(err);
         console.error(c.err(`\n请求失败: ${message}`));
-        console.error(c.gray('可用 /config 检查模型配置，或稍后重试。\n'));
+        console.error(
+          c.gray(`上一条内容「${line.slice(0, 60)}${line.length > 60 ? '…' : ''}」未发送成功，可修改后重发；也可用 /config 检查模型配置。\n`),
+        );
       }
     } finally {
       currentCtl = null;

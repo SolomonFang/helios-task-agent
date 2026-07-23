@@ -15,9 +15,14 @@ interface WatchTaskState {
   projectId: string;
 }
 
+interface WatchApproval {
+  id: string;
+  label: string;
+}
+
 interface WatchState {
   tasks: Record<string, WatchTaskState>;
-  approvals: string[];
+  approvals: WatchApproval[];
 }
 
 interface KanbanTaskRow {
@@ -64,8 +69,17 @@ export class KanbanWatcher {
   private load(): WatchState | null {
     try {
       if (!fs.existsSync(this.opts.statePath)) return null;
-      const raw = JSON.parse(fs.readFileSync(this.opts.statePath, 'utf8')) as WatchState;
-      return raw && typeof raw === 'object' && raw.tasks ? raw : null;
+      const raw = JSON.parse(fs.readFileSync(this.opts.statePath, 'utf8')) as Omit<WatchState, 'approvals'> & {
+        approvals?: Array<string | WatchApproval>;
+      };
+      if (!raw || typeof raw !== 'object' || !raw.tasks) return null;
+      // 兼容旧格式（approvals 为 string[]）
+      const approvals = Array.isArray(raw.approvals)
+        ? raw.approvals
+            .map((a) => (typeof a === 'string' ? { id: a, label: a } : a))
+            .filter((a) => a && typeof a.id === 'string' && a.id)
+        : [];
+      return { tasks: raw.tasks, approvals };
     } catch {
       return null;
     }
@@ -102,7 +116,17 @@ export class KanbanWatcher {
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
           const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
           const hint = cur.status === 'done' ? '\n回复「帮我 review」看结果，或「再跟它说一句…」继续迭代' : '';
-          events.push(`${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}${hint}`);
+          let extra = '';
+          if (cur.status === 'done') {
+            try {
+              extra = KanbanWatcher.pickDetail(await this.api(`/tasks/${id}`));
+            } catch {
+              /* 详情拉取失败不阻断通知 */
+            }
+          }
+          events.push(
+            `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}${extra ? `\n${extra}` : ''}${hint}`,
+          );
         }
         if (old.running && !cur.running && cur.failed) {
           events.push(
@@ -110,9 +134,13 @@ export class KanbanWatcher {
           );
         }
       }
-      const newApprovals = current.approvals.filter((a) => !prev.approvals.includes(a));
+      const newApprovals = current.approvals.filter((a) => !prev.approvals.some((p) => p.id === a.id));
       if (newApprovals.length) {
-        events.push(`⏳ 看板有 ${newApprovals.length} 个新的待审批项，回复「待审批」处理`);
+        const lines = newApprovals
+          .slice(0, 5)
+          .map((a) => `· ${a.label}`)
+          .join('\n');
+        events.push(`⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`);
       }
       for (const e of events) await this.opts.notify(e);
     } catch (err) {
@@ -139,19 +167,35 @@ export class KanbanWatcher {
         };
       }
     }
-    let approvals: string[] = [];
+    let approvals: WatchApproval[] = [];
     try {
-      const list = (await this.api('/approvals')) as Array<{ id?: string }>;
+      const list = (await this.api('/approvals')) as Array<Record<string, unknown>>;
       if (Array.isArray(list)) {
         approvals = list
           .filter((a) => /pending/i.test(JSON.stringify(a)))
-          .map((a) => String(a.id || ''))
-          .filter(Boolean);
+          .map((a) => {
+            const id = String(a.id || '');
+            const label = String(a.title || a.task_title || a.name || a.summary || id);
+            return { id, label };
+          })
+          .filter((a) => a.id);
       }
     } catch {
       /* approvals 端点可选，失败不阻断任务监控 */
     }
     return { tasks, approvals };
+  }
+
+  /** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
+  private static pickDetail(detail: unknown): string {
+    if (!detail || typeof detail !== 'object') return '';
+    const o = detail as Record<string, unknown>;
+    const summary = o.last_attempt_summary ?? o.summary ?? o.result ?? o.last_attempt_output;
+    if (typeof summary === 'string' && summary.trim()) {
+      const t = summary.trim();
+      return `结果摘要：${t.slice(0, 200)}${t.length > 200 ? '…' : ''}`;
+    }
+    return '';
   }
 
   private async fetchProjectIds(): Promise<string[]> {

@@ -33,8 +33,8 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
-· 点「确认执行 / 取消」按钮，或直接回复「确认 / 取消」（120 秒超时自动拒绝）
-· 同类型写操作批准后 10 分钟内自动放行；删除/取消/停止类仍逐次确认
+· 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 都允许 / 取消」
+· 普通写操作 120 秒、删除/取消/停止类 300 秒未操作自动拒绝
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
@@ -132,21 +132,22 @@ async function main(): Promise<void> {
   let watcher: KanbanWatcher | null = null;
   let stopDaily: (() => void) | null = null;
 
-  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；120 秒超时自动拒绝
+  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）
   const confirmations = new ConfirmationManager(
-    async (openId, chatId, req, id) => {
+    async (openId, chatId, req, id, timeoutMs) => {
       if (chatId) {
         try {
-          await channel.sendCard(chatId, buildConfirmCard(req, id));
+          await channel.sendCard(chatId, buildConfirmCard(req, id, timeoutMs));
           return;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           console.error(`[confirm] 卡片发送失败，降级文本: ${message}`);
         }
       }
+      const batchHint = req.batchKey ? '，「都允许」同类免问 10 分钟' : '';
       await channel.notifyOpenId(
         openId,
-        `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行，回复「取消」拒绝（120 秒超时自动拒绝）。`,
+        `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
       );
     },
     {
@@ -159,12 +160,6 @@ async function main(): Promise<void> {
           .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}`)
           .catch(() => {});
       },
-      onApprove: (openId, req) => {
-        if (!req.batchKey) return;
-        void channel
-          .notifyOpenId(openId, '10 分钟内同类型写操作自动放行，不再重复询问（删除/取消/停止类仍会逐次确认）。')
-          .catch(() => {});
-      },
     },
   );
 
@@ -172,8 +167,10 @@ async function main(): Promise<void> {
     const openId = action.operator?.open_id || '';
     const value = action.action?.value || {};
     if (!openId || !value.hta_confirm) return;
-    const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), value.decision === 'yes');
+    const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), String(value.decision || ''));
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
+    else if (result === 'approved_batch')
+      void channel.notifyOpenId(openId, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…').catch(() => {});
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
   };
 
@@ -269,6 +266,10 @@ async function main(): Promise<void> {
       await channel.reply(msg, '✅ 已批准，正在执行…');
       return;
     }
+    if (answer === 'approved_batch') {
+      await channel.reply(msg, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…');
+      return;
+    }
     if (answer === 'denied') {
       await channel.reply(msg, '已取消，操作未执行。');
       return;
@@ -324,7 +325,7 @@ async function main(): Promise<void> {
       const session = router.getOrCreate(openId);
 
       if (cmd === '/memory') {
-        await channel.reply(msg, `你的记忆（open_id=${openId}）\n${session.formatMemory()}`);
+        await channel.reply(msg, `你的记忆\n${session.formatMemory()}`);
         return;
       }
       if (cmd === '/clear') {
@@ -374,7 +375,10 @@ async function main(): Promise<void> {
           await channel.reply(msg, '⏹ 已中断。');
         } else {
           const message = err instanceof Error ? err.message : String(err);
-          await channel.reply(msg, `请求失败: ${message}\n请检查模型配置或稍后重试。`);
+          await channel.reply(
+            msg,
+            `请求失败: ${message}\n你的上一条消息未处理：「${text.slice(0, 60)}${text.length > 60 ? '…' : ''}」，可修改后重发。`,
+          );
         }
       } finally {
         running.delete(openId);

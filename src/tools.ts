@@ -87,6 +87,22 @@ function batchKeyForHk(argv: string[]): string | undefined {
   return NO_BATCH_RE.test(sub) ? undefined : `hk:${sub}`;
 }
 
+/** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
+const MAX_CREATES_PER_SESSION = 10;
+const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，代码层强制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
+
+/** 闸门卡片 detail：create 类结构化展示（标题/项目/描述预览），其余保持命令行原文。 */
+function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
+  if (!/create/i.test(toolName)) return `kanban_${toolName}(${JSON.stringify(args).slice(0, 800)})`;
+  const title = typeof args.title === 'string' ? args.title : '';
+  const desc = typeof args.description === 'string' ? args.description : '';
+  const project = String(args.project_id ?? args.projectId ?? '');
+  const preview = desc.length > 300 ? `${desc.slice(0, 300)}…` : desc;
+  return [`标题：${title}`, project ? `项目：${project}` : '', preview ? `描述预览：\n${preview}` : '']
+    .filter(Boolean)
+    .join('\n');
+}
+
 const LOCAL_TOOLS: OpenAiTool[] = [
   {
     type: 'function',
@@ -261,6 +277,7 @@ export function buildTools({
   const handlers: ToolHandlers = new Map();
   const uid = userId || 'local';
   const reg = registry || new SourceRegistry();
+  let createCount = 0;
 
   /** Returns a block message if any source URL was already synced; cleans stale mappings. */
   const checkDuplicates = async (urls: string[]): Promise<string | null> => {
@@ -272,7 +289,8 @@ export function buildTools({
         return (
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
           `- 已创建：${hit.createdAt} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
-          '如确需重建，请先在 kanban 中删除原任务（或告知用户该任务已存在）。'
+          '如确需重建，请先在 kanban 中删除原任务（或告知用户该任务已存在）；\n' +
+          '如用户是想把最新内容合并进原任务，改用 update 更新该任务，不要重建。'
         );
       }
       reg.remove(uid, url); // 原任务已被删除 → 清理映射后放行
@@ -311,9 +329,9 @@ export function buildTools({
             return `MCP 工具 ${tool.name} 调用失败: ${message}`;
           }
         }
-        // write path: dedupe → gate → execute → audit (+record)
+        // write path: dedupe → cap → gate → execute → audit (+record)
         const summary = summarizeMcp(tool.name, args);
-        const detail = `kanban_${tool.name}(${JSON.stringify(args).slice(0, 800)})`;
+        const detail = formatMcpDetail(tool.name, args);
         const isCreate = /create/i.test(tool.name);
         const urls = isCreate ? extractSourceUrls(JSON.stringify(args)) : [];
         if (urls.length) {
@@ -322,6 +340,10 @@ export function buildTools({
             auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'blocked_dup' }, auditHome);
             return dup;
           }
+        }
+        if (isCreate && createCount >= MAX_CREATES_PER_SESSION) {
+          auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'denied' }, auditHome);
+          return CREATE_CAP_MESSAGE;
         }
         const gate = await passGate({ kind: 'kanban', summary, detail, batchKey: batchKeyForMcp(tool.name) }, confirm);
         if (!gate.allowed) {
@@ -341,6 +363,7 @@ export function buildTools({
           auditHome,
         );
         if (ok && urls.length) recordSources(urls, result, typeof args.title === 'string' ? args.title : '');
+        if (ok && isCreate) createCount++;
         return result;
       });
     }
@@ -397,6 +420,10 @@ export function buildTools({
         return dup;
       }
     }
+    if (isCreate && createCount >= MAX_CREATES_PER_SESSION) {
+      auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'denied' }, auditHome);
+      return CREATE_CAP_MESSAGE;
+    }
     const gate = await passGate({ kind: 'hk', summary, detail, batchKey: batchKeyForHk(argv) }, confirm);
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
@@ -406,6 +433,7 @@ export function buildTools({
     const ok = !looksLikeFailure(out);
     auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
     if (ok && urls.length) recordSources(urls, out, title);
+    if (ok && isCreate) createCount++;
     return out;
   });
 

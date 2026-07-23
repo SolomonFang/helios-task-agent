@@ -193,7 +193,7 @@ async function main(): Promise<void> {
   const cm = new ConfirmationManager(async () => {});
   const pr1 = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
   const a1 = cm.resolveFromText('u1', '确认');
-  check('文本「确认」放行闸门', a1 === 'approved' && (await pr1) === true);
+  check('文本「确认」放行闸门（仅此次）', a1 === 'approved' && (await pr1) === 'once');
   const pr2 = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
   const a2 = cm.resolveFromText('u1', '取消');
   check('文本「取消」拒绝闸门', a2 === 'denied' && (await pr2) === false);
@@ -201,15 +201,15 @@ async function main(): Promise<void> {
   const cm2 = new ConfirmationManager(async (_o, _c, _r, id) => {
     cardId = id;
   });
-  const pr3 = cm2.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  const pr3 = cm2.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'kanban:create_task' });
   await new Promise((r) => setImmediate(r));
   check(
-    '卡片回调放行 + 过期卡片忽略',
-    cm2.resolveFromCard('u1', cardId, true) === 'approved' &&
-      (await pr3) === true &&
-      cm2.resolveFromCard('u1', cardId, true) === 'ignored',
+    '卡片回调「同类免问」+ 过期卡片忽略',
+    cm2.resolveFromCard('u1', cardId, 'batch') === 'approved_batch' &&
+      (await pr3) === 'batch' &&
+      cm2.resolveFromCard('u1', cardId, 'batch') === 'ignored',
   );
-  const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30 });
+  const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30, destructiveTimeoutMs: 30 });
   check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);
 
   // 收窄确认词：pending 期间随口应答不再误放行；明确词仍可批准
@@ -218,44 +218,56 @@ async function main(): Promise<void> {
     'pending 期间随口「好」/「ok」不批准',
     cm.resolveFromText('u1', '好') === 'ignored' && cm.resolveFromText('u1', 'ok') === 'ignored',
   );
-  check('「确认执行」仍可批准', cm.resolveFromText('u1', '确认执行') === 'approved' && (await prC) === true);
+  check('「确认执行」仍可批准', cm.resolveFromText('u1', '确认执行') === 'approved' && (await prC) === 'once');
 
-  // pending 被新请求替代：旧请求拒绝 + onSuperseded 通知；批准触发 onApprove
+  // 「都允许」仅对可批量操作生效；无 batchKey 时按非应答忽略
+  const prBatch = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
+  check(
+    '文本「都允许」= 同类免问',
+    cm.resolveFromText('u1', '都允许') === 'approved_batch' && (await prBatch) === 'batch',
+  );
+  const prNoKey = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+  check('无 batchKey 时「都允许」不生效', cm.resolveFromText('u1', '都允许') === 'ignored');
+  cm.resolveFromText('u1', '取消');
+  await prNoKey;
+
+  // pending 被新请求替代：旧请求拒绝 + onSuperseded 通知
   let supersededSummary = '';
-  let approvedSummary = '';
   const cm4 = new ConfirmationManager(async () => {}, {
     onSuperseded: (_o, req) => {
       supersededSummary = req.summary;
-    },
-    onApprove: (_o, req) => {
-      approvedSummary = req.summary;
     },
   });
   const prOld = cm4.request('u3', { kind: 'kanban', summary: 'old', detail: 'd' });
   const prNew = cm4.request('u3', { kind: 'kanban', summary: 'new', detail: 'd' });
   check('pending 被替代时旧请求拒绝并通知', (await prOld) === false && supersededSummary === 'old');
   const aNew = cm4.resolveFromText('u3', '确认');
-  check(
-    '替代后新请求可确认并触发 onApprove',
-    aNew === 'approved' && (await prNew) === true && approvedSummary === 'new',
-  );
+  check('替代后新请求可确认', aNew === 'approved' && (await prNew) === 'once');
 
-  // ---- 批量确认（同类放行 / 异类与无 key 重问 / 拒绝不缓存） ----
+  // ---- 批量确认（仅 'batch' 裁决缓存：同类放行 / 异类与无 key 重问 / 'once' 与拒绝不缓存） ----
   let asks = 0;
   const batchConfirm = withBatchApproval(async () => {
     asks++;
-    return true;
+    return 'batch' as const;
   }, 60000);
   const mkReq = (batchKey?: string): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey });
   const b1 = await batchConfirm(mkReq('kanban:create_task'));
   const b2 = await batchConfirm(mkReq('kanban:create_task'));
   const b3 = await batchConfirm(mkReq('kanban:start_task'));
   const b4 = await batchConfirm(mkReq());
-  check('批量确认：同类放行、异类/无key重问', b1 && b2 && b3 && b4 && asks === 3, `asks=${asks}`);
+  check('批量确认：同类放行、异类/无key重问', Boolean(b1 && b2 && b3 && b4) && asks === 3, `asks=${asks}`);
+  let onceAsks = 0;
+  const onceConfirm = withBatchApproval(async () => {
+    onceAsks++;
+    return 'once' as const;
+  }, 60000);
+  await onceConfirm(mkReq('k'));
+  await onceConfirm(mkReq('k'));
+  check('批量确认：「仅此次」不缓存', onceAsks === 2);
   let denyAsks = 0;
   const denyConfirm = withBatchApproval(async () => {
     denyAsks++;
-    return false;
+    return false as const;
   }, 60000);
   await denyConfirm(mkReq('k'));
   await denyConfirm(mkReq('k'));

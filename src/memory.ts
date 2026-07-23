@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import type { MemoryFile, UserMemory } from './types';
 
-const MAX_NOTES = 20;
+const MAX_NOTES = 50;
 const FILE_VERSION = 1;
 
 export function defaultDataHome(): string {
