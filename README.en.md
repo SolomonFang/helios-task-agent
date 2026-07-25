@@ -40,7 +40,7 @@ npm version patch          # or minor / major — bumps version and creates the 
 git push --follow-tags     # pushes commit + tag, triggering the release
 ```
 
-The tag must match `package.json` `version` (enforced in CI). Prerelease versions (e.g. `1.1.0-beta.0`) go to the npm `next` dist-tag; stable releases go to `latest`. CI runs typecheck + smoke + e2e + build before publishing (via `prepublishOnly` / `prepack`).
+The tag must match `package.json` `version` (enforced in CI). Prerelease versions (e.g. `1.1.0-beta.0`) go to the npm `next` dist-tag; stable releases go to `latest`. CI runs typecheck + build before publishing (`prepublishOnly` / `prepack`). smoke / e2e need a local helios-kanban — run `npm run verify` locally before tagging.
 
 Requires an `NPM_TOKEN` repository secret (npm → Access Tokens → Granular Token with publish permission).
 

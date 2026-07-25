@@ -15,7 +15,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm run smoke && npm run test:e2e",
+    "verify": "npm run typecheck && npm run smoke && npm run test:e2e",
+    "prepublishOnly": "npm run typecheck",
     "bot": "tsx src/bot.ts"
   },
   "files": [
