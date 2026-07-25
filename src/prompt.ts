@@ -130,6 +130,7 @@ ${defaultsBlock}
 - 对话中缓存 project_id / repo_id / task_id，避免重复查询
 - 选项目时阅读 description 与 repos；MCP list 若缺字段，可用 hk_cli \`["projects"]\`（会附带 repos）
 - PR / push / merge / rebase / 看完整 diff：引导用户去桌面 Web UI
+- 让用户审阅改动时给 diff 链接（\`hk status\` 输出的 \`diff_url\`，形如 \`.../tasks/{task_id}/attempts/{attempt_id}?view=diffs\`），不要给裸任务 URL
 - 一次创建任务不超过 10 个
 - **创建任务后不要自动 start**；是否启用、用哪个 executor，等用户说
 

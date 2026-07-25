@@ -736,11 +736,20 @@ cmd_status() {
   attempt_flags=$(echo "$tasks_list" | jq --arg tid "$task_id" \
     '[.[] | select(.id == $tid)][0] | {has_in_progress_attempt, last_attempt_failed, executor}')
 
+  local latest_ws_id
+  latest_ws_id=$(echo "$workspaces" | jq -r \
+    '(((map(select(.archived != true)) | sort_by(.created_at) | last) // (sort_by(.created_at) | last)) // {}) | .id // ""')
+  local diff_url=""
+  if [[ -n "$latest_ws_id" ]]; then
+    diff_url="${BASE_URL}/local-projects/${project_id}/tasks/${task_id}/attempts/${latest_ws_id}?view=diffs"
+  fi
+
   echo "$task" | jq \
     --argjson workspaces "$workspaces" \
     --argjson summaries "$(echo "$summaries" | jq '.summaries // []')" \
     --argjson flags "$attempt_flags" \
     --arg url "$(task_url "$project_id" "$task_id")" \
+    --arg diff_url "$diff_url" \
     '{
       task: {
         id: .id,
@@ -750,6 +759,7 @@ cmd_status() {
         description: .description
       },
       url: $url,
+      diff_url: $diff_url,
       running: ($flags.has_in_progress_attempt // false),
       last_attempt_failed: ($flags.last_attempt_failed // false),
       executor: ($flags.executor // null),

@@ -3,7 +3,7 @@ import path from 'path';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
- * notifications when tasks finish / fail or new approvals appear.
+ * notifications when tasks enter review / finish / fail or new approvals appear.
  * First successful poll only establishes a baseline (no notification storm).
  */
 
@@ -113,11 +113,25 @@ export class KanbanWatcher {
         const old = prev.tasks[id];
         if (!old) continue; // 新任务不打扰（创建流程本身已有反馈）
         const url = this.taskUrl(cur.projectId, id);
+        // 进入待审阅：状态变为 inreview，或状态停在 inreview 但跟进已跑完（running 翻转兜底）
+        const enteredReview = cur.status === 'inreview' && old.status !== 'inreview' && !cur.failed;
+        const finishedInReview =
+          cur.status === 'inreview' && old.status === 'inreview' && old.running && !cur.running && !cur.failed;
+        if (enteredReview || finishedInReview) {
+          const transition = enteredReview ? `${old.status} → ${cur.status}` : '跟进执行完成';
+          const diffUrl = await this.reviewUrl(cur.projectId, id);
+          events.push(
+            `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${diffUrl}\n点开链接直接 review diff；没问题回复「标记完成」，要继续改直接说`,
+          );
+          continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
+        }
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
           const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
           const hint = cur.status === 'done' ? '\n回复「帮我 review」看结果，或「再跟它说一句…」继续迭代' : '';
           let extra = '';
+          let link = url;
           if (cur.status === 'done') {
+            link = await this.reviewUrl(cur.projectId, id);
             try {
               extra = KanbanWatcher.pickDetail(await this.api(`/tasks/${id}`));
             } catch {
@@ -125,7 +139,7 @@ export class KanbanWatcher {
             }
           }
           events.push(
-            `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${url}${extra ? `\n${extra}` : ''}${hint}`,
+            `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n${extra}` : ''}${hint}`,
           );
         }
         if (old.running && !cur.running && cur.failed) {
@@ -206,6 +220,29 @@ export class KanbanWatcher {
   private taskUrl(projectId: string, taskId: string): string {
     const base = this.opts.kanbanUrl.replace(/\/+$/, '');
     return `${base}/local-projects/${projectId}/tasks/${taskId}`;
+  }
+
+  /** 最新 attempt 的 diff 视图地址（优先未归档、按创建时间取最新）；取不到 attempt 时回退任务页。 */
+  private async reviewUrl(projectId: string, taskId: string): Promise<string> {
+    const base = this.taskUrl(projectId, taskId);
+    try {
+      const list = (await this.api(`/task-attempts?task_id=${taskId}`)) as Array<{
+        id?: string;
+        archived?: boolean;
+        created_at?: string;
+      } | null>;
+      if (!Array.isArray(list)) return base;
+      const rows = list.filter((a): a is { id: string; archived?: boolean; created_at?: string } =>
+        Boolean(a && a.id),
+      );
+      const live = rows.filter((a) => !a.archived);
+      const pool = live.length ? live : rows;
+      if (!pool.length) return base;
+      pool.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+      return `${base}/attempts/${pool[pool.length - 1]!.id}?view=diffs`;
+    } catch {
+      return base; // attempts 拉取失败不阻断通知，回退任务页
+    }
   }
 
   private async api(p: string): Promise<unknown> {

@@ -105,8 +105,11 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **分支**: {target_branch}
 **Executor**: {executor}
 **URL**: {url}
+**Diff**: {diff_url}（`hk status` 输出；有 attempt 时非空）
 **下一步**: {suggestion}
 ```
+
+让用户审阅改动时给 `diff_url`（形如 `.../tasks/{task_id}/attempts/{attempt_id}?view=diffs`），不要给裸任务 URL。
 
 ## Executor names (only when user names one)
 
