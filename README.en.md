@@ -1,0 +1,181 @@
+# Helios Task Agent
+
+[中文](./README.md) | **English**
+
+Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanban](https://github.com/SolomonFang/vibe-kanban) cards.
+
+**Whether (and with which executor) to start a coding agent is always your choice.**
+
+## End-to-end flow
+
+```text
+Feishu Task Center / docs / group chats
+  → List or read; expand Feishu URLs in title/description one hop (display only; ~10 expands per turn)
+  → “Write to helios-kanban”: draft title + requirements summary
+       → code write-gate confirm (terminal y/b/N or Feishu card) → create (no auto start)
+  → Same Feishu source already synced → block and point to existing task
+       (if that task was deleted, the mapping self-heals and sync can proceed)
+  → Whether to start, and which executor: your call
+```
+
+| Stage | Who | Output |
+|-------|-----|--------|
+| Fetch / expand | Task Agent + `lark_cli` | In-chat summary |
+| Write to board | Task Agent + MCP / `hk_cli` | Kanban task (source + requirements) |
+| Run task | **You choose** | Workspace (optional) |
+
+## Safety (code-enforced)
+
+| Mechanism | Behavior |
+|-----------|----------|
+| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`. Feishu: 3-button card or strict phrases (确认 / 都允许 / 取消 — casual “ok” ignored). Timeouts 120s / 300s (destructive). New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
+| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
+| Session create cap | Max **10** kanban creates per session; `/clear` resets |
+| Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt |
+| Untrusted wrap | `lark_cli` output marked UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
+| Owner claim | Empty `FEISHU_ALLOWED_OPEN_IDS` → first DM user becomes owner (written to `.env`); others rejected once |
+| Source dedupe | URL → task map in `synced-sources.json`; self-heals after deletes; unreachable kanban conservatively blocks |
+| Audit log | Approvals/denies/dup blocks → `audit.log` (JSONL) |
+| Workspace ready | Fills `base_branch` on start; detects silent setup failures |
+
+## Kanban status push (bot)
+
+Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failure, new approvals — and injects session context so you can reply in-thread.
+
+- First poll is baseline only (`watch-state.json`)  
+- Does **not** notify on brand-new tasks  
+- With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
+- `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
+
+## MCP health supervisor (bot)
+
+~60s probe. On drop: fall back to `hk_cli`, reconnect, notify; on recover: switch back. `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
+
+## Install
+
+```bash
+npm i -g helios-task-agent
+# or
+npx helios-task-agent
+```
+
+Node.js >= 18. Feishu reads need **lark-cli**:
+
+```bash
+npm i -g @larksuite/cli && lark-cli auth login
+```
+
+## Config home (Hermes-style)
+
+```text
+~/.helios-task-agent/.env
+~/.helios-task-agent/memory.json
+~/.helios-task-agent/synced-sources.json
+~/.helios-task-agent/audit.log
+~/.helios-task-agent/watch-state.json
+```
+
+### Terminal
+
+```bash
+helios-task-agent
+```
+
+First-run LLM wizard (presets: Kimi Coding / Moonshot CN·INTL / OpenAI / DeepSeek / custom) plus optional kanban defaults — or edit `.env`.
+
+### Feishu DM bot
+
+```bash
+helios-task-agent bot
+# or
+helios-task-agent-bot
+```
+
+1. Wizard when credentials are missing (online validation by default; you may force-save and fix later)  
+2. Open Platform: long connection + `im.message.receive_v1`  
+3. DM only (p2p); no public webhook; process must stay up  
+
+**Reconfigure**: edit `~/.helios-task-agent/.env`. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — clear those vars first. Terminal has `/config`.
+
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `helios-task-agent` | Interactive terminal agent |
+| `helios-task-agent bot` | Feishu DM bot (wizard if unconfigured) |
+| `helios-task-agent-bot` | Same |
+| `helios-task-agent help` / `-h` / `--help` | Help |
+
+Local: `npm start` / `npm run bot`.
+
+**Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up.
+
+## Environment variables
+
+| Variable | Meaning |
+|----------|---------|
+| `LLM_*` | Required (wizard can write) |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | Required for bot |
+| `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner |
+| `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
+| `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
+| `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
+| `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
+| `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
+| `HTA_DEBUG` | `1` = kanban/MCP debug logs |
+
+Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example).
+
+### Open-platform checklist
+
+1. Company app → enable Bot  
+2. Events → **long connection** → `im.message.receive_v1`  
+3. (Optional) Callbacks → **long connection** → `card.action.trigger`  
+4. Permissions: read DMs, send as app → publish  
+5. Copy App ID / Secret  
+
+## What you can say
+
+**Terminal**: `/help` `/config` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
+
+**Feishu**: `/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop`. Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
+
+**Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
+
+Bot accepts text + post; other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes.
+
+Memory tools: `memory_set` / `get` / `delete` / `note`. Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
+
+## Tools
+
+| Tool | Role |
+|------|------|
+| `lark_cli` | Feishu/Lark I/O |
+| kanban MCP | Preferred board API |
+| `hk_cli` | Always on; bundled `hk.sh` REST fallback/supplement |
+| `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
+| `memory_*` | Persistent prefs & notes |
+
+Bundled skill: `skills/helios-kanban-remote/`.
+
+## Dependencies
+
+- **helios-kanban** (local auto-start optional)  
+- **lark-cli** (recommended for Feishu reads)  
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+npm run smoke
+npm run test:e2e   # mock path, no real LLM
+npm run build
+```
+
+Design notes: [docs/superpowers/](docs/superpowers/). Embeddable via `src/index.ts` exports.
+
+## License
+
+ISC

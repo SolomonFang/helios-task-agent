@@ -21,7 +21,8 @@
     "bin",
     "skills",
     ".env.example",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "keywords": [
     "helios-kanban",
