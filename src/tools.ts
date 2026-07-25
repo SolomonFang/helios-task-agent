@@ -15,6 +15,14 @@ import {
 } from './guard';
 import { auditLog } from './audit';
 import { SourceRegistry, extractSourceUrls, kanbanTaskExists } from './source-registry';
+import {
+  applyRepoBaseBranches,
+  extractWorkspaceId,
+  fetchRepoDefaultBranches,
+  formatMissingBaseBranchError,
+  waitForWorkspaceReady,
+  type RepoStartInput,
+} from './workspace-ready';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
@@ -85,6 +93,63 @@ function batchKeyForMcp(name: string): string | undefined {
 function batchKeyForHk(argv: string[]): string | undefined {
   const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
   return NO_BATCH_RE.test(sub) ? undefined : `hk:${sub}`;
+}
+
+function parseMcpStartRepos(args: Record<string, unknown>): RepoStartInput[] | null {
+  if (!Array.isArray(args.repos)) return null;
+  const out: RepoStartInput[] = [];
+  for (const item of args.repos) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.repo_id !== 'string' || !row.repo_id) continue;
+    out.push({
+      repo_id: row.repo_id,
+      base_branch: typeof row.base_branch === 'string' ? row.base_branch : undefined,
+    });
+  }
+  return out.length ? out : null;
+}
+
+/** Ensure start repos have base_branch; mutates args.repos when filled from defaults. */
+async function prepareMcpStartArgs(
+  args: Record<string, unknown>,
+  kanbanUrl: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const repos = parseMcpStartRepos(args);
+  if (!repos) return null;
+  const defaults = await fetchRepoDefaultBranches(
+    kanbanUrl,
+    repos.map((r) => r.repo_id),
+    signal,
+  );
+  const { repos: filled, unresolved } = applyRepoBaseBranches(repos, defaults);
+  if (unresolved.length) return formatMissingBaseBranchError(unresolved);
+  args.repos = filled.map((r) => ({
+    repo_id: r.repo_id,
+    ...(r.base_branch ? { base_branch: r.base_branch } : {}),
+  }));
+  return null;
+}
+
+function hkStartHasBranch(argv: string[]): boolean {
+  if (argv.includes('--branch')) return true;
+  return argv.some((a, i) => a === '--repo' && typeof argv[i + 1] === 'string' && String(argv[i + 1]).includes(':'));
+}
+
+async function appendWorkspaceReadyCheck(
+  result: string,
+  kanbanUrl: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (looksLikeFailure(result)) return result;
+  const workspaceId = extractWorkspaceId(result);
+  if (!workspaceId) return result;
+  const ready = await waitForWorkspaceReady(kanbanUrl, workspaceId, { signal });
+  if (ready.ok) {
+    return `${result}\n\n（workspace setup 已就绪：container 已创建）`;
+  }
+  return `${result}\n\n⚠️ setup 未完成：\n${ready.message || '未知原因'}`;
 }
 
 /** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
@@ -333,6 +398,7 @@ export function buildTools({
         const summary = summarizeMcp(tool.name, args);
         const detail = formatMcpDetail(tool.name, args);
         const isCreate = /create/i.test(tool.name);
+        const isStart = /start_workspace/i.test(tool.name);
         const urls = isCreate ? extractSourceUrls(JSON.stringify(args)) : [];
         if (urls.length) {
           const dup = await checkDuplicates(urls);
@@ -344,6 +410,13 @@ export function buildTools({
         if (isCreate && createCount >= MAX_CREATES_PER_SESSION) {
           auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'denied' }, auditHome);
           return CREATE_CAP_MESSAGE;
+        }
+        if (isStart) {
+          const prepErr = await prepareMcpStartArgs(args, kanbanUrl, ctx?.signal);
+          if (prepErr) {
+            auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'error' }, auditHome);
+            return prepErr;
+          }
         }
         const gate = await passGate({ kind: 'kanban', summary, detail, batchKey: batchKeyForMcp(tool.name) }, confirm);
         if (!gate.allowed) {
@@ -357,7 +430,10 @@ export function buildTools({
           const message = err instanceof Error ? err.message : String(err);
           result = `MCP 工具 ${tool.name} 调用失败: ${message}`;
         }
-        const ok = !looksLikeFailure(result);
+        if (isStart && !looksLikeFailure(result)) {
+          result = await appendWorkspaceReadyCheck(result, kanbanUrl, ctx?.signal);
+        }
+        const ok = !looksLikeFailure(result) && !/⚠️ setup 未完成/.test(result);
         auditLog(
           { user: uid, kind: 'kanban', summary, detail, decision: 'approved', ok, resultSnippet: result },
           auditHome,
@@ -409,6 +485,7 @@ export function buildTools({
       return run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
     }
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
+    const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
     const summary = isCreate ? `创建看板任务「${title}」（hk_cli）` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
     const detail = `hk ${argv.join(' ')}`.slice(0, 800);
@@ -424,13 +501,40 @@ export function buildTools({
       auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'denied' }, auditHome);
       return CREATE_CAP_MESSAGE;
     }
+    if (isStart && !hkStartHasBranch(argv)) {
+      // Prefer env default repo's configured branch; otherwise require explicit --branch.
+      const repoId = kanbanRepoId || '';
+      if (repoId) {
+        const defaults = await fetchRepoDefaultBranches(kanbanUrl, [repoId], ctx?.signal);
+        const { unresolved } = applyRepoBaseBranches([{ repo_id: repoId }], defaults);
+        if (unresolved.length) {
+          auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
+          return formatMissingBaseBranchError(unresolved);
+        }
+        const branch = defaults[repoId];
+        if (branch) argv.push('--branch', branch);
+      } else {
+        // Multi-repo or unspecified: hk.sh would fall back to main — block that.
+        const hasRepo = argv.includes('--repo');
+        if (!hasRepo) {
+          auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
+          return (
+            '无法启动 workspace：未指定 --branch / --repo ID:branch，且未配置 HELIOS_KANBAN_REPO_ID。\n' +
+            '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。'
+          );
+        }
+      }
+    }
     const gate = await passGate({ kind: 'hk', summary, detail, batchKey: batchKeyForHk(argv) }, confirm);
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
-    const out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
-    const ok = !looksLikeFailure(out);
+    let out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
+    if (isStart && !looksLikeFailure(out)) {
+      out = await appendWorkspaceReadyCheck(out, kanbanUrl, ctx?.signal);
+    }
+    const ok = !looksLikeFailure(out) && !/⚠️ setup 未完成/.test(out);
     auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
     if (ok && urls.length) recordSources(urls, out, title);
     if (ok && isCreate) createCount++;

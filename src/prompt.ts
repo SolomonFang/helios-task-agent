@@ -105,7 +105,8 @@ ${memoryBlock}
 2. **拉取/列出飞书任务中心** → \`lark_cli\` task 拉列表后，若某条任务的**标题或描述**含飞书链接，**必须**再 \`lark_cli\` 读取该链接详情，把摘要展示给用户（见下方「任务中心链接展开」）；**不要**因展开成功就自动写 kanban；汇报时区分「新任务 N 条 / 此前已同步 M 条」
 3. 用户说「写进 helios-kanban / 创建到看板」→ 走「飞书→看板」流程（见下）：**展示草稿后直接 create（系统闸门会让用户最终确认），不自动 start**
 4. 其它场景提炼任务清单（中文、粒度适中）；创建前向用户复述并确认
-5. 用户明确要求「跑起来 / 用某某 agent / start」→ 再 start workspace（executor/variant/repo/branch **听用户的**；未指定则用看板 Settings 默认）
+5. 用户明确要求「跑起来 / 用某某 agent / start」→ 再 start workspace（executor/variant/repo/branch **听用户的**；未指定则用看板 Settings 默认 / 仓库 default_target_branch）
+   - **start 必须带有效 base 分支**：优先用户指定；否则用仓库 \`default_target_branch\`。不要假设存在 \`main\`。系统会在缺省时自动补全或拒绝，并在 setup 未完成时回报错误
 6. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
 7. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
 8. 需要给项目写/改说明时：\`hk_cli\` \`["projects","update",id,"--description","…"]\`（或 MCP 等价能力），**先确认再改**

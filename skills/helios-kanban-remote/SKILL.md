@@ -73,7 +73,7 @@ Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so comma
 | Flag | When omitted |
 |------|----------------|
 | `--executor` | Settings → `config.executor_profile` via `hk info` |
-| `--branch` | `repo.default_target_branch`, else `main` |
+| `--branch` | `repo.default_target_branch`（**必须**有其一；不再回退 `main`） |
 | `--repo` | `HELIOS_KANBAN_REPO_ID` |
 | `--iteration` | `HELIOS_KANBAN_ITERATION` |
 | `project_id` arg | `HELIOS_KANBAN_PROJECT_ID` |

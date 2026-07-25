@@ -15,6 +15,12 @@ import { ConfirmationManager } from '../src/confirm';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
 import { parseDailyTime } from '../src/scheduler';
 import { runAgentTurn } from '../src/llm';
+import {
+  applyRepoBaseBranches,
+  classifyWorkspaceSetup,
+  extractWorkspaceId,
+  formatWorkspaceSetupFailure,
+} from '../src/workspace-ready';
 import type { OpenAiClient } from '../src/types';
 
 async function main(): Promise<void> {
@@ -324,6 +330,44 @@ async function main(): Promise<void> {
       postText.includes('@张三') &&
       postText.includes('[图片]'),
     postText.slice(0, 60).replace(/\n/g, ' '),
+  );
+
+  // ---- start workspace：base_branch / setup 诊断 ----
+  const filled = applyRepoBaseBranches(
+    [{ repo_id: 'aaaa' }, { repo_id: 'bbbb', base_branch: 'develop' }],
+    { aaaa: 'hly-dev', bbbb: 'main' },
+  );
+  check(
+    'start：补全缺失的 base_branch',
+    filled.repos[0]?.base_branch === 'hly-dev' &&
+      filled.repos[1]?.base_branch === 'develop' &&
+      filled.unresolved.length === 0,
+  );
+  const missing = applyRepoBaseBranches([{ repo_id: 'cccc' }], { cccc: null });
+  check(
+    'start：无默认分支时标记 unresolved',
+    missing.unresolved.length === 1 && missing.unresolved[0] === 'cccc',
+  );
+  check(
+    'workspace setup 分类',
+    classifyWorkspaceSetup(null) === 'failed' &&
+      classifyWorkspaceSetup({ container_ref: null }) === 'pending' &&
+      classifyWorkspaceSetup({ container_ref: '/tmp/ws' }) === 'ready',
+  );
+  check(
+    '从 start 结果提取 workspace_id',
+    extractWorkspaceId('{"task_id":"11111111-1111-1111-1111-111111111111","workspace_id":"22222222-2222-2222-2222-222222222222"}') ===
+      '22222222-2222-2222-2222-222222222222',
+  );
+  const failMsg = formatWorkspaceSetupFailure({
+    workspaceId: '22222222-2222-2222-2222-222222222222',
+    targetBranches: ['main'],
+    elapsedMs: 15000,
+  });
+  check(
+    'setup 失败文案提示 main/base_branch',
+    /main/.test(failMsg) && /base_branch|默认分支|default_target/.test(failMsg),
+    failMsg.slice(0, 80).replace(/\n/g, ' '),
   );
 
   // ---- /stop 中断 ----

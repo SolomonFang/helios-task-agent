@@ -119,7 +119,8 @@ resolve_target_branch() {
   repo=$(api GET "/repos/${repo_id}")
   branch=$(echo "$repo" | jq -r '.default_target_branch // empty')
   if [[ -z "$branch" ]]; then
-    branch="main"
+    echo "error: repo ${repo_id} has no default_target_branch; pass --branch or --repo ID:branch (refusing silent fallback to main)" >&2
+    exit 1
   fi
   RESOLVED_BRANCH="$branch"
 }
@@ -269,7 +270,7 @@ Commands:
 
 Notes:
   --executor optional → Settings default (config.executor_profile)
-  --branch optional → repo.default_target_branch, else main
+  --branch optional → repo.default_target_branch（必填其一；不再静默回退 main）
   --repo may repeat; use ID:branch for per-repo base branch
   --iteration optional → HELIOS_KANBAN_ITERATION when unset
   @tagname in --desc / follow-up expands via /api/tags
