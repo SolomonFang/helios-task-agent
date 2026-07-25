@@ -1,0 +1,50 @@
+name: Publish to npm
+
+# 打 tag 触发：git tag v1.0.1 && git push origin v1.0.1
+# tag 必须与 package.json 的 version 一致；预发布 tag（含 -，如 v1.1.0-beta.0）发布到 npm 的 next 频道
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+
+      # smoke / e2e 依赖 lark-cli 可执行（仅需 --version，无需授权）
+      - run: npm i -g @larksuite/cli
+
+      - name: Check tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG package=$PKG"
+          [ "$TAG" = "$PKG" ]
+
+      # npm publish 会自动执行 prepublishOnly（typecheck + smoke + e2e）和 prepack（build）
+      - name: Publish
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            npm publish --tag next
+          else
+            npm publish
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -31,6 +31,19 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 从源码开发：`npm install && npm start`。
 
+## 发布（维护者）
+
+打 tag 即触发 GitHub Action 自动发布（`.github/workflows/publish.yml`）：
+
+```bash
+npm version patch          # 或 minor / major，自动改 version 并打 tag
+git push --follow-tags     # 推送 commit + tag，触发发布
+```
+
+tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布版本（如 `1.1.0-beta.0`）自动发到 npm `next` 频道，正式版发到 `latest`。发布前 CI 自动跑 typecheck + smoke + e2e + build（经 `prepublishOnly` / `prepack`）。
+
+需要在仓库 Secrets 配置 `NPM_TOKEN`（npm → Access Tokens → Granular Token，勾选 publish 权限）。
+
 ## 端到端主流程
 
 ```text
