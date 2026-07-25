@@ -145,7 +145,8 @@ async function main(): Promise<void> {
       classifyHk(['tasks', 'create', 't']) === 'write' &&
       classifyHk(['tasks', 'delete', 'id']) === 'write' &&
       classifyHk(['start', 'id']) === 'write' &&
-      classifyHk(['projects', 'update', 'id']) === 'write',
+      classifyHk(['projects', 'update', 'id']) === 'write' &&
+      classifyHk(['projects', 'create', 'x']) === 'write',
   );
   check(
     'mcp 分类',

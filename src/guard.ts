@@ -149,7 +149,7 @@ export function classifyHk(args: string[]): 'read' | 'write' {
   const [cmd, sub] = args;
   if (!cmd || cmd === '--help' || cmd === '-h') return 'read';
   if (cmd === 'tasks') return HK_WRITE_TASK_SUBS.has(sub || '') ? 'write' : 'read';
-  if (cmd === 'projects') return sub === 'update' ? 'write' : 'read';
+  if (cmd === 'projects') return sub === 'update' || sub === 'create' ? 'write' : 'read';
   return HK_WRITE_COMMANDS.has(cmd) ? 'write' : 'read';
 }
 
@@ -168,7 +168,13 @@ export function classifyMcp(toolName: string): 'read' | 'write' {
 export function summarizeMcp(toolName: string, args: Record<string, unknown>): string {
   const title = typeof args.title === 'string' ? args.title : '';
   const id = String(args.task_id ?? args.taskId ?? args.id ?? args.workspace_id ?? args.approval_id ?? '');
-  if (/create/i.test(toolName)) return `创建看板任务${title ? `「${title}」` : ''}`;
+  if (/create/i.test(toolName)) {
+    if (/project/i.test(toolName)) {
+      const name = typeof args.name === 'string' ? args.name : title;
+      return `创建看板项目${name ? `「${name}」` : ''}`;
+    }
+    return `创建看板任务${title ? `「${title}」` : ''}`;
+  }
   if (/delete/i.test(toolName)) return `删除看板任务 ${id}`;
   if (/cancel/i.test(toolName)) return `取消看板任务 ${id}`;
   if (/update/i.test(toolName)) return `更新看板任务 ${id}${title ? `（新标题「${title}」）` : ''}`;
