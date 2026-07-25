@@ -6,6 +6,31 @@
 
 **是否启动 coding agent、用哪个 executor，由你决定。**
 
+## 安装
+
+要求：Node.js ≥ 18，macOS / Linux。
+
+```bash
+npm i -g helios-task-agent
+```
+
+然后直接运行（首次启动进入交互向导，配置自动写入 `~/.helios-task-agent/.env`）：
+
+```bash
+helios-task-agent        # 终端交互 agent
+helios-task-agent bot    # 飞书私聊机器人
+```
+
+**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban` 拉起。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
+
+**飞书读取需另装 lark-cli**（不装则飞书任务/文档读取不可用，看板功能不受影响）：
+
+```bash
+npm i -g @larksuite/cli && lark-cli auth login
+```
+
+从源码开发：`npm install && npm start`。
+
 ## 端到端主流程
 
 ```text
@@ -51,22 +76,6 @@
 ## MCP 健康监督（bot）
 
 约每 60s 探测 MCP：掉线降级 `hk_cli` 并自动重连（退避至约 5 分钟一次），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.sh`）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
-
-## 安装
-
-```bash
-npm i -g helios-task-agent
-# 或
-npx helios-task-agent
-```
-
-Node.js >= 18。读飞书需要 **lark-cli**：
-
-```bash
-npm i -g @larksuite/cli && lark-cli auth login
-```
-
-不装则飞书读取不可用，看板功能不受影响。
 
 ## 配置目录（Hermes 风格）
 

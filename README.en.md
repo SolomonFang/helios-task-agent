@@ -6,6 +6,31 @@ Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanb
 
 **Whether (and with which executor) to start a coding agent is always your choice.**
 
+## Install
+
+Requires: Node.js ≥ 18, macOS / Linux.
+
+```bash
+npm i -g helios-task-agent
+```
+
+Then run it directly (first launch opens an interactive wizard that writes config to `~/.helios-task-agent/.env`):
+
+```bash
+helios-task-agent        # interactive terminal agent
+helios-task-agent bot    # Feishu DM bot
+```
+
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban`. Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+
+**Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
+
+```bash
+npm i -g @larksuite/cli && lark-cli auth login
+```
+
+From source: `npm install && npm start`.
+
 ## End-to-end flow
 
 ```text
@@ -50,20 +75,6 @@ Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failu
 ## MCP health supervisor (bot)
 
 ~60s probe. On drop: fall back to `hk_cli`, auto-reconnect with backoff (down to ~every 5 min), notify; on recover: switch back (both transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
-
-## Install
-
-```bash
-npm i -g helios-task-agent
-# or
-npx helios-task-agent
-```
-
-Node.js >= 18. Feishu reads need **lark-cli**:
-
-```bash
-npm i -g @larksuite/cli && lark-cli auth login
-```
 
 ## Config home (Hermes-style)
 

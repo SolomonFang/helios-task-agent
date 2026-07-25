@@ -1,4 +1,4 @@
-import type { KanbanMcp } from './mcp';
+import type { KanbanMcp } from './kanban/mcp';
 import { MemoryStore } from './memory';
 import { createClient, runAgentTurn } from './llm';
 import { buildSystemPrompt } from './prompt';

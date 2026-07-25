@@ -1,6 +1,6 @@
 import path from 'path';
 import { execFile } from 'child_process';
-import type { KanbanMcp } from './mcp';
+import type { KanbanMcp } from './kanban/mcp';
 import type { MemoryStore } from './memory';
 import type { OpenAiTool, ToolHandlers } from './types';
 import { runRepoFs } from './repo-fs';
@@ -22,7 +22,7 @@ import {
   formatMissingBaseBranchError,
   waitForWorkspaceReady,
   type RepoStartInput,
-} from './workspace-ready';
+} from './kanban/workspace-ready';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;

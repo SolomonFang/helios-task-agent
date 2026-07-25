@@ -19,7 +19,9 @@ Usage:
   helios-task-agent-bot       Same as "helios-task-agent bot"
   helios-task-agent help      Show this help
 
-Config: copy .env.example to .env (LLM_* required; FEISHU_* for bot).
+Config: first run opens an interactive wizard that writes to
+  ~/.helios-task-agent/.env (override with HELIOS_TASK_AGENT_HOME).
+  LLM_* required; FEISHU_* for bot.
 Docs: see README.md
 `);
 }

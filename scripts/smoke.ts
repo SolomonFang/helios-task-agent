@@ -4,7 +4,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { KanbanMcp } from '../src/mcp';
+import { KanbanMcp } from '../src/kanban/mcp';
 import { buildTools } from '../src/tools';
 import { currentConfig } from '../src/config';
 import { buildSystemPrompt } from '../src/prompt';
@@ -19,7 +19,7 @@ import {
   classifyWorkspaceSetup,
   extractWorkspaceId,
   formatWorkspaceSetupFailure,
-} from '../src/workspace-ready';
+} from '../src/kanban/workspace-ready';
 import type { OpenAiClient } from '../src/types';
 
 async function main(): Promise<void> {

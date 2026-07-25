@@ -1,9 +1,10 @@
 /** Public API for embedding (e.g. Feishu channel process). */
 export { AgentSession } from './session';
 export { SessionRouter } from './session-router';
-export { KanbanMcp } from './mcp';
+export { KanbanMcp } from './kanban/mcp';
 export { MemoryStore, defaultDataHome, SUGGESTED_MEMORY_KEYS } from './memory';
-export { ensureConfig, currentConfig, feishuBotConfig, isFeishuBotConfigured, ensureBotConfig, userEnvPath, PRESETS } from './config';
+export { currentConfig, feishuBotConfig, isFeishuBotConfigured, userEnvPath, PRESETS } from './config';
+export { ensureConfig, ensureBotConfig } from './config-wizard';
 export { buildSystemPrompt } from './prompt';
 export { buildTools } from './tools';
 export { createClient, runAgentTurn, trimHistory } from './llm';

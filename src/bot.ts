@@ -7,14 +7,15 @@
 
 import readline from 'readline';
 import path from 'path';
-import { currentConfig, ensureBotConfig, feishuBotConfig, userEnvPath, writeEnvFile } from './config';
-import { KanbanMcp } from './mcp';
+import { currentConfig, feishuBotConfig, userEnvPath, writeEnvFile } from './config';
+import { ensureBotConfig } from './config-wizard';
+import { KanbanMcp } from './kanban/mcp';
 import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
-import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
+import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
-import { KanbanWatcher } from './watcher';
+import { KanbanWatcher } from './kanban/watcher';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import type { AskFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';

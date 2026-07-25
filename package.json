@@ -2,7 +2,8 @@
   "name": "helios-task-agent",
   "version": "1.0.0",
   "description": "Terminal agent that turns Lark/Feishu content into helios-kanban tasks",
-  "main": "dist/cli.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "helios-task-agent": "bin/helios-task-agent.js",
     "helios-task-agent-bot": "bin/helios-task-agent-bot.js"
@@ -14,6 +15,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm run smoke && npm run test:e2e",
     "bot": "tsx src/bot.ts"
   },
   "files": [
@@ -22,7 +24,9 @@
     "skills",
     ".env.example",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "CHANGELOG.md",
+    "!dist/**/*.map"
   ],
   "keywords": [
     "helios-kanban",
@@ -31,9 +35,21 @@
     "agent",
     "mcp"
   ],
-  "author": "",
+  "author": "qiang.fang",
   "license": "ISC",
   "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SolomonFang/helios-task-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SolomonFang/helios-task-agent/issues"
+  },
+  "homepage": "https://github.com/SolomonFang/helios-task-agent#readme",
+  "os": [
+    "darwin",
+    "linux"
+  ],
   "engines": {
     "node": ">=18"
   },
