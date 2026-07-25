@@ -297,7 +297,7 @@ const MEMORY_TOOLS: OpenAiTool[] = [
     type: 'function',
     function: {
       name: 'memory_note',
-      description: '追加一条自由备注（非键值事实）。保留最近约 20 条。',
+      description: '追加一条自由备注（非键值事实）。保留最近约 50 条。',
       parameters: {
         type: 'object',
         properties: {

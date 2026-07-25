@@ -28,14 +28,14 @@ Feishu Task Center / docs / group chats
 
 | Mechanism | Behavior |
 |-----------|----------|
-| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`. Feishu: 3-button card or strict phrases (确认 / 都允许 / 取消 — casual “ok” ignored). Timeouts 120s / 300s (destructive). New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
+| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`; no timeout (Ctrl+C at the prompt rejects). Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 都允许 / 取消 — casual “ok” ignored); timeouts 120s for batchable ops, 300s for destructive ops and Feishu writes; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
 | Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt |
 | Untrusted wrap | `lark_cli` output marked UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
 | Owner claim | Empty `FEISHU_ALLOWED_OPEN_IDS` → first DM user becomes owner (written to `.env`); others rejected once |
-| Source dedupe | URL → task map in `synced-sources.json`; self-heals after deletes; unreachable kanban conservatively blocks |
-| Audit log | Approvals/denies/dup blocks → `audit.log` (JSONL) |
+| Source dedupe | URL → task map per user in `synced-sources.json`; self-heals after deletes; unreachable kanban conservatively blocks |
+| Audit log | Approvals/denies/dup blocks (`blocked_dup`)/no-gate/results → `audit.log` (JSONL) |
 | Workspace ready | Fills `base_branch` on start; detects silent setup failures |
 
 ## Kanban status push (bot)
@@ -49,7 +49,7 @@ Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failu
 
 ## MCP health supervisor (bot)
 
-~60s probe. On drop: fall back to `hk_cli`, reconnect, notify; on recover: switch back. `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
+~60s probe. On drop: fall back to `hk_cli`, auto-reconnect with backoff (down to ~every 5 min), notify; on recover: switch back (both transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
 
 ## Install
 
@@ -174,7 +174,7 @@ npm run test:e2e   # mock path, no real LLM
 npm run build
 ```
 
-Design notes: [docs/superpowers/](docs/superpowers/). Embeddable via `src/index.ts` exports.
+Embeddable via `src/index.ts` exports.
 
 ## License
 
