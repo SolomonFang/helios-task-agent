@@ -37,14 +37,14 @@ flowchart TD
 | 飞书长连接 bot | `src/bot.ts`, `channels/feishu.ts` | 仅 p2p；进程常驻 |
 | 终端 REPL | `src/cli.ts` | |
 | 系统规则 | `src/prompt.ts` | 展开 / 写看板 / 不擅自 start |
-| 写操作闸门 | `src/guard.ts`, `src/tools.ts` | 分类 read/write；写操作强制用户确认；「同类免问」批量 10 分钟免重复确认（默认仅此次） |
-| 确认通道 | `src/confirm.ts`, `src/cli.ts` | CLI y/b/N；飞书三按钮卡片 / 文本兜底；破坏性操作超时 300s、其余 120s |
+| 写操作闸门 | `src/guard.ts`, `src/tools.ts` | 分类 read/write；写操作强制用户确认；「同类免问」批量 10 分钟免重复确认（默认仅此次；可「恢复确认」/ `/confirm on` 撤销） |
+| 确认通道 | `src/confirm.ts`, `src/cli.ts` | CLI y/b/N；飞书三按钮卡片 / 文本兜底；决策/超时/作废后卡片原地更新为终态；破坏性操作超时 300s、其余 120s；/stop 一并取消挂起确认 |
 | 访问控制 | `channels/feishu.ts` | 白名单为空 → 首个私聊用户认领 owner 并写回 .env |
 | 来源查重 | `src/source-registry.ts` | 飞书 URL → 看板任务映射 |
 | 审计 | `src/audit.ts` | `~/.helios-task-agent/audit.log` |
 | 状态推送 | `src/watcher.ts` | 轮询看板 → 飞书通知（注入会话上下文） |
 | MCP 监督 | `src/bot.ts`, `src/mcp.ts` | 60s 探测，掉线降级 + 自动重连切回 |
-| 晨报 | `src/scheduler.ts`, `src/bot.ts` | `BOT_DAILY_REPORT=HH:MM` |
+| 排队回执 | `src/bot.ts`, `src/session-router.ts` | 任务忙或确认挂起时新消息立即收到提示 |
 | 看板自动拉起 | `src/kanban-ensure.ts` | `HELIOS_KANBAN_AUTO_START` |
 | 本地读仓 | `src/repo-fs.ts` | 可选 |
 | 看板 API | MCP + `skills/.../hk.sh` | MCP 优先 |
@@ -57,7 +57,7 @@ flowchart TD
 | [feishu-task-link-expand-design](./specs/2026-07-21-feishu-task-link-expand-design.md) | implemented |
 | [feishu-to-kanban-design](./specs/2026-07-21-feishu-to-kanban-design.md) | implemented |
 | [write-gate-design](./specs/2026-07-22-write-gate-design.md) | implemented |
-| [trust-batch-progress-design](./specs/2026-07-22-trust-batch-progress-design.md) | implemented |
+| [trust-batch-progress-design](./specs/2026-07-22-trust-batch-progress-design.md) | implemented（晨报已于 2026-07-25 移除） |
 | [bot-experience-p1-design](./specs/2026-07-22-bot-experience-p1-design.md) | implemented |
 
 ## 审查结论（本轮）

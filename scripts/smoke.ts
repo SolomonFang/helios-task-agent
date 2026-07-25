@@ -11,9 +11,8 @@ import { buildSystemPrompt } from '../src/prompt';
 import { MemoryStore } from '../src/memory';
 import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/guard';
 import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
-import { ConfirmationManager } from '../src/confirm';
+import { ConfirmationManager, buildResolvedCard } from '../src/confirm';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
-import { parseDailyTime } from '../src/scheduler';
 import { runAgentTurn } from '../src/llm';
 import {
   applyRepoBaseBranches,
@@ -196,7 +195,7 @@ async function main(): Promise<void> {
   check('lark_cli 输出带 UNTRUSTED 标记', wrapped.includes('UNTRUSTED_FEISHU_CONTENT'));
 
   // ---- 确认管理器（bot 通道，离线） ----
-  const cm = new ConfirmationManager(async () => {});
+  const cm = new ConfirmationManager(async () => undefined);
   const pr1 = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
   const a1 = cm.resolveFromText('u1', '确认');
   check('文本「确认」放行闸门（仅此次）', a1 === 'approved' && (await pr1) === 'once');
@@ -206,6 +205,7 @@ async function main(): Promise<void> {
   let cardId = '';
   const cm2 = new ConfirmationManager(async (_o, _c, _r, id) => {
     cardId = id;
+    return undefined;
   });
   const pr3 = cm2.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'kanban:create_task' });
   await new Promise((r) => setImmediate(r));
@@ -215,7 +215,7 @@ async function main(): Promise<void> {
       (await pr3) === 'batch' &&
       cm2.resolveFromCard('u1', cardId, 'batch') === 'ignored',
   );
-  const cm3 = new ConfirmationManager(async () => {}, { timeoutMs: 30, destructiveTimeoutMs: 30 });
+  const cm3 = new ConfirmationManager(async () => undefined, { timeoutMs: 30, destructiveTimeoutMs: 30 });
   check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);
 
   // 收窄确认词：pending 期间随口应答不再误放行；明确词仍可批准
@@ -239,7 +239,7 @@ async function main(): Promise<void> {
 
   // pending 被新请求替代：旧请求拒绝 + onSuperseded 通知
   let supersededSummary = '';
-  const cm4 = new ConfirmationManager(async () => {}, {
+  const cm4 = new ConfirmationManager(async () => undefined, {
     onSuperseded: (_o, req) => {
       supersededSummary = req.summary;
     },
@@ -249,6 +249,27 @@ async function main(): Promise<void> {
   check('pending 被替代时旧请求拒绝并通知', (await prOld) === false && supersededSummary === 'old');
   const aNew = cm4.resolveFromText('u3', '确认');
   check('替代后新请求可确认', aNew === 'approved' && (await prNew) === 'once');
+
+  // /stop 取消挂起确认：按拒绝处理；onSettled 收到 denied 终态与卡片 message id
+  const settleLog: string[] = [];
+  const cm5 = new ConfirmationManager(async () => 'card-mid-1', {
+    onSettled: (_o, _r, settle, mid) => settleLog.push(`${settle}:${mid ?? ''}`),
+  });
+  const prStop = cm5.request('u4', { kind: 'kanban', summary: 's', detail: 'd' });
+  await new Promise((r) => setImmediate(r));
+  check(
+    '/stop 取消挂起确认',
+    cm5.cancel('u4') === true && (await prStop) === false && cm5.cancel('u4') === false,
+  );
+  check('onSettled 携带终态与卡片 id', settleLog.join(',') === 'denied:card-mid-1', settleLog.join(','));
+
+  // 终态卡片：无按钮（action），模板随终态变化
+  const resolvedCard = buildResolvedCard({ kind: 'kanban', summary: 's', detail: 'd' }, 'timeout');
+  const resolvedHeader = (resolvedCard as { header?: { template?: string } }).header;
+  check(
+    '终态卡片无按钮且模板正确',
+    resolvedHeader?.template === 'grey' && !JSON.stringify(resolvedCard).includes('"action"'),
+  );
 
   // ---- 批量确认（仅 'batch' 裁决缓存：同类放行 / 异类与无 key 重问 / 'once' 与拒绝不缓存） ----
   let asks = 0;
@@ -279,6 +300,23 @@ async function main(): Promise<void> {
   await denyConfirm(mkReq('k'));
   check('批量确认：拒绝不缓存', denyAsks === 2);
 
+  // 「恢复确认」：撤销后同类写操作重新进闸门
+  let revokeAsks = 0;
+  const revokeConfirm = withBatchApproval(async () => {
+    revokeAsks++;
+    return 'batch' as const;
+  }, 60000);
+  await revokeConfirm(mkReq('kanban:create_task'));
+  await revokeConfirm(mkReq('kanban:create_task'));
+  const revoked = revokeConfirm.revokeBatchApprovals();
+  const activeAfterRevoke = revokeConfirm.activeBatchApprovals();
+  await revokeConfirm(mkReq('kanban:create_task')); // 撤销后同类写操作重新进闸门
+  check(
+    '批量免问可撤销（恢复确认）',
+    revoked === 1 && activeAfterRevoke === 0 && revokeAsks === 2,
+    `revoked=${revoked} asks=${revokeAsks}`,
+  );
+
   // ---- 飞书文本拆分 ----
   const longText = '段落一\n\n'.repeat(1500);
   const parts = splitText(longText, 3000);
@@ -300,16 +338,6 @@ async function main(): Promise<void> {
   );
   const ac2 = createAccessChecker(['ou_a']);
   check('白名单已配：仅放行列表内用户', ac2.check('ou_a') === 'allow' && ac2.check('ou_b') === 'deny');
-
-  // ---- 晨报时间解析 ----
-  check(
-    '每日时间解析',
-    parseDailyTime('9:05')?.hh === 9 &&
-      parseDailyTime('23:59')?.mm === 59 &&
-      parseDailyTime('25:00') === null &&
-      parseDailyTime('abc') === null &&
-      parseDailyTime('') === null,
-  );
 
   // ---- post 富文本解析 ----
   const postJson = JSON.stringify({

@@ -301,8 +301,8 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
-  /** Send an interactive card (e.g. write-op confirmation with buttons). */
-  async sendCard(chatId: string, card: Record<string, unknown>): Promise<void> {
+  /** Send an interactive card (e.g. write-op confirmation with buttons); returns message_id. */
+  async sendCard(chatId: string, card: Record<string, unknown>): Promise<string | undefined> {
     const res = await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
@@ -313,6 +313,21 @@ export class FeishuChannel implements AgentChannel {
     });
     if (res.code !== 0) {
       throw new Error(`飞书发卡片失败: code=${res.code} msg=${res.msg}`);
+    }
+    return res.data?.message_id;
+  }
+
+  /** Replace an interactive card in place（确认卡片决策/超时后更新为终态）。 */
+  async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
+    const res = await this.client.im.v1.message.update({
+      path: { message_id: messageId },
+      data: {
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书更新卡片失败: code=${res.code} msg=${res.msg}`);
     }
   }
 

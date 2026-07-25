@@ -50,6 +50,11 @@ export class SessionRouter {
     for (const session of this.sessions.values()) session.setMcpOk(ok);
   }
 
+  /** 该用户是否有排队中/进行中的任务（新消息排队回执用）。 */
+  busy(openId: string): boolean {
+    return this.queues.has(openId);
+  }
+
   /** Run work for a user strictly in order (prevents overlapping tool rounds). */
   enqueue(openId: string, work: () => Promise<void>): Promise<void> {
     const prev = this.queues.get(openId) || Promise.resolve();

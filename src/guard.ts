@@ -29,10 +29,24 @@ export type ConfirmFn = (req: ConfirmRequest) => Promise<ConfirmVerdict>;
 
 export const BATCH_APPROVAL_TTL_MS = 10 * 60 * 1000;
 
+/** ConfirmFn 附带「同类免问」查询/撤销能力（「恢复确认」/ `/confirm on` 用）。 */
+export interface BatchConfirmFn extends ConfirmFn {
+  /** 撤销全部「同类免问」授权，返回撤销的类数（先清理已过期授权）。 */
+  revokeBatchApprovals: () => number;
+  /** 当前生效中的「同类免问」授权类数。 */
+  activeBatchApprovals: () => number;
+}
+
 /** Remember 'batch' approvals per batchKey for ttlMs; destructive ops (no batchKey) always re-ask. */
-export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL_MS): ConfirmFn {
+export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL_MS): BatchConfirmFn {
   const approved = new Map<string, number>();
-  return async (req) => {
+  const prune = (): void => {
+    const now = Date.now();
+    for (const [key, exp] of approved) {
+      if (exp <= now) approved.delete(key);
+    }
+  };
+  const fn = (async (req) => {
     if (req.batchKey) {
       const exp = approved.get(req.batchKey);
       if (exp && exp > Date.now()) return 'batch';
@@ -40,7 +54,18 @@ export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL
     const verdict = await confirm(req);
     if (verdict === 'batch' && req.batchKey) approved.set(req.batchKey, Date.now() + ttlMs);
     return verdict;
+  }) as BatchConfirmFn;
+  fn.revokeBatchApprovals = () => {
+    prune();
+    const n = approved.size;
+    approved.clear();
+    return n;
   };
+  fn.activeBatchApprovals = () => {
+    prune();
+    return approved.size;
+  };
+  return fn;
 }
 
 export type GateResult =

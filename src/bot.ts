@@ -13,10 +13,9 @@ import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban-ensure';
-import { ConfirmationManager, buildConfirmCard } from './confirm';
+import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher } from './watcher';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
-import { parseDailyTime, scheduleDaily } from './scheduler';
 import type { AskFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
 import { c } from './ui';
@@ -25,15 +24,17 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 命令
 /help     显示帮助
-/status   健康检查（kanban / MCP / lark-cli / 推送 / 晨报）
+/status   健康检查（kanban / MCP / lark-cli / 推送）
 /tools    列出当前可用工具
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
-/stop     中断当前正在执行的任务
+/stop     中断当前任务（待确认的写操作一并取消）
+/confirm  查看「同类免问」状态；/confirm on 或回复「恢复确认」撤销免问
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
 · 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 都允许 / 取消」
+· 免问期间回复「恢复确认」立即撤销，恢复逐次确认
 · 普通写操作 120 秒、删除/取消/停止类 300 秒未操作自动拒绝
 
 可以说
@@ -130,15 +131,14 @@ async function main(): Promise<void> {
   const memory = new MemoryStore();
   const channel = new FeishuChannel(feishuCfg);
   let watcher: KanbanWatcher | null = null;
-  let stopDaily: (() => void) | null = null;
 
-  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）
+  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）；
+  // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
   const confirmations = new ConfirmationManager(
     async (openId, chatId, req, id, timeoutMs) => {
       if (chatId) {
         try {
-          await channel.sendCard(chatId, buildConfirmCard(req, id, timeoutMs));
-          return;
+          return await channel.sendCard(chatId, buildConfirmCard(req, id, timeoutMs));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           console.error(`[confirm] 卡片发送失败，降级文本: ${message}`);
@@ -149,6 +149,7 @@ async function main(): Promise<void> {
         openId,
         `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
       );
+      return undefined;
     },
     {
       timeoutMs: 120000,
@@ -160,6 +161,13 @@ async function main(): Promise<void> {
           .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}`)
           .catch(() => {});
       },
+      onSettled: (_openId, req, settle, cardMessageId) => {
+        if (!cardMessageId) return;
+        void channel.updateCard(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[confirm] 卡片终态更新失败: ${message}`);
+        });
+      },
     },
   );
 
@@ -170,8 +178,11 @@ async function main(): Promise<void> {
     const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), String(value.decision || ''));
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
     else if (result === 'approved_batch')
-      void channel.notifyOpenId(openId, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…').catch(() => {});
+      void channel
+        .notifyOpenId(openId, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…（回复「恢复确认」可随时撤销）')
+        .catch(() => {});
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
+    else void channel.notifyOpenId(openId, '该确认已处理或已过期，无需重复操作。').catch(() => {});
   };
 
   // 白名单为空时：首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）
@@ -267,7 +278,7 @@ async function main(): Promise<void> {
       return;
     }
     if (answer === 'approved_batch') {
-      await channel.reply(msg, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…');
+      await channel.reply(msg, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…（回复「恢复确认」可随时撤销）');
       return;
     }
     if (answer === 'denied') {
@@ -284,12 +295,36 @@ async function main(): Promise<void> {
     // 即时命令（不进串行队列，否则 /stop 会排在它要中断的任务后面）
     if (cmd === '/stop') {
       const ctl = running.get(msg.senderId);
+      const gateCancelled = confirmations.cancel(msg.senderId);
       if (ctl) {
         ctl.abort();
         running.delete(msg.senderId);
-        await channel.reply(msg, '⏹ 已中断当前任务。');
+      }
+      if (ctl || gateCancelled) {
+        await channel.reply(msg, `⏹ 已中断当前任务${gateCancelled ? '，待确认的写操作已一并取消' : ''}。`);
       } else {
         await channel.reply(msg, '当前没有正在执行的任务。');
+      }
+      return;
+    }
+
+    // 「同类免问」查询/撤销：即时生效（若进串行队列，等当前任务结束才撤销就晚了）
+    if (cmd === '/confirm' || text === '恢复确认') {
+      const session = router.getOrCreate(msg.senderId);
+      if (text === '恢复确认' || text.toLowerCase() === '/confirm on') {
+        const n = session.revokeBatchApprovals();
+        await channel.reply(
+          msg,
+          n ? `✅ 已恢复逐次确认（撤销 ${n} 类「同类免问」授权）。` : '当前没有生效中的「同类免问」，无需撤销。',
+        );
+      } else {
+        const active = session.activeBatchApprovals();
+        await channel.reply(
+          msg,
+          active
+            ? `当前有 ${active} 类写操作处于「同类免问」中；回复「恢复确认」撤销。`
+            : '当前没有生效中的「同类免问」（写操作逐次确认）。',
+        );
       }
       return;
     }
@@ -309,7 +344,6 @@ async function main(): Promise<void> {
         `MCP: ${mcpAlive ? `ok（${mcp.tools.length} 个工具）` : '降级 hk_cli（自动重连中）'}`,
         `lark-cli: ${checkLarkCli() ? 'ok' : '未安装（飞书读取不可用）'}`,
         `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
-        `晨报: ${process.env.BOT_DAILY_REPORT || '关'}`,
       ];
       await channel.reply(msg, lines.join('\n'));
       return;
@@ -321,6 +355,15 @@ async function main(): Promise<void> {
     }
 
     const openId = msg.senderId;
+    // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
+    if (confirmations.hasPending(openId)) {
+      await channel.reply(
+        msg,
+        '⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复「确认」/「取消」，超时自动拒绝）。本条消息已排队，会按顺序处理。',
+      );
+    } else if (router.busy(openId)) {
+      await channel.reply(msg, '📥 已收到并排队：当前任务完成后依次处理。');
+    }
     await router.enqueue(openId, async () => {
       const session = router.getOrCreate(openId);
 
@@ -389,7 +432,6 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     console.log('\n' + c.gray('正在退出…'));
     clearInterval(mcpTimer);
-    stopDaily?.();
     watcher?.stop();
     await channel.stop();
     await mcp.close();
@@ -441,33 +483,6 @@ async function main(): Promise<void> {
     });
     watcher.start();
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
-  }
-
-  // 晨报/定时同步：每天固定时间「只读」跑同步并推送结果（不写看板，避免用户醒来面对一堆确认卡片）；
-  // 写闸门仍在兜底：模型若仍发起写操作，确认卡片照常出现。
-  const dailyTime = parseDailyTime(process.env.BOT_DAILY_REPORT || '');
-  if (dailyTime) {
-    stopDaily = scheduleDaily(dailyTime, () => {
-      for (const oid of channel.allowedOpenIds()) {
-        void router.enqueue(oid, async () => {
-          try {
-            const session = router.getOrCreate(oid);
-            await channel.notifyOpenId(oid, '🌅 每日任务同步进行中…');
-            const reply = await session.handleUserMessage(
-              '同步我的任务（晨报只读模式：只列出/展开任务，不要写入 helios-kanban；最后列出值得写入看板的候选）',
-            );
-            await channel.notifyOpenId(
-              oid,
-              `${reply || '(无内容)'}\n\n——\n要把哪些写进 helios-kanban？回复「写进 helios-kanban」或直接指定即可。`,
-            );
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            await channel.notifyOpenId(oid, `每日同步失败: ${message}`).catch(() => {});
-          }
-        });
-      }
-    });
-    console.log(c.gray(`每日同步已开启：每天 ${process.env.BOT_DAILY_REPORT} 只读跑「同步我的任务」并推送`));
   }
 
   console.log(c.gray('Ctrl+C 退出'));

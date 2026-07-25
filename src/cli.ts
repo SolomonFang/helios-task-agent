@@ -58,6 +58,7 @@ const HELP = `
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
+  ${c.info('/confirm')}  查看「同类免问」状态；/confirm on 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（任务运行中按 Ctrl+C 只中断不退出）
 
   ${c.strong('试试对我说')}
@@ -180,7 +181,7 @@ export async function main(): Promise<void> {
     const once = !batch && /^(y|yes|确认|同意)$/.test(t);
     spinner.start('思考中…（Ctrl+C 中断）');
     if (batch) {
-      console.log(c.ok('已批准；同类写操作 10 分钟内免问。'));
+      console.log(c.ok('已批准；同类写操作 10 分钟内免问（/confirm on 撤销）。'));
       return 'batch';
     }
     if (once) {
@@ -231,6 +232,20 @@ export async function main(): Promise<void> {
       } else if (cmd === '/clear') {
         session.clearHistory();
         console.log(c.gray('对话历史已清空（记忆保留）。'));
+      } else if (cmd === '/confirm' || cmd === '/confirm on') {
+        if (cmd === '/confirm on') {
+          const n = session.revokeBatchApprovals();
+          console.log(
+            n ? c.ok(`已恢复逐次确认（撤销 ${n} 类「同类免问」授权）。`) : c.gray('当前没有生效中的「同类免问」。'),
+          );
+        } else {
+          const active = session.activeBatchApprovals();
+          console.log(
+            active
+              ? c.warn(`当前有 ${active} 类写操作处于「同类免问」中；输入 /confirm on 恢复逐次确认。`)
+              : c.gray('当前没有生效中的「同类免问」（写操作逐次确认）。'),
+          );
+        }
       } else if (cmd === '/memory') {
         console.log(c.strong('用户记忆') + c.gray(`  user=${session.memoryUserId}`));
         console.log(session.formatMemory());

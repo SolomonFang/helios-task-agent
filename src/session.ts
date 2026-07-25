@@ -3,7 +3,7 @@ import { MemoryStore } from './memory';
 import { createClient, runAgentTurn } from './llm';
 import { buildSystemPrompt } from './prompt';
 import { buildTools } from './tools';
-import { withBatchApproval, type ConfirmFn } from './guard';
+import { withBatchApproval, type BatchConfirmFn, type ConfirmFn } from './guard';
 import type {
   AgentConfig,
   ChatMessage,
@@ -33,7 +33,7 @@ export class AgentSession {
   private readonly userId: string;
   private readonly memory: MemoryStore;
   private readonly confirm?: ConfirmFn;
-  private batchedConfirm?: ConfirmFn;
+  private batchedConfirm?: BatchConfirmFn;
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
@@ -71,6 +71,16 @@ export class AgentSession {
 
   formatMemory(): string {
     return this.memory.formatForPrompt(this.userId);
+  }
+
+  /** 撤销当前会话所有「同类免问」授权（恢复逐次确认），返回撤销的类数。 */
+  revokeBatchApprovals(): number {
+    return this.batchedConfirm?.revokeBatchApprovals() ?? 0;
+  }
+
+  /** 当前生效中的「同类免问」授权类数（/confirm 查询用）。 */
+  activeBatchApprovals(): number {
+    return this.batchedConfirm?.activeBatchApprovals() ?? 0;
   }
 
   private refreshSystemPrompt(): void {

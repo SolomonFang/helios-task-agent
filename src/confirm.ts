@@ -10,16 +10,26 @@ import type { ConfirmRequest, ConfirmVerdict } from './guard';
  *
  * 裁决三态：'once' = 批准仅此次；'batch' = 批准且同类免问 10 分钟；false = 拒绝。
  * 超时分级：可批量操作 120s；破坏性操作（无 batchKey）决策成本高，放宽到 300s。
+ * 终态回调（onSettled）：携带确认卡片 message id，bot 层据此把卡片原地更新为
+ * 终态（按钮消失），避免"点了没反应"与过期卡片误点。
  */
 
 /** 'approved' = 仅此次；'approved_batch' = 同类免问；'denied'；'ignored' = 无 pending 或非应答。 */
 export type ConfirmAnswer = 'approved' | 'approved_batch' | 'denied' | 'ignored';
+
+/**
+ * 确认请求的终态：once/batch = 批准；denied = 用户取消（含 /stop 一并取消）；
+ * timeout = 超时自动拒绝；superseded = 被新的写操作确认替代。
+ */
+export type ConfirmSettle = 'once' | 'batch' | 'denied' | 'timeout' | 'superseded';
 
 interface Pending {
   id: string;
   req: ConfirmRequest;
   resolve: (ok: ConfirmVerdict) => void;
   timer: NodeJS.Timeout;
+  /** 确认卡片的消息 id（文本降级时无），异步回填，用于终态时原地更新卡片。 */
+  cardMessageId?: string;
 }
 
 // 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作
@@ -32,13 +42,14 @@ export class ConfirmationManager {
   private chatIds = new Map<string, string>();
 
   constructor(
+    /** 发送确认请求；返回确认卡片的消息 id（文本降级返回 undefined）。 */
     private sendPrompt: (
       openId: string,
       chatId: string | undefined,
       req: ConfirmRequest,
       id: string,
       timeoutMs: number,
-    ) => Promise<void>,
+    ) => Promise<string | undefined>,
     private opts: {
       /** 非破坏性操作（可批量）的确认超时，默认 120s。 */
       timeoutMs?: number;
@@ -47,6 +58,8 @@ export class ConfirmationManager {
       onTimeout?: (openId: string, req: ConfirmRequest) => void;
       /** 新写操作顶掉未应答的 pending 时通知（否则用户会以为是自己拒绝的）。 */
       onSuperseded?: (openId: string, req: ConfirmRequest) => void;
+      /** 请求进入终态时回调；带卡片 message id 时可原地更新为终态卡片。 */
+      onSettled?: (openId: string, req: ConfirmRequest, settle: ConfirmSettle, cardMessageId?: string) => void;
     } = {},
   ) {}
 
@@ -72,6 +85,7 @@ export class ConfirmationManager {
       prev.resolve(false);
       this.pendings.delete(openId);
       this.opts.onSuperseded?.(openId, prev.req);
+      this.opts.onSettled?.(openId, prev.req, 'superseded', prev.cardMessageId);
     }
     const timeoutMs = this.timeoutFor(req);
     return new Promise((resolve) => {
@@ -81,11 +95,18 @@ export class ConfirmationManager {
         if (p && p.id === id) {
           this.pendings.delete(openId);
           this.opts.onTimeout?.(openId, req);
+          this.opts.onSettled?.(openId, req, 'timeout', p.cardMessageId);
           resolve(false);
         }
       }, timeoutMs);
       this.pendings.set(openId, { id, req, resolve, timer });
-      void this.sendPrompt(openId, this.chatIds.get(openId), req, id, timeoutMs).catch(() => {});
+      void this.sendPrompt(openId, this.chatIds.get(openId), req, id, timeoutMs)
+        .then((messageId) => {
+          // 回填卡片 message id 前确认 pending 仍是这一条（可能已被答复/替代）
+          const p = this.pendings.get(openId);
+          if (p && p.id === id && messageId) p.cardMessageId = messageId;
+        })
+        .catch(() => {});
     });
   }
 
@@ -125,10 +146,19 @@ export class ConfirmationManager {
     return 'denied';
   }
 
+  /** /stop 等场景一并取消挂起的确认（按拒绝处理）。返回是否确实有 pending 被取消。 */
+  cancel(openId: string): boolean {
+    const p = this.pendings.get(openId);
+    if (!p) return false;
+    this.finish(openId, p, false);
+    return true;
+  }
+
   private finish(openId: string, p: Pending, verdict: ConfirmVerdict): void {
     clearTimeout(p.timer);
     this.pendings.delete(openId);
     p.resolve(verdict);
+    this.opts.onSettled?.(openId, p.req, verdict === false ? 'denied' : verdict, p.cardMessageId);
   }
 }
 
@@ -178,6 +208,52 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
         tag: 'action',
         actions,
       },
+    ],
+  };
+}
+
+/** 决策/超时/作废后的终态卡片（原地替换确认卡片；无按钮，避免误点与"没反应"）。 */
+export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): Record<string, unknown> {
+  const kindLabel = req.kind === 'lark' ? '飞书' : '看板';
+  const meta: Record<ConfirmSettle, { template: string; title: string; note: string }> = {
+    once: {
+      template: 'green',
+      title: `✅ ${kindLabel}写操作已批准（仅此次）`,
+      note: '操作已放行，正在执行。',
+    },
+    batch: {
+      template: 'green',
+      title: `✅ ${kindLabel}写操作已批准（同类免问 10 分钟）`,
+      note: '回复「恢复确认」可随时撤销免问。',
+    },
+    denied: {
+      template: 'red',
+      title: `🚫 ${kindLabel}写操作已取消`,
+      note: '操作未执行。',
+    },
+    timeout: {
+      template: 'grey',
+      title: `⏰ ${kindLabel}写操作确认超时`,
+      note: '超时未处理，已自动拒绝，操作未执行。',
+    },
+    superseded: {
+      template: 'grey',
+      title: `⚠️ ${kindLabel}写操作确认已作废`,
+      note: '该确认已被新的写操作确认替代，请以最新卡片为准。',
+    },
+  };
+  const m = meta[settle];
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: m.template,
+      title: { tag: 'plain_text', content: m.title },
+    },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
+      { tag: 'div', text: { tag: 'plain_text', content: req.detail } },
+      { tag: 'hr' },
+      { tag: 'div', text: { tag: 'lark_md', content: m.note } },
     ],
   };
 }
