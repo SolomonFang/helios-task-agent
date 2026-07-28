@@ -23,6 +23,8 @@ import {
   waitForWorkspaceReady,
   type RepoStartInput,
 } from './kanban/workspace-ready';
+import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
+import { summarizeForChat, writeSummaryReports } from './report';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
@@ -242,6 +244,32 @@ const LOCAL_TOOLS: OpenAiTool[] = [
           },
         },
         required: ['action'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'work_summary',
+      description:
+        '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
+        '数据来自 helios-kanban 任务及其 diff 统计（改动文件、增删行数、attempt 摘要）。只读，不写看板。',
+      parameters: {
+        type: 'object',
+        properties: {
+          scope: {
+            type: 'string',
+            enum: ['iteration', 'today', 'all'],
+            description:
+              '统计范围：iteration 按迭代（配置了默认迭代时为默认）、today 今天有更新的、all 全部任务',
+          },
+          iteration: { type: 'string', description: '可选；覆盖默认迭代号' },
+          format: {
+            type: 'string',
+            enum: ['both', 'html', 'md'],
+            description: '输出格式，默认 both',
+          },
+        },
       },
     },
   },
@@ -551,6 +579,35 @@ export function buildTools({
       pattern: typeof raw.pattern === 'string' ? raw.pattern : undefined,
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
     });
+  });
+
+  handlers.set('work_summary', async (raw) => {
+    const iteration =
+      (typeof raw.iteration === 'string' && raw.iteration.trim()) || kanbanIteration || '';
+    const scopeArg = typeof raw.scope === 'string' ? raw.scope : '';
+    let scope: WorkSummaryScope;
+    if (scopeArg === 'iteration' || scopeArg === 'today' || scopeArg === 'all') scope = scopeArg;
+    else scope = iteration ? 'iteration' : 'today';
+    if (scope === 'iteration' && !iteration) scope = 'today';
+    const format = raw.format === 'html' || raw.format === 'md' ? raw.format : 'both';
+    try {
+      const data = await collectWorkSummary({
+        kanbanUrl,
+        projectId: kanbanProjectId || undefined,
+        iteration: iteration || undefined,
+        scope,
+      });
+      const paths = writeSummaryReports(data, { format });
+      const empty = data.tasks.length
+        ? ''
+        : '该范围内没有匹配的任务，已生成空报告（各项为 0）。\n\n';
+      return empty + summarizeForChat(data, paths);
+    } catch (err) {
+      return (
+        `生成工作总结失败: ${err instanceof Error ? err.message : String(err)}\n` +
+        `请确认 kanban 服务可访问（${kanbanUrl}）后重试。`
+      );
+    }
   });
 
   if (memory) {

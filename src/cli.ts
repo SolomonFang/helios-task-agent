@@ -68,6 +68,7 @@ const HELP = `
   · 有哪些项目 / 创建一个任务：修复登录页样式 bug
   · 用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）
   · 把 xx 群最近的聊天整理成任务
+  · 总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）
 `;
 
 export async function main(): Promise<void> {

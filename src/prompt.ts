@@ -110,6 +110,7 @@ ${memoryBlock}
 6. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
 7. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
 8. 需要给项目写/改说明时：\`hk_cli\` \`["projects","update",id,"--description","…"]\`（或 MCP 等价能力），**先确认再改**
+9. 用户问「这个迭代做了什么 / 今天完成了什么 / 总结一下进展或成果」→ 调用 \`work_summary\`；未说明范围时：配置了默认迭代用 \`iteration\`，否则用 \`today\`；回复只给报告文件路径 + 3~5 行文字概览，不要把整份报告贴进对话
 
 ## 飞书（lark-cli）使用规则
 - 用法自发现：\`["--help"]\`、\`["<skill>", "--help"]\`（im、doc、wiki、calendar、task、base 等）
