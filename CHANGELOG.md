@@ -4,6 +4,24 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Fixed
+
+- 中断（/stop、Ctrl+C）或工具调用超限发生在多工具批次中途时，为未执行的 tool_calls 补占位响应，修复后续对话被 API 拒绝（orphan tool_calls）的问题；新增 `sanitizeToolPairs` 防御性修复历史残留
+- 成功结果的头 300 字符含 error/失败 字样时不再误判为失败：操作成功判定与来源映射记录改用强失败信号（命令执行失败/调用失败/HTTP 状态/API error 等），修复「已同步来源漏记导致重复建任务」
+- `repo_fs` 解析符号链接真实路径，拦截指向仓库根目录之外的链接逃逸；仓库 path 解析请求增加 8s 超时
+- lark-cli 未安装时返回安装指引，而非裸 `spawn ENOENT`
+
+### Security
+
+- `~/.helios-task-agent/.env`（含 LLM_API_KEY / FEISHU_APP_SECRET）落盘权限收紧为 0600，重写历史文件时一并 chmod
+
+### Added
+
+- 纯逻辑单元测试 `scripts/unit.ts`（31 项：guard 分类、确认状态机、history 修剪/修复、runAgentTurn 中断与超限、飞书解析、查重注册表、记忆、repo_fs 边界、.env 权限），`npm test` 运行并纳入 `npm run verify` 与发布 CI
+- CLI `/config` 修改看板地址后提示 MCP 仍连接旧实例，建议重启重连
+
 ## [1.0.0] - 2026-07-25
 
 初始发布。

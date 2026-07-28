@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import type {
   ChatMessage,
   LlmClientConfig,
@@ -46,6 +47,49 @@ export function trimHistory(messages: ChatMessage[], maxMessages = MAX_HISTORY_M
   return messages;
 }
 
+/**
+ * Repair orphaned assistant `tool_calls` (e.g. left by an interrupted turn in
+ * older versions): any function call without a following `tool` response gets
+ * a placeholder response inserted, otherwise the next API request is rejected
+ * ("assistant message with tool_calls must be followed by tool messages").
+ * Mutates `messages` in place.
+ */
+export function sanitizeToolPairs(messages: ChatMessage[]): ChatMessage[] {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
+    const answered = new Set<string>();
+    let j = i + 1;
+    while (j < messages.length && messages[j]!.role === 'tool') {
+      const id = (messages[j] as { tool_call_id?: string }).tool_call_id;
+      if (id) answered.add(id);
+      j++;
+    }
+    for (const call of m.tool_calls) {
+      if (call.type !== 'function' || answered.has(call.id)) continue;
+      messages.splice(j, 0, {
+        role: 'tool',
+        tool_call_id: call.id,
+        content: '（该工具调用无响应记录：所在轮次曾被中断）',
+      });
+      j++;
+    }
+  }
+  return messages;
+}
+
+/** 提前中止时为未执行的 tool_calls 补占位响应，保持历史可继续（见 sanitizeToolPairs）。 */
+function fillUnanswered(messages: ChatMessage[], calls: ChatCompletionMessageToolCall[]): void {
+  for (const call of calls) {
+    if (call.type !== 'function') continue;
+    messages.push({
+      role: 'tool',
+      tool_call_id: call.id,
+      content: '（该工具调用未执行：本轮已提前中止）',
+    });
+  }
+}
+
 export async function runAgentTurn({
   client,
   model,
@@ -64,6 +108,7 @@ export async function runAgentTurn({
   /** Aborted by /stop: checked before each round/tool call, passed to the LLM request. */
   signal?: AbortSignal;
 }): Promise<string> {
+  sanitizeToolPairs(messages);
   trimHistory(messages);
   let toolCallCount = 0;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -89,11 +134,17 @@ export async function runAgentTurn({
       return msg.content || '(模型未返回内容)';
     }
 
-    for (const call of toolCalls) {
+    for (let i = 0; i < toolCalls.length; i++) {
+      const call = toolCalls[i]!;
       if (call.type !== 'function') continue;
       toolCallCount++;
-      if (signal?.aborted) return '（已被用户中断）';
+      // 中断/超限时先为剩余 tool_calls 补占位响应再返回，避免 orphan tool_calls 损坏后续轮次
+      if (signal?.aborted) {
+        fillUnanswered(messages, toolCalls.slice(i));
+        return '（已被用户中断）';
+      }
       if (toolCallCount > MAX_TOOL_CALLS) {
+        fillUnanswered(messages, toolCalls.slice(i));
         return `（工具调用次数超过上限 ${MAX_TOOL_CALLS}，已中止。请缩小任务范围或分步执行。）`;
       }
       const name = call.function.name;

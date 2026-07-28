@@ -193,7 +193,13 @@ export function writeEnvFile(
   ];
   const keys = [...preferredOrder.filter((k) => k in map), ...Object.keys(map).filter((k) => !preferredOrder.includes(k))];
   const body = keys.map((k) => `${k}=${map[k]}`).join('\n') + '\n';
-  fs.writeFileSync(filePath, body, 'utf8');
+  // 含 LLM_API_KEY / FEISHU_APP_SECRET 等凭证：仅属主可读写（mode 仅对新建生效，故对已存在文件再 chmod）
+  fs.writeFileSync(filePath, body, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    /* best-effort（如 Windows 或不支持的文件系统） */
+  }
   applyProcessEnv(map);
   return filePath;
 }

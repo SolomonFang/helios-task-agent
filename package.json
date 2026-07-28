@@ -10,12 +10,13 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
+    "test": "tsx scripts/unit.ts",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
-    "verify": "npm run typecheck && npm run smoke && npm run test:e2e",
+    "verify": "npm run typecheck && npm test && npm run smoke && npm run test:e2e",
     "prepublishOnly": "npm run typecheck",
     "bot": "tsx src/bot.ts"
   },

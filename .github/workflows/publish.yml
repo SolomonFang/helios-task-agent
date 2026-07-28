@@ -2,7 +2,7 @@ name: Publish to npm
 
 # 打 tag 触发：git tag v1.0.1 && git push origin v1.0.1
 # tag 必须与 package.json 的 version 一致；预发布 tag（含 -，如 v1.1.0-beta.0）发布到 npm 的 next 频道
-# smoke / e2e 依赖本机 helios-kanban，不在 CI 跑；发布前请本地执行 npm run verify
+# 单元测试（npm test）无外部依赖，在 CI 跑；smoke / e2e 依赖本机 helios-kanban，发布前请本地执行 npm run verify
 on:
   push:
     tags:
@@ -28,6 +28,9 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # 纯逻辑单元测试：无 LLM / kanban 依赖，CI 可直接跑
+      - run: npm test
 
       - name: Check tag matches package.json version
         run: |

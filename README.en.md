@@ -193,6 +193,7 @@ Bundled skill: `skills/helios-kanban-remote/`.
 ```bash
 npm install
 npm run typecheck
+npm test           # pure-logic unit tests, no external deps
 npm run smoke
 npm run test:e2e   # mock path, no real LLM
 npm run build

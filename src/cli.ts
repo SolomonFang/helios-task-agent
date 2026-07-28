@@ -284,9 +284,18 @@ export async function main(): Promise<void> {
         console.log('');
       } else if (cmd === '/config') {
         try {
+          const prevKanbanUrl = cfg.kanbanUrl;
           cfg = await ensureConfig(ask, { force: true, choose });
           session.applyConfig(cfg);
           console.log(c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel));
+          if (cfg.kanbanUrl !== prevKanbanUrl) {
+            console.log(
+              c.warn(
+                `看板地址已改为 ${cfg.kanbanUrl}，但 MCP 连接仍是启动时的旧实例（kanban_* 工具将操作旧看板）；` +
+                  'hk_cli 已指向新地址。建议 /exit 后重启以重连 MCP。',
+              ),
+            );
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           console.error(c.err(`配置失败: ${message}`));

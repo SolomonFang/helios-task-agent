@@ -205,6 +205,7 @@ bot 支持文字与 post（富文本：链接/@/图片/文件/代码块等转纯
 ```bash
 npm install
 npm run typecheck
+npm test          # 纯逻辑单元测试，无外部依赖
 npm run smoke
 npm run test:e2e   # mock 链路，不需真实 LLM
 npm run build

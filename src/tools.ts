@@ -8,11 +8,13 @@ import {
   classifyHk,
   classifyLark,
   classifyMcp,
+  looksLikeStrongFailure,
   passGate,
   summarizeMcp,
   wrapUntrusted,
   type ConfirmFn,
 } from './guard';
+import { LARK_CLI_INSTALL_HINT } from './deps';
 import { auditLog } from './audit';
 import { SourceRegistry, extractSourceUrls, kanbanTaskExists } from './source-registry';
 import {
@@ -55,6 +57,11 @@ function run(
           return;
         }
         if (error && !stdout) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            const hint = command === 'lark-cli' ? `\n${LARK_CLI_INSTALL_HINT}` : '';
+            resolve(`未找到可执行命令「${command}」。${hint}`.trim());
+            return;
+          }
           resolve(`命令执行失败: ${error.message}\n${truncate(stderr || '')}`.trim());
         } else {
           const out = truncate(stdout || '');
@@ -392,7 +399,8 @@ export function buildTools({
   };
 
   const recordSources = (urls: string[], result: string, title: string): void => {
-    if (!urls.length || looksLikeFailure(result)) return;
+    // 用强失败判定：成功结果的内容文本（如描述提到 error）不应阻碍来源映射记录
+    if (!urls.length || looksLikeStrongFailure(result)) return;
     const taskId = extractUuid(result);
     if (!taskId) return;
     const entry = { taskId, title, createdAt: new Date().toISOString() };
@@ -461,7 +469,7 @@ export function buildTools({
         if (isStart && !looksLikeFailure(result)) {
           result = await appendWorkspaceReadyCheck(result, kanbanUrl, ctx?.signal);
         }
-        const ok = !looksLikeFailure(result) && !/⚠️ setup 未完成/.test(result);
+        const ok = !looksLikeStrongFailure(result) && !/⚠️ setup 未完成/.test(result);
         auditLog(
           { user: uid, kind: 'kanban', summary, detail, decision: 'approved', ok, resultSnippet: result },
           auditHome,
@@ -489,7 +497,7 @@ export function buildTools({
       }
       const out = await run('lark-cli', argv, { signal: ctx?.signal });
       auditLog(
-        { user: uid, kind: 'lark', summary, detail, decision: 'approved', ok: !looksLikeFailure(out), resultSnippet: out },
+        { user: uid, kind: 'lark', summary, detail, decision: 'approved', ok: !looksLikeStrongFailure(out), resultSnippet: out },
         auditHome,
       );
       return wrapUntrusted(out);
@@ -562,7 +570,7 @@ export function buildTools({
     if (isStart && !looksLikeFailure(out)) {
       out = await appendWorkspaceReadyCheck(out, kanbanUrl, ctx?.signal);
     }
-    const ok = !looksLikeFailure(out) && !/⚠️ setup 未完成/.test(out);
+    const ok = !looksLikeStrongFailure(out) && !/⚠️ setup 未完成/.test(out);
     auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
     if (ok && urls.length) recordSources(urls, out, title);
     if (ok && isCreate) createCount++;

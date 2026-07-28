@@ -10,7 +10,7 @@ export function truncateOutput(s: string, max = MAX_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
 }
 
-/** Resolve relPath under root; reject escapes outside root. */
+/** Resolve relPath under root; reject escapes outside root (including via symlinks). */
 export function resolveUnderRoot(
   root: string,
   relPath = '.',
@@ -20,6 +20,16 @@ export function resolveUnderRoot(
   const rel = path.relative(rootAbs, target);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     return { ok: false, error: `路径越界：禁止访问仓库根目录之外（root=${rootAbs}, path=${relPath}）` };
+  }
+  // 符号链接防逃逸：字符串路径在界内但真实路径可能在界外
+  if (fs.existsSync(target)) {
+    const realRoot = fs.realpathSync(rootAbs);
+    const realTarget = fs.realpathSync(target);
+    const relReal = path.relative(realRoot, realTarget);
+    if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+      return { ok: false, error: `路径越界：符号链接指向仓库根目录之外（path=${relPath}）` };
+    }
+    return { ok: true, abs: realTarget };
   }
   return { ok: true, abs: target };
 }
@@ -31,7 +41,7 @@ export async function fetchRepoPath(
   const base = kanbanUrl.replace(/\/$/, '');
   const url = `${base}/api/repos/${encodeURIComponent(repoId)}`;
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
     const text = await res.text();
     let json: { success?: boolean; data?: { path?: string }; message?: string };
     try {
