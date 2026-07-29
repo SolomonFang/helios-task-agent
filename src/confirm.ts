@@ -162,14 +162,20 @@ export class ConfirmationManager {
   }
 }
 
+/** lark_md 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
+function detailCodeBlock(detail: string): string {
+  return '```\n' + detail.replace(/```/g, "'''") + '\n```';
+}
+
 /** Interactive card shown for a pending write operation (legacy card schema). */
 export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 120000): Record<string, unknown> {
-  const kindLabel = req.kind === 'lark' ? '飞书' : '看板';
+  const isLark = req.kind === 'lark';
+  const kindLabel = isLark ? '飞书' : '看板';
   const timeoutSec = Math.round(timeoutMs / 1000);
   const actions: Record<string, unknown>[] = [
     {
       tag: 'button',
-      text: { tag: 'plain_text', content: '确认执行（仅此次）' },
+      text: { tag: 'plain_text', content: '✅ 确认执行（仅此次）' },
       type: 'primary',
       value: { hta_confirm: id, decision: 'yes' },
     },
@@ -177,37 +183,38 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   if (req.batchKey) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '同类免问 10 分钟' },
+      text: { tag: 'plain_text', content: '🔁 同类免问 10 分钟' },
       value: { hta_confirm: id, decision: 'batch' },
     });
   }
   actions.push({
     tag: 'button',
-    text: { tag: 'plain_text', content: '取消' },
+    text: { tag: 'plain_text', content: '✖️ 取消' },
     type: 'danger',
     value: { hta_confirm: id, decision: 'no' },
   });
   const replyHint = req.batchKey
-    ? '点按钮，或回复「确认」（仅此次）/「同类免问」（10 分钟）/「取消」。'
-    : '点按钮，或回复「确认」/「取消」。';
+    ? '或回复文本：「确认」仅此次 ·「同类免问」10 分钟 ·「取消」'
+    : '或回复文本：「确认」·「取消」';
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, enable_forward: false },
     header: {
-      template: 'orange',
-      title: { tag: 'plain_text', content: `⚠️ ${kindLabel}写操作确认` },
+      template: isLark ? 'blue' : 'orange',
+      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindLabel}写操作确认` },
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
-      { tag: 'div', text: { tag: 'plain_text', content: req.detail } },
-      { tag: 'hr' },
       {
         tag: 'div',
-        text: { tag: 'lark_md', content: `${replyHint}${timeoutSec} 秒未操作自动拒绝。` },
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindLabel}写操作` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**裁决时效**\n${timeoutSec} 秒未操作自动拒绝` } },
+        ],
       },
-      {
-        tag: 'action',
-        actions,
-      },
+      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
+      { tag: 'hr' },
+      { tag: 'action', actions },
+      { tag: 'note', elements: [{ tag: 'plain_text', content: replyHint }] },
     ],
   };
 }
@@ -223,7 +230,7 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     },
     batch: {
       template: 'green',
-      title: `✅ ${kindLabel}写操作已批准（同类免问 10 分钟）`,
+      title: `🔁 ${kindLabel}写操作已批准（同类免问 10 分钟）`,
       note: '回复「恢复确认」可随时撤销免问。',
     },
     denied: {
@@ -243,17 +250,17 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     },
   };
   const m = meta[settle];
+  const time = new Date().toLocaleString('zh-CN', { hour12: false });
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, enable_forward: false },
     header: {
       template: m.template,
       title: { tag: 'plain_text', content: m.title },
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
-      { tag: 'div', text: { tag: 'plain_text', content: req.detail } },
-      { tag: 'hr' },
-      { tag: 'div', text: { tag: 'lark_md', content: m.note } },
+      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
+      { tag: 'note', elements: [{ tag: 'plain_text', content: `${m.note} · ${time}` }] },
     ],
   };
 }
