@@ -19,7 +19,10 @@ Then run it directly (first launch opens an interactive wizard that writes confi
 ```bash
 helios-task-agent        # interactive terminal agent
 helios-task-agent bot    # Feishu DM bot
+helios-task-agent --version   # show installed version
 ```
+
+**Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
 **No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban`. Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
@@ -117,7 +120,7 @@ helios-task-agent-bot
 
 1. Wizard when credentials are missing (online validation by default; you may force-save and fix later)  
 2. Open Platform: long connection + `im.message.receive_v1`  
-3. DM only (p2p); no public webhook; process must stay up  
+3. DM only (p2p); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
 
 **Reconfigure**: edit `~/.helios-task-agent/.env`. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — clear those vars first. Terminal has `/config`.
 
@@ -129,6 +132,7 @@ helios-task-agent-bot
 | `helios-task-agent bot` | Feishu DM bot (wizard if unconfigured) |
 | `helios-task-agent-bot` | Same |
 | `helios-task-agent help` / `-h` / `--help` | Help |
+| `helios-task-agent --version` / `-v` | Show version |
 
 Local: `npm start` / `npm run bot`.
 
@@ -147,6 +151,7 @@ Local: `npm start` / `npm run bot`.
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
 | `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
+| `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
 Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example).

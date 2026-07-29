@@ -17,6 +17,8 @@ import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher } from './kanban/watcher';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
+import { friendlyLlmError } from './llm-error';
 import type { AskFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
 import { c } from './ui';
@@ -70,7 +72,8 @@ function createAsk(): { ask: AskFn; close: () => void } {
 }
 
 async function main(): Promise<void> {
-  console.log(c.strong('Helios Task Agent — 飞书机器人'));
+  const version = readPkgVersion();
+  console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
 
   const { ask, close } = createAsk();
@@ -92,6 +95,23 @@ async function main(): Promise<void> {
   // Refresh from env after wizard
   agentCfg = currentConfig();
   feishuCfg = feishuBotConfig();
+
+  // npm 更新检查：发现新版本先请示（结果缓存 24h，离线静默；HTA_UPDATE_CHECK=0 关闭）
+  if (!updateCheckDisabled() && process.stdin.isTTY) {
+    const info = await checkForUpdate({ current: version });
+    if (info) {
+      const { ask: upAsk, close: upClose } = createAsk();
+      try {
+        const outcome = await promptVersionUpdate({ info, ask: upAsk });
+        if (outcome === 'updated') {
+          console.log(c.ok('请重新运行 helios-task-agent bot 使用新版本。'));
+          process.exit(0);
+        }
+      } finally {
+        upClose();
+      }
+    }
+  }
 
   console.log(c.gray(`模型: ${agentCfg.llmModel}  kanban: ${agentCfg.kanbanUrl}`));
   if (feishuCfg.allowedOpenIds.length) {
@@ -420,9 +440,10 @@ async function main(): Promise<void> {
           await channel.reply(msg, '⏹ 已中断。');
         } else {
           const message = err instanceof Error ? err.message : String(err);
+          const friendly = friendlyLlmError(message);
           await channel.reply(
             msg,
-            `请求失败: ${message}\n你的上一条消息未处理：「${text.slice(0, 60)}${text.length > 60 ? '…' : ''}」，可修改后重发。`,
+            `请求失败: ${message}${friendly ? `\n${friendly}` : ''}\n你的上一条消息未处理：「${text.slice(0, 60)}${text.length > 60 ? '…' : ''}」，可修改后重发。`,
           );
         }
       } finally {

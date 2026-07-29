@@ -19,7 +19,10 @@ npm i -g helios-task-agent
 ```bash
 helios-task-agent        # 终端交互 agent
 helios-task-agent bot    # 飞书私聊机器人
+helios-task-agent --version   # 查看版本
 ```
+
+**自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
 
 **helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban` 拉起。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
 
@@ -120,7 +123,7 @@ helios-task-agent-bot
 2. 在 [飞书开放平台](https://open.feishu.cn/) 建机器人（长连接 + `im.message.receive_v1`）  
 3. 保存后建立长连接；手机**私聊**即可（仅 p2p，忽略群消息）  
 
-无需公网 Webhook。进程在线才能收消息。
+无需公网 Webhook。进程在线才能收消息；常驻运行可用 `pm2 start helios-task-agent -- bot`（或任何进程守护方式）。
 
 **改配置**：编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——要重跑向导请先删掉或清空 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。终端可用 `/config` 改模型与看板地址。
 
@@ -132,6 +135,7 @@ helios-task-agent-bot
 | `helios-task-agent bot` | 飞书私聊机器人（缺凭证则向导） |
 | `helios-task-agent-bot` | 同上 |
 | `helios-task-agent help` / `-h` / `--help` | 帮助 |
+| `helios-task-agent --version` / `-v` | 查看版本 |
 
 本地开发：`npm start` / `npm run bot`。
 
@@ -152,6 +156,8 @@ helios-task-agent-bot
 | `HELIOS_TASK_AGENT_ENV` | 强制 `.env` 路径（写入目标；加载优先级最高） |
 | `KANBAN_WATCH` | bot 看板推送，默认开；`0` 关闭 |
 | `KANBAN_WATCH_INTERVAL_SEC` | 推送间隔秒（默认 60，最小 15） |
+| `HTA_UPDATE_CHECK` | 启动时检查 npm 新版本，默认开；`0` 关闭 |
+| `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
 加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。

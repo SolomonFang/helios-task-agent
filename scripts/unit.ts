@@ -21,6 +21,8 @@ import { resolveUnderRoot } from '../src/repo-fs';
 import { writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
 import type { KanbanMcp } from '../src/kanban/mcp';
+import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
+import { friendlyLlmError } from '../src/llm-error';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -456,6 +458,83 @@ async function main(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.ok(blocked.includes('已达上限'), '第 11 次创建应被上限拦截');
   });
+
+  // ---------- npm 更新检查 ----------
+  check('compareVersions 版本比较', (() => {
+    return (
+      compareVersions('1.0.2', '1.0.2') === 0 &&
+      compareVersions('1.1.0', '1.0.9') === 1 &&
+      compareVersions('1.0.10', '1.0.9') === 1 &&
+      compareVersions('0.9.9', '1.0.0') === -1 &&
+      compareVersions('1.1.0-beta.0', '1.1.0') === -1 &&
+      compareVersions('1.1.0-beta.1', '1.1.0-beta.0') === 1 &&
+      compareVersions('1.2.0-alpha.0', '1.2.0-beta.0') === -1 &&
+      compareVersions('v1.2.0', '1.2.0') === 0
+    );
+  })());
+
+  await checkAsync('checkForUpdate：发现新版 / 无新版 / 缓存 24h / 失败静默', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-upd-'));
+    let fetches = 0;
+    const fetchTags = async (): Promise<DistTags> => {
+      fetches++;
+      return { latest: '1.1.0', next: '1.2.0-beta.0' };
+    };
+    const upd = await checkForUpdate({ current: '1.0.2', home: tmp, fetchDistTags: fetchTags });
+    assert.ok(upd && upd.latest === '1.1.0' && upd.tag === 'latest');
+    // 24h 内第二次走缓存，不再请求
+    await checkForUpdate({ current: '1.0.2', home: tmp, fetchDistTags: fetchTags });
+    assert.equal(fetches, 1);
+    // 已是最新 → null
+    const none = await checkForUpdate({ current: '1.1.0', home: tmp, fetchDistTags: fetchTags });
+    assert.equal(none, null);
+    // 预发布用户关注 next 频道
+    const pre = await checkForUpdate({ current: '1.2.0-alpha.0', home: tmp, fetchDistTags: fetchTags, now: Date.now() + 25 * 3600 * 1000 });
+    assert.ok(pre && pre.tag === 'next' && pre.latest === '1.2.0-beta.0');
+    // registry 失败 → 静默 null
+    const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-upd2-'));
+    const fail = await checkForUpdate({
+      current: '1.0.2',
+      home: tmp2,
+      fetchDistTags: async () => {
+        throw new Error('offline');
+      },
+    });
+    assert.equal(fail, null);
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  await checkAsync('promptVersionUpdate：y 执行更新 / N 跳过 / 失败回报', async () => {
+    const info = { current: '1.0.2', latest: '1.1.0', tag: 'latest' as const };
+    const ran: string[] = [];
+    const yes = await promptVersionUpdate({
+      info,
+      ask: async () => 'y',
+      runUpdate: async (tag) => {
+        ran.push(tag);
+        return true;
+      },
+    });
+    assert.equal(yes, 'updated');
+    assert.deepEqual(ran, ['latest']);
+    const no = await promptVersionUpdate({ info, ask: async () => '', runUpdate: async () => true });
+    assert.equal(no, 'skipped');
+    const fail = await promptVersionUpdate({ info, ask: async () => 'y', runUpdate: async () => false });
+    assert.equal(fail, 'failed');
+  });
+
+  // ---------- LLM 错误友好化 ----------
+  check('friendlyLlmError 常见错误映射', (() => {
+    return (
+      friendlyLlmError('401 Unauthorized: invalid api key') !== null &&
+      friendlyLlmError("This model's maximum context length is 128000 tokens") !== null &&
+      friendlyLlmError('429 rate limit reached') !== null &&
+      friendlyLlmError('The model `gpt-x` does not exist') !== null &&
+      friendlyLlmError('fetch failed: ECONNREFUSED 127.0.0.1') !== null &&
+      friendlyLlmError('some other weird error') === null
+    );
+  })());
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);

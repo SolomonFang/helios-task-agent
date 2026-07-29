@@ -8,6 +8,8 @@ import { KanbanMcp } from './kanban/mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
+import { friendlyLlmError } from './llm-error';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
@@ -104,6 +106,9 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // npm 更新检查：与看板/MCP 启动并发进行，banner 打印后再请示（结果缓存 24h，离线静默）
+  const pendingUpdate = !updateCheckDisabled() && isTTY ? checkForUpdate({ current: pkg.version }) : null;
+
   let kanbanChild: ChildProcess | null = null;
   const bootKanban = new Spinner('检查 helios-kanban…').start();
   try {
@@ -148,6 +153,20 @@ export async function main(): Promise<void> {
     larkOk,
   });
   if (!larkOk) console.log(c.warn(LARK_CLI_INSTALL_HINT));
+
+  // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效）
+  if (pendingUpdate) {
+    const info = await pendingUpdate;
+    if (info) {
+      const outcome = await promptVersionUpdate({ info, ask, log: (m) => console.log(c.gray(m)) });
+      if (outcome === 'updated') {
+        console.log(c.ok('请重新运行 helios-task-agent 使用新版本。'));
+        await mcp.close();
+        rl.close();
+        process.exit(0);
+      }
+    }
+  }
 
   const spinner = new Spinner('思考中…');
 
@@ -327,6 +346,8 @@ export async function main(): Promise<void> {
       } else {
         const message = err instanceof Error ? err.message : String(err);
         console.error(c.err(`\n请求失败: ${message}`));
+        const friendly = friendlyLlmError(message);
+        if (friendly) console.error(c.warn(friendly));
         console.error(
           c.gray(`上一条内容「${line.slice(0, 60)}${line.length > 60 ? '…' : ''}」未发送成功，可修改后重发；也可用 /config 检查模型配置。\n`),
         );

@@ -10,6 +10,7 @@ import {
 } from './config';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { verifyFeishuApp } from './feishu-verify';
+import { verifyLlmConfig } from './llm-verify';
 import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig } from './types';
 
 export function printFeishuSetupChecklist(): void {
@@ -48,11 +49,33 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentCon
   if (!baseUrl) {
     baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
   }
-  const apiKey = await need('API Key (sk-...): ');
-  if (!apiKey) throw new Error('API Key 不能为空');
+  const apiKeyInput = await need('API Key (sk-...): ');
+  if (!apiKeyInput) throw new Error('API Key 不能为空');
+  let apiKey = apiKeyInput;
   const modelInput = await need(`模型名（默认 ${preset.model || '必填'}）: `);
   const model = modelInput || preset.model;
   if (!model) throw new Error('模型名不能为空');
+
+  // 联网预检模型配置：Key 无效在向导里暴露（可重输）；端点不支持预检/网络不通则提示后可仍保存
+  for (;;) {
+    console.log(c.gray('正在联网校验模型配置…'));
+    const check = await verifyLlmConfig(baseUrl, apiKey);
+    if (check.ok) {
+      console.log(c.ok('模型配置校验通过'));
+      break;
+    }
+    if (check.uncertain) {
+      console.log(c.warn(`无法预检：${check.message}`));
+      const keep = (await need('仍然保存？[Y/n]（n = 重新输入 API Key）: ')).toLowerCase();
+      if (keep !== 'n' && keep !== 'no' && keep !== '否') break;
+    } else {
+      console.log(c.err(`模型配置校验失败：${check.message}`));
+      const retry = (await need('重新输入 API Key？[Y/n]（n = 仍然保存）: ')).toLowerCase();
+      if (retry === 'n' || retry === 'no' || retry === '否') break;
+    }
+    apiKey = await need('API Key (sk-...): ');
+    if (!apiKey) throw new Error('API Key 不能为空');
+  }
   const kanbanUrl = (await need(`helios-kanban 地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
   const kanbanProjectId =
     (await need(`默认项目 ID（可选，回车跳过${old.kanbanProjectId ? `，当前 ${old.kanbanProjectId}` : ''}）: `)) ||
