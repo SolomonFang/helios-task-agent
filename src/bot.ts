@@ -15,7 +15,7 @@ import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
-import { KanbanWatcher } from './kanban/watcher';
+import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
@@ -488,17 +488,23 @@ async function main(): Promise<void> {
       projectId: agentCfg.kanbanProjectId || undefined,
       intervalMs: intervalSec * 1000,
       statePath: path.join(defaultDataHome(), 'watch-state.json'),
-      notify: async (text) => {
+      notify: async (event) => {
         for (const oid of channel.allowedOpenIds()) {
           try {
-            await channel.notifyOpenId(oid, text);
+            await channel.notifyCardOpenId(oid, buildWatchEventCard(event));
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            console.error(`[watch] 推送失败(${oid}): ${message}`);
+            console.error(`[watch] 卡片推送失败(${oid}): ${message}，降级纯文本`);
+            try {
+              await channel.notifyOpenId(oid, event.text);
+            } catch (err2) {
+              const msg2 = err2 instanceof Error ? err2.message : String(err2);
+              console.error(`[watch] 推送失败(${oid}): ${msg2}`);
+            }
           }
           // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
           try {
-            router.getOrCreate(oid).injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${text}`);
+            router.getOrCreate(oid).injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${event.text}`);
           } catch {
             /* ignore */
           }

@@ -34,13 +34,32 @@ interface KanbanTaskRow {
   last_attempt_failed?: boolean;
 }
 
+export type WatchEventKind = 'review' | 'done' | 'cancelled' | 'failed' | 'approvals';
+
+/** 一条看板状态事件：结构化字段用于渲染飞书卡片，text 为纯文本版本（会话注入 + 卡片发送失败时降级）。 */
+export interface WatchEvent {
+  kind: WatchEventKind;
+  /** 任务标题；approvals 事件为空串。 */
+  title: string;
+  /** 状态迁移描述，如 "todo → inreview"；review 的兜底场景为「跟进执行完成」。 */
+  transition?: string;
+  /** 主链接（review/done 优先 diff 视图，failed 为任务页）。 */
+  url?: string;
+  /** 结果摘要原文（已截断，无前缀）。 */
+  extra?: string;
+  /** 待审批标签列表（kind === 'approvals'）。 */
+  items?: string[];
+  /** 纯文本版本，与卡片内容等价。 */
+  text: string;
+}
+
 export interface KanbanWatcherOptions {
   kanbanUrl: string;
   /** Limit polling to one project; otherwise all projects are watched. */
   projectId?: string;
   intervalMs?: number;
   statePath: string;
-  notify: (text: string) => Promise<void>;
+  notify: (event: WatchEvent) => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -109,7 +128,7 @@ export class KanbanWatcher {
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
         return;
       }
-      const events: string[] = [];
+      const events: WatchEvent[] = [];
       for (const [id, cur] of Object.entries(current.tasks)) {
         const old = prev.tasks[id];
         if (!old) continue; // 新任务不打扰（创建流程本身已有反馈）
@@ -121,9 +140,13 @@ export class KanbanWatcher {
         if (enteredReview || finishedInReview) {
           const transition = enteredReview ? `${old.status} → ${cur.status}` : '跟进执行完成';
           const diffUrl = await this.reviewUrl(cur.projectId, id);
-          events.push(
-            `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${diffUrl}\n点开链接直接 review diff；没问题回复「标记完成」，要继续改直接说`,
-          );
+          events.push({
+            kind: 'review',
+            title: cur.title,
+            transition,
+            url: diffUrl,
+            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${diffUrl}\n点开链接直接 review diff；没问题回复「标记完成」，要继续改直接说`,
+          });
           continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
         }
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
@@ -139,14 +162,22 @@ export class KanbanWatcher {
               /* 详情拉取失败不阻断通知 */
             }
           }
-          events.push(
-            `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n${extra}` : ''}${hint}`,
-          );
+          events.push({
+            kind: cur.status === 'done' ? 'done' : 'cancelled',
+            title: cur.title,
+            transition: `${old.status} → ${cur.status}`,
+            url: link,
+            extra: extra || undefined,
+            text: `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
+          });
         }
         if (old.running && !cur.running && cur.failed) {
-          events.push(
-            `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
-          );
+          events.push({
+            kind: 'failed',
+            title: cur.title,
+            url,
+            text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
+          });
         }
       }
       const newApprovals = current.approvals.filter((a) => !prev.approvals.some((p) => p.id === a.id));
@@ -155,7 +186,12 @@ export class KanbanWatcher {
           .slice(0, 5)
           .map((a) => `· ${a.label}`)
           .join('\n');
-        events.push(`⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`);
+        events.push({
+          kind: 'approvals',
+          title: '',
+          items: newApprovals.slice(0, 5).map((a) => a.label),
+          text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
+        });
       }
       for (const e of events) await this.opts.notify(e);
     } catch (err) {
@@ -208,7 +244,7 @@ export class KanbanWatcher {
     const summary = o.last_attempt_summary ?? o.summary ?? o.result ?? o.last_attempt_output;
     if (typeof summary === 'string' && summary.trim()) {
       const t = summary.trim();
-      return `结果摘要：${t.slice(0, 200)}${t.length > 200 ? '…' : ''}`;
+      return `${t.slice(0, 200)}${t.length > 200 ? '…' : ''}`;
     }
     return '';
   }
@@ -254,4 +290,59 @@ export class KanbanWatcher {
     if (json && json.success === true) return json.data;
     throw new Error(json?.message || 'kanban api error');
   }
+}
+
+/** 看板事件通知的飞书卡片（legacy schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
+export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
+  const meta: Record<WatchEventKind, { template: string; title: string }> = {
+    review: { template: 'yellow', title: '🔍 看板任务待审阅' },
+    done: { template: 'green', title: '✅ 看板任务已完成' },
+    cancelled: { template: 'grey', title: '🚫 看板任务已取消' },
+    failed: { template: 'red', title: '❌ 看板任务执行失败' },
+    approvals: { template: 'blue', title: `⏳ 看板有 ${e.items?.length ?? 0} 个新的待审批项` },
+  };
+  const m = meta[e.kind];
+  const elements: Array<Record<string, unknown>> = [];
+
+  if (e.kind === 'approvals') {
+    // 审批标签来自看板数据，用 plain_text 避免 markdown 字符误解析
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: (e.items ?? []).map((l) => `· ${l}`).join('\n') } });
+    elements.push({ tag: 'hr' });
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '回复「待审批」处理' }] });
+  } else {
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**《${e.title}》**` } });
+    if (e.transition) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${e.transition}\`` } });
+    }
+    if (e.kind === 'failed') {
+      elements.push({ tag: 'div', text: { tag: 'plain_text', content: '请到看板查看日志定位问题。' } });
+    }
+    if (e.extra) {
+      elements.push({ tag: 'div', text: { tag: 'plain_text', content: `结果摘要：${e.extra}` } });
+    }
+    if (e.url) {
+      const btn =
+        e.kind === 'review' ? '🔍 查看 Diff' : e.kind === 'failed' ? '📄 查看日志' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
+      elements.push({
+        tag: 'action',
+        actions: [{ tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url }],
+      });
+    }
+    const hints: Partial<Record<WatchEventKind, string>> = {
+      review: '没问题回复「标记完成」，要继续改直接说',
+      done: '回复「帮我 review」看结果，或「再跟它说一句…」继续迭代',
+      failed: '回复「为什么失败」让它分析原因',
+    };
+    const hint = hints[e.kind];
+    if (hint) {
+      elements.push({ tag: 'hr' });
+      elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: hint }] });
+    }
+  }
+
+  return {
+    config: { wide_screen_mode: true, enable_forward: false },
+    header: { template: m.template, title: { tag: 'plain_text', content: m.title } },
+    elements,
+  };
 }

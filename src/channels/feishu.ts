@@ -338,6 +338,21 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
+  /** Proactive interactive-card push to a user (watcher notifications). */
+  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
+    const res = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: openId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书发卡片失败: code=${res.code} msg=${res.msg}`);
+    }
+  }
+
   async stop(): Promise<void> {
     // WSClient has no public stop in older SDK versions; process exit tears down the socket.
     this.wsClient = null;
