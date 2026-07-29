@@ -6,6 +6,8 @@ export class KanbanMcp {
   readonly command: string;
   readonly args: string[];
   private client: Client | null = null;
+  /** 子进程 stderr 尾部（连接失败时用于诊断已知模式，如端口文件缺失）。 */
+  private stderrTail = '';
   tools: Tool[] = [];
 
   constructor({ command, args }: { command: string; args: string[] }) {
@@ -14,6 +16,7 @@ export class KanbanMcp {
   }
 
   async connect({ timeoutMs = 30000 }: { timeoutMs?: number } = {}): Promise<Tool[]> {
+    this.stderrTail = '';
     const transport = new StdioClientTransport({
       command: this.command,
       args: this.args,
@@ -21,6 +24,7 @@ export class KanbanMcp {
     });
     if (transport.stderr) {
       transport.stderr.on('data', (chunk: Buffer) => {
+        this.stderrTail = (this.stderrTail + chunk.toString()).slice(-2000);
         if (process.env.HTA_DEBUG) process.stderr.write(`[mcp] ${chunk}`);
       });
     }
@@ -41,6 +45,11 @@ export class KanbanMcp {
 
   get connected(): boolean {
     return Boolean(this.client);
+  }
+
+  /** 最近一次 connect 期间捕获的子进程 stderr 尾部（诊断用）。 */
+  getStderrTail(): string {
+    return this.stderrTail.trim();
   }
 
   /** Liveness probe used by the supervisor (listTools is known to be supported). */
@@ -80,4 +89,21 @@ export class KanbanMcp {
       this.client = null;
     }
   }
+}
+
+/**
+ * MCP 启动失败的已知模式诊断：命中返回给用户看的排查提示，未命中返回 null。
+ * 典型场景：本机看板进程运行时间过长，其端口文件（vibe-kanban.port）被系统
+ * 清理，MCP 服务启动即退出（Error: No such file or directory），重启看板即恢复。
+ */
+export function diagnoseMcpFailure(stderrTail: string): string | null {
+  if (!stderrTail) return null;
+  if (/vibe-kanban\.port|Reading port from/i.test(stderrTail) && /No such file|not found|error/i.test(stderrTail)) {
+    return (
+      '提示：MCP 未能发现看板端口文件（vibe-kanban.port）。本机看板进程运行时间过长时，' +
+      '该文件可能已被系统清理——重启 helios-kanban 后重新运行本程序即可恢复' +
+      '（当前已自动降级 hk_cli，看板功能不受影响）。'
+    );
+  }
+  return null;
 }

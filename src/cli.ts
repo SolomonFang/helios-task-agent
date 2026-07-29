@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { c, printBanner, Spinner, renderReply, selectList } from './ui';
 import { ensureConfig } from './config-wizard';
-import { KanbanMcp } from './kanban/mcp';
+import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
@@ -140,6 +140,11 @@ export async function main(): Promise<void> {
     }
   }
   boot.stop();
+  if (!mcpOk) {
+    console.log(c.warn('MCP 连接失败，已自动降级 hk_cli（看板功能不受影响）。'));
+    const hint = diagnoseMcpFailure(mcp.getStderrTail());
+    if (hint) console.log(c.warn(hint));
+  }
 
   const larkOk = checkLarkCli();
 

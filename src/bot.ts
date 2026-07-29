@@ -9,7 +9,7 @@ import readline from 'readline';
 import path from 'path';
 import { currentConfig, feishuBotConfig, userEnvPath, writeEnvFile } from './config';
 import { ensureBotConfig } from './config-wizard';
-import { KanbanMcp } from './kanban/mcp';
+import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
@@ -148,6 +148,8 @@ async function main(): Promise<void> {
     mcpOk = false;
     const message = err instanceof Error ? err.message : String(err);
     process.stdout.write(c.warn(`\rMCP 连接失败，降级 hk_cli：${message}\n`));
+    const hint = diagnoseMcpFailure(mcp.getStderrTail());
+    if (hint) process.stdout.write(c.warn(`${hint}\n`));
   }
 
   const memory = new MemoryStore();

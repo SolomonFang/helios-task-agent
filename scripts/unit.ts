@@ -23,6 +23,7 @@ import { buildTools } from '../src/tools';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
+import { diagnoseMcpFailure } from '../src/kanban/mcp';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -536,6 +537,17 @@ async function main(): Promise<void> {
       friendlyLlmError('The model `gpt-x` does not exist') !== null &&
       friendlyLlmError('fetch failed: ECONNREFUSED 127.0.0.1') !== null &&
       friendlyLlmError('some other weird error') === null
+    );
+  })());
+
+  // ---------- MCP 失败诊断 ----------
+  check('diagnoseMcpFailure 端口文件缺失模式', (() => {
+    const portFileStderr =
+      '2026-07-29T02:22:26Z DEBUG utils::port_file: Reading port from "/var/folders/…/vibe-kanban/vibe-kanban.port"\nError: No such file or directory (os error 2)';
+    return (
+      diagnoseMcpFailure(portFileStderr) !== null &&
+      diagnoseMcpFailure('Error: spawn npx ENOENT') === null &&
+      diagnoseMcpFailure('') === null
     );
   })());
 

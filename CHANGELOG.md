@@ -12,6 +12,7 @@
 
 ### Added
 
+- MCP 连接失败时捕获子进程 stderr 并诊断已知模式：识别「看板端口文件（vibe-kanban.port）被系统清理」场景，提示重启看板即可恢复（此前只有裸 `Connection closed`，无从下手）
 - `helios-task-agent --version` / `-v`（及 `version` 子命令）查看版本；bot 启动日志显示版本号
 - 启动时自动检查 npm 新版本并请示是否更新：结果缓存 24h（`update-check.json`），registry 跟随 `npm config`（含 npmmirror 镜像）、请求 8s 超时、离线静默跳过；`HTA_UPDATE_CHECK=0` 关闭、`HTA_UPDATE_REGISTRY` 显式指定；源码仓库内（本地开发）自动跳过；确认更新后执行 `npm i -g` 并提示重启
 - 配置向导新增 LLM 凭证联网预检（GET /models）：Key 无效可当场重输；端点不支持预检/网络不通时可选择仍保存
