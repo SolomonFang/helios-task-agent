@@ -171,8 +171,14 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const title = typeof args.title === 'string' ? args.title : '';
   const desc = typeof args.description === 'string' ? args.description : '';
   const project = String(args.project_id ?? args.projectId ?? '');
+  const priority = typeof args.priority === 'string' ? args.priority : '';
   const preview = desc.length > 300 ? `${desc.slice(0, 300)}…` : desc;
-  return [`标题：${title}`, project ? `项目：${project}` : '', preview ? `描述预览：\n${preview}` : '']
+  return [
+    `标题：${title}`,
+    project ? `项目：${project}` : '',
+    priority ? `优先级：${priority}` : '',
+    preview ? `描述预览：\n${preview}` : '',
+  ]
     .filter(Boolean)
     .join('\n');
 }

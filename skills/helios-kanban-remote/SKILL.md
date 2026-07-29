@@ -37,12 +37,13 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "找登录相关任务" | `hk tasks list --query 登录` |
 | "260717 迭代" | `hk tasks list --iteration 260717` |
 | "创建任务" | `hk tasks create "标题" --desc "用 @coding-standards"` |
-| "启动任务" | `hk start <task_id> [--executor E] [--variant V]`（听用户指定） |
+| "紧急任务" | `hk tasks create "标题" --priority urgent` |
+| "看紧急/高优任务" | `hk tasks list --priority urgent` |
 | "有哪些分支" | `hk branches <repo_id> [--query develop]` |
 | "多仓启动" | `hk start <task_id> --repo <id1> --repo <id2>:develop` |
 | "有哪些 tag" | `hk tags` |
 | "基于 develop 启动" | `hk start <task_id> --branch develop` |
-| "新建并启动" | 仅当用户明确要求「创建并启动」→ `hk create-and-start "标题"`；默认只 create |
+| "新建并启动" | `hk create-and-start "标题"` |
 | "再跟它说一句…" | `hk follow-up <task_id> <prompt>`（运行中自动排队） |
 | "跑得怎么样了" | `hk status <task_id>` |
 | "有没有待审批" | `hk approvals` → `hk approve/deny … --process <ep_id>` |
@@ -57,7 +58,7 @@ Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so comma
 
 ```text
 1. hk repos / hk branches <repo>
-2. hk tasks create "标题" [--iteration CODE]
+2. hk tasks create "标题" [--iteration CODE] [--priority P]
 3. hk start <task_id> [--branch B] [--repo R]
      └─ or: hk create-and-start "标题" …
 4. hk status <task_id>                  # progress / diff summary
@@ -74,7 +75,7 @@ Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so comma
 | Flag | When omitted |
 |------|----------------|
 | `--executor` | Settings → `config.executor_profile` via `hk info` |
-| `--branch` | `repo.default_target_branch`（**必须**有其一；不再回退 `main`） |
+| `--branch` | `repo.default_target_branch`, else `main` |
 | `--repo` | `HELIOS_KANBAN_REPO_ID` |
 | `--iteration` | `HELIOS_KANBAN_ITERATION` |
 | `project_id` arg | `HELIOS_KANBAN_PROJECT_ID` |
@@ -101,15 +102,13 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **项目**: {name}
 **任务**: {title} (`{id}`)
 **迭代**: {iteration or —}
+**优先级**: {priority}
 **状态**: {status} | running: {yes/no} | failed: {yes/no}
 **分支**: {target_branch}
 **Executor**: {executor}
 **URL**: {url}
-**Diff**: {diff_url}（`hk status` 输出；有 attempt 时非空）
 **下一步**: {suggestion}
 ```
-
-让用户审阅改动时给 `diff_url`（形如 `.../tasks/{task_id}/attempts/{attempt_id}?view=diffs`），不要给裸任务 URL。
 
 ## Executor names (only when user names one)
 
@@ -122,11 +121,14 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 | Reasonix | `REASONIX` |
 | Cursor | `CURSOR_AGENT` |
 | Copilot | `COPILOT` |
-| Kimi | `KIMI_CLI` |
 
 ## Task statuses
 
 `todo` | `inprogress` | `inreview` | `done` | `cancelled`
+
+## Task priorities
+
+`urgent` | `high` | `medium` | `low` — default `medium` when omitted. Cards show a colored badge (red/orange/blue/gray).
 
 ## Safety rules
 

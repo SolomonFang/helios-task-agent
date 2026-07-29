@@ -14,7 +14,7 @@ export function loadSkillDigest(): string {
     for (const sec of sections) {
       const title = (sec.match(/^## (.+)/) || [])[1] || '';
       if (
-        /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Safety rules|Out of scope/i.test(
+        /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Task priorities|Safety rules|Out of scope/i.test(
           title,
         )
       ) {
@@ -131,7 +131,7 @@ ${defaultsBlock}
 - 对话中缓存 project_id / repo_id / task_id，避免重复查询
 - 选项目时阅读 description 与 repos；MCP list 若缺字段，可用 hk_cli \`["projects"]\`（会附带 repos）
 - PR / push / merge / rebase / 看完整 diff：引导用户去桌面 Web UI
-- 让用户审阅改动时给 diff 链接（\`hk status\` 输出的 \`diff_url\`，形如 \`.../tasks/{task_id}/attempts/{attempt_id}?view=diffs\`），不要给裸任务 URL
+- 创建/更新任务支持优先级：urgent / high / medium / low（省略默认 medium）；用户说「紧急」→ urgent，「高优」→ high，「不重要/低优」→ low；未提及则不主动设置
 - 一次创建任务不超过 10 个
 - **创建任务后不要自动 start**；是否启用、用哪个 executor，等用户说
 
@@ -155,7 +155,7 @@ ${defaultsBlock}
 ## 回复风格
 - 使用用户的语言（默认中文）
 - 简洁、结构化；操作完成后用：
-  **项目**: … / **任务**: … (\`id\`) / **迭代**: … / **状态**: … / **下一步**: …
+  **项目**: … / **任务**: … (\`id\`) / **迭代**: … / **优先级**: … / **状态**: … / **下一步**: …
 
 ---
 
