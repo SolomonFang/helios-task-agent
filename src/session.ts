@@ -149,9 +149,9 @@ export class AgentSession {
     this.messages.push({ role: 'system', content: note });
   }
 
-  /** Clear chat history only — memory is kept. */
+  /** Clear chat history only — memory is kept. 重建工具闭包以重置「单会话创建上限」等会话级计数。 */
   clearHistory(): void {
-    this.refreshSystemPrompt();
+    this.applyConfig(this.cfg);
     this.messages = this.messages.slice(0, 1);
   }
 

@@ -19,6 +19,8 @@ import { extractSourceUrls, SourceRegistry } from '../src/source-registry';
 import { MemoryStore } from '../src/memory';
 import { resolveUnderRoot } from '../src/repo-fs';
 import { writeEnvFile } from '../src/config';
+import { buildTools } from '../src/tools';
+import type { KanbanMcp } from '../src/kanban/mcp';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -429,6 +431,31 @@ async function main(): Promise<void> {
     check('.env 合并写保留既有键', content.includes('LLM_API_KEY=sk-test') && content.includes('LLM_BASE_URL=https://x'));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+
+  // ---------- 会话创建上限（buildTools 闭包级） ----------
+  await checkAsync('单会话创建上限 10 个：第 11 个被代码层拦截', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-cap-'));
+    const fakeMcp = {
+      connected: true,
+      tools: [{ name: 'create_task', description: 'create', inputSchema: { type: 'object', properties: {} } }],
+      callTool: async () => '{"success":true,"data":{"id":"11111111-2222-3333-4444-555555555555"}}',
+    } as unknown as KanbanMcp;
+    const { handlers } = buildTools({
+      mcp: fakeMcp,
+      kanbanUrl: 'http://localhost:1',
+      confirm: async () => 'once',
+      registry: new SourceRegistry(tmp),
+      auditHome: tmp,
+    });
+    const create = handlers.get('kanban_create_task')!;
+    let blocked = '';
+    for (let i = 0; i < 11; i++) {
+      const out = await create({ title: `t${i}` });
+      if (out.includes('已达上限')) blocked = out;
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+    assert.ok(blocked.includes('已达上限'), '第 11 次创建应被上限拦截');
+  });
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);
