@@ -6,8 +6,10 @@ import { AgentSession } from './session';
 
 /**
  * One AgentSession per Feishu open_id; serializes messages per user.
+ * 会话数设上限（LRU 淘汰最旧的空闲会话），防止长驻 bot 无界累积。
  */
 export class SessionRouter {
+  private static MAX_SESSIONS = 50;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly cfg: AgentConfig;
@@ -31,15 +33,28 @@ export class SessionRouter {
   }
 
   getOrCreate(openId: string): AgentSession {
-    let session = this.sessions.get(openId);
-    if (!session) {
-      session = new AgentSession(this.cfg, this.mcp, this.mcpOk, {
-        userId: openId,
-        memory: this.memory,
-        confirm: this.confirmFactory?.(openId),
-      });
-      this.sessions.set(openId, session);
+    const existing = this.sessions.get(openId);
+    if (existing) {
+      // LRU touch：移到最新位置
+      this.sessions.delete(openId);
+      this.sessions.set(openId, existing);
+      return existing;
     }
+    if (this.sessions.size >= SessionRouter.MAX_SESSIONS) {
+      // 淘汰最旧的空闲会话；都在忙则暂时超额（极端情况，下轮再淘汰）
+      for (const key of this.sessions.keys()) {
+        if (!this.busy(key)) {
+          this.sessions.delete(key);
+          break;
+        }
+      }
+    }
+    const session = new AgentSession(this.cfg, this.mcp, this.mcpOk, {
+      userId: openId,
+      memory: this.memory,
+      confirm: this.confirmFactory?.(openId),
+    });
+    this.sessions.set(openId, session);
     return session;
   }
 

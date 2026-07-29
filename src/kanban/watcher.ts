@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { writeFilePrivateSync } from '../private-file';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -89,7 +90,7 @@ export class KanbanWatcher {
     try {
       fs.mkdirSync(path.dirname(this.opts.statePath), { recursive: true });
       const tmp = `${this.opts.statePath}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2) + '\n', 'utf8');
+      writeFilePrivateSync(tmp, JSON.stringify(this.state, null, 2) + '\n');
       fs.renameSync(tmp, this.opts.statePath);
     } catch {
       /* best-effort */

@@ -2,8 +2,10 @@
 
 import assert from 'node:assert/strict';
 import fs from 'fs';
+import http from 'http';
 import os from 'os';
 import path from 'path';
+import type { AddressInfo } from 'net';
 import {
   classifyHk,
   classifyLark,
@@ -17,9 +19,12 @@ import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } fr
 import { createAccessChecker, parsePostContent, splitText } from '../src/channels/feishu';
 import { extractSourceUrls, SourceRegistry } from '../src/source-registry';
 import { MemoryStore } from '../src/memory';
-import { resolveUnderRoot } from '../src/repo-fs';
+import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
 import { writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
+import { auditLog } from '../src/audit';
+import { SessionRouter } from '../src/session-router';
+import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
@@ -230,6 +235,17 @@ async function main(): Promise<void> {
     );
   })());
 
+  check('trimHistory 字符预算：超限丢最旧整轮', (() => {
+    const messages: ChatMessage[] = [{ role: 'system', content: 'sys' }];
+    for (let i = 0; i < 10; i++) {
+      messages.push({ role: 'user', content: `u${i}` });
+      messages.push({ role: 'assistant', content: 'x'.repeat(3000) });
+    }
+    trimHistory(messages, 100, 10_000);
+    const chars = messages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : 0), 0);
+    return chars <= 10_000 && messages[0]!.role === 'system' && messages[1]!.role === 'user';
+  })());
+
   check('sanitizeToolPairs 补齐缺失的 tool 响应', (() => {
     const messages: ChatMessage[] = [
       { role: 'system', content: 'sys' },
@@ -323,6 +339,52 @@ async function main(): Promise<void> {
     const answered = toolResponseIds(messages);
     assert.equal(toolCallIds(messages).length, 31);
     for (const id of toolCallIds(messages)) assert.ok(answered.has(id), `缺少 ${id} 的 tool 响应`);
+  });
+
+  await checkAsync('runAgentTurn 上下文超限：自动丢最旧轮次并恢复', async () => {
+    let calls = 0;
+    const client = {
+      chat: {
+        completions: {
+          create: async () => {
+            calls++;
+            if (calls === 1) throw new Error('400 This model\'s maximum context length is 8192 tokens');
+            return finalText('恢复成功');
+          },
+        },
+      },
+    } as unknown as OpenAiClient;
+    const messages: ChatMessage[] = [{ role: 'system', content: 'sys' }];
+    for (let i = 0; i < 5; i++) {
+      messages.push({ role: 'user', content: `old-${i}` });
+      messages.push({ role: 'assistant', content: 'x'.repeat(5000) });
+    }
+    messages.push({ role: 'user', content: '当前问题' });
+    const reply = await runAgentTurn({ client, model: 'm', messages, tools: [], handlers: new Map() });
+    assert.equal(reply, '恢复成功');
+    assert.equal(calls, 2); // 第一次超限，丢轮后第二次成功
+    assert.ok(messages.length < 12); // 旧轮次被丢弃
+    assert.equal(messages[messages.length - 1]!.role, 'assistant');
+  });
+
+  await checkAsync('runAgentTurn 上下文超限不可恢复：有限重试后抛出', async () => {
+    let calls = 0;
+    const client = {
+      chat: {
+        completions: {
+          create: async () => {
+            calls++;
+            throw new Error('maximum context length exceeded');
+          },
+        },
+      },
+    } as unknown as OpenAiClient;
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    await assert.rejects(() => runAgentTurn({ client, model: 'm', messages, tools: [], handlers: new Map() }));
+    assert.ok(calls <= 4, `重试应有上限，实际 ${calls} 次`); // 1 + 最多 3 次重试（且无可丢时提前终止）
   });
 
   // ---------- 飞书通道 ----------
@@ -437,6 +499,76 @@ async function main(): Promise<void> {
     check('.env 合并写保留既有键', content.includes('LLM_API_KEY=sk-test') && content.includes('LLM_BASE_URL=https://x'));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+
+  // ---------- 数据文件权限 0600 ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-perm-'));
+    const mem = new MemoryStore(tmp);
+    mem.setFact('u1', 'k', 'v');
+    const reg = new SourceRegistry(tmp);
+    reg.record('u1', 'https://a.feishu.cn/docx/1', { taskId: 't', title: 'T', createdAt: 'x' });
+    auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, tmp);
+    const modes = ['memory.json', 'synced-sources.json', 'audit.log'].map(
+      (f) => fs.statSync(path.join(tmp, f)).mode & 0o777,
+    );
+    check('数据文件（memory/查重/审计）均为 0600', modes.every((m) => m === 0o600), modes.map((m) => m.toString(8)).join(','));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- repo_fs root 白名单 ----------
+  await checkAsync('repo_fs：root 必须是看板注册仓库（未注册拒绝 / 不可达失败关闭）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-wl-'));
+    const registered = path.join(tmp, 'repo-a');
+    const stranger = path.join(tmp, 'repo-b');
+    fs.mkdirSync(registered, { recursive: true });
+    fs.mkdirSync(stranger, { recursive: true });
+    const server = http.createServer((req, res) => {
+      if (req.url === '/api/repos') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: [{ path: registered }] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const okOut = await runRepoFs(base, { action: 'list', root: registered, path: '.' });
+      assert.ok(okOut.includes('root:'), `已注册仓库应放行，实际：${okOut.slice(0, 120)}`);
+      const subOut = await runRepoFs(base, { action: 'list', root: path.join(registered, '..', 'repo-a'), path: '.' });
+      assert.ok(subOut.includes('root:'), '等价路径应放行');
+      const badOut = await runRepoFs(base, { action: 'list', root: stranger, path: '.' });
+      assert.ok(badOut.includes('不在看板注册仓库内'), `未注册仓库应拒绝，实际：${badOut.slice(0, 120)}`);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+    }
+    const downOut = await runRepoFs('http://127.0.0.1:1', { action: 'list', root: registered, path: '.' });
+    assert.ok(downOut.includes('无法校验仓库白名单'), `kanban 不可达应失败关闭，实际：${downOut.slice(0, 120)}`);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- 会话上限淘汰 ----------
+  check('SessionRouter 会话数上限（LRU 淘汰空闲会话）', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-sess-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1',
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+    for (let i = 0; i < 55; i++) router.getOrCreate(`u${i}`);
+    const size = (router as unknown as { sessions: Map<string, unknown> }).sessions.size;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return size <= 50;
+  })());
 
   // ---------- 会话创建上限（buildTools 闭包级） ----------
   await checkAsync('单会话创建上限 10 个：第 11 个被代码层拦截', async () => {

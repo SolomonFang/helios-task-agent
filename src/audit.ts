@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from './memory';
+import { appendFilePrivateSync } from './private-file';
 
 export type AuditDecision = 'approved' | 'denied' | 'blocked_dup' | 'no_gate' | 'error';
 
@@ -25,7 +26,7 @@ export function auditLog(entry: AuditEntry, homeDir?: string): void {
       detail: entry.detail.slice(0, 1000),
       resultSnippet: entry.resultSnippet?.slice(0, 500),
     };
-    fs.appendFileSync(file, JSON.stringify(record) + '\n', 'utf8');
+    appendFilePrivateSync(file, JSON.stringify(record) + '\n');
   } catch {
     /* ignore */
   }

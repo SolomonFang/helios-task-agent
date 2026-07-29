@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from './memory';
+import { writeFilePrivateSync } from './private-file';
 
 /**
  * Dedupe registry: remembers which Feishu/Lark source URLs already became
@@ -62,7 +63,7 @@ export class SourceRegistry {
     try {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const tmp = `${this.filePath}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', 'utf8');
+      writeFilePrivateSync(tmp, JSON.stringify(this.data, null, 2) + '\n');
       fs.renameSync(tmp, this.filePath);
     } catch {
       /* best-effort */

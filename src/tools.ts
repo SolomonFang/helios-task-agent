@@ -228,7 +228,7 @@ const LOCAL_TOOLS: OpenAiTool[] = [
       description:
         '在 helios-kanban 关联仓库的本机 path 下只读浏览代码（list / read / grep）。' +
         '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否 start 由用户决定。' +
-        '必须提供 root（绝对路径）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
+        '必须提供 root（绝对路径，且必须是看板已注册仓库或其子目录）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
         '禁止用于写文件或访问仓库外路径。',
       parameters: {
         type: 'object',

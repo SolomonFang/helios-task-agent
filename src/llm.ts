@@ -15,6 +15,11 @@ const MAX_TOOL_ROUNDS = 25;
 const MAX_TOOL_CALLS = 30;
 /** Keep system + this many subsequent messages (tool-call chains trimmed intact). */
 export const MAX_HISTORY_MESSAGES = 40;
+/**
+ * 历史字符预算（粗 token 代理，含 tool 输出）：条数上限之外的双保险。
+ * 工具输出单条可达 8000 字符，仅按条数裁剪仍可能撑爆小上下文模型。
+ */
+export const MAX_HISTORY_CHARS = 100_000;
 
 export function createClient(cfg: LlmClientConfig): OpenAiClient {
   return new OpenAI({
@@ -25,27 +30,61 @@ export function createClient(cfg: LlmClientConfig): OpenAiClient {
   });
 }
 
+function messageChars(m: ChatMessage): number {
+  let n = 0;
+  const c = (m as { content?: unknown }).content;
+  if (typeof c === 'string') n += c.length;
+  else if (c != null) n += JSON.stringify(c).length;
+  const tc = (m as { tool_calls?: unknown }).tool_calls;
+  if (tc) n += JSON.stringify(tc).length;
+  return n;
+}
+
+/**
+ * 丢弃最旧的一整轮（system 之后到第二条 user 之前的全部消息，tool 链随轮次整体移除）。
+ * 返回 false 表示只剩当前轮（system + 当前 user + 本轮 assistant/tool），不可再丢。
+ */
+function dropOldestTurn(messages: ChatMessage[]): boolean {
+  if (messages.length <= 3) return false;
+  let idx = -1;
+  for (let i = 2; i < messages.length; i++) {
+    if (messages[i]!.role === 'user') {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) return false;
+  messages.splice(1, idx - 1);
+  sanitizeToolPairs(messages);
+  return true;
+}
+
 /**
  * Trim old turns from the front while preserving the system message and
  * not leaving orphaned `tool` messages without their assistant tool_calls.
- * Mutates `messages` in place.
+ * 双重上限：条数（maxMessages）与总字符（maxChars）。Mutates in place.
  */
-export function trimHistory(messages: ChatMessage[], maxMessages = MAX_HISTORY_MESSAGES): ChatMessage[] {
-  if (messages.length <= maxMessages) return messages;
-  const system = messages[0]!;
-  const rest = messages.slice(1);
-  while (rest.length > maxMessages - 1) {
-    rest.shift();
-    while (rest.length && rest[0]?.role === 'tool') rest.shift();
+export function trimHistory(
+  messages: ChatMessage[],
+  maxMessages = MAX_HISTORY_MESSAGES,
+  maxChars = MAX_HISTORY_CHARS,
+): ChatMessage[] {
+  while (messages.length > maxMessages && messages.length > 3) {
+    if (!dropOldestTurn(messages)) break;
   }
-  while (rest.length && rest[0]?.role !== 'user') {
-    rest.shift();
-    while (rest.length && rest[0]?.role === 'tool') rest.shift();
+  let chars = messages.reduce((n, m) => n + messageChars(m), 0);
+  while (messages.length > 3 && chars > maxChars) {
+    const before = messages.length;
+    if (!dropOldestTurn(messages)) break;
+    chars = messages.reduce((n, m) => n + messageChars(m), 0);
+    if (messages.length === before) break; // 防御：无进展即停
   }
-  messages.length = 0;
-  messages.push(system, ...rest);
   return messages;
 }
+
+/** 模型返回的上下文超限错误特征（用于自动恢复重试）。 */
+const CONTEXT_OVERFLOW_RE =
+  /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|reduce the length|exceed.{0,20}token|token.{0,10}exceed/i;
 
 /**
  * Repair orphaned assistant `tool_calls` (e.g. left by an interrupted turn in
@@ -114,16 +153,39 @@ export async function runAgentTurn({
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     if (signal?.aborted) return '（已被用户中断）';
     if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
-    const resp = await client.chat.completions.create(
-      {
-        model,
-        messages,
-        tools: tools.length ? tools : undefined,
-        tool_choice: tools.length ? 'auto' : undefined,
-        temperature: 0.3,
-      },
-      signal ? { signal } : {},
-    );
+    const createReq = () =>
+      client.chat.completions.create(
+        {
+          model,
+          messages,
+          tools: tools.length ? tools : undefined,
+          tool_choice: tools.length ? 'auto' : undefined,
+          temperature: 0.3,
+        },
+        signal ? { signal } : {},
+      );
+    let resp: Awaited<ReturnType<typeof createReq>> | undefined;
+    try {
+      resp = await createReq();
+    } catch (err) {
+      const msgText = err instanceof Error ? err.message : String(err);
+      if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
+      // 上下文超限自愈：逐级丢弃最旧轮次后重试（最多 3 次），仍失败则抛出原始错误
+      let recovered = false;
+      for (let attempt = 0; attempt < 3 && !recovered; attempt++) {
+        if (!dropOldestTurn(messages)) break;
+        try {
+          resp = await createReq();
+          recovered = true;
+        } catch (retryErr) {
+          const retryText = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          if (!CONTEXT_OVERFLOW_RE.test(retryText)) throw retryErr;
+        }
+      }
+      if (!recovered) throw err;
+      if (onProgress) onProgress({ type: 'continue' });
+    }
+    if (!resp) throw new Error('模型请求失败');
     const msg = resp.choices[0]?.message;
     if (!msg) throw new Error('模型返回为空');
 

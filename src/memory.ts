@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { writeFilePrivateSync } from './private-file';
 import type { MemoryFile, UserMemory } from './types';
 
 const MAX_NOTES = 50;
@@ -46,7 +47,7 @@ export class MemoryStore {
     const dir = path.dirname(this.filePath);
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${this.filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', 'utf8');
+    writeFilePrivateSync(tmp, JSON.stringify(this.data, null, 2) + '\n');
     fs.renameSync(tmp, this.filePath);
   }
 

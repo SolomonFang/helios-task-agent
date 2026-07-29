@@ -9,11 +9,20 @@
 ### Changed
 
 - 批量免问的广告回复词统一为「同类免问」（原「都允许」歧义——像「全部放行」——且与按钮/「恢复确认」术语不一致）；「都允许」作为旧同义词仍兼容可用，终端同时接受输入「同类免问」
+- 对话历史在条数上限（40 条）之外增加字符预算上限（10 万字符），双维度裁剪，避免大工具输出撑爆小上下文模型
+- SessionRouter 会话数上限 50（LRU 淘汰最旧空闲会话），长驻 bot 不再无界累积
+- 更新检查的 npm registry 解析改为异步（不再同步阻塞事件循环）
 
 ### Added
 
+- 模型返回「上下文超限」错误时自动恢复：逐级丢弃最旧对话轮次并重试（最多 3 次），不再直接把 400 抛给用户（不可恢复时保留原有友好指引）
 - MCP 连接失败时捕获子进程 stderr 并诊断已知模式：识别「看板端口文件（vibe-kanban.port）被系统清理」场景，提示重启看板即可恢复（此前只有裸 `Connection closed`，无从下手）
 - `helios-task-agent --version` / `-v`（及 `version` 子命令）查看版本；bot 启动日志显示版本号
+
+### Security
+
+- `repo_fs` 显式 `root` 必须是 helios-kanban 已注册仓库（或其子目录），未注册路径拒绝、kanban 不可达时失败关闭——杜绝借道读取任意本机路径
+- 数据文件统一收紧为 0600：`memory.json`、`synced-sources.json`、`audit.log`、`watch-state.json`、`update-check.json`（此前仅 `.env`）
 - 启动时自动检查 npm 新版本并请示是否更新：结果缓存 24h（`update-check.json`），registry 跟随 `npm config`（含 npmmirror 镜像）、请求 8s 超时、离线静默跳过；`HTA_UPDATE_CHECK=0` 关闭、`HTA_UPDATE_REGISTRY` 显式指定；源码仓库内（本地开发）自动跳过；确认更新后执行 `npm i -g` 并提示重启
 - 配置向导新增 LLM 凭证联网预检（GET /models）：Key 无效可当场重输；端点不支持预检/网络不通时可选择仍保存
 - LLM 请求失败的友好排查指引（401 / 429 / 上下文超长 / 模型不存在 / 连接失败 → 对应操作建议），终端与飞书通道同时生效

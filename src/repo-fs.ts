@@ -62,11 +62,43 @@ export async function fetchRepoPath(
   }
 }
 
+/** 看板已注册仓库的本机路径列表（root 白名单校验用）。 */
+async function fetchRegisteredRepoPaths(kanbanUrl: string): Promise<string[]> {
+  const base = kanbanUrl.replace(/\/+$/, '');
+  const res = await fetch(`${base}/api/repos`, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = (await res.json()) as { success?: boolean; data?: Array<{ path?: string }> };
+  if (json?.success !== true || !Array.isArray(json.data)) return [];
+  return json.data.map((r) => r.path || '').filter(Boolean);
+}
+
+/** root 是否落在看板已注册仓库（或其子目录）内——按真实路径比较。 */
+function isUnderRegisteredRepo(rootAbs: string, repoPaths: string[]): boolean {
+  let realRoot = rootAbs;
+  try {
+    realRoot = fs.realpathSync(rootAbs);
+  } catch {
+    /* 不存在则按字符串路径判定（后续 existsSync 会报错） */
+  }
+  for (const p of repoPaths) {
+    let realRepo = p;
+    try {
+      realRepo = fs.realpathSync(p);
+    } catch {
+      continue;
+    }
+    const rel = path.relative(realRepo, realRoot);
+    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return true;
+  }
+  return false;
+}
+
 export async function resolveRepoRoot(opts: {
   kanbanUrl: string;
   root?: string;
   repoId?: string;
 }): Promise<{ ok: true; root: string } | { ok: false; error: string }> {
+  const explicitRoot = Boolean(opts.root?.trim());
   let root = opts.root?.trim() || '';
   if (!root && opts.repoId?.trim()) {
     const fetched = await fetchRepoPath(opts.kanbanUrl, opts.repoId.trim());
@@ -80,6 +112,24 @@ export async function resolveRepoRoot(opts: {
   }
   if (!fs.statSync(rootAbs).isDirectory()) {
     return { ok: false, error: `本地仓库路径不是目录: ${rootAbs}` };
+  }
+  // 显式 root 必须是看板已注册仓库（或其子目录），防止借道读取任意本机路径；校验失败关闭
+  if (explicitRoot) {
+    let repoPaths: string[];
+    try {
+      repoPaths = await fetchRegisteredRepoPaths(opts.kanbanUrl);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
+      return {
+        ok: false,
+        error: `路径不在看板注册仓库内，已拒绝访问（root=${rootAbs}）。请在看板中注册该仓库，或改用 repo_id 参数。`,
+      };
+    }
   }
   return { ok: true, root: rootAbs };
 }

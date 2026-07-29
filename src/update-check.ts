@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { execFileSync, spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { defaultDataHome } from './memory';
+import { writeFilePrivateSync } from './private-file';
 
 /**
  * npm 版本更新检查：启动时探测 registry 上的更新版本，发现后请示用户是否更新。
@@ -91,30 +92,28 @@ export function compareVersions(a: string, b: string): number {
   return comparePrerelease(pa.pre, pb.pre);
 }
 
-/** 解析检查更新用的 registry：显式 env > npm 用户配置（镜像）> 官方。每进程解析一次。 */
+/** 解析检查更新用的 registry：显式 env > npm 用户配置（镜像）> 官方。每进程解析一次（异步，不阻塞事件循环）。 */
 let cachedRegistry: string | null = null;
-function npmRegistry(): string {
+function npmConfigRegistry(): Promise<string> {
+  return new Promise((resolve) => {
+    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000 }, (err, stdout) => {
+      const out = (stdout || '').trim();
+      resolve(!err && /^https?:\/\//.test(out) ? out : '');
+    });
+  });
+}
+
+async function npmRegistry(): Promise<string> {
   if (cachedRegistry) return cachedRegistry;
   let r = process.env.HTA_UPDATE_REGISTRY || process.env.NPM_CONFIG_REGISTRY || '';
-  if (!r) {
-    try {
-      const out = execFileSync('npm', ['config', 'get', 'registry'], {
-        timeout: 3000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
-        .toString()
-        .trim();
-      if (/^https?:\/\//.test(out)) r = out;
-    } catch {
-      /* npm 不可用则回落官方源 */
-    }
-  }
+  if (!r) r = await npmConfigRegistry();
   cachedRegistry = (r || 'https://registry.npmjs.org').replace(/\/+$/, '');
   return cachedRegistry;
 }
 
 async function fetchDistTags(): Promise<DistTags> {
-  const res = await fetch(`${npmRegistry()}/${PKG_NAME}`, {
+  const registry = await npmRegistry();
+  const res = await fetch(`${registry}/${PKG_NAME}`, {
     headers: { accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
@@ -137,10 +136,9 @@ function readCache(cachePath: string, now: number): DistTags | null {
 function writeCache(cachePath: string, tags: DistTags): void {
   try {
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-    fs.writeFileSync(
+    writeFilePrivateSync(
       cachePath,
       JSON.stringify({ checkedAt: new Date().toISOString(), latest: tags.latest, next: tags.next }) + '\n',
-      'utf8',
     );
   } catch {
     /* best-effort */
