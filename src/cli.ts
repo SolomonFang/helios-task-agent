@@ -159,20 +159,6 @@ export async function main(): Promise<void> {
   });
   if (!larkOk) console.log(c.warn(LARK_CLI_INSTALL_HINT));
 
-  // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效）
-  if (pendingUpdate) {
-    const info = await pendingUpdate;
-    if (info) {
-      const outcome = await promptVersionUpdate({ info, ask, log: (m) => console.log(c.gray(m)) });
-      if (outcome === 'updated') {
-        console.log(c.ok('请重新运行 helios-task-agent 使用新版本。'));
-        await mcp.close();
-        rl.close();
-        process.exit(0);
-      }
-    }
-  }
-
   const spinner = new Spinner('思考中…');
 
   /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
@@ -240,6 +226,18 @@ export async function main(): Promise<void> {
     console.log('\n' + c.gray('再见 👋'));
     void cleanup();
   });
+
+  // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效，复用 cleanup 的看板处置）
+  if (pendingUpdate) {
+    const info = await pendingUpdate;
+    if (info) {
+      const outcome = await promptVersionUpdate({ info, ask, log: (m) => console.log(c.gray(m)) });
+      if (outcome === 'updated') {
+        console.log(c.ok('请重新运行 helios-task-agent 使用新版本。'));
+        await cleanup();
+      }
+    }
+  }
 
   for (;;) {
     const input = await ask(c.info('› '));
