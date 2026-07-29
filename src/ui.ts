@@ -92,16 +92,16 @@ export interface BannerStatus {
 }
 
 export function printBanner(status: BannerStatus): void {
-  process.stdout.write(`${ESC}[2J${ESC}[H`);
+  // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
   const mcpLine =
     status.mcp === 'ok'
       ? c.ok('●') + ` helios-kanban MCP  已连接（${status.mcpToolCount} 个工具）`
       : status.mcp === 'fail'
-        ? c.err('●') + ' helios-kanban MCP  连接失败（降级为 HTTP/hk.sh）'
+        ? c.warn('●') + ' helios-kanban MCP  连接失败（已降级为 HTTP/hk.sh，功能不受影响）'
         : c.warn('●') + ' helios-kanban MCP  连接中…';
   const larkLine = status.larkOk
     ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
-    : c.err('●') + ' lark-cli         未找到，飞书能力不可用';
+    : c.warn('●') + ' lark-cli         未找到，飞书能力不可用（可选，见下方安装提示）';
   const lines = [
     '',
     c.strong(c.info('  ██╗  ██╗███████╗██╗     ██╗ ██████╗ ███████╗')),
@@ -203,7 +203,7 @@ export function selectList({
           return i === current ? `  ${c.info('❯')} ${c.info(text)}` : `    ${text}`;
         }),
         '',
-        c.gray('  ↑/↓ 选择，回车确认，数字键直选'),
+        c.gray('  ↑/↓ 选择，回车确认，数字键直选，Esc 取消'),
       ];
       process.stdout.write(lines.join('\n') + '\n');
       return lines.length;
@@ -252,6 +252,60 @@ export function selectList({
       }
     };
 
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY && !wasRaw) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('keypress', onKeypress);
+  });
+}
+
+/**
+ * 密码式输入（API Key / App Secret 等敏感信息）：回显 * 而非明文，
+ * 避免肩窥与终端滚屏残留。仅用于 TTY；调用方在非 TTY 时应回退普通逐行输入。
+ * 与 selectList 同一模式：调用前需 rl.pause()，结束后 rl.resume()。
+ */
+export function readSecret(promptText: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin;
+    const wasRaw = stdin.isTTY ? Boolean(stdin.isRaw) : false;
+    let buf = '';
+    let settled = false;
+
+    const cleanup = () => {
+      stdin.removeListener('keypress', onKeypress);
+      if (stdin.isTTY && Boolean(stdin.isRaw) !== wasRaw) stdin.setRawMode(wasRaw);
+      stdin.pause();
+    };
+
+    const onKeypress = (str: string | undefined, key: readline.Key | undefined) => {
+      key = key || {};
+      if (key.name === 'return') {
+        if (settled) return;
+        settled = true;
+        process.stdout.write('\n');
+        cleanup();
+        resolve(buf);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        if (settled) return;
+        settled = true;
+        process.stdout.write('\n');
+        cleanup();
+        reject(new Error('已取消'));
+      } else if (key.name === 'backspace') {
+        if (buf.length) {
+          buf = buf.slice(0, -1);
+          process.stdout.write('\b \b');
+        }
+      } else if (str && !key.ctrl && !key.meta) {
+        // 粘贴可能一次进来多个字符（含换行，剔除后整体入库）
+        const clean = str.replace(/[\r\n]/g, '');
+        if (!clean) return;
+        buf += clean;
+        process.stdout.write('*'.repeat([...clean].length));
+      }
+    };
+
+    process.stdout.write(promptText);
     readline.emitKeypressEvents(stdin);
     if (stdin.isTTY && !wasRaw) stdin.setRawMode(true);
     stdin.resume();

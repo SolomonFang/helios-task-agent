@@ -108,7 +108,7 @@ Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failu
 helios-task-agent
 ```
 
-First-run LLM wizard (presets: Kimi Coding / Moonshot CN·INTL / OpenAI / DeepSeek / custom) plus optional kanban defaults — or edit `.env`.
+First-run LLM wizard (presets: Kimi Coding / Moonshot CN·INTL / OpenAI / DeepSeek / custom; API key input is masked) plus optional kanban defaults — or edit `.env`.
 
 ### Feishu DM bot
 
@@ -168,7 +168,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Terminal**: `/help` `/config` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
 
-**Feishu**: `/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop`. Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
+**Feishu**: `/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 

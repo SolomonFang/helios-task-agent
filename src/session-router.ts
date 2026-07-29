@@ -12,6 +12,10 @@ export class SessionRouter {
   private static MAX_SESSIONS = 50;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly queues = new Map<string, Promise<void>>();
+  /** 每用户排队代际：/stop 时 +1，未开始的排队项据此自我丢弃。 */
+  private readonly epochs = new Map<string, number>();
+  /** 每用户「已入队但未开始」的消息数（/stop 丢弃计数与回执用）。 */
+  private readonly queuedCounts = new Map<string, number>();
   private readonly cfg: AgentConfig;
   private readonly mcp: KanbanMcp | null;
   private mcpOk: boolean;
@@ -70,14 +74,35 @@ export class SessionRouter {
     return this.queues.has(openId);
   }
 
+  /** 尚未开始处理的排队消息数（不含正在执行的那条）。 */
+  queuedCount(openId: string): number {
+    return this.queuedCounts.get(openId) || 0;
+  }
+
+  /**
+   * 丢弃该用户所有未开始的排队消息（/stop）：递增代际，轮到它们时自行跳过。
+   * 正在执行的那条不受影响（由调用方用 AbortController 中断）。返回丢弃条数。
+   */
+  cancelQueued(openId: string): number {
+    const n = this.queuedCount(openId);
+    if (n > 0) this.epochs.set(openId, (this.epochs.get(openId) || 0) + 1);
+    return n;
+  }
+
   /** Run work for a user strictly in order (prevents overlapping tool rounds). */
   enqueue(openId: string, work: () => Promise<void>): Promise<void> {
+    const epoch = this.epochs.get(openId) || 0;
     const prev = this.queues.get(openId) || Promise.resolve();
+    this.queuedCounts.set(openId, this.queuedCount(openId) + 1);
     const next = prev
       .catch(() => {
         /* keep chain alive */
       })
-      .then(work);
+      .then(() => {
+        this.queuedCounts.set(openId, Math.max(0, this.queuedCount(openId) - 1));
+        if ((this.epochs.get(openId) || 0) !== epoch) return; // 已被 /stop 丢弃
+        return work();
+      });
     this.queues.set(
       openId,
       next.finally(() => {

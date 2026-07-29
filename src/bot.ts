@@ -19,9 +19,10 @@ import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
-import type { AskFn, InboundMessage, ProgressInfo } from './types';
+import { LOCAL_TOOL_SUMMARY } from './tools';
+import type { AskFn, ChooseFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
-import { c } from './ui';
+import { c, readSecret, selectList } from './ui';
 
 const BOT_HELP = `Helios Task Agent（飞书私聊）
 
@@ -31,7 +32,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /tools    列出当前可用工具
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
-/stop     中断当前任务（待确认的写操作一并取消）
+/stop     中断当前任务（排队消息与待确认写操作一并取消）
 /confirm  查看「同类免问」状态；/confirm on 或回复「恢复确认」撤销免问
 
 写操作安全闸门
@@ -54,7 +55,7 @@ function isCommand(text: string): string | null {
   return t.split(/\s+/)[0]!.toLowerCase();
 }
 
-function createAsk(): { ask: AskFn; close: () => void } {
+function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: () => void } {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -65,8 +66,30 @@ function createAsk(): { ask: AskFn; close: () => void } {
       rl.question(promptText, (ans) => resolve(ans));
       rl.once('close', () => resolve(null));
     });
+  const isTTY = process.stdin.isTTY === true;
+  // 与终端一致的向导体验：箭头选择列表 + 密钥掩码输入（仅 TTY）
+  const askSecret: AskFn | undefined = isTTY
+    ? async (promptText) => {
+        rl.pause();
+        try {
+          return await readSecret(promptText);
+        } finally {
+          rl.resume();
+        }
+      }
+    : undefined;
+  const choose: ChooseFn = async (presets) => {
+    rl.pause();
+    try {
+      return await selectList({ title: '配置模型（OpenAI 兼容协议）：', options: presets });
+    } finally {
+      rl.resume();
+    }
+  };
   return {
     ask,
+    askSecret,
+    choose,
     close: () => rl.close(),
   };
 }
@@ -76,11 +99,11 @@ async function main(): Promise<void> {
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
 
-  const { ask, close } = createAsk();
+  const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
   let feishuCfg;
   try {
-    const ready = await ensureBotConfig(ask, { force: false });
+    const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
     agentCfg = ready.agent;
     feishuCfg = ready.feishu;
     console.log(c.gray(`已加载配置: ${ready.envPath}`));
@@ -320,12 +343,17 @@ async function main(): Promise<void> {
     if (cmd === '/stop') {
       const ctl = running.get(msg.senderId);
       const gateCancelled = confirmations.cancel(msg.senderId);
+      const dropped = router.cancelQueued(msg.senderId);
       if (ctl) {
         ctl.abort();
         running.delete(msg.senderId);
       }
-      if (ctl || gateCancelled) {
-        await channel.reply(msg, `⏹ 已中断当前任务${gateCancelled ? '，待确认的写操作已一并取消' : ''}。`);
+      const stopped: string[] = [];
+      if (ctl) stopped.push('已中断当前任务');
+      if (gateCancelled) stopped.push('待确认的写操作已一并取消');
+      if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
+      if (stopped.length) {
+        await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
       } else {
         await channel.reply(msg, '当前没有正在执行的任务。');
       }
@@ -373,8 +401,19 @@ async function main(): Promise<void> {
       return;
     }
     if (cmd === '/tools') {
-      const session = router.getOrCreate(msg.senderId);
-      await channel.reply(msg, `当前工具（${session.toolNames.length} 个）\n${session.toolNames.join('、')}`);
+      const lines: string[] = [];
+      if (mcpAlive && mcp.tools.length) {
+        lines.push(`看板工具（MCP，${mcp.tools.length} 个）`);
+        for (const t of mcp.tools) {
+          const desc = (t.description || '').split('\n')[0];
+          lines.push(`· kanban_${t.name}${desc ? `  ${desc}` : ''}`);
+        }
+      } else {
+        lines.push('看板工具：MCP 未连接（已自动降级 hk_cli，功能不受影响）');
+      }
+      lines.push('本地工具');
+      for (const t of LOCAL_TOOL_SUMMARY) lines.push(`· ${t.name}  ${t.summary}`);
+      await channel.reply(msg, lines.join('\n'));
       return;
     }
 
@@ -442,7 +481,7 @@ async function main(): Promise<void> {
           await channel.reply(msg, '⏹ 已中断。');
         } else {
           const message = err instanceof Error ? err.message : String(err);
-          const friendly = friendlyLlmError(message);
+          const friendly = friendlyLlmError(message, { channel: 'bot' });
           await channel.reply(
             msg,
             `请求失败: ${message}${friendly ? `\n${friendly}` : ''}\n你的上一条消息未处理：「${text.slice(0, 60)}${text.length > 60 ? '…' : ''}」，可修改后重发。`,
@@ -466,14 +505,16 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 
-  console.log(c.ok('正在建立飞书长连接…'));
+  console.log(c.gray('正在建立飞书长连接…'));
   try {
     await channel.start(handle);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(c.err(`\n长连接失败: ${message}`));
     console.error(c.gray('请确认：开放平台事件订阅已选「长连接」、已添加 im.message.receive_v1、App 已发布/可用。'));
-    console.error(c.gray('改凭证可再运行一次 helios-task-agent bot（会进入向导），或编辑 ' + userEnvPath()));
+    console.error(
+      c.gray(`改凭证请直接编辑 ${userEnvPath()}；或清空其中 FEISHU_APP_ID / FEISHU_APP_SECRET 后重新运行（会重新进入配置向导）。`),
+    );
     await mcp.close();
     await stopKanbanChild(kanbanChild);
     process.exit(1);

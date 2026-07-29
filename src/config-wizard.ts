@@ -23,9 +23,16 @@ export function printFeishuSetupChecklist(): void {
   console.log(c.gray('  （与 Hermes 相同：凭证配好后，本机常驻进程即可收私聊）\n'));
 }
 
-async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentConfig> {
+async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
+    if (ans === null) throw new Error('输入已结束');
+    return ans.trim();
+  };
+  /** 敏感信息（API Key / App Secret）：TTY 下掩码回显；非 TTY 或未提供时回退普通输入。 */
+  const needSecret = async (promptText: string): Promise<string> => {
+    if (!askSecret) return need(promptText);
+    const ans = await askSecret(promptText);
     if (ans === null) throw new Error('输入已结束');
     return ans.trim();
   };
@@ -49,7 +56,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentCon
   if (!baseUrl) {
     baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
   }
-  const apiKeyInput = await need('API Key (sk-...): ');
+  const apiKeyInput = await needSecret('API Key (sk-...，输入显示为 *): ');
   if (!apiKeyInput) throw new Error('API Key 不能为空');
   let apiKey = apiKeyInput;
   const modelInput = await need(`模型名（默认 ${preset.model || '必填'}）: `);
@@ -73,9 +80,10 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentCon
       const retry = (await need('重新输入 API Key？[Y/n]（n = 仍然保存）: ')).toLowerCase();
       if (retry === 'n' || retry === 'no' || retry === '否') break;
     }
-    apiKey = await need('API Key (sk-...): ');
+    apiKey = await needSecret('API Key (sk-...，输入显示为 *): ');
     if (!apiKey) throw new Error('API Key 不能为空');
   }
+  console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
   const kanbanUrl = (await need(`helios-kanban 地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
   const kanbanProjectId =
     (await need(`默认项目 ID（可选，回车跳过${old.kanbanProjectId ? `，当前 ${old.kanbanProjectId}` : ''}）: `)) ||
@@ -104,10 +112,10 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null): Promise<AgentCon
 
 export async function ensureConfig(
   ask: AskFn,
-  { force = false, choose = null }: { force?: boolean; choose?: ChooseFn | null } = {},
+  { force = false, choose = null, askSecret = null }: { force?: boolean; choose?: ChooseFn | null; askSecret?: AskFn | null } = {},
 ): Promise<AgentConfig> {
   if (!force && isConfigured()) return currentConfig();
-  return runWizard(ask, choose);
+  return runWizard(ask, choose, askSecret);
 }
 
 /**
@@ -115,17 +123,23 @@ export async function ensureConfig(
  */
 export async function ensureBotConfig(
   ask: AskFn,
-  { force = false, choose = null }: { force?: boolean; choose?: ChooseFn | null } = {},
+  { force = false, choose = null, askSecret = null }: { force?: boolean; choose?: ChooseFn | null; askSecret?: AskFn | null } = {},
 ): Promise<{ agent: AgentConfig; feishu: FeishuBotConfig; envPath: string }> {
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
     if (ans === null) throw new Error('输入已结束');
     return ans.trim();
   };
+  const needSecret = async (promptText: string): Promise<string> => {
+    if (!askSecret) return need(promptText);
+    const ans = await askSecret(promptText);
+    if (ans === null) throw new Error('输入已结束');
+    return ans.trim();
+  };
 
   let agent = currentConfig();
   if (force || !isConfigured()) {
-    agent = await ensureConfig(ask, { force: true, choose });
+    agent = await ensureConfig(ask, { force: true, choose, askSecret });
   }
 
   let feishu = feishuBotConfig();
@@ -138,7 +152,7 @@ export async function ensureBotConfig(
     for (;;) {
       appId = await need('FEISHU_APP_ID (cli_...): ');
       if (!appId) throw new Error('App ID 不能为空');
-      appSecret = await need('FEISHU_APP_SECRET: ');
+      appSecret = await needSecret('FEISHU_APP_SECRET (输入显示为 *): ');
       if (!appSecret) throw new Error('App Secret 不能为空');
       console.log(c.gray('正在联网校验凭证…'));
       const check = await verifyFeishuApp(appId, appSecret);

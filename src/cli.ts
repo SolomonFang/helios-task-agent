@@ -2,7 +2,7 @@ import readline from 'readline';
 import { type ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { c, printBanner, Spinner, renderReply, selectList } from './ui';
+import { c, printBanner, Spinner, renderReply, selectList, readSecret } from './ui';
 import { ensureConfig } from './config-wizard';
 import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { AgentSession } from './session';
@@ -10,6 +10,7 @@ import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
+import { LOCAL_TOOL_SUMMARY } from './tools';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
@@ -95,10 +96,22 @@ export async function main(): Promise<void> {
       nextLine.drain();
     }
   };
+  /** 密钥掩码输入（仅 TTY；非 TTY 回退普通输入，向导内自动处理） */
+  const askSecret: AskFn | undefined = isTTY
+    ? async (promptText) => {
+        rl.pause();
+        try {
+          return await readSecret(promptText);
+        } finally {
+          rl.resume();
+          nextLine.drain();
+        }
+      }
+    : undefined;
 
   let cfg: AgentConfig;
   try {
-    cfg = await ensureConfig(ask, { choose });
+    cfg = await ensureConfig(ask, { choose, askSecret });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(c.err(`\n配置失败: ${message}`));
@@ -274,17 +287,17 @@ export async function main(): Promise<void> {
         console.log(session.formatMemory());
         console.log('');
       } else if (cmd === '/tools') {
-        if (!mcpOk) {
-          console.log(c.warn('MCP 未连接（降级模式），本地工具：lark_cli / hk_cli / repo_fs / memory_*。'));
-        } else {
+        if (mcpOk) {
           console.log(c.strong('kanban MCP 工具:'));
           for (const t of mcp.tools) {
             console.log(`  ${c.info('kanban_' + t.name)}  ${c.gray((t.description || '').split('\n')[0])}`);
           }
-          console.log(c.strong('本地工具:'));
-          for (const t of ['lark_cli', 'hk_cli', 'repo_fs', 'memory_set', 'memory_get', 'memory_delete', 'memory_note']) {
-            console.log(`  ${c.info(t)}`);
-          }
+        } else {
+          console.log(c.warn('MCP 未连接（已降级 hk_cli，看板功能不受影响）。'));
+        }
+        console.log(c.strong('本地工具:'));
+        for (const t of LOCAL_TOOL_SUMMARY) {
+          console.log(`  ${c.info(t.name)}  ${c.gray(t.summary)}`);
         }
       } else if (cmd === '/status') {
         let kanbanHealth: string;
@@ -307,7 +320,7 @@ export async function main(): Promise<void> {
       } else if (cmd === '/config') {
         try {
           const prevKanbanUrl = cfg.kanbanUrl;
-          cfg = await ensureConfig(ask, { force: true, choose });
+          cfg = await ensureConfig(ask, { force: true, choose, askSecret });
           session.applyConfig(cfg);
           console.log(c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel));
           if (cfg.kanbanUrl !== prevKanbanUrl) {

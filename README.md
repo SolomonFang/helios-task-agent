@@ -109,7 +109,7 @@ tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布�
 helios-task-agent
 ```
 
-首次运行引导配置 LLM（可选预设：Kimi Coding / Moonshot 国内·国际 / OpenAI / DeepSeek / 自定义），并可填写看板 URL / 默认 project、repo、iteration。也可直接编辑 `.env`。
+首次运行引导配置 LLM（可选预设：Kimi Coding / Moonshot 国内·国际 / OpenAI / DeepSeek / 自定义；API Key 掩码输入），并可填写看板 URL / 默认 project、repo、iteration。也可直接编辑 `.env`。
 
 ### 飞书私聊机器人
 
@@ -174,7 +174,7 @@ helios-task-agent-bot
 
 **终端命令**：`/help` `/config` `/status` `/tools` `/memory` `/clear` `/confirm`（查免问状态）`/confirm on`（撤销免问）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
 
-**飞书命令**：`/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop`（中断当前任务并取消待确认写操作）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
+**飞书命令**：`/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
 
 **自然语言示例**：
 

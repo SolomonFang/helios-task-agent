@@ -288,6 +288,15 @@ const LOCAL_TOOLS: OpenAiTool[] = [
   },
 ];
 
+/** /tools 展示的本地工具一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
+export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
+  { name: 'lark_cli', summary: '飞书读写：任务 / 文档 / 群消息等' },
+  { name: 'hk_cli', summary: '看板 HTTP REST 命令（MCP 降级与补充）' },
+  { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
+  { name: 'work_summary', summary: '生成工作总结报告（HTML/MD）' },
+  { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' },
+];
+
 const MEMORY_TOOLS: OpenAiTool[] = [
   {
     type: 'function',

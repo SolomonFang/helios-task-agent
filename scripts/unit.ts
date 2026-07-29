@@ -683,6 +683,65 @@ async function main(): Promise<void> {
     );
   })());
 
+  // ---------- /stop 丢弃排队消息 ----------
+  await checkAsync('SessionRouter.cancelQueued：丢弃未开始的排队项，进行中与后续新消息不受影响', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-queue-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1',
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+    const ran: string[] = [];
+    let releaseFirst!: () => void;
+    const p1 = router.enqueue('u1', async () => {
+      ran.push('first');
+      await new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+    });
+    const p2 = router.enqueue('u1', async () => {
+      ran.push('second');
+    });
+    const p3 = router.enqueue('u1', async () => {
+      ran.push('third');
+    });
+    await new Promise((r) => setImmediate(r)); // 让 first 进入执行态（移出排队计数）
+    assert.equal(router.queuedCount('u1'), 2);
+    assert.equal(router.cancelQueued('u1'), 2);
+    releaseFirst();
+    await Promise.all([p1, p2, p3]);
+    assert.deepEqual(ran, ['first']); // second/third 被丢弃
+    assert.equal(router.queuedCount('u1'), 0);
+    assert.equal(router.cancelQueued('u1'), 0); // 无排队时幂等
+    await router.enqueue('u1', async () => {
+      ran.push('fourth');
+    });
+    assert.deepEqual(ran, ['first', 'fourth']); // 丢弃后新消息正常处理
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- LLM 错误指引按通道区分 ----------
+  check('friendlyLlmError：bot 通道不提不存在的 /config，指向 .env', (() => {
+    const cliHint = friendlyLlmError('401 invalid api key', { channel: 'cli' }) || '';
+    const botHint = friendlyLlmError('401 invalid api key', { channel: 'bot' }) || '';
+    const defaultHint = friendlyLlmError('401 invalid api key') || '';
+    const botNet = friendlyLlmError('fetch failed: ECONNREFUSED', { channel: 'bot' }) || '';
+    return (
+      cliHint.includes('/config') &&
+      defaultHint.includes('/config') &&
+      !botHint.includes('/config') &&
+      botHint.includes('.env') &&
+      botNet.includes('.env')
+    );
+  })());
+
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);
 }
