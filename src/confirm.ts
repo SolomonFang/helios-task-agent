@@ -4,7 +4,7 @@ import type { ConfirmRequest, ConfirmVerdict } from './guard';
 /**
  * Bot-side write confirmation: one pending action per user.
  * The agent's tool handler awaits request(); the user's answer arrives either
- * as a plain text reply（「确认」/「都允许」/「取消」）or as a card button callback
+ * as a plain text reply（「确认」/「同类免问」/「取消」）or as a card button callback
  * (card.action.trigger), resolving the promise — both bypass the per-user
  * message queue, so there is no deadlock.
  *
@@ -188,7 +188,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     value: { hta_confirm: id, decision: 'no' },
   });
   const replyHint = req.batchKey
-    ? '点按钮，或回复「确认」（仅此次）/「都允许」（同类免问 10 分钟）/「取消」。'
+    ? '点按钮，或回复「确认」（仅此次）/「同类免问」（10 分钟）/「取消」。'
     : '点按钮，或回复「确认」/「取消」。';
   return {
     config: { wide_screen_mode: true },

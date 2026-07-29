@@ -146,19 +146,22 @@ async function main(): Promise<void> {
     assert.equal(mgr.resolveFromText('u1', '确认'), 'approved');
     assert.equal(await p1, 'once');
     const p2 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
-    assert.equal(mgr.resolveFromText('u1', '都允许'), 'approved_batch');
+    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'approved_batch');
     assert.equal(await p2, 'batch');
+    const p2b = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
+    assert.equal(mgr.resolveFromText('u1', '都允许'), 'approved_batch'); // 旧同义词保持兼容
+    assert.equal(await p2b, 'batch');
     const p3 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
     assert.equal(mgr.resolveFromText('u1', '取消'), 'denied');
     assert.equal(await p3, false);
     assert.equal(mgr.resolveFromText('u1', '确认'), 'ignored'); // 无 pending
-    assert.deepEqual(settled, ['once', 'batch', 'denied']);
+    assert.deepEqual(settled, ['once', 'batch', 'batch', 'denied']);
   });
 
-  await checkAsync('确认管理器：无 batchKey 时「都允许」不生效', async () => {
+  await checkAsync('确认管理器：无 batchKey 时「同类免问」不生效', async () => {
     const mgr = new ConfirmationManager(async () => undefined);
     const p = mgr.request('u1', { kind: 'lark', summary: 's', detail: 'd' });
-    assert.equal(mgr.resolveFromText('u1', '都允许'), 'ignored'); // 破坏性操作不支持免问
+    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'ignored'); // 破坏性操作不支持免问
     assert.equal(mgr.resolveFromText('u1', '确认'), 'approved');
     assert.equal(await p, 'once');
   });

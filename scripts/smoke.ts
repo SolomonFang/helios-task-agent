@@ -227,14 +227,19 @@ async function main(): Promise<void> {
   );
   check('「确认执行」仍可批准', cm.resolveFromText('u1', '确认执行') === 'approved' && (await prC) === 'once');
 
-  // 「都允许」仅对可批量操作生效；无 batchKey 时按非应答忽略
+  // 「同类免问」仅对可批量操作生效；无 batchKey 时按非应答忽略；旧词「都允许」保持兼容
   const prBatch = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
   check(
-    '文本「都允许」= 同类免问',
-    cm.resolveFromText('u1', '都允许') === 'approved_batch' && (await prBatch) === 'batch',
+    '文本「同类免问」= 批量免问',
+    cm.resolveFromText('u1', '同类免问') === 'approved_batch' && (await prBatch) === 'batch',
+  );
+  const prBatchCompat = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
+  check(
+    '旧词「都允许」兼容',
+    cm.resolveFromText('u1', '都允许') === 'approved_batch' && (await prBatchCompat) === 'batch',
   );
   const prNoKey = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
-  check('无 batchKey 时「都允许」不生效', cm.resolveFromText('u1', '都允许') === 'ignored');
+  check('无 batchKey 时「同类免问」不生效', cm.resolveFromText('u1', '同类免问') === 'ignored');
   cm.resolveFromText('u1', '取消');
   await prNoKey;
 

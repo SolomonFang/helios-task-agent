@@ -197,7 +197,7 @@ export async function main(): Promise<void> {
     const batchHint = req.batchKey ? '，b=同类免问10分钟' : '';
     const ans = await askWithAbort(c.warn(`允许执行？[y=仅此次${batchHint} / N=拒绝] `));
     const t = (ans || '').trim().toLowerCase();
-    const batch = Boolean(req.batchKey) && /^(b|batch|都|都允许|免问)$/.test(t);
+    const batch = Boolean(req.batchKey) && /^(b|batch|都|都允许|免问|同类免问)$/.test(t);
     const once = !batch && /^(y|yes|确认|同意)$/.test(t);
     spinner.start('思考中…（Ctrl+C 中断）');
     if (batch) {

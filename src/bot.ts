@@ -36,7 +36,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
-· 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 都允许 / 取消」
+· 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
 · 普通写操作 120 秒、删除/取消/停止类 300 秒未操作自动拒绝
 
@@ -166,7 +166,7 @@ async function main(): Promise<void> {
           console.error(`[confirm] 卡片发送失败，降级文本: ${message}`);
         }
       }
-      const batchHint = req.batchKey ? '，「都允许」同类免问 10 分钟' : '';
+      const batchHint = req.batchKey ? '，「同类免问」10 分钟内同类操作免问' : '';
       await channel.notifyOpenId(
         openId,
         `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,

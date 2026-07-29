@@ -69,7 +69,7 @@ Feishu Task Center / docs / group chats
 
 | Mechanism | Behavior |
 |-----------|----------|
-| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`; no timeout (Ctrl+C at the prompt rejects). Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 都允许 / 取消 — casual “ok” ignored); timeouts 120s for batchable ops, 300s for destructive ops and Feishu writes; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
+| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`; no timeout (Ctrl+C at the prompt rejects). Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); timeouts 120s for batchable ops, 300s for destructive ops and Feishu writes; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
 | Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt |
