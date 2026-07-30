@@ -34,7 +34,7 @@ import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanb
 import { fetchHealth } from '../src/kanban/kanban-ensure';
 import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
-import { renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
+import { parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
 import { startReportServer } from '../src/report-server';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
@@ -851,6 +851,66 @@ async function main(): Promise<void> {
       page.includes('x&quot;&gt;&lt;script&gt;') &&
       page.includes('main → feat') &&
       !page.includes('<script>')
+    );
+  })());
+
+  check('parseOcrReview：无分隔符时返回 null（回退扁平渲染）', (() => {
+    return parseOcrReview('## 结论\n- ok') === null;
+  })());
+
+  check('parseOcrReview：解析 summary / 意见 / 类别严重度', (() => {
+    const parsed = parseOcrReview(
+      [
+        '[ocr] Summary: 2 file(s) reviewed, 1 comment(s), ~1234 token(s) used, 12s elapsed',
+        '─── src/a/b.js:10-12 ───',
+        '[bug · high] 这里有问题',
+        '',
+        '正文说明',
+        '─── src/c/d.vue:5 ───',
+        '[performance · low] 性能建议',
+      ].join('\n'),
+    );
+    return (
+      parsed !== null &&
+      parsed.summary === '2 file(s) reviewed, 1 comment(s), ~1234 token(s) used, 12s elapsed' &&
+      parsed.intro === '' &&
+      parsed.findings.length === 2 &&
+      parsed.findings[0]!.file === 'src/a/b.js' &&
+      parsed.findings[0]!.lines === '10-12' &&
+      parsed.findings[0]!.category === 'bug' &&
+      parsed.findings[0]!.severity === 'high' &&
+      parsed.findings[0]!.body.includes('这里有问题') &&
+      parsed.findings[0]!.body.includes('正文说明') &&
+      parsed.findings[1]!.lines === '5'
+    );
+  })());
+
+  check('renderReviewHtml：结构化渲染为分级卡片 + diff 高亮 + 转义', (() => {
+    const page = renderReviewHtml({
+      title: 't',
+      attemptId: 'a1',
+      generatedAt: '2026/7/30 12:00:00',
+      text: [
+        '[ocr] Summary: 2 file(s) reviewed, 1 comment(s), ~1234 token(s) used, 12s elapsed',
+        '─── src/a/b.js:10-12 ───',
+        '[bug · high] 这里有 <b> 问题',
+        '',
+        '- const a = 1;',
+        '+ const a = 2;',
+      ].join('\n'),
+    });
+    return (
+      page.includes('共 1 条审查意见') &&
+      page.includes('sev sev-high') &&
+      page.includes('高危 × 1') &&
+      page.includes('src/a/b.js') &&
+      page.includes(':10-12') &&
+      page.includes('&lt;b&gt;') &&
+      !page.includes('<b> 问题') &&
+      page.includes('<span class="dl del">- const a = 1;</span>') &&
+      page.includes('<span class="dl add">+ const a = 2;</span>') &&
+      !page.includes('<li>const a = 1') && // diff 行不得被当成 markdown 列表
+      page.includes('<b>2</b> 审查文件')
     );
   })());
 

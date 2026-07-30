@@ -1,6 +1,14 @@
 /**
  * AI 审查结果 → 自包含 HTML 报告（无外部资源、无 JS），写入数据目录 reviews/，
  * 由 report-server 提供 HTTP 访问，飞书只推链接，避免长文本被截断。
+ *
+ * ocr --format text 的输出有固定结构：
+ *   [ocr] Summary: N file(s) reviewed, M comment(s), ... elapsed
+ *   ─── path/to/file.js:357-360 ───
+ *   [bug · high] 问题描述……
+ *   - 旧代码
+ *   + 新代码
+ * 解析为「概览 + 分级卡片 + diff 高亮」；识别不到该结构时回退为扁平 markdown 渲染。
  */
 
 import fs from 'fs';
@@ -95,25 +103,268 @@ export function renderReviewMarkdown(text: string): string {
   return out.join('\n');
 }
 
-export function renderReviewHtml(data: ReviewReportData): string {
-  const range =
-    data.fromRef && data.toRef ? `${escapeHtml(data.fromRef)} → ${escapeHtml(data.toRef)}` : '';
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI 审查 · ${escapeHtml(data.title || '(无标题)')}</title>
-<style>
+// ---------- ocr 文本结构解析 ----------
+
+export interface ReviewFinding {
+  /** 文件路径。 */
+  file: string;
+  /** 行范围（如 "357-360"），可能为空。 */
+  lines: string;
+  /** 类别原文（bug / performance / …），可能为空。 */
+  category: string;
+  /** 严重度原文（high / medium / …），可能为空。 */
+  severity: string;
+  /** 该条意见的详细说明（含代码片段、修改建议）。 */
+  body: string;
+}
+
+export interface ParsedReview {
+  /** [ocr] Summary: 后的统计原文。 */
+  summary?: string;
+  /** 首个分隔符之前的补充文本（summary 行已剔除）。 */
+  intro: string;
+  findings: ReviewFinding[];
+}
+
+/** 意见分隔符：─── path/to/file:10-20 ───（兼容 ─/—/- 混用，要求含 :行号，避免误匹配分隔线）。 */
+const SEP_RE = /^[─—-]{3,}\s*(.+?:\d+(?:\s*-\s*\d+)?)\s*[─—-]{3,}\s*$/;
+/** 意见首行的类别与严重度标签：[bug · high] … */
+const TAG_RE = /^\[([^\]·•・|]+)\s*[·•・|]\s*([^\]]+)\]\s*(.*)$/;
+
+/** 解析 ocr --format text 输出；无分隔符结构时返回 null（调用方回退扁平渲染）。 */
+export function parseOcrReview(text: string): ParsedReview | null {
+  const lines = text.split('\n');
+  const sepIdx: number[] = [];
+  lines.forEach((l, i) => {
+    if (SEP_RE.test(l)) sepIdx.push(i);
+  });
+  if (!sepIdx.length) return null;
+
+  let summary: string | undefined;
+  const intro = lines
+    .slice(0, sepIdx[0]!)
+    .filter((l) => {
+      const m = /^\s*\[ocr\]\s*Summary:\s*(.+)$/i.exec(l);
+      if (m) {
+        summary = m[1]!.trim();
+        return false;
+      }
+      return true;
+    })
+    .join('\n')
+    .trim();
+
+  const findings: ReviewFinding[] = [];
+  for (let k = 0; k < sepIdx.length; k++) {
+    const head = SEP_RE.exec(lines[sepIdx[k]!]!)![1]!.trim();
+    const lm = /^(.*):(\d+(?:\s*-\s*\d+)?)$/.exec(head);
+    const file = (lm ? lm[1]! : head).trim();
+    const lineRange = lm ? lm[2]!.replace(/\s+/g, '') : '';
+    const bodyLines = lines.slice(sepIdx[k]! + 1, k + 1 < sepIdx.length ? sepIdx[k + 1]! : lines.length);
+    let category = '';
+    let severity = '';
+    while (bodyLines.length && !bodyLines[0]!.trim()) bodyLines.shift();
+    const tag = TAG_RE.exec(bodyLines[0] ?? '');
+    if (tag) {
+      category = tag[1]!.trim();
+      severity = tag[2]!.trim();
+      bodyLines[0] = tag[3]!;
+    }
+    findings.push({ file, lines: lineRange, category, severity, body: bodyLines.join('\n').trim() });
+  }
+  return { summary, intro, findings };
+}
+
+// ---------- 结构化渲染 ----------
+
+interface SevMeta {
+  cls: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  label: string;
+}
+
+const SEV_MAP: Record<string, SevMeta> = {
+  critical: { cls: 'critical', label: '严重' },
+  blocker: { cls: 'critical', label: '严重' },
+  high: { cls: 'high', label: '高危' },
+  major: { cls: 'high', label: '高危' },
+  medium: { cls: 'medium', label: '中危' },
+  low: { cls: 'low', label: '低危' },
+  minor: { cls: 'low', label: '低危' },
+  info: { cls: 'info', label: '提示' },
+  严重: { cls: 'critical', label: '严重' },
+  高: { cls: 'high', label: '高危' },
+  中: { cls: 'medium', label: '中危' },
+  低: { cls: 'low', label: '低危' },
+};
+
+function sevMeta(raw: string): SevMeta {
+  return SEV_MAP[raw.trim().toLowerCase()] ?? { cls: 'info', label: raw.trim() || '提示' };
+}
+
+const CAT_LABELS: Record<string, string> = {
+  bug: '缺陷',
+  security: '安全',
+  performance: '性能',
+  maintainability: '可维护性',
+  readability: '可读性',
+  style: '风格',
+  docs: '文档',
+  test: '测试',
+};
+
+function catLabel(raw: string): string {
+  return CAT_LABELS[raw.trim().toLowerCase()] ?? raw.trim();
+}
+
+/** diff 候选行：带 +/- 前缀，或缩进 ≥2 的代码上下文行。 */
+function isCodeCandidate(line: string): boolean {
+  return /^\s*[+-]\s*\S/.test(line) || /^[ \t]{2,}\S/.test(line);
+}
+
+/** 符号行去掉 +/- 后是否像代码（避免把 markdown 列表误当 diff）。 */
+function looksLikeCode(s: string): boolean {
+  return (
+    /[()[\]{};=]|=>/.test(s) ||
+    /^\s*(const|let|var|function|return|if|for|while|import|export|await|new|this\.)\b/.test(s)
+  );
+}
+
+/** 一段 diff/代码行 → 逐行着色的 <pre>。 */
+function renderDiffBlock(run: string[]): string {
+  const rows = run.map((line) => {
+    const m = /^\s*([+-])/.exec(line);
+    const cls = m ? (m[1] === '+' ? 'add' : 'del') : 'ctx';
+    return `<span class="dl ${cls}">${escapeHtml(line)}</span>`;
+  });
+  return `<pre class="diff">${rows.join('\n')}</pre>`;
+}
+
+/** 意见正文：把连续的 +/- / 缩进代码行识别为 diff 块，其余按 markdown 渲染。 */
+function renderFindingBody(body: string): string {
+  if (!body.trim()) return '<p class="empty">（无详细说明）</p>';
+  const lines = body.split('\n');
+  const out: string[] = [];
+  let prose: string[] = [];
+  let inFence = false;
+  const flush = () => {
+    const chunk = prose.join('\n');
+    prose = [];
+    if (chunk.trim()) out.push(renderReviewMarkdown(chunk));
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      prose.push(line);
+      i++;
+      continue;
+    }
+    if (!inFence && isCodeCandidate(line)) {
+      const run: string[] = [];
+      while (i < lines.length && isCodeCandidate(lines[i]!) && !/^\s*```/.test(lines[i]!)) {
+        run.push(lines[i]!);
+        i++;
+      }
+      const isDiff = run.some((l) => {
+        const m = /^\s*[+-]\s*(.*)$/.exec(l);
+        return m ? looksLikeCode(m[1]!) : false;
+      });
+      if (isDiff) {
+        flush();
+        out.push(renderDiffBlock(run));
+      } else {
+        prose.push(...run);
+      }
+      continue;
+    }
+    prose.push(line);
+    i++;
+  }
+  flush();
+  return out.join('\n');
+}
+
+function renderFinding(f: ReviewFinding, idx: number): string {
+  const sev = sevMeta(f.severity);
+  const cat = catLabel(f.category);
+  const loc = f.lines
+    ? `${escapeHtml(f.file)}<span class="lines">:${escapeHtml(f.lines)}</span>`
+    : escapeHtml(f.file);
+  return `<section class="finding sev-${sev.cls}">
+  <header class="finding-head">
+    <span class="fno">#${idx + 1}</span>
+    <span class="sev sev-${sev.cls}">${escapeHtml(sev.label)}</span>
+    ${cat ? `<span class="cat">${escapeHtml(cat)}</span>` : ''}
+    <code class="loc">${loc}</code>
+  </header>
+  <div class="finding-body md">
+${renderFindingBody(f.body)}
+  </div>
+</section>`;
+}
+
+function fmtNum(v: string): string {
+  return v.replace(/\d+/g, (d) => d.replace(/\B(?=(\d{3})+(?!\d))/g, ','));
+}
+
+/** [ocr] Summary 原文 → 统计 chips；解析不到时原样展示。 */
+function summaryChips(summary: string | undefined): string {
+  if (!summary) return '';
+  const defs: Array<[RegExp, string]> = [
+    [/(\d+)\s*file\(s\)\s*reviewed/i, '审查文件'],
+    [/(\d+)\s*comment\(s\)/i, '意见数'],
+    [/(~?[\d,]+)\s*token\(s\)/i, 'Token 消耗'],
+    [/([\d.hms]+)\s*elapsed/i, '耗时'],
+  ];
+  const chips = defs
+    .map(([re, label]) => {
+      const m = re.exec(summary);
+      return m ? `<span class="chip"><b>${escapeHtml(fmtNum(m[1]!))}</b> ${label}</span>` : '';
+    })
+    .filter(Boolean);
+  return chips.length ? chips.join('') : `<span class="chip">${escapeHtml(summary)}</span>`;
+}
+
+/** 结构化渲染：概览卡（严重度分布 + ocr 统计）+ 逐条意见卡片。 */
+function renderStructured(parsed: ParsedReview): string {
+  const counts = new Map<string, { meta: SevMeta; n: number }>();
+  for (const f of parsed.findings) {
+    const meta = sevMeta(f.severity);
+    const cur = counts.get(meta.cls);
+    if (cur) cur.n++;
+    else counts.set(meta.cls, { meta, n: 1 });
+  }
+  const order: SevMeta['cls'][] = ['critical', 'high', 'medium', 'low', 'info'];
+  const sevBadges = order
+    .map((cls) => counts.get(cls))
+    .filter((c): c is { meta: SevMeta; n: number } => Boolean(c))
+    .map((c) => `<span class="sev sev-${c.meta.cls}">${escapeHtml(c.meta.label)} × ${c.n}</span>`)
+    .join('');
+  const chips = summaryChips(parsed.summary);
+  const parts: string[] = [];
+  parts.push(`<section class="summary">
+    <span class="total">共 ${parsed.findings.length} 条审查意见</span>
+    ${sevBadges}
+    ${chips ? `<span class="chip-group">${chips}</span>` : ''}
+  </section>`);
+  if (parsed.intro) {
+    parts.push(`<article class="report md">\n${renderReviewMarkdown(parsed.intro)}\n  </article>`);
+  }
+  parts.push(`<div class="findings">\n${parsed.findings.map(renderFinding).join('\n')}\n  </div>`);
+  return parts.join('\n  ');
+}
+
+const PAGE_CSS = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    background: #f3f4f8;
+    background: #f1f5f9;
     color: #1f2937;
     line-height: 1.7;
     padding: 32px 16px 64px;
   }
-  .page { max-width: 880px; margin: 0 auto; }
+  .page { max-width: 920px; margin: 0 auto; }
   .hero {
     background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
     color: #fff;
@@ -124,23 +375,120 @@ export function renderReviewHtml(data: ReviewReportData): string {
   .hero h1 { font-size: 24px; letter-spacing: 1px; }
   .hero .subtitle { font-size: 15px; margin-top: 6px; opacity: 0.95; word-break: break-all; }
   .hero .gen { font-size: 12px; margin-top: 8px; opacity: 0.75; }
+
+  /* 概览卡 */
+  .summary {
+    background: #fff;
+    border-radius: 12px;
+    padding: 14px 22px;
+    margin-top: 20px;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .summary .total { font-size: 14px; font-weight: 600; color: #334155; margin-right: 4px; }
+  .summary .chip-group { display: inline-flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+  .chip {
+    font-size: 12.5px;
+    color: #475569;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 999px;
+    padding: 3px 12px;
+    white-space: nowrap;
+  }
+  .chip b { color: #0f172a; font-weight: 600; }
+
+  /* 严重度徽章 */
+  .sev {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 2px 10px;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .sev-critical { background: #fee2e2; color: #b91c1c; }
+  .sev-high { background: #ffedd5; color: #c2410c; }
+  .sev-medium { background: #fef9c3; color: #a16207; }
+  .sev-low { background: #dbeafe; color: #1d4ed8; }
+  .sev-info { background: #e2e8f0; color: #475569; }
+
+  /* 意见卡片 */
+  .finding {
+    background: #fff;
+    border-radius: 12px;
+    padding: 18px 24px;
+    margin-top: 16px;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+    border-left: 4px solid #cbd5e1;
+  }
+  .finding.sev-critical { border-left-color: #dc2626; }
+  .finding.sev-high { border-left-color: #ea580c; }
+  .finding.sev-medium { border-left-color: #d97706; }
+  .finding.sev-low { border-left-color: #3b82f6; }
+  .finding.sev-info { border-left-color: #94a3b8; }
+  .finding-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 10px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid #f1f5f9;
+  }
+  .fno { font-size: 12px; font-weight: 700; color: #94a3b8; }
+  .cat {
+    font-size: 12px;
+    color: #475569;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    padding: 2px 10px;
+    white-space: nowrap;
+  }
+  .loc {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: #334155;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 2px 8px;
+    word-break: break-all;
+  }
+  .loc .lines { color: #94a3b8; }
+
+  /* 回退 / 引言的整段报告卡 */
   .report {
     background: #fff;
     border-radius: 12px;
     padding: 24px 28px;
     margin-top: 20px;
     box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-    font-size: 14px;
-    overflow-wrap: break-word;
   }
-  .report h2 { font-size: 20px; margin: 20px 0 10px; }
-  .report h3 { font-size: 18px; margin: 18px 0 8px; }
-  .report h4 { font-size: 16px; margin: 16px 0 6px; }
-  .report h5, .report h6 { font-size: 14px; margin: 14px 0 6px; }
-  .report p { margin: 6px 0; }
-  .report ul, .report ol { margin: 6px 0 10px 22px; }
-  .report li { margin: 3px 0; }
-  .report code {
+
+  /* markdown 正文（报告卡与意见正文共用） */
+  .md { font-size: 14px; overflow-wrap: break-word; }
+  .md > :first-child { margin-top: 0; }
+  .md h2 {
+    font-size: 19px;
+    margin: 24px 0 12px;
+    padding-left: 10px;
+    border-left: 4px solid #6366f1;
+    line-height: 1.4;
+    color: #111827;
+  }
+  .md h3 { font-size: 16.5px; margin: 20px 0 8px; color: #111827; }
+  .md h4 { font-size: 15px; margin: 16px 0 6px; }
+  .md h5, .md h6 { font-size: 14px; margin: 14px 0 6px; color: #374151; }
+  .md p { margin: 6px 0; }
+  .md ul, .md ol { margin: 6px 0 10px 22px; }
+  .md li { margin: 3px 0; }
+  .md .empty { color: #94a3b8; }
+  .md code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12.5px;
     background: #f3f4f6;
@@ -149,7 +497,7 @@ export function renderReviewHtml(data: ReviewReportData): string {
     padding: 1px 5px;
     color: #374151;
   }
-  .report pre {
+  .md pre {
     background: #0f172a;
     color: #e2e8f0;
     border-radius: 8px;
@@ -157,14 +505,43 @@ export function renderReviewHtml(data: ReviewReportData): string {
     margin: 10px 0;
     overflow-x: auto;
   }
-  .report pre code {
+  .md pre code {
     background: none;
     border: none;
     padding: 0;
     color: inherit;
     font-size: 12.5px;
   }
-</style>
+
+  /* diff 块：逐行红/绿高亮 */
+  .md pre.diff {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    padding: 8px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.65;
+  }
+  .diff .dl { display: block; padding: 0 12px; white-space: pre; }
+  .diff .del { background: #fef2f2; color: #b91c1c; }
+  .diff .add { background: #f0fdf4; color: #15803d; }
+  .diff .ctx { color: #64748b; }
+`;
+
+export function renderReviewHtml(data: ReviewReportData): string {
+  const range =
+    data.fromRef && data.toRef ? `${escapeHtml(data.fromRef)} → ${escapeHtml(data.toRef)}` : '';
+  const parsed = parseOcrReview(data.text);
+  const content = parsed
+    ? renderStructured(parsed)
+    : `<article class="report md">\n${renderReviewMarkdown(data.text)}\n  </article>`;
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 审查 · ${escapeHtml(data.title || '(无标题)')}</title>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
 <div class="page">
@@ -173,9 +550,7 @@ export function renderReviewHtml(data: ReviewReportData): string {
     <p class="subtitle">${escapeHtml(data.title || '(无标题)')}</p>
     <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间 ${escapeHtml(data.generatedAt)}</p>
   </header>
-  <article class="report">
-${renderReviewMarkdown(data.text)}
-  </article>
+  ${content}
 </div>
 </body>
 </html>
