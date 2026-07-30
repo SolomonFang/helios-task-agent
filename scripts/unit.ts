@@ -1217,12 +1217,11 @@ async function main(): Promise<void> {
     await close(notFound.s);
   });
 
-  // ---------- npx 包规格：钉版本 + env 可覆盖 ----------
-  check('npx 包规格钉版本且 env 可覆盖', (() => {
+  // ---------- npx 包规格：kanban 跟随最新版 / ocr 钉版本，env 均可覆盖 ----------
+  check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
-      kanbanPackageSpec({}).startsWith('helios-kanban@') &&
-      !kanbanPackageSpec({}).endsWith('@latest') &&
-      kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@latest' }) === 'helios-kanban@latest' &&
+      kanbanPackageSpec({}) === 'helios-kanban@latest' &&
+      kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36' &&
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&
       ocrPackageSpec({ OCR_PACKAGE: 'x@1' }) === 'x@1'

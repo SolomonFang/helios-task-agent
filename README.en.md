@@ -32,7 +32,7 @@ helios-task-agent --version   # show installed version
 
 **Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
-**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban` (pinned version — override with `HELIOS_KANBAN_PACKAGE`; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (tracks the latest release — pin a version with `HELIOS_KANBAN_PACKAGE` if needed; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
 **Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
 
@@ -156,8 +156,8 @@ Local: `npm start` / `npm run bot`.
 | `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
-| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@0.1.36 --mcp` (pinned) |
-| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP (pinned against supply-chain drift); set `helios-kanban@latest` to float |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
+| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, defaults to `@latest`; set `helios-kanban@x.y.z` to pin |
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
