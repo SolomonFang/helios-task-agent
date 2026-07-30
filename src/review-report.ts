@@ -201,6 +201,16 @@ function sevMeta(raw: string): SevMeta {
   return SEV_MAP[raw.trim().toLowerCase()] ?? { cls: 'info', label: raw.trim() || '提示' };
 }
 
+/**
+ * 是否「全部通过」：结构化解析无任何意见，或 ocr Summary 明确 0 comment(s)。
+ * 无分隔符且也无 0 comment 线索的自由文本不算（无法区分「无意见」与「解析失败」）。
+ */
+export function isAllPass(text: string, parsed?: ParsedReview | null): boolean {
+  const p = parsed === undefined ? parseOcrReview(text) : parsed;
+  if (p) return p.findings.length === 0;
+  return /(?<!\d)0\s*comment\(s\)/i.test(text);
+}
+
 const CAT_LABELS: Record<string, string> = {
   bug: '缺陷',
   security: '安全',
@@ -355,6 +365,37 @@ function renderStructured(parsed: ParsedReview): string {
   return parts.join('\n  ');
 }
 
+/** 全通过时的夸赞语，随机选一句，避免每次都是同一句。 */
+const PASS_PRAISES = [
+  '真棒！代码干净得像刚擦过的玻璃。',
+  '漂亮！AI 都没挑出毛病。',
+  '稳！这次变更一条意见都没有。',
+  '优秀！审查全绿，放心合并。',
+];
+
+/** 从原文中提取 [ocr] Summary 行（parseOcrReview 无分隔符返回 null 时兜底）。 */
+function extractSummary(text: string): string | undefined {
+  const m = /^\s*\[ocr\]\s*Summary:\s*(.+)$/im.exec(text);
+  return m ? m[1]!.trim() : undefined;
+}
+
+/** 全通过渲染：庆祝横幅 + ocr 统计（若有）。 */
+function renderPass(parsed: ParsedReview | null, text: string): string {
+  const praise = PASS_PRAISES[Math.floor(Math.random() * PASS_PRAISES.length)]!;
+  const chips = summaryChips(parsed?.summary ?? extractSummary(text));
+  const parts: string[] = [];
+  parts.push(`<section class="pass-banner">
+    <div class="pass-emoji">🎉</div>
+    <h2>审查全部通过</h2>
+    <p class="pass-praise">${escapeHtml(praise)}</p>
+    ${chips ? `<div class="chip-group pass-chips">${chips}</div>` : ''}
+  </section>`);
+  if (parsed?.intro) {
+    parts.push(`<article class="report md">\n${renderReviewMarkdown(parsed.intro)}\n  </article>`);
+  }
+  return parts.join('\n  ');
+}
+
 const PAGE_CSS = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -375,6 +416,25 @@ const PAGE_CSS = `
   .hero h1 { font-size: 24px; letter-spacing: 1px; }
   .hero .subtitle { font-size: 15px; margin-top: 6px; opacity: 0.95; word-break: break-all; }
   .hero .gen { font-size: 12px; margin-top: 8px; opacity: 0.75; }
+  .hero.pass {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    box-shadow: 0 8px 24px rgba(16, 185, 129, 0.25);
+  }
+
+  /* 全通过庆祝横幅 */
+  .pass-banner {
+    background: linear-gradient(180deg, #ecfdf5 0%, #ffffff 70%);
+    border: 1px solid #a7f3d0;
+    border-radius: 16px;
+    margin-top: 20px;
+    padding: 44px 32px;
+    text-align: center;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+  }
+  .pass-banner .pass-emoji { font-size: 56px; line-height: 1.2; }
+  .pass-banner h2 { font-size: 22px; color: #047857; margin-top: 14px; letter-spacing: 1px; }
+  .pass-banner .pass-praise { font-size: 15px; color: #059669; margin-top: 8px; }
+  .pass-banner .pass-chips { display: inline-flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; justify-content: center; }
 
   /* 概览卡 */
   .summary {
@@ -532,9 +592,12 @@ export function renderReviewHtml(data: ReviewReportData): string {
   const range =
     data.fromRef && data.toRef ? `${escapeHtml(data.fromRef)} → ${escapeHtml(data.toRef)}` : '';
   const parsed = parseOcrReview(data.text);
-  const content = parsed
-    ? renderStructured(parsed)
-    : `<article class="report md">\n${renderReviewMarkdown(data.text)}\n  </article>`;
+  const pass = isAllPass(data.text, parsed);
+  const content = pass
+    ? renderPass(parsed, data.text)
+    : parsed
+      ? renderStructured(parsed)
+      : `<article class="report md">\n${renderReviewMarkdown(data.text)}\n  </article>`;
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -545,8 +608,8 @@ export function renderReviewHtml(data: ReviewReportData): string {
 </head>
 <body>
 <div class="page">
-  <header class="hero">
-    <h1>🤖 AI 代码审查</h1>
+  <header class="hero${pass ? ' pass' : ''}">
+    <h1>${pass ? '✅' : '🤖'} AI 代码审查${pass ? ' · 全部通过' : ''}</h1>
     <p class="subtitle">${escapeHtml(data.title || '(无标题)')}</p>
     <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间 ${escapeHtml(data.generatedAt)}</p>
   </header>

@@ -17,7 +17,7 @@ import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { runAiReview } from './kanban/ai-review';
-import { reviewsDir, writeReviewReport } from './review-report';
+import { isAllPass, reviewsDir, writeReviewReport } from './review-report';
 import { startReportServer, type ReportServer } from './report-server';
 import { checkLarkCli, checkOcrCli, kanbanPackageSpec, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
@@ -300,17 +300,56 @@ async function main(): Promise<void> {
         llm: { baseUrl: agentCfg.llmBaseUrl, apiKey: agentCfg.llmApiKey, model: agentCfg.llmModel },
       });
       if (reportServer) {
-        // 完整结果写入 HTML 报告，飞书只推链接（报告服务随机端口，进程存活期间有效）
+        // 完整结果写入 HTML 报告，飞书推卡片（按钮直达静态报告页，进程存活期间有效）
         const name = writeReviewReport({
           title,
           attemptId,
           generatedAt: new Date().toLocaleString('zh-CN'),
           text: result,
         });
-        await channel.notifyOpenId(
-          openId,
-          `🤖 AI 审查完成：《${title}》\n完整报告：${reportServer.baseUrl}/${name}\n\n已注入会话上下文，可直接回复「按审查意见修一下」。`,
-        );
+        const url = `${reportServer.baseUrl}/${name}`;
+        const pass = isAllPass(result);
+        await channel.notifyCardOpenId(openId, {
+          header: {
+            template: pass ? 'green' : 'blue',
+            title: {
+              tag: 'plain_text',
+              content: pass ? `✅ AI 审查全部通过：《${title}》` : `🤖 AI 审查完成：《${title}》`,
+            },
+          },
+          elements: [
+            {
+              tag: 'div',
+              text: {
+                tag: 'lark_md',
+                content: pass ? '🎉 真棒！本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。',
+              },
+            },
+            {
+              tag: 'action',
+              actions: [
+                {
+                  tag: 'button',
+                  text: { tag: 'plain_text', content: '📄 查看完整报告' },
+                  type: 'primary',
+                  url,
+                  multi_url: { url, android_url: url, ios_url: url, pc_url: url },
+                },
+              ],
+            },
+            {
+              tag: 'note',
+              elements: [
+                {
+                  tag: 'plain_text',
+                  content: pass
+                    ? '已注入会话上下文，可直接继续追问。'
+                    : '已注入会话上下文，可直接回复「按审查意见修一下」。',
+                },
+              ],
+            },
+          ],
+        });
       } else {
         await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
       }

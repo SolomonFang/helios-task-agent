@@ -34,7 +34,7 @@ import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanb
 import { fetchHealth } from '../src/kanban/kanban-ensure';
 import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
-import { parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
+import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
 import { startReportServer } from '../src/report-server';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
@@ -912,6 +912,48 @@ async function main(): Promise<void> {
       !page.includes('<li>const a = 1') && // diff 行不得被当成 markdown 列表
       page.includes('<b>2</b> 审查文件')
     );
+  })());
+
+  check('isAllPass：有意见 false / 0 comment(s) 或空 findings true / 自由文本 false', (() => {
+    const withFindings = [
+      '[ocr] Summary: 1 file(s) reviewed, 1 comment(s), 3s elapsed',
+      '─── src/a.js:1 ───',
+      '[bug · high] 有问题',
+    ].join('\n');
+    const zeroComments = '[ocr] Summary: 3 file(s) reviewed, 0 comment(s), ~500 token(s) used, 8s elapsed';
+    return (
+      isAllPass(withFindings) === false &&
+      isAllPass(zeroComments) === true &&
+      isAllPass('一切正常') === false &&
+      isAllPass('有 10 comment(s) 待处理') === false
+    );
+  })());
+
+  check('renderReviewHtml：全通过时渲染绿色 hero + 庆祝横幅', (() => {
+    const page = renderReviewHtml({
+      title: 't',
+      attemptId: 'a1',
+      generatedAt: '2026/7/30 12:00:00',
+      text: '[ocr] Summary: 2 file(s) reviewed, 0 comment(s), ~800 token(s) used, 6s elapsed',
+    });
+    return (
+      page.includes('<header class="hero pass">') &&
+      page.includes('AI 代码审查 · 全部通过') &&
+      page.includes('class="pass-banner"') &&
+      page.includes('审查全部通过') &&
+      page.includes('<b>0</b> 意见数') &&
+      !page.includes('class="finding') // 无意见卡片
+    );
+  })());
+
+  check('renderReviewHtml：有意见时不出现庆祝横幅', (() => {
+    const page = renderReviewHtml({
+      title: 't',
+      attemptId: 'a1',
+      generatedAt: '2026/7/30 12:00:00',
+      text: ['─── src/a.js:1 ───', '[bug · low] 小问题'].join('\n'),
+    });
+    return !page.includes('class="pass-banner"') && !page.includes('<header class="hero pass">');
   })());
 
   // ---------- AI 审查：报告静态服务 ----------
