@@ -84,14 +84,14 @@ tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布�
 
 约每 60s 轮询看板（可调）。任务进入待审阅（`inreview`，附 diff 直链）/完成（附摘要）/取消、执行失败、新待审批 → 推送飞书并注入会话上下文，可直接回「这个怎么样 / 帮我 review」。
 
-待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），完成后把行级审查意见推回飞书并注入会话（可直接回「按审查意见修一下」）。
+待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），结果要求简体中文输出，完整内容渲染为 HTML 报告（写入数据目录 `reviews/`，由 bot 内置静态服务托管），飞书只推报告链接（长结果不再截断），同时注入会话（可直接回「按审查意见修一下」）。
 
 - 首轮只建基线（`watch-state.json`），重启不重复打扰  
 - **不**推送「新创建的任务」  
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
 
 ## MCP 健康监督（bot）
 

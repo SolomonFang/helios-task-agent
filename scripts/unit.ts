@@ -34,6 +34,8 @@ import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanb
 import { fetchHealth } from '../src/kanban/kanban-ensure';
 import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
+import { renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
+import { startReportServer } from '../src/report-server';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -819,6 +821,64 @@ async function main(): Promise<void> {
   check('sanitizeCliOutput 去 ANSI 与回车', (() => {
     return sanitizeCliOutput('\x1b[32mok\x1b[0m\r\nnext') === 'ok\nnext';
   })());
+
+  // ---------- AI 审查：HTML 报告渲染 ----------
+  check('renderReviewMarkdown：转义 / 标题 / 列表 / 代码围栏 / 行内格式', (() => {
+    const html = renderReviewMarkdown(
+      '## 结论\n- **严重** `a<b>.ts` 有问题\n1. 第一\n2. 第二\n```ts\nconst x = "<raw>";\n```\n普通段落',
+    );
+    return (
+      html.includes('<h3>结论</h3>') &&
+      html.includes('<li><strong>严重</strong> <code>a&lt;b&gt;.ts</code> 有问题</li>') &&
+      html.includes('<ol>\n<li>第一</li>\n<li>第二</li>\n</ol>') &&
+      html.includes('<pre><code>const x = &quot;&lt;raw&gt;&quot;;</code></pre>') &&
+      html.includes('<p>普通段落</p>') &&
+      !html.includes('<b>')
+    );
+  })());
+
+  check('renderReviewHtml：自包含页面，标题与范围转义', (() => {
+    const page = renderReviewHtml({
+      title: 'x"><script>',
+      attemptId: 'a1',
+      fromRef: 'main',
+      toRef: 'feat',
+      generatedAt: '2026/7/30 12:00:00',
+      text: '一切正常',
+    });
+    return (
+      page.startsWith('<!DOCTYPE html>') &&
+      page.includes('x&quot;&gt;&lt;script&gt;') &&
+      page.includes('main → feat') &&
+      !page.includes('<script>')
+    );
+  })());
+
+  // ---------- AI 审查：报告静态服务 ----------
+  await checkAsync('report-server：服务 reviews 目录 html / 拒绝路径穿越与非 html', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-report-'));
+    const name = writeReviewReport(
+      { title: '测试任务', attemptId: 'att-9', generatedAt: '2026/7/30 12:00:00', text: '## 结论\n- ok' },
+      tmp,
+    );
+    const server = await startReportServer(tmp, 'http://127.0.0.1:7964');
+    try {
+      assert.match(name, /^review-.*-att-9-\d+\.html$/);
+      assert.ok(server.baseUrl.startsWith('http://127.0.0.1:'));
+      const ok = await fetch(`${server.baseUrl}/${name}`);
+      const body = await ok.text();
+      assert.equal(ok.status, 200);
+      assert.match(ok.headers.get('content-type') || '', /text\/html/);
+      assert.ok(body.includes('测试任务') && body.includes('<h3>结论</h3>'));
+      for (const bad of ['/../etc/passwd', '/foo.txt', '/a%2f..%2fb.html', '/nope.html']) {
+        const res = await fetch(`${server.baseUrl}${bad}`);
+        assert.equal(res.status, 404, bad);
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   // ---------- AI 审查：attempt 目录解析 ----------
   await checkAsync('resolveReviewTarget：workspace 仓库目录优先 / 原仓库兜底 / 全失败报错', async () => {

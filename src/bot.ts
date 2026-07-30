@@ -17,6 +17,8 @@ import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { runAiReview } from './kanban/ai-review';
+import { reviewsDir, writeReviewReport } from './review-report';
+import { startReportServer, type ReportServer } from './report-server';
 import { checkLarkCli, checkOcrCli, kanbanPackageSpec, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
@@ -165,6 +167,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // AI 审查报告静态服务：报告写入数据目录 reviews/，飞书只推链接，避免长文本截断
+  let reportServer: ReportServer | null = null;
+  try {
+    reportServer = await startReportServer(reviewsDir(), agentCfg.kanbanUrl);
+    console.log(c.gray(`审查报告服务: ${reportServer.baseUrl}`));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(c.warn(`审查报告服务启动失败，AI 审查结果将回退为文本推送: ${message}`));
+  }
+
   const bootLabel = '正在连接 helios-kanban MCP…';
   process.stdout.write(c.gray(bootLabel));
   const mcp = new KanbanMcp({ command: agentCfg.mcpCommand, args: agentCfg.mcpArgs });
@@ -287,7 +299,21 @@ async function main(): Promise<void> {
         title,
         llm: { baseUrl: agentCfg.llmBaseUrl, apiKey: agentCfg.llmApiKey, model: agentCfg.llmModel },
       });
-      await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
+      if (reportServer) {
+        // 完整结果写入 HTML 报告，飞书只推链接（报告服务随机端口，进程存活期间有效）
+        const name = writeReviewReport({
+          title,
+          attemptId,
+          generatedAt: new Date().toLocaleString('zh-CN'),
+          text: result,
+        });
+        await channel.notifyOpenId(
+          openId,
+          `🤖 AI 审查完成：《${title}》\n完整报告：${reportServer.baseUrl}/${name}\n\n已注入会话上下文，可直接回复「按审查意见修一下」。`,
+        );
+      } else {
+        await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
+      }
       // 注入会话：用户追问「按审查意见修一下」时 agent 有上下文
       // （审查结果含被审仓库代码，属外部内容，UNTRUSTED 包裹；注入发生在轮边界）
       try {

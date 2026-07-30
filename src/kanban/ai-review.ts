@@ -176,12 +176,13 @@ export interface RunAiReviewOptions {
   llm: OcrLlmConfig;
   /** 整体超时（默认 15 分钟；ocr 内部单任务超时另计）。 */
   timeoutMs?: number;
-  /** 输出截断上限（默认 4000 字符，飞书推送用）。 */
-  maxOutputChars?: number;
   env?: NodeJS.ProcessEnv;
 }
 
-/** 执行 AI 审查，返回可推送的文本结果；失败抛出带排查信息的中文错误。 */
+/** ocr 无语言选项，通过 --background 注入输出语言要求。 */
+const LANG_HINT = '输出要求：请全程使用简体中文撰写审查结论与建议。';
+
+/** 执行 AI 审查，返回完整文本结果（不截断，完整内容供 HTML 报告使用）；失败抛出带排查信息的中文错误。 */
 export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
   const target = await resolveReviewTarget(opts.kanbanUrl, opts.attemptId);
   const ocr = findOcrCommand(opts.env);
@@ -191,10 +192,9 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
   }
   args.push('--audience', 'agent', '--format', 'text');
   const bg = (opts.title || '').trim();
-  if (bg) args.push('--background', bg.slice(0, 200));
+  args.push('--background', bg ? `${bg.slice(0, 200)}\n${LANG_HINT}` : LANG_HINT);
 
   const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
-  const maxOutput = opts.maxOutputChars ?? 4000;
   let stdout = '';
   let stderr = '';
   try {
@@ -221,6 +221,5 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     throw new Error(`ocr 执行失败：${tail || e.message || '未知错误'}`);
   }
   const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
-  if (!text) return '（ocr 无输出：可能没有可审查的变更）';
-  return text.length > maxOutput ? `${text.slice(0, maxOutput)}\n…（输出过长已截断）` : text;
+  return text || '（ocr 无输出：可能没有可审查的变更）';
 }
