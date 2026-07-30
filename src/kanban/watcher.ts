@@ -45,6 +45,8 @@ export interface WatchEvent {
   transition?: string;
   /** 主链接（review/done 优先 diff 视图，failed 为任务页）。 */
   url?: string;
+  /** review 事件的最新 attempt id：卡片「AI 审查」按钮回传用。 */
+  attemptId?: string;
   /** 结果摘要原文（已截断，无前缀）。 */
   extra?: string;
   /** 待审批标签列表（kind === 'approvals'）。 */
@@ -139,13 +141,14 @@ export class KanbanWatcher {
           cur.status === 'inreview' && old.status === 'inreview' && old.running && !cur.running && !cur.failed;
         if (enteredReview || finishedInReview) {
           const transition = enteredReview ? `${old.status} → ${cur.status}` : '跟进执行完成';
-          const diffUrl = await this.reviewUrl(cur.projectId, id);
+          const review = await this.reviewTarget(cur.projectId, id);
           events.push({
             kind: 'review',
             title: cur.title,
             transition,
-            url: diffUrl,
-            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${diffUrl}\n点开链接直接 review diff；没问题回复「标记完成」，要继续改直接说`,
+            url: review.url,
+            attemptId: review.attemptId,
+            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工 review diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
           });
           continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
         }
@@ -155,7 +158,7 @@ export class KanbanWatcher {
           let extra = '';
           let link = url;
           if (cur.status === 'done') {
-            link = await this.reviewUrl(cur.projectId, id);
+            link = (await this.reviewTarget(cur.projectId, id)).url;
             try {
               extra = KanbanWatcher.pickDetail(await this.api(`/tasks/${id}`));
             } catch {
@@ -259,8 +262,8 @@ export class KanbanWatcher {
     return `${base}/local-projects/${projectId}/tasks/${taskId}`;
   }
 
-  /** 最新 attempt 的 diff 视图地址（优先未归档、按创建时间取最新）；取不到 attempt 时回退任务页。 */
-  private async reviewUrl(projectId: string, taskId: string): Promise<string> {
+  /** 最新 attempt 的 diff 视图地址与 attempt id（优先未归档、按创建时间取最新）；取不到 attempt 时回退任务页。 */
+  private async reviewTarget(projectId: string, taskId: string): Promise<{ url: string; attemptId?: string }> {
     const base = this.taskUrl(projectId, taskId);
     try {
       const list = (await this.api(`/task-attempts?task_id=${taskId}`)) as Array<{
@@ -268,17 +271,18 @@ export class KanbanWatcher {
         archived?: boolean;
         created_at?: string;
       } | null>;
-      if (!Array.isArray(list)) return base;
+      if (!Array.isArray(list)) return { url: base };
       const rows = list.filter((a): a is { id: string; archived?: boolean; created_at?: string } =>
         Boolean(a && a.id),
       );
       const live = rows.filter((a) => !a.archived);
       const pool = live.length ? live : rows;
-      if (!pool.length) return base;
+      if (!pool.length) return { url: base };
       pool.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
-      return `${base}/attempts/${pool[pool.length - 1]!.id}?view=diffs`;
+      const latest = pool[pool.length - 1]!.id;
+      return { url: `${base}/attempts/${latest}?view=diffs`, attemptId: latest };
     } catch {
-      return base; // attempts 拉取失败不阻断通知，回退任务页
+      return { url: base }; // attempts 拉取失败不阻断通知，回退任务页
     }
   }
 
@@ -322,14 +326,22 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     }
     if (e.url) {
       const btn =
-        e.kind === 'review' ? '🔍 查看 Diff' : e.kind === 'failed' ? '📄 查看日志' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
-      elements.push({
-        tag: 'action',
-        actions: [{ tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url }],
-      });
+        e.kind === 'review' ? '🔍 人工审查' : e.kind === 'failed' ? '📄 查看日志' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
+      const actions: Array<Record<string, unknown>> = [
+        { tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url },
+      ];
+      // AI 审查：回传按钮（card.action.trigger），bot 侧调 open-code-review 跑该 attempt 的 diff
+      if (e.kind === 'review' && e.attemptId) {
+        actions.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🤖 AI 审查' },
+          value: { hta_review: e.attemptId, title: e.title.slice(0, 50) },
+        });
+      }
+      elements.push({ tag: 'action', actions });
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
-      review: '没问题回复「标记完成」，要继续改直接说',
+      review: '「AI 审查」让 AI 先过一遍 diff；没问题回复「标记完成」，要继续改直接说',
       done: '回复「帮我 review」看结果，或「再跟它说一句…」继续迭代',
       failed: '回复「为什么失败」让它分析原因',
     };

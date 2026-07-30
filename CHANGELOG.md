@@ -16,6 +16,7 @@
 
 ### Added
 
+- 待审阅卡片新增「🤖 AI 审查」按钮（原「查看 Diff」改名「🔍 人工审查」）：点击后 bot 调 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr review`）审查该 attempt 的 diff——自动定位 workspace 仓库目录（`container_ref`+`agent_working_dir`，兜底看板注册仓库 path），按 merge-base(target_branch)..attempt 分支取 diff（与看板 diff 视图同口径），任务标题作为 `--background` 传入；结果推回飞书并注入会话上下文便于追问/修复；`ocr` 未安装时自动 `npx` 拉取，LLM 默认复用机器人模型配置（显式 `OCR_LLM_*` 或已有 `~/.opencodereview/config.json` 优先），整体超时 15 分钟、按 attempt 去重防连点；`/status` 与启动日志增加 ocr 可用性检查
 - 模型返回「上下文超限」错误时自动恢复：逐级丢弃最旧对话轮次并重试（最多 3 次），不再直接把 400 抛给用户（不可恢复时保留原有友好指引）
 - MCP 连接失败时捕获子进程 stderr 并诊断已知模式：识别「看板端口文件（vibe-kanban.port）被系统清理」场景，提示重启看板即可恢复（此前只有裸 `Connection closed`，无从下手）
 - `helios-task-agent --version` / `-v`（及 `version` 子命令）查看版本；bot 启动日志显示版本号

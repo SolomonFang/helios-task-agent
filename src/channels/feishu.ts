@@ -24,7 +24,7 @@ export interface FeishuInboundMessage extends InboundMessage {
 /** Subset of the card.action.trigger callback payload we care about. */
 export interface FeishuCardAction {
   operator?: { open_id?: string };
-  action?: { value?: { hta_confirm?: string; decision?: string } };
+  action?: { value?: { hta_confirm?: string; decision?: string; hta_review?: string; title?: string } };
 }
 
 export type AccessDecision = 'allow' | 'claim' | 'deny';

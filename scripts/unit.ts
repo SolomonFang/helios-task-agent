@@ -29,6 +29,8 @@ import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
+import { buildWatchEventCard, type WatchEvent } from '../src/kanban/watcher';
+import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -741,6 +743,118 @@ async function main(): Promise<void> {
       botNet.includes('.env')
     );
   })());
+
+  // ---------- 看板事件卡片：人工审查 + AI 审查按钮 ----------
+  check('待审阅卡片：有人工审查链接按钮，有 attemptId 时追加 AI 审查回传按钮', (() => {
+    type Btn = { text?: { content?: string }; url?: string; value?: { hta_review?: string; title?: string } };
+    const actionsOf = (card: Record<string, unknown>): Btn[] => {
+      const els = (card as { elements: Array<{ tag: string; actions?: Btn[] }> }).elements;
+      return els.find((e) => e.tag === 'action')?.actions ?? [];
+    };
+    const base: WatchEvent = {
+      kind: 'review',
+      title: '测试任务',
+      transition: 'inprogress → inreview',
+      url: 'http://kanban/tasks/t1?view=diffs',
+      text: 'x',
+    };
+    const withId = actionsOf(buildWatchEventCard({ ...base, attemptId: 'att-1' }));
+    const withoutId = actionsOf(buildWatchEventCard(base));
+    const done = actionsOf(buildWatchEventCard({ ...base, kind: 'done', attemptId: 'att-1' }));
+    return (
+      withId.length === 2 &&
+      withId[0]!.url === base.url &&
+      withId[0]!.text?.content === '🔍 人工审查' &&
+      withId[1]!.value?.hta_review === 'att-1' &&
+      withId[1]!.value?.title === '测试任务' &&
+      withId[1]!.text?.content === '🤖 AI 审查' &&
+      withoutId.length === 1 && // 无 attemptId 不渲染 AI 审查
+      done.length === 1 // 非 review 事件不渲染 AI 审查
+    );
+  })());
+
+  // ---------- AI 审查：ocr 环境派生 ----------
+  check('buildOcrEnv：派生机器人 LLM 配置 / 显式 OCR_LLM_URL 与已有 OCR 配置优先', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-ocr-'));
+    const llm = { baseUrl: 'https://api.example.com/v1/', apiKey: 'sk-x', model: 'm1' };
+    const derived = buildOcrEnv(llm, {}, tmp);
+    const derivedOk =
+      derived.OCR_LLM_URL === 'https://api.example.com/v1/chat/completions' &&
+      derived.OCR_LLM_TOKEN === 'sk-x' &&
+      derived.OCR_LLM_MODEL === 'm1' &&
+      derived.OCR_USE_ANTHROPIC === 'false';
+    // 已是完整端点不再拼接
+    const full = buildOcrEnv({ ...llm, baseUrl: 'https://api.example.com/v1/chat/completions' }, {}, tmp);
+    const fullOk = full.OCR_LLM_URL === 'https://api.example.com/v1/chat/completions';
+    // 显式 env 优先，不覆盖
+    const explicit = buildOcrEnv(llm, { OCR_LLM_URL: 'https://custom/v1/chat/completions' }, tmp);
+    const explicitOk = explicit.OCR_LLM_URL === 'https://custom/v1/chat/completions' && !explicit.OCR_LLM_TOKEN;
+    // 用户已有 OCR provider 配置 → 不注入
+    fs.mkdirSync(path.join(tmp, '.opencodereview'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.opencodereview', 'config.json'), JSON.stringify({ provider: 'deepseek' }));
+    const respect = buildOcrEnv(llm, {}, tmp);
+    const respectOk = !respect.OCR_LLM_URL;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return derivedOk && fullOk && explicitOk && respectOk;
+  })());
+
+  check('findOcrCommand：PATH 无 ocr 时回退 npx', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-ocrpath-'));
+    const cmd = findOcrCommand({ PATH: tmp });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return cmd.via === 'npx' && cmd.cmd === 'npx' && cmd.prefixArgs.join(' ').includes('open-code-review');
+  })());
+
+  check('sanitizeCliOutput 去 ANSI 与回车', (() => {
+    return sanitizeCliOutput('\x1b[32mok\x1b[0m\r\nnext') === 'ok\nnext';
+  })());
+
+  // ---------- AI 审查：attempt 目录解析 ----------
+  await checkAsync('resolveReviewTarget：workspace 仓库目录优先 / 原仓库兜底 / 全失败报错', async () => {
+    const { execFileSync } = await import('child_process');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-resolve-'));
+    const wsRepo = path.join(tmp, 'ws', 'myrepo');
+    const origRepo = path.join(tmp, 'orig');
+    fs.mkdirSync(wsRepo, { recursive: true });
+    fs.mkdirSync(origRepo, { recursive: true });
+    execFileSync('git', ['init'], { cwd: wsRepo, stdio: 'ignore' });
+    execFileSync('git', ['init'], { cwd: origRepo, stdio: 'ignore' });
+    const routes: Record<string, unknown> = {};
+    const server = http.createServer((req, res) => {
+      const body = routes[req.url || ''];
+      if (body !== undefined) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: body }));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      // container_ref + agent_working_dir 命中最优先
+      routes['/api/task-attempts/a1'] = { container_ref: path.join(tmp, 'ws'), agent_working_dir: 'myrepo', branch: 'er/x' };
+      routes['/api/task-attempts/a1/repos'] = [{ path: origRepo, name: 'myrepo', target_branch: 'dev' }];
+      const t1 = await resolveReviewTarget(base, 'a1');
+      assert.equal(t1.repoDir, wsRepo);
+      assert.equal(t1.fromRef, 'dev');
+      assert.equal(t1.toRef, 'er/x');
+      // workspace 目录不存在 → 兜底原始仓库 path
+      routes['/api/task-attempts/a2'] = { container_ref: path.join(tmp, 'gone'), agent_working_dir: null, branch: 'main' };
+      routes['/api/task-attempts/a2/repos'] = [{ path: origRepo, name: 'myrepo', target_branch: 'main' }];
+      const t2 = await resolveReviewTarget(base, 'a2');
+      assert.equal(t2.repoDir, origRepo);
+      // 全部候选不可用 → 中文报错
+      routes['/api/task-attempts/a3'] = { container_ref: null, agent_working_dir: null, branch: 'main' };
+      routes['/api/task-attempts/a3/repos'] = [];
+      await assert.rejects(() => resolveReviewTarget(base, 'a3'), /无法定位/);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);

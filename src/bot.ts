@@ -16,7 +16,8 @@ import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
-import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { runAiReview } from './kanban/ai-review';
+import { checkLarkCli, checkOcrCli, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
 import { LOCAL_TOOL_SUMMARY } from './tools';
@@ -145,6 +146,9 @@ async function main(): Promise<void> {
   if (!checkLarkCli()) {
     console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}`));
   }
+  if (!checkOcrCli()) {
+    console.log(c.warn(`未检测到 ocr（AI 审查）。${OCR_INSTALL_HINT}`));
+  }
 
   let kanbanChild: ChildProcess | null = null;
   try {
@@ -218,10 +222,19 @@ async function main(): Promise<void> {
     },
   );
 
+  /** 进行中的 AI 审查（按 attempt 去重，防止连点按钮）。 */
+  const aiReviewRunning = new Set<string>();
+
   channel.onCardAction = (action) => {
     const openId = action.operator?.open_id || '';
     const value = action.action?.value || {};
-    if (!openId || !value.hta_confirm) return;
+    if (!openId) return;
+    // 「AI 审查」按钮：异步执行并立即返回（ocr 审查耗时可达数分钟，回调需快速 ACK）
+    if (value.hta_review) {
+      void handleAiReview(openId, String(value.hta_review), String(value.title || ''));
+      return;
+    }
+    if (!value.hta_confirm) return;
     const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), String(value.decision || ''));
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
     else if (result === 'approved_batch')
@@ -254,6 +267,39 @@ async function main(): Promise<void> {
     memory,
     (openId) => (req) => confirmations.request(openId, req),
   );
+
+  /** 执行 AI 审查（open-code-review）并把结果推回飞书；同时注入会话上下文便于追问/修复。 */
+  const handleAiReview = async (openId: string, attemptId: string, title: string): Promise<void> => {
+    if (aiReviewRunning.has(attemptId)) {
+      await channel.notifyOpenId(openId, `🤖 《${title}》的 AI 审查正在进行中，请稍候…`).catch(() => {});
+      return;
+    }
+    aiReviewRunning.add(attemptId);
+    try {
+      await channel.notifyOpenId(
+        openId,
+        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用可能需下载 ocr，耗时稍长）。`,
+      );
+      const result = await runAiReview({
+        kanbanUrl: agentCfg.kanbanUrl,
+        attemptId,
+        title,
+        llm: { baseUrl: agentCfg.llmBaseUrl, apiKey: agentCfg.llmApiKey, model: agentCfg.llmModel },
+      });
+      await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
+      // 注入会话：用户追问「按审查意见修一下」时 agent 有上下文
+      try {
+        router.getOrCreate(openId).injectSystemNote(`[AI 审查完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${result.slice(0, 1500)}`);
+      } catch {
+        /* ignore */
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await channel.notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}`).catch(() => {});
+    } finally {
+      aiReviewRunning.delete(attemptId);
+    }
+  };
 
   const notifyOwners = (text: string): void => {
     for (const oid of channel.allowedOpenIds()) {
@@ -395,6 +441,7 @@ async function main(): Promise<void> {
         `kanban: ${kanbanHealth}（${agentCfg.kanbanUrl}）`,
         `MCP: ${mcpAlive ? `ok（${mcp.tools.length} 个工具）` : '降级 hk_cli（自动重连中）'}`,
         `lark-cli: ${checkLarkCli() ? 'ok' : '未安装（飞书读取不可用）'}`,
+        `ocr: ${checkOcrCli() ? 'ok' : '未安装（AI 审查首次点击自动 npx 拉取）'}`,
         `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
       ];
       await channel.reply(msg, lines.join('\n'));
