@@ -6,6 +6,14 @@
 
 **是否启动 coding agent、用哪个 executor，由你决定。**
 
+## 60 秒上手（终端，零配置）
+
+```bash
+npx helios-task-agent@latest
+```
+
+向导只需选一个 LLM 预设并填 API Key（看板默认值可一路回车跳过）。看板**无需预装**，本机不可达时自动拉起——马上就能建任务、跑任务。飞书机器人是可选升级，见下文。
+
 ## 安装
 
 要求：Node.js ≥ 18，macOS / Linux。

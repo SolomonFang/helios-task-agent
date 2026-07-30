@@ -6,6 +6,14 @@ Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanb
 
 **Whether (and with which executor) to start a coding agent is always your choice.**
 
+## 60-second start (terminal, zero config)
+
+```bash
+npx helios-task-agent@latest
+```
+
+The wizard only asks for one LLM preset + API key (kanban defaults can be skipped with Enter). No need to preinstall the kanban board — it auto-spawns if unreachable, so you can create and run tasks right away. The Feishu bot is an optional upgrade, see below.
+
 ## Install
 
 Requires: Node.js ≥ 18, macOS / Linux.
