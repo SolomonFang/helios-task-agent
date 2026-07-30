@@ -24,12 +24,15 @@ import { writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
 import { auditLog } from '../src/audit';
 import { SessionRouter } from '../src/session-router';
+import { AgentSession } from '../src/session';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
-import { buildWatchEventCard, type WatchEvent } from '../src/kanban/watcher';
+import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
+import { fetchHealth } from '../src/kanban/kanban-ensure';
+import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
@@ -107,6 +110,14 @@ async function main(): Promise<void> {
   check('classifyLark 写动词拦截', classifyLark(['im', 'send', '--text', 'x']) === 'write');
   check('classifyLark api 仅 GET 免确认', classifyLark(['api', 'GET', '/x']) === 'read' && classifyLark(['api', 'POST', '/x']) === 'write');
   check('classifyLark 未知命令安全默认写', classifyLark(['doc', 'frobnicate']) === 'write');
+  check(
+    'classifyLark：update 与夹带 --help 的写命令不免确认',
+    classifyLark(['update']) === 'write' &&
+      classifyLark(['im', 'send', 'ou_x', '--help']) === 'write' &&
+      classifyLark(['im', 'send', '--help']) === 'read' &&
+      classifyLark(['task', 'list', '--help']) === 'read' &&
+      classifyLark(['--help']) === 'read',
+  );
   check('classifyHk 读写分类', classifyHk(['tasks', 'create', 't']) === 'write' && classifyHk(['tasks', 'list']) === 'read' && classifyHk(['start', 'id']) === 'write' && classifyHk(['health']) === 'read');
   check('classifyMcp 读写分类', classifyMcp('list_projects') === 'read' && classifyMcp('create_task') === 'write' && classifyMcp('xyzzy') === 'write');
 
@@ -855,6 +866,206 @@ async function main(): Promise<void> {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  // ---------- 闸门 batchKey：create 可批量，start/approve/delete 始终逐次确认 ----------
+  await checkAsync('闸门 batchKey：create 可批量，start/approve/delete 始终逐次确认', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-batchkey-'));
+    const fakeMcp = {
+      connected: true,
+      tools: [
+        { name: 'create_task', description: '', inputSchema: { type: 'object', properties: {} } },
+        { name: 'start_workspace', description: '', inputSchema: { type: 'object', properties: {} } },
+        { name: 'approve', description: '', inputSchema: { type: 'object', properties: {} } },
+        { name: 'delete_task', description: '', inputSchema: { type: 'object', properties: {} } },
+      ],
+      callTool: async () => '{"success":true}',
+    } as unknown as KanbanMcp;
+    const seen: Array<string | undefined> = [];
+    const { handlers } = buildTools({
+      mcp: fakeMcp,
+      kanbanUrl: 'http://localhost:1',
+      confirm: async (req) => {
+        seen.push(req.batchKey);
+        return 'once';
+      },
+      registry: new SourceRegistry(tmp),
+      auditHome: tmp,
+    });
+    await handlers.get('kanban_create_task')!({ title: 't' });
+    await handlers.get('kanban_start_workspace')!({ task_id: 'x' });
+    await handlers.get('kanban_approve')!({ approval_id: 'a' });
+    await handlers.get('kanban_delete_task')!({ task_id: 'x' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    assert.deepEqual(seen, ['kanban:create_task', undefined, undefined, undefined]);
+  });
+
+  // ---------- SessionRouter.busy：队列清理生效 ----------
+  await checkAsync('SessionRouter.busy：任务完成后恢复空闲（修复清理失效导致的永真）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-busy-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1',
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+    assert.equal(router.busy('u1'), false);
+    let release!: () => void;
+    const p = router.enqueue(
+      'u1',
+      () =>
+        new Promise<void>((r) => {
+          release = r;
+        }),
+    );
+    assert.equal(router.busy('u1'), true);
+    await new Promise((r) => setImmediate(r)); // 等 work 进入执行态（release 被赋值）
+    release();
+    await p;
+    await new Promise((r) => setImmediate(r)); // 等 finally 清理微任务
+    assert.equal(router.busy('u1'), false);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- injectSystemNote：轮边界注入 ----------
+  await checkAsync('injectSystemNote：缓存到轮边界注入，不直接打断历史', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-note-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1', // 不可达：handleUserMessage 预期快速失败
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const session = new AgentSession(cfg, null, false, { userId: 'u1', memory: new MemoryStore(tmp) });
+    const msgs = () => (session as unknown as { messages: ChatMessage[] }).messages;
+    session.injectSystemNote('后台事件-1');
+    assert.equal(msgs().length, 1); // 只有 system prompt，未直接插入
+    try {
+      await session.handleUserMessage('hi');
+    } catch {
+      /* LLM 不可达，预期失败 */
+    }
+    // 失败的用户消息被弹出；note 已在轮边界注入到 system prompt 之后
+    assert.equal(msgs().length, 2);
+    assert.equal(msgs()[1]!.role, 'system');
+    assert.equal(msgs()[1]!.content, '后台事件-1');
+    try {
+      await session.handleUserMessage('hi2');
+    } catch {
+      /* 同上 */
+    }
+    assert.equal(msgs().filter((m) => m.content === '后台事件-1').length, 1); // 不重复注入
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- KanbanWatcher：推送失败不推进快照 ----------
+  await checkAsync('KanbanWatcher：推送失败不推进快照，恢复后重投同一事件且不重复', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-watch-'));
+    let taskStatus = 'inprogress';
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/tasks?')) return json([{ id: 't1', title: '任务1', status: taskStatus }]);
+      if (url.startsWith('/api/task-attempts')) return json([]);
+      if (url.startsWith('/api/tasks/')) return json({ last_attempt_summary: '摘要' });
+      if (url.startsWith('/api/approvals')) return json([]);
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const events: WatchEvent[] = [];
+      let failNext = false;
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        notify: async (e) => {
+          if (failNext) throw new Error('feishu down');
+          events.push(e);
+        },
+      });
+      const tick = (watcher as unknown as { tick: () => Promise<void> }).tick.bind(watcher);
+      await tick(); // 基线，不通知
+      assert.equal(events.length, 0);
+      taskStatus = 'done';
+      failNext = true;
+      await tick(); // 推送失败 → 快照不推进，事件不丢
+      assert.equal(events.length, 0);
+      failNext = false;
+      await tick(); // 恢复后同一事件重投
+      assert.equal(events.length, 1);
+      assert.equal(events[0]!.kind, 'done');
+      await tick(); // 快照已推进，不再重复
+      assert.equal(events.length, 1);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- fetchHealth：2xx + kanban 信封才算健康 ----------
+  await checkAsync('fetchHealth：404 / HTML 占端口不再误判为「看板已在运行」', async () => {
+    const mk = async (handler: http.RequestListener) => {
+      const s = http.createServer(handler);
+      await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+      return { s, url: `http://127.0.0.1:${(s.address() as AddressInfo).port}` };
+    };
+    const close = async (s: http.Server) => {
+      s.closeAllConnections?.();
+      await new Promise((r) => s.close(r));
+    };
+    const kanban = await mk((req, res) => {
+      if (req.url === '/api/health') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"success":true,"data":"OK","error_data":null,"message":null}');
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    assert.equal(await fetchHealth(kanban.url, 1500), true);
+    await close(kanban.s);
+    const html = await mk((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<!DOCTYPE html><html></html>');
+    });
+    assert.equal(await fetchHealth(html.url, 1500), false);
+    await close(html.s);
+    const notFound = await mk((_req, res) => {
+      res.writeHead(404);
+      res.end('not found');
+    });
+    assert.equal(await fetchHealth(notFound.url, 1500), false);
+    await close(notFound.s);
+  });
+
+  // ---------- npx 包规格：钉版本 + env 可覆盖 ----------
+  check('npx 包规格钉版本且 env 可覆盖', (() => {
+    return (
+      kanbanPackageSpec({}).startsWith('helios-kanban@') &&
+      !kanbanPackageSpec({}).endsWith('@latest') &&
+      kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@latest' }) === 'helios-kanban@latest' &&
+      ocrPackageSpec({}).includes('open-code-review@') &&
+      !ocrPackageSpec({}).endsWith('@latest') &&
+      ocrPackageSpec({ OCR_PACKAGE: 'x@1' }) === 'x@1'
+    );
+  })());
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);

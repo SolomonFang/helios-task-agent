@@ -103,12 +103,14 @@ export class SessionRouter {
         if ((this.epochs.get(openId) || 0) !== epoch) return; // 已被 /stop 丢弃
         return work();
       });
-    this.queues.set(
-      openId,
-      next.finally(() => {
-        if (this.queues.get(openId) === next) this.queues.delete(openId);
-      }),
-    );
+    // 注意：必须引用同一个 promise 做比较——之前把 finally 的新 promise 存入 map、
+    // 却与 next 比较，导致清理永不生效（busy() 永真、LRU 找不到空闲会话）。
+    const tracked = next.finally(() => {
+      if (this.queues.get(openId) === tracked) this.queues.delete(openId);
+    });
+    // 链尾 rejection 由调用方（enqueue 返回值）处理；tracked 仅作占位，兜底避免未处理 rejection。
+    tracked.catch(() => {});
+    this.queues.set(openId, tracked);
     return next;
   }
 }

@@ -38,6 +38,8 @@ export class AgentSession {
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
   private messages: ChatMessage[];
+  /** 后台事件缓存（injectSystemNote）：下一个轮边界注入，避免打断 tool_calls 配对。 */
+  private pendingNotes: string[] = [];
 
   constructor(cfg: AgentConfig, mcp: KanbanMcp | null, mcpOk: boolean, opts: AgentSessionOptions = {}) {
     this.cfg = cfg;
@@ -146,7 +148,17 @@ export class AgentSession {
 
   /** Inject a background event (e.g. kanban watcher notification) into the conversation context. */
   injectSystemNote(note: string): void {
-    this.messages.push({ role: 'system', content: note });
+    // 不直接插入历史：后台事件可能在 tool 轮次中途（assistant(tool_calls) 与其 tool
+    // 响应之间，例如等待写确认时）到达，直接 push 会破坏配对，导致后续请求被 API 拒绝。
+    // 缓存到下一轮用户消息的轮边界再注入。
+    this.pendingNotes.push(note);
+  }
+
+  /** 把待注入的后台事件落到历史里（仅允许在轮边界调用）。 */
+  private flushPendingNotes(): void {
+    if (!this.pendingNotes.length) return;
+    for (const note of this.pendingNotes) this.messages.push({ role: 'system', content: note });
+    this.pendingNotes = [];
   }
 
   /** Clear chat history only — memory is kept. 重建工具闭包以重置「单会话创建上限」等会话级计数。 */
@@ -160,6 +172,7 @@ export class AgentSession {
     onProgress?: (info: ProgressInfo) => void,
     signal?: AbortSignal,
   ): Promise<string> {
+    this.flushPendingNotes();
     this.messages.push({ role: 'user', content: text });
     try {
       return await runAgentTurn({

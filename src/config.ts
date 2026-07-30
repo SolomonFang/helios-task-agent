@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import { defaultDataHome } from './memory';
+import { kanbanPackageSpec } from './deps';
 import type { AgentConfig, FeishuBotConfig, LlmPreset } from './types';
 
 /** User-level config (Hermes-style). Wizards write here. */
@@ -105,7 +106,7 @@ export function currentConfig(): AgentConfig {
     llmApiKey: process.env.LLM_API_KEY || '',
     llmModel: process.env.LLM_MODEL || '',
     mcpCommand: process.env.HELIOS_KANBAN_MCP_COMMAND || 'npx',
-    mcpArgs: (process.env.HELIOS_KANBAN_MCP_ARGS || '-y helios-kanban@latest --mcp').split(/\s+/).filter(Boolean),
+    mcpArgs: (process.env.HELIOS_KANBAN_MCP_ARGS || `-y ${kanbanPackageSpec()} --mcp`).split(/\s+/).filter(Boolean),
     kanbanUrl: process.env.HELIOS_KANBAN_URL || 'http://localhost:7964',
     kanbanProjectId: process.env.HELIOS_KANBAN_PROJECT_ID || '',
     kanbanRepoId: process.env.HELIOS_KANBAN_REPO_ID || '',

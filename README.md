@@ -24,7 +24,7 @@ helios-task-agent --version   # 查看版本
 
 **自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
 
-**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban` 拉起。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
+**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban` 拉起（钉版本防供应链漂移，`HELIOS_KANBAN_PACKAGE` 可覆盖；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
 
 **飞书读取需另装 lark-cli**（不装则飞书任务/文档读取不可用，看板功能不受影响）：
 
@@ -71,10 +71,10 @@ tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布�
 | 机制 | 说明 |
 |------|------|
 | 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`b`（同类免问）/`N`；无超时（确认提示时 Ctrl+C = 拒绝）。飞书：确认卡片（仅非破坏性操作带「同类免问 10 分钟」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；可批量操作 120 秒、破坏性操作与飞书写操作 300 秒超时自动拒绝；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
-| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/deny 等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm on` 立即撤销 |
+| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/审批/启动（approve/start）等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm on` 立即撤销 |
 | 会话创建上限 | 单会话最多创建 **10** 个看板任务；超限需 `/clear` 后再建 |
-| 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认 |
-| 防注入标记 | `lark_cli` 读回内容包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
+| 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
+| 防注入标记 | `lark_cli` / 看板工具（MCP、`hk_cli`）/ `repo_fs` 的读回内容，以及看板事件、AI 审查结果的会话注入，统一包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
 | owner 认领 | `FEISHU_ALLOWED_OPEN_IDS` 留空时，首个私聊用户自动成为 owner 并写回 `.env`；其余用户拒绝（每人只提示一次） |
 | 来源查重 | 飞书链接 → 任务映射按用户分桶存 `synced-sources.json`；重复同步拦截。原任务已删则映射清理后可再同步；看板不可达时保守拦截 |
 | 审计日志 | 批准/拒绝/重复拦截（`blocked_dup`）/无闸门/执行结果等追加到 `audit.log`（JSONL） |
@@ -88,13 +88,14 @@ tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布�
 
 - 首轮只建基线（`watch-state.json`），重启不重复打扰  
 - **不**推送「新创建的任务」  
+- 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟
 
 ## MCP 健康监督（bot）
 
-约每 60s 探测 MCP：掉线降级 `hk_cli` 并自动重连（退避至约 5 分钟一次），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.sh`）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
+约每 60s 探测 MCP：连续探测失败才降级 `hk_cli`（避免瞬时抖动误报）并自动重连（退避至约 5 分钟一次；有任务执行中不重连，避免打断进行中的工具调用），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.sh`）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
 
 ## 配置目录（Hermes 风格）
 
@@ -153,7 +154,10 @@ helios-task-agent-bot
 | `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；**留空则首个私聊用户成为 owner** |
 | `HELIOS_KANBAN_URL` | 看板地址，默认 `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | 默认开；本机看板未就绪时自动拉起；`0` 关闭 |
-| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@latest --mcp` |
+| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@0.1.36 --mcp`（钉版本） |
+| `HELIOS_KANBAN_PACKAGE` | 自动拉起 / MCP 默认的 helios-kanban 包规格（钉版本防供应链漂移），设 `helios-kanban@latest` 恢复浮动 |
+| `HELIOS_KANBAN_HOST` | 自动拉起看板的监听地址，默认 `127.0.0.1`（看板 Web/API 无鉴权，谨慎改为 `0.0.0.0`） |
+| `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | 可选默认；设了 `PROJECT_ID` 时 bot 推送只盯该项目 |
 | `HELIOS_TASK_AGENT_HOME` | 数据目录，默认 `~/.helios-task-agent` |
 | `HELIOS_TASK_AGENT_ENV` | 强制 `.env` 路径（写入目标；加载优先级最高） |

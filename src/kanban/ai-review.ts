@@ -3,12 +3,13 @@ import { promisify } from 'util';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { ocrPackageSpec } from '../deps';
 
 /**
  * AI 审查（open-code-review）：根据看板 attempt 定位代码目录，调用 ocr CLI
  * 审查该 attempt 的 diff（merge-base(target_branch)..attempt_branch，与看板 diff 视图同口径）。
  *
- * - ocr 优先用 PATH 上的 `ocr`，未安装则 `npx -y @alibaba-group/open-code-review@latest`（与看板自身的 npx 启动方式一致）。
+ * - ocr 优先用 PATH 上的 `ocr`，未安装则 `npx -y <钉版本包规格>`（OCR_PACKAGE 可覆盖）。
  * - LLM 默认复用机器人的 OpenAI 兼容配置（派生为 OCR_LLM_* 环境变量）；用户已显式配置
  *   OCR_LLM_URL 或 ~/.opencodereview/config.json 里有 provider/llm 时尊重用户配置，不再注入。
  */
@@ -151,13 +152,13 @@ export function buildOcrEnv(
   return out;
 }
 
-/** ocr 可执行命令：PATH 优先，缺失回退 npx（首次会下载，缓存后同速）。 */
+/** ocr 可执行命令：PATH 优先，缺失回退 npx 钉版本包（首次会下载，缓存后同速）。 */
 export function findOcrCommand(env: NodeJS.ProcessEnv = process.env): OcrCommand {
   try {
     execFileSync('ocr', ['version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env });
     return { cmd: 'ocr', prefixArgs: [], via: 'path' };
   } catch {
-    return { cmd: 'npx', prefixArgs: ['-y', '@alibaba-group/open-code-review@latest'], via: 'npx' };
+    return { cmd: 'npx', prefixArgs: ['-y', ocrPackageSpec(env)], via: 'npx' };
   }
 }
 

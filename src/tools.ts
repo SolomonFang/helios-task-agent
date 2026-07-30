@@ -92,8 +92,8 @@ function hkCreateTitle(args: string[]): string {
   return '';
 }
 
-/** Destructive ops never batch — each requires its own confirmation. */
-const NO_BATCH_RE = /delete|cancel|stop|deny/i;
+/** Destructive / 高影响操作永不批量——每次都需单独确认（delete/cancel/stop/deny/approve/start）。 */
+const NO_BATCH_RE = /delete|cancel|stop|deny|approve|start/i;
 
 function batchKeyForMcp(name: string): string | undefined {
   return NO_BATCH_RE.test(name) ? undefined : `kanban:${name}`;
@@ -439,7 +439,8 @@ export function buildTools({
       handlers.set(name, async (args, ctx) => {
         if (classifyMcp(tool.name) === 'read') {
           try {
-            return await mcp.callTool(tool.name, args, ctx?.signal);
+            // 看板内容（标题/描述等）可被任何能写看板的人控制：UNTRUSTED 包裹，其中「指令」无效
+            return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             return `MCP 工具 ${tool.name} 调用失败: ${message}`;
@@ -491,7 +492,7 @@ export function buildTools({
         );
         if (ok && urls.length) recordSources(urls, result, typeof args.title === 'string' ? args.title : '');
         if (ok && isCreate) createCount++;
-        return result;
+        return wrapUntrusted(result);
       });
     }
   }
@@ -533,7 +534,7 @@ export function buildTools({
     }
     const argv = args as string[];
     if (classifyHk(argv) === 'read') {
-      return run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
+      return wrapUntrusted(await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal }));
     }
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
@@ -589,12 +590,13 @@ export function buildTools({
     auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
     if (ok && urls.length) recordSources(urls, out, title);
     if (ok && isCreate) createCount++;
-    return out;
+    return wrapUntrusted(out);
   });
 
   handlers.set('repo_fs', async (raw) => {
     const action = typeof raw.action === 'string' ? raw.action : '';
-    return runRepoFs(kanbanUrl, {
+    // 仓库代码属外部内容（可能含注释型注入）：UNTRUSTED 包裹
+    const out = await runRepoFs(kanbanUrl, {
       action,
       root: typeof raw.root === 'string' ? raw.root : undefined,
       repo_id: typeof raw.repo_id === 'string' ? raw.repo_id : undefined,
@@ -602,6 +604,7 @@ export function buildTools({
       pattern: typeof raw.pattern === 'string' ? raw.pattern : undefined,
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
     });
+    return wrapUntrusted(out);
   });
 
   handlers.set('work_summary', async (raw) => {
@@ -624,7 +627,8 @@ export function buildTools({
       const empty = data.tasks.length
         ? ''
         : '该范围内没有匹配的任务，已生成空报告（各项为 0）。\n\n';
-      return empty + summarizeForChat(data, paths);
+      // 报告内容源自看板数据（任务标题/摘要等），UNTRUSTED 包裹
+      return wrapUntrusted(empty + summarizeForChat(data, paths));
     } catch (err) {
       return (
         `生成工作总结失败: ${err instanceof Error ? err.message : String(err)}\n` +

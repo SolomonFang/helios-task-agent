@@ -27,3 +27,21 @@ export function checkOcrCli(): boolean {
 /** ocr 缺失时的提示文案（AI 审查仍可走 npx 兜底，仅首次较慢）。 */
 export const OCR_INSTALL_HINT =
   '安装：npm i -g @alibaba-group/open-code-review；未安装时点击「AI 审查」会自动 npx 拉取（首次较慢）。LLM 默认复用机器人模型配置，也可用 ocr config provider 单独配置。';
+
+/**
+ * 运行时 npx 拉取的 helios-kanban 包规格。钉版本而非 @latest：
+ * 避免上游新发版本（含 breaking change 或供应链投毒）不经验证直接击穿所有已安装用户。
+ * 可用 HELIOS_KANBAN_PACKAGE 覆盖（如 helios-kanban@latest 恢复浮动）。
+ */
+export const DEFAULT_KANBAN_PACKAGE = 'helios-kanban@0.1.36';
+
+export function kanbanPackageSpec(env: NodeJS.ProcessEnv = process.env): string {
+  return env.HELIOS_KANBAN_PACKAGE || DEFAULT_KANBAN_PACKAGE;
+}
+
+/** ocr（open-code-review）npx 包规格，同理钉版本；OCR_PACKAGE 可覆盖。 */
+export const DEFAULT_OCR_PACKAGE = '@alibaba-group/open-code-review@1.8.0';
+
+export function ocrPackageSpec(env: NodeJS.ProcessEnv = process.env): string {
+  return env.OCR_PACKAGE || DEFAULT_OCR_PACKAGE;
+}

@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
+import { kanbanPackageSpec } from '../deps';
 
 export interface KanbanEnsureResult {
   /** True if we spawned a new process. */
@@ -15,7 +16,8 @@ function isLocalHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0';
 }
 
-async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<boolean> {
+/** 导出以便单测直接验证健康判定（单测起本地 HTTP server 模拟各类占用者）。 */
+export async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<boolean> {
   const root = baseUrl.replace(/\/$/, '');
   const paths = ['/api/health', '/health'];
   for (const p of paths) {
@@ -30,8 +32,20 @@ async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<boolean> 
         const u = new URL(root + p);
         const lib = u.protocol === 'https:' ? https : http;
         const req = lib.get(u, { timeout: timeoutMs }, (res) => {
-          res.resume();
-          done(Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 500));
+          // 仅 2xx 且响应体是 kanban API 信封（"success":true）才算健康：
+          // 任意占用端口的 HTTP 服务（含对这些路径回 404/HTML 的）不得误判为「看板已在运行」
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+            res.resume();
+            done(false);
+            return;
+          }
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk: string) => {
+            if (body.length < 8192) body += chunk;
+          });
+          res.on('end', () => done(body.includes('"success":true')));
+          res.on('error', () => done(false));
         });
         req.on('error', () => done(false));
         req.on('timeout', () => {
@@ -93,11 +107,12 @@ export async function ensureKanbanRunning(
     throw new Error(`helios-kanban 未运行（${url}）。非本机地址不会自动启动，请先手动拉起看板服务。`);
   }
 
-  log(`未检测到看板，正在启动 npx helios-kanban（PORT=${port}）…`);
-  const child = spawn('npx', ['-y', 'helios-kanban'], {
+  log(`未检测到看板，正在启动 npx ${kanbanPackageSpec()}（PORT=${port}）…`);
+  const child = spawn('npx', ['-y', kanbanPackageSpec()], {
     env: {
       ...process.env,
-      HOST: '0.0.0.0',
+      // 默认只监听回环：看板 Web/API 无鉴权，绑定 0.0.0.0 会暴露到局域网
+      HOST: process.env.HELIOS_KANBAN_HOST || '127.0.0.1',
       PORT: port,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

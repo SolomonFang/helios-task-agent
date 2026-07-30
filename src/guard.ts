@@ -126,10 +126,16 @@ function larkVerbs(args: string[]): string[] {
 export function classifyLark(args: string[]): 'read' | 'write' {
   if (!args.length) return 'read';
   const first = args[0]!;
-  if (['--help', '-h', '--version', '-v', 'help', 'schema', 'doctor', 'skills', 'update'].includes(first)) {
+  // 注意：`update`（lark-cli 自我更新 = 替换本机代码）不在此列，按写操作走闸门
+  if (['--help', '-h', '--version', '-v', 'help', 'schema', 'doctor', 'skills'].includes(first)) {
     return 'read';
   }
-  if (args.includes('--help') || args.includes('-h')) return 'read';
+  // 帮助仅在「命令路径 + --help/-h 收尾」形态下判 read（如 ["task","list","--help"]）；
+  // 携带其它实参时不得免确认——防止写命令夹带 --help 绕过闸门（如 ["im","send","ou_x","--help"]）
+  const helpIdx = args.findIndex((a) => a === '--help' || a === '-h');
+  if (helpIdx === args.length - 1 && args.slice(0, helpIdx).filter((a) => !a.startsWith('-')).length <= 2) {
+    return 'read';
+  }
   if (first === 'api') {
     const method = (args[1] || '').toUpperCase();
     return method === 'GET' ? 'read' : 'write';

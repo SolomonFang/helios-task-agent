@@ -17,7 +17,8 @@ import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
 import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { runAiReview } from './kanban/ai-review';
-import { checkLarkCli, checkOcrCli, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
+import { checkLarkCli, checkOcrCli, kanbanPackageSpec, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
+import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
 import { LOCAL_TOOL_SUMMARY } from './tools';
@@ -40,7 +41,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
 · 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
-· 普通写操作 120 秒、删除/取消/停止类 300 秒未操作自动拒绝
+· 普通写操作 120 秒、删除/取消/停止/审批/启动类 300 秒未操作自动拒绝
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
@@ -159,7 +160,7 @@ async function main(): Promise<void> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(c.err(`看板启动失败: ${message}`));
-    console.error(c.gray('可手动执行: HOST=0.0.0.0 PORT=7964 npx -y helios-kanban'));
+    console.error(c.gray(`可手动执行: PORT=7964 npx -y ${kanbanPackageSpec()}`));
     console.error(c.gray('或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。'));
     process.exit(1);
   }
@@ -288,8 +289,13 @@ async function main(): Promise<void> {
       });
       await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
       // 注入会话：用户追问「按审查意见修一下」时 agent 有上下文
+      // （审查结果含被审仓库代码，属外部内容，UNTRUSTED 包裹；注入发生在轮边界）
       try {
-        router.getOrCreate(openId).injectSystemNote(`[AI 审查完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${result.slice(0, 1500)}`);
+        router
+          .getOrCreate(openId)
+          .injectSystemNote(
+            `[AI 审查完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${wrapUntrusted(result.slice(0, 1500))}`,
+          );
       } catch {
         /* ignore */
       }
@@ -310,36 +316,41 @@ async function main(): Promise<void> {
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
 
-  // MCP 健康监督：60s 探测；掉线自动降级 hk_cli 并重连（退避至 ~5 分钟），恢复后切回
+  // MCP 健康监督：60s 探测；连续失败才降级 hk_cli（避免瞬时抖动误报），
+  // 自动重连（退避至 ~5 分钟），恢复后切回。有用户轮次进行中时不重连：
+  // reconnect 的 close() 会杀掉 in-flight 的工具调用。
   let mcpAlive = mcpOk;
   let mcpFailures = 0;
   let mcpBusy = false;
+  const MCP_FAIL_THRESHOLD = 2; // 连续 2 次探测失败才判定掉线
   const mcpTimer = setInterval(() => {
     if (mcpBusy) return;
     mcpBusy = true;
     void (async () => {
       try {
-        await mcp.ping();
-        if (!mcpAlive) {
-          mcpAlive = true;
+        try {
+          await mcp.ping();
+          if (!mcpAlive) {
+            mcpAlive = true;
+            router.setMcpOk(true);
+            console.log(c.ok('MCP 已恢复'));
+            notifyOwners('✅ 看板 MCP 连接已恢复');
+          }
           mcpFailures = 0;
-          router.setMcpOk(true);
-          console.log(c.ok('MCP 已恢复'));
-          notifyOwners('✅ 看板 MCP 连接已恢复');
-        }
-      } catch {
-        mcpFailures++;
-        if (mcpAlive) {
-          mcpAlive = false;
-          router.setMcpOk(false);
-          console.log(c.warn('MCP 连接丢失，降级 hk_cli，将自动重连…'));
-          notifyOwners('⚠️ 看板 MCP 连接丢失，已自动降级 hk_cli（恢复后自动切回）');
-        }
-        if (mcpFailures <= 3 || mcpFailures % 5 === 0) {
-          try {
-            await mcp.reconnect();
-          } catch {
-            /* 下一轮再试 */
+        } catch {
+          mcpFailures++;
+          if (mcpAlive && mcpFailures >= MCP_FAIL_THRESHOLD) {
+            mcpAlive = false;
+            router.setMcpOk(false);
+            console.log(c.warn('MCP 连接丢失，降级 hk_cli，将自动重连…'));
+            notifyOwners('⚠️ 看板 MCP 连接丢失，已自动降级 hk_cli（恢复后自动切回）');
+          }
+          if (!mcpAlive && running.size === 0 && (mcpFailures <= 3 || mcpFailures % 5 === 0)) {
+            try {
+              await mcp.reconnect();
+            } catch {
+              /* 下一轮再试 */
+            }
           }
         }
       } finally {
@@ -577,6 +588,7 @@ async function main(): Promise<void> {
       intervalMs: intervalSec * 1000,
       statePath: path.join(defaultDataHome(), 'watch-state.json'),
       notify: async (event) => {
+        let firstErr: unknown = null;
         for (const oid of channel.allowedOpenIds()) {
           try {
             await channel.notifyCardOpenId(oid, buildWatchEventCard(event));
@@ -588,15 +600,22 @@ async function main(): Promise<void> {
             } catch (err2) {
               const msg2 = err2 instanceof Error ? err2.message : String(err2);
               console.error(`[watch] 推送失败(${oid}): ${msg2}`);
+              firstErr = err2;
             }
           }
           // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
+          // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
+          //   注入发生在轮边界，不会打断进行中的 tool 配对）
           try {
-            router.getOrCreate(oid).injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${event.text}`);
+            router
+              .getOrCreate(oid)
+              .injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`);
           } catch {
             /* ignore */
           }
         }
+        // 有 owner 未送达时抛出：watcher 据此不推进状态快照，下轮重试（事件不丢）
+        if (firstErr) throw firstErr;
       },
       log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
     });

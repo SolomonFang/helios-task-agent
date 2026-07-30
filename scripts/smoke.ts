@@ -14,6 +14,7 @@ import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
 import { ConfirmationManager, buildResolvedCard } from '../src/confirm';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
 import { runAgentTurn } from '../src/llm';
+import { checkLarkCli } from '../src/deps';
 import {
   applyRepoBaseBranches,
   classifyWorkspaceSetup,
@@ -91,8 +92,15 @@ async function main(): Promise<void> {
     }
   }
 
+  // lark-cli 已装：--version 必须返回版本号；未装：必须返回 ENOENT 引导文案。
+  // （旧断言 /lark-cli/i 会撞上未安装提示文案里的 "lark-cli" 字样，是永真断言）
   const larkOut = await handlers.get('lark_cli')!({ args: ['--version'] });
-  check('lark_cli 工具', /lark-cli/i.test(larkOut), larkOut.trim());
+  const larkInstalled = checkLarkCli();
+  check(
+    'lark_cli 工具',
+    larkInstalled ? /\d+\.\d+\.\d+|version/i.test(larkOut) : /未找到可执行命令「lark-cli」/.test(larkOut),
+    larkInstalled ? larkOut.trim().slice(0, 120) : 'lark-cli 未安装（改为校验缺失引导文案）',
+  );
 
   const hkOut = await handlers.get('hk_cli')!({ args: ['health'] });
   check('hk_cli health', /success|OK/i.test(hkOut), hkOut.slice(0, 80).replace(/\n/g, ' '));

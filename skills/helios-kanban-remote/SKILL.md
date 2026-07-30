@@ -165,7 +165,7 @@ https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-rem
 {
   "helios_kanban": {
     "command": "npx",
-    "args": ["-y", "helios-kanban@latest", "--mcp"]
+    "args": ["-y", "helios-kanban@0.1.36", "--mcp"]
   }
 }
 ```

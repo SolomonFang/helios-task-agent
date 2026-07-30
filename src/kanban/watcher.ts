@@ -124,9 +124,9 @@ export class KanbanWatcher {
     try {
       const current = await this.collect();
       const prev = this.state;
-      this.state = current;
-      this.persist();
       if (!prev) {
+        this.state = current;
+        this.persist();
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
         return;
       }
@@ -196,7 +196,25 @@ export class KanbanWatcher {
           text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
         });
       }
-      for (const e of events) await this.opts.notify(e);
+      // 推送失败不推进 state：下一轮基于旧快照重新 diff，事件不丢。
+      // 代价是部分送达的事件可能重复推送——重复优于丢失。
+      let delivered = true;
+      for (const e of events) {
+        try {
+          await this.opts.notify(e);
+        } catch (err) {
+          delivered = false;
+          this.opts.log?.(
+            `事件推送失败（${e.kind}《${e.title}》）: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (delivered) {
+        this.state = current;
+        this.persist();
+      } else {
+        this.opts.log?.('存在推送失败，状态快照未推进，下轮将重试未送达事件');
+      }
     } catch (err) {
       this.opts.log?.(`轮询失败: ${err instanceof Error ? err.message : String(err)}`);
     } finally {

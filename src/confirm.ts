@@ -53,7 +53,7 @@ export class ConfirmationManager {
     private opts: {
       /** 非破坏性操作（可批量）的确认超时，默认 120s。 */
       timeoutMs?: number;
-      /** 破坏性操作（无 batchKey：删除/取消/停止/deny 及飞书写）的确认超时，默认 300s。 */
+      /** 破坏性操作（无 batchKey：删除/取消/停止/审批/启动及飞书写）的确认超时，默认 300s。 */
       destructiveTimeoutMs?: number;
       onTimeout?: (openId: string, req: ConfirmRequest) => void;
       /** 新写操作顶掉未应答的 pending 时通知（否则用户会以为是自己拒绝的）。 */

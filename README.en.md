@@ -24,7 +24,7 @@ helios-task-agent --version   # show installed version
 
 **Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
-**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban`. Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban` (pinned version — override with `HELIOS_KANBAN_PACKAGE`; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
 **Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
 
@@ -70,10 +70,10 @@ Feishu Task Center / docs / group chats
 | Mechanism | Behavior |
 |-----------|----------|
 | Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`; no timeout (Ctrl+C at the prompt rejects). Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); timeouts 120s for batchable ops, 300s for destructive ops and Feishu writes; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
-| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
+| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start) always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
-| Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt |
-| Untrusted wrap | `lark_cli` output marked UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
+| Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
+| Untrusted wrap | External output (`lark_cli`, kanban MCP / `hk_cli`, `repo_fs`) plus kanban-event and AI-review context injections are wrapped UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
 | Owner claim | Empty `FEISHU_ALLOWED_OPEN_IDS` → first DM user becomes owner (written to `.env`); others rejected once |
 | Source dedupe | URL → task map per user in `synced-sources.json`; self-heals after deletes; unreachable kanban conservatively blocks |
 | Audit log | Approvals/denies/dup blocks (`blocked_dup`)/no-gate/results → `audit.log` (JSONL) |
@@ -85,12 +85,13 @@ Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failu
 
 - First poll is baseline only (`watch-state.json`)  
 - Does **not** notify on brand-new tasks  
+- Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
 - With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
 - `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
 
 ## MCP health supervisor (bot)
 
-~60s probe. On drop: fall back to `hk_cli`, auto-reconnect with backoff (down to ~every 5 min), notify; on recover: switch back (both transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
+~60s probe. Degrades to `hk_cli` only after consecutive probe failures (no flapping on transient jitter); auto-reconnect with backoff (down to ~every 5 min), skipped while a task is running so in-flight calls aren't killed; on recover: switch back (all transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
 
 ## Config home (Hermes-style)
 
@@ -147,7 +148,10 @@ Local: `npm start` / `npm run bot`.
 | `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
-| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@0.1.36 --mcp` (pinned) |
+| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP (pinned against supply-chain drift); set `helios-kanban@latest` to float |
+| `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
+| `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
 | `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
