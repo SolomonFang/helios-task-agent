@@ -148,7 +148,25 @@ Local: `npm start` / `npm run bot`.
 
 ## Adding skills
 
-Doc-style skills: drop a `SKILL.md` (frontmatter + Markdown, same format as `skills/helios-kanban-remote/`) into `skills/<skill-name>/` — at startup every `skills/*/SKILL.md` is scanned and a digest is injected into the system prompt, no code change needed. The digest keeps only key sections (`Quick workflow`, `Safety rules`, …; otherwise truncated), so full docs stay on disk instead of being dumped every turn. Executable capabilities (new tools) still need registration in `src/tools.ts`.
+Doc-style skills: drop a `SKILL.md` with frontmatter into `skills/<skill-name>/` — at startup every `skills/*/SKILL.md` is scanned, no code change needed. The frontmatter is the skill contract:
+
+```markdown
+---
+name: my-skill
+description: One line on when to use this skill (routing cue, always injected into the system prompt)
+digest_sections:        # which `## ` sections get injected (case-insensitive substring match)
+  - Quick workflow
+  - Safety rules
+---
+
+# My Skill
+Body… undeclared sections stay out of the prompt; the agent reads the full doc on demand
+via the `skill_doc` tool (progressive disclosure).
+```
+
+- Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` (covered by unit tests) — contract problems surface at test time instead of silently degrading.
+- Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
+- Executable capabilities (new tools) still need registration in `src/tools.ts`.
 
 **Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up.
 

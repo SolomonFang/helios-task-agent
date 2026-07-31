@@ -27,6 +27,7 @@ import {
 } from './kanban/workspace-ready';
 import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
 import { summarizeForChat, writeSummaryReports } from './report';
+import { readSkillDoc } from './prompt';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
@@ -263,6 +264,22 @@ const LOCAL_TOOLS: OpenAiTool[] = [
   {
     type: 'function',
     function: {
+      name: 'skill_doc',
+      description:
+        '读取内置技能（skills/ 下的 SKILL.md）的完整文档，按需取用细节。' +
+        '省略 name 则列出全部已安装技能及其 description；指定 name 返回该技能全文。' +
+        '系统提示词里只有技能摘要，需要完整命令表/规则时用这个工具读取，不要臆造。只读，不触发确认闸门。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '技能名（如 helios-kanban-remote）；省略则列出全部技能' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'work_summary',
       description:
         '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
@@ -294,6 +311,7 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
   { name: 'hk_cli', summary: '看板 HTTP REST 命令（MCP 降级与补充）' },
   { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
   { name: 'work_summary', summary: '生成工作总结报告（HTML/MD）' },
+  { name: 'skill_doc', summary: '按需读取内置技能完整文档（SKILL.md）' },
   { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' },
 ];
 
@@ -605,6 +623,12 @@ export function buildTools({
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
     });
     return wrapUntrusted(out);
+  });
+
+  handlers.set('skill_doc', async (raw) => {
+    const name = typeof raw.name === 'string' ? raw.name : '';
+    // 技能文档是本仓库自带内容（非外部注入），无需 UNTRUSTED 包裹
+    return truncate(readSkillDoc(name));
   });
 
   handlers.set('work_summary', async (raw) => {

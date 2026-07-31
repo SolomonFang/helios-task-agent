@@ -11,6 +11,7 @@ import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
 import { LOCAL_TOOL_SUMMARY } from './tools';
+import { loadSkillDigests } from './prompt';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
@@ -58,6 +59,7 @@ const HELP = `
   ${c.info('/help')}     显示帮助
   ${c.info('/config')}   重新配置模型 / kanban 地址
   ${c.info('/tools')}    列出当前可用的 kanban 工具
+  ${c.info('/skills')}   列出已安装技能（skills/ 目录）
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
@@ -298,6 +300,18 @@ export async function main(): Promise<void> {
         console.log(c.strong('本地工具:'));
         for (const t of LOCAL_TOOL_SUMMARY) {
           console.log(`  ${c.info(t.name)}  ${c.gray(t.summary)}`);
+        }
+      } else if (cmd === '/skills') {
+        const skills = loadSkillDigests();
+        if (!skills.length) {
+          console.log(c.gray('（skills/ 下没有已安装技能）'));
+        } else {
+          console.log(c.strong('已安装技能:'));
+          for (const s of skills) {
+            const brief = s.description.replace(/\s+/g, ' ').slice(0, 100);
+            console.log(`  ${c.info(s.name)}  ${c.gray(brief)}`);
+          }
+          console.log(c.gray('对话中可直接问「你有什么技能」；细节由 agent 用 skill_doc 按需读取。'));
         }
       } else if (cmd === '/status') {
         let kanbanHealth: string;

@@ -24,6 +24,7 @@ import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import { friendlyLlmError } from './llm-error';
 import { LOCAL_TOOL_SUMMARY } from './tools';
+import { loadSkillDigests } from './prompt';
 import type { AskFn, ChooseFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
 import { c, readSecret, selectList } from './ui';
@@ -34,6 +35,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /help     显示帮助
 /status   健康检查（kanban / MCP / lark-cli / 推送）
 /tools    列出当前可用工具
+/skills   列出已安装技能（skills/ 目录）
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
 /stop     中断当前任务（排队消息与待确认写操作一并取消）
@@ -548,6 +550,14 @@ async function main(): Promise<void> {
       lines.push('本地工具');
       for (const t of LOCAL_TOOL_SUMMARY) lines.push(`· ${t.name}  ${t.summary}`);
       await channel.reply(msg, lines.join('\n'));
+      return;
+    }
+    if (cmd === '/skills') {
+      const skills = loadSkillDigests();
+      const lines = skills.length
+        ? skills.map((s) => `· ${s.name}  ${s.description.replace(/\s+/g, ' ').slice(0, 100)}`)
+        : ['（skills/ 下没有已安装技能）'];
+      await channel.reply(msg, ['已安装技能', ...lines].join('\n'));
       return;
     }
 

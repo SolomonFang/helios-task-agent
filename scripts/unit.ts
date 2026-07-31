@@ -22,6 +22,7 @@ import { MemoryStore } from '../src/memory';
 import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
 import { writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
+import { parseFrontmatter, loadSkillDigests, readSkillDoc, renderSkillsBlock, validateSkills } from '../src/prompt';
 import { auditLog } from '../src/audit';
 import { SessionRouter } from '../src/session-router';
 import { AgentSession } from '../src/session';
@@ -1227,6 +1228,61 @@ async function main(): Promise<void> {
       ocrPackageSpec({ OCR_PACKAGE: 'x@1' }) === 'x@1'
     );
   })());
+
+  // ---------- 技能机制：frontmatter 解析 / 摘要 / 按需读取 / 契约校验 ----------
+  await checkAsync('parseFrontmatter：标量 / 折叠块 / 列表', async () => {
+    const { data, body } = parseFrontmatter(
+      '---\nname: demo\ndescription: >-\n  first line\n  second line\nflags: |\n  a\n  b\ndigest_sections:\n  - Quick workflow\n  - Safety rules\n---\n\n# Body\n',
+    );
+    assert.equal(data.name, 'demo');
+    assert.equal(data.description, 'first line second line');
+    assert.equal(data.flags, 'a\nb');
+    assert.deepEqual(data.digest_sections, ['Quick workflow', 'Safety rules']);
+    assert.equal(body.trim(), '# Body');
+    // 无 frontmatter 时原样返回
+    const plain = parseFrontmatter('# just body\n');
+    assert.deepEqual(plain.data, {});
+    assert.equal(plain.body, '# just body\n');
+  });
+
+  await checkAsync('技能加载：description + digest_sections 声明的章节进入摘要', async () => {
+    const digests = loadSkillDigests();
+    assert.equal(digests.length >= 1, true);
+    const hk = digests.find((s) => s.name === 'helios-kanban-remote');
+    assert.ok(hk, 'helios-kanban-remote 应被扫描到');
+    assert.ok(hk.description.includes('Helios Kanban'), 'description 应来自 frontmatter');
+    assert.ok(hk.digest.includes('Quick workflow'), '摘要应含声明的章节');
+    assert.ok(hk.digest.includes('Safety rules'), '摘要应含 Safety rules');
+    assert.ok(!hk.digest.includes('Prerequisites'), '未声明的章节不进摘要');
+  });
+
+  await checkAsync('renderSkillsBlock：含指引与完整文档路径；readSkillDoc 按需读取', async () => {
+    const block = renderSkillsBlock();
+    assert.ok(block.includes('skill_doc'), '提示词应指引用 skill_doc 按需读取');
+    assert.ok(block.includes('helios-kanban-remote'), '应包含已安装技能');
+    const list = readSkillDoc('');
+    assert.ok(list.includes('helios-kanban-remote'), '空 name 应列出技能');
+    const full = readSkillDoc('helios-kanban-remote');
+    assert.ok(full.includes('Prerequisites'), '全文读取应包含未注入摘要的章节');
+    assert.ok(!full.includes('digest_sections'), '全文读取应剥离 frontmatter');
+    assert.ok(readSkillDoc('no-such-skill').includes('未找到技能'));
+    assert.ok(readSkillDoc('../etc').includes('非法技能名'), '路径穿越应被拒绝');
+  });
+
+  await checkAsync('validateSkills：包内技能契约全部健康', async () => {
+    assert.deepEqual(validateSkills(), []);
+  });
+
+  await checkAsync('skill_doc 工具：注册且只读（无确认闸门）', async () => {
+    const { openAiTools, handlers } = buildTools({
+      mcp: null,
+      kanbanUrl: 'http://127.0.0.1:1',
+      // 不传 confirm：写操作应被阻止，但 skill_doc 是只读，不受影响
+    });
+    assert.ok(openAiTools.some((t) => t.function.name === 'skill_doc'), 'skill_doc 应注册');
+    const out = await handlers.get('skill_doc')!({}, undefined);
+    assert.ok(out.includes('helios-kanban-remote'), '省略 name 应返回技能清单');
+  });
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
   process.exit(failures ? 1 : 0);

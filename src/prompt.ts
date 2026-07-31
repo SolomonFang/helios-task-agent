@@ -2,61 +2,165 @@ import fs from 'fs';
 import path from 'path';
 import type { UserMemory } from './types';
 
-const SKILLS_DIR = path.join(__dirname, '..', 'skills');
+export const SKILLS_DIR = path.join(__dirname, '..', 'skills');
 
-/** 摘要保留的章节标题——完整文档留在磁盘上，只有这些章节进入系统提示词。 */
-const DIGEST_SECTION_RE =
-  /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Task priorities|Safety rules|Out of scope/i;
-/** 无匹配章节时截断注入的长度上限（避免每个回合倾倒全文）。 */
+/** 单个技能注入系统提示词的摘要长度上限（避免每个回合倾倒全文）。 */
 const DIGEST_MAX_LEN = 3500;
 
 export interface SkillDigest {
+  /** 技能名：frontmatter name，缺省回退目录名。 */
   name: string;
+  /** frontmatter description——路由依据，始终注入。 */
+  description: string;
+  /** frontmatter digest_sections 声明的章节内容。 */
   digest: string;
-}
-
-function digestSkillBody(body: string): string {
-  const keep: string[] = [];
-  const sections = body.split(/\n(?=## )/);
-  for (const sec of sections) {
-    const title = (sec.match(/^## (.+)/) || [])[1] || '';
-    if (DIGEST_SECTION_RE.test(title)) keep.push(sec.trim());
-  }
-  if (keep.length) return keep.join('\n\n');
-  return body.slice(0, DIGEST_MAX_LEN);
+  /** 相对项目根的技能目录（提示词中指引按需读取完整文档）。 */
+  dir: string;
 }
 
 /**
- * 扫描 skills/<name>/SKILL.md，为每个技能生成注入系统提示词的紧凑摘要。
- * 新增技能 = 在 skills/ 下放一个含 SKILL.md 的目录，无需改代码。
+ * 极简 frontmatter 解析：支持 `key: value`、`key: >-`/`|` 折叠/字面块、`- item` 列表。
+ * 不引入 YAML 依赖；技能 frontmatter 只应使用这三种形态。
  */
-export function loadSkillDigests(): SkillDigest[] {
+export function parseFrontmatter(raw: string): { data: Record<string, string | string[]>; body: string } {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n*/);
+  if (!m) return { data: {}, body: raw };
+  const data: Record<string, string | string[]> = {};
+  const lines = m[1]!.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const kv = lines[i]!.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
+    if (!kv) continue;
+    const [, key, rest] = kv;
+    const cont: string[] = [];
+    while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]!)) cont.push(lines[++i]!);
+    if (rest === '>-' || rest === '>') {
+      data[key!] = cont.map((l) => l.trim()).join(' ').replace(/\s+$/, '');
+    } else if (rest === '|' || rest === '|-') {
+      data[key!] = cont.map((l) => l.replace(/^\s+/, '')).join('\n');
+    } else if (rest === '') {
+      const items = cont.map((l) => l.match(/^\s+-\s+(.*)$/)?.[1]).filter(Boolean) as string[];
+      if (items.length) data[key!] = items;
+      else data[key!] = '';
+    } else {
+      data[key!] = rest;
+    }
+  }
+  return { data, body: raw.slice(m[0].length) };
+}
+
+/** 按声明的章节名（大小写不敏感的子串匹配）摘取 `## ` 章节。 */
+function digestSkillBody(body: string, sections: string[]): string {
+  if (!sections.length) return '';
+  const keep: string[] = [];
+  for (const sec of body.split(/\n(?=## )/)) {
+    const title = ((sec.match(/^## (.+)/) || [])[1] || '').toLowerCase();
+    if (sections.some((s) => title.includes(s.toLowerCase()))) keep.push(sec.trim());
+  }
+  return keep.join('\n\n').slice(0, DIGEST_MAX_LEN);
+}
+
+function loadSkill(dirName: string): { digest: SkillDigest; problems: string[] } | null {
+  const dir = path.join(SKILLS_DIR, dirName);
+  const skillFile = path.join(dir, 'SKILL.md');
+  if (!fs.existsSync(skillFile)) return null;
+  const rel = path.relative(process.cwd(), dir) || dir;
+  const problems: string[] = [];
+  let raw: string;
+  try {
+    raw = fs.readFileSync(skillFile, 'utf8');
+  } catch (err) {
+    return { digest: { name: dirName, description: '', digest: '', dir: rel }, problems: [`${dirName}: SKILL.md 读取失败（${err instanceof Error ? err.message : err}）`] };
+  }
+  const { data, body } = parseFrontmatter(raw);
+  const name = typeof data.name === 'string' && data.name ? data.name : dirName;
+  const description = typeof data.description === 'string' ? data.description.trim() : '';
+  if (!data.name) problems.push(`${dirName}: frontmatter 缺少 name（已回退为目录名）`);
+  if (!description) problems.push(`${dirName}: frontmatter 缺少 description（技能路由将不可靠）`);
+  const sections = Array.isArray(data.digest_sections) ? data.digest_sections : [];
+  const digest = digestSkillBody(body, sections);
+  for (const s of sections) {
+    if (!new RegExp(`^## .*${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'im').test(body)) {
+      problems.push(`${dirName}: digest_sections「${s}」未匹配到任何章节（拼写或章节已改名？）`);
+    }
+  }
+  if (!sections.length) problems.push(`${dirName}: 未声明 digest_sections（仅注入 description，细节靠 skill_doc 按需读取）`);
+  return { digest: { name, description, digest, dir: rel }, problems };
+}
+
+function skillDirNames(): string[] {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
   } catch {
     return [];
   }
+  return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * 扫描 skills/<name>/SKILL.md，为每个技能生成注入系统提示词的紧凑摘要。
+ * 新增技能 = 在 skills/ 下放一个含 SKILL.md（带 frontmatter）的目录，无需改代码：
+ * - `name` / `description` 始终注入（路由依据）；
+ * - `digest_sections` 声明哪些章节进系统提示词（契约写在技能自己头上）；
+ * - 完整文档留在磁盘，用 skill_doc 工具按需读取（渐进式披露）。
+ */
+export function loadSkillDigests(): SkillDigest[] {
   const digests: SkillDigest[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const skillFile = path.join(SKILLS_DIR, entry.name, 'SKILL.md');
-    if (!fs.existsSync(skillFile)) continue;
-    try {
-      const raw = fs.readFileSync(skillFile, 'utf8');
-      const body = raw.replace(/^---[\s\S]*?---\n*/, '');
-      digests.push({ name: entry.name, digest: digestSkillBody(body) });
-    } catch {
-      digests.push({ name: entry.name, digest: `(技能 ${entry.name}/SKILL.md 读取失败)` });
-    }
+  for (const dirName of skillDirNames()) {
+    const loaded = loadSkill(dirName);
+    if (loaded) digests.push(loaded.digest);
   }
-  return digests.sort((a, b) => a.name.localeCompare(b.name));
+  return digests;
+}
+
+/** 启动期/测试期校验：返回所有技能的契约问题（空数组 = 全部健康）。 */
+export function validateSkills(): string[] {
+  const problems: string[] = [];
+  for (const dirName of skillDirNames()) {
+    const loaded = loadSkill(dirName);
+    if (loaded) problems.push(...loaded.problems);
+  }
+  return problems;
+}
+
+/** 读取技能完整文档（skill_doc 工具用）；name 为空返回技能清单文本。 */
+export function readSkillDoc(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    const digests = loadSkillDigests();
+    if (!digests.length) return '（skills/ 下没有已安装技能）';
+    return digests.map((s) => `- ${s.name}：${s.description || '（无 description）'}`).join('\n');
+  }
+  if (!/^[\w][\w.-]*$/.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
+  const loaded = loadSkill(trimmed);
+  if (!loaded) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
+  try {
+    const raw = fs.readFileSync(path.join(SKILLS_DIR, trimmed, 'SKILL.md'), 'utf8');
+    const { body } = parseFrontmatter(raw);
+    return `# 技能 ${loaded.digest.name} 完整文档\n\n${body.trim()}`;
+  } catch (err) {
+    return `读取技能「${trimmed}」失败：${err instanceof Error ? err.message : err}`;
+  }
 }
 
 /** 渲染系统提示词尾部的技能摘要区块（无技能时返回空串）。 */
 export function renderSkillsBlock(): string {
   const digests = loadSkillDigests();
-  return digests.map((s) => `# 内置技能摘要：${s.name}\n\n${s.digest}`).join('\n\n');
+  if (!digests.length) return '';
+  const header =
+    '# 内置技能\n\n' +
+    '以下技能已安装。此处只含 description 与关键章节摘要；需要完整细节时用 `skill_doc` 工具读取全文，不要臆造用法。';
+  const blocks = digests.map((s) =>
+    [
+      `## 技能：${s.name}`,
+      s.description,
+      s.digest,
+      `完整文档：\`${s.dir}/SKILL.md\`（用 skill_doc 读取）`,
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  );
+  return [header, ...blocks].join('\n\n');
 }
 
 export interface SystemPromptOpts {

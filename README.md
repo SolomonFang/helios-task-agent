@@ -154,7 +154,24 @@ helios-task-agent-bot
 
 ## 添加技能
 
-文档型技能：在 `skills/<技能名>/` 下放一个 `SKILL.md`（带 frontmatter 的 Markdown，格式同 `skills/helios-kanban-remote/`）即可——启动时自动扫描所有 `skills/*/SKILL.md`，把摘要注入系统提示词，无需改代码。摘要只保留 `Quick workflow` / `Safety rules` 等关键章节（无匹配章节时截断注入），完整文档留在磁盘，避免每回合倾倒全文。可执行能力（新工具）仍需在 `src/tools.ts` 注册。
+文档型技能：在 `skills/<技能名>/` 下放一个带 frontmatter 的 `SKILL.md` 即可——启动时自动扫描所有 `skills/*/SKILL.md`，无需改代码。frontmatter 就是技能契约：
+
+```markdown
+---
+name: my-skill
+description: 一句话说明什么时候用这个技能（路由依据，始终注入系统提示词）
+digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大小写不敏感子串匹配）
+  - Quick workflow
+  - Safety rules
+---
+
+# My Skill
+正文……未声明的章节不进提示词，agent 需要细节时会用 `skill_doc` 工具按需读取全文（渐进式披露）。
+```
+
+- `name` / `description` 缺失或 `digest_sections` 匹配不到章节时，`validateSkills()`（单元测试覆盖）会报出契约问题——问题在测试期暴露，而不是静默降级。
+- 用户侧可用 `/skills`（CLI 与飞书 bot 一致）或直接问「你有什么技能」查看已安装技能。
+- 可执行能力（新工具）仍需在 `src/tools.ts` 注册。
 
 **看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。
 

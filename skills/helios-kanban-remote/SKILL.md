@@ -7,6 +7,15 @@ description: >-
   Kanban / helios-kanban / vibe-kanban remotely, or asks to create tasks, start
   agents, or check progress on a running instance. If the skill is not installed
   yet, read and follow INSTALL.md to self-install from GitHub first.
+digest_sections:
+  - Quick workflow
+  - Complete lifecycle
+  - Response format
+  - Executor names
+  - Task statuses
+  - Task priorities
+  - Safety rules
+  - Out of scope
 ---
 
 # Helios Kanban Remote Control
