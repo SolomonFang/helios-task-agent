@@ -16,6 +16,7 @@ function printHelp() {
 Usage:
   helios-task-agent           Start interactive terminal agent
   helios-task-agent bot       Start Feishu DM bot (long connection)
+  helios-task-agent bot --rebind  Rebind / switch the Feishu bot (Feishu wizard only)
   helios-task-agent-bot       Same as "helios-task-agent bot"
   helios-task-agent help      Show this help
   helios-task-agent --version Show installed version

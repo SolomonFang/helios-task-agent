@@ -119,6 +119,79 @@ export async function ensureConfig(
 }
 
 /**
+ * 收集并校验飞书机器人凭证（联网校验失败可重输）。
+ * allowClear 用于换绑场景：白名单可输入 `-` 清除（换新应用后旧 open_id 可能失效）。
+ */
+async function promptFeishuConfig(
+  need: (promptText: string) => Promise<string>,
+  needSecret: (promptText: string) => Promise<string>,
+  existing: FeishuBotConfig,
+  { allowClear = false }: { allowClear?: boolean } = {},
+): Promise<FeishuBotConfig> {
+  printFeishuSetupChecklist();
+  console.log(c.strong('配置飞书机器人凭证：\n'));
+  let appId = '';
+  let appSecret = '';
+  // 联网校验凭证：无效凭证/未启用机器人在此暴露，而不是等长连接失败
+  for (;;) {
+    appId = await need('FEISHU_APP_ID (cli_...): ');
+    if (!appId) throw new Error('App ID 不能为空');
+    appSecret = await needSecret('FEISHU_APP_SECRET (输入显示为 *): ');
+    if (!appSecret) throw new Error('App Secret 不能为空');
+    console.log(c.gray('正在联网校验凭证…'));
+    const check = await verifyFeishuApp(appId, appSecret);
+    if (check.ok) {
+      console.log(c.ok(`凭证校验通过${check.botName ? `：机器人「${check.botName}」` : ''}`));
+      break;
+    }
+    console.log(c.err(`凭证校验失败：${check.message}`));
+    const retry = (await need('重新输入？[Y/n]（n = 仍然保存）: ')).toLowerCase();
+    if (retry === 'n' || retry === 'no' || retry === '否') break;
+  }
+  const allowedPrompt = existing.allowedOpenIds.length
+    ? `允许的 open_id（可选，逗号分隔；回车=保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
+    : '允许的 open_id（可选，逗号分隔；回车=不限制）: ';
+  const allowedRaw = await need(allowedPrompt);
+  const allowedOpenIds =
+    allowClear && allowedRaw === '-'
+      ? []
+      : allowedRaw
+        ? allowedRaw.split(',').map((s) => s.trim()).filter(Boolean)
+        : existing.allowedOpenIds;
+  return { appId, appSecret, allowedOpenIds };
+}
+
+/**
+ * 换绑飞书机器人：只重跑飞书凭证部分（模型/看板配置保留）。
+ * 绑错机器人或要切换到另一个应用时使用：helios-task-agent bot --rebind
+ */
+export async function rebindFeishuBot(
+  ask: AskFn,
+  { askSecret = null }: { askSecret?: AskFn | null } = {},
+): Promise<{ feishu: FeishuBotConfig; envPath: string }> {
+  const need = async (promptText: string): Promise<string> => {
+    const ans = await ask(promptText);
+    if (ans === null) throw new Error('输入已结束');
+    return ans.trim();
+  };
+  const needSecret = async (promptText: string): Promise<string> => {
+    if (!askSecret) return need(promptText);
+    const ans = await askSecret(promptText);
+    if (ans === null) throw new Error('输入已结束');
+    return ans.trim();
+  };
+
+  const existing = feishuBotConfig();
+  if (existing.appId) {
+    console.log(c.gray(`当前绑定 App ID: ${existing.appId}，输入新机器人的凭证即完成换绑。`));
+  }
+  const feishu = await promptFeishuConfig(need, needSecret, existing, { allowClear: true });
+  const envPath = writeEnv(currentConfig(), feishu);
+  console.log(c.ok(`\n飞书机器人已换绑，配置保存到 ${envPath}\n`));
+  return { feishu, envPath };
+}
+
+/**
  * Hermes-style bot onboarding: print checklist, collect Feishu (+ LLM if missing), save, ready to connect.
  */
 export async function ensureBotConfig(
@@ -144,33 +217,7 @@ export async function ensureBotConfig(
 
   let feishu = feishuBotConfig();
   if (force || !isFeishuBotConfigured()) {
-    printFeishuSetupChecklist();
-    console.log(c.strong('配置飞书机器人凭证：\n'));
-    let appId = '';
-    let appSecret = '';
-    // 联网校验凭证：无效凭证/未启用机器人在此暴露，而不是等长连接失败
-    for (;;) {
-      appId = await need('FEISHU_APP_ID (cli_...): ');
-      if (!appId) throw new Error('App ID 不能为空');
-      appSecret = await needSecret('FEISHU_APP_SECRET (输入显示为 *): ');
-      if (!appSecret) throw new Error('App Secret 不能为空');
-      console.log(c.gray('正在联网校验凭证…'));
-      const check = await verifyFeishuApp(appId, appSecret);
-      if (check.ok) {
-        console.log(c.ok(`凭证校验通过${check.botName ? `：机器人「${check.botName}」` : ''}`));
-        break;
-      }
-      console.log(c.err(`凭证校验失败：${check.message}`));
-      const retry = (await need('重新输入？[Y/n]（n = 仍然保存）: ')).toLowerCase();
-      if (retry === 'n' || retry === 'no' || retry === '否') break;
-    }
-    const allowedRaw = await need(
-      `允许的 open_id（可选，逗号分隔；回车=不限制${feishu.allowedOpenIds.length ? `，当前 ${feishu.allowedOpenIds.join(',')}` : ''}）: `,
-    );
-    const allowedOpenIds = allowedRaw
-      ? allowedRaw.split(',').map((s) => s.trim()).filter(Boolean)
-      : feishu.allowedOpenIds;
-    feishu = { appId, appSecret, allowedOpenIds };
+    feishu = await promptFeishuConfig(need, needSecret, feishu);
     const envPath = writeEnv(agent, feishu);
     console.log(c.ok(`\n飞书配置已保存到 ${envPath}\n`));
     if (!checkLarkCli()) console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}\n`));

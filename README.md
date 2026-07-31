@@ -137,7 +137,7 @@ helios-task-agent-bot
 
 无需公网 Webhook。进程在线才能收消息；常驻运行可用 `pm2 start helios-task-agent -- bot`（或任何进程守护方式）。
 
-**改配置**：编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——要重跑向导请先删掉或清空 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。终端可用 `/config` 改模型与看板地址。
+**改配置**：编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——绑错机器人要换绑时用 `helios-task-agent bot --rebind`（只重跑飞书凭证向导，模型/看板配置保留；白名单可输入 `-` 清除）。终端可用 `/config` 改模型与看板地址。
 
 ## 命令
 
@@ -145,7 +145,8 @@ helios-task-agent-bot
 |------|------|
 | `helios-task-agent` | 交互式终端 Agent |
 | `helios-task-agent bot` | 飞书私聊机器人（缺凭证则向导） |
-| `helios-task-agent-bot` | 同上 |
+| `helios-task-agent bot --rebind` | 换绑飞书机器人（只重跑飞书凭证向导） |
+| `helios-task-agent-bot` | 同 `bot`（同样支持 `--rebind`） |
 | `helios-task-agent help` / `-h` / `--help` | 帮助 |
 | `helios-task-agent --version` / `-v` | 查看版本 |
 

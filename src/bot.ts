@@ -7,8 +7,8 @@
 
 import readline from 'readline';
 import path from 'path';
-import { currentConfig, feishuBotConfig, userEnvPath, writeEnvFile } from './config';
-import { ensureBotConfig } from './config-wizard';
+import { currentConfig, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config';
+import { ensureBotConfig, rebindFeishuBot } from './config-wizard';
 import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
@@ -103,14 +103,25 @@ async function main(): Promise<void> {
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
 
+  // helios-task-agent bot --rebind：换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
+  const rebind = process.argv.slice(2).some((a) => a === 'rebind' || a === '--rebind');
+
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
   let feishuCfg;
   try {
-    const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
-    agentCfg = ready.agent;
-    feishuCfg = ready.feishu;
-    console.log(c.gray(`已加载配置: ${ready.envPath}`));
+    if (rebind && isConfigured() && isFeishuBotConfigured()) {
+      const rb = await rebindFeishuBot(ask, { askSecret });
+      agentCfg = currentConfig();
+      feishuCfg = rb.feishu;
+      console.log(c.gray(`已加载配置: ${rb.envPath}`));
+    } else {
+      if (rebind) console.log(c.gray('配置尚不完整，进入完整配置向导。'));
+      const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
+      agentCfg = ready.agent;
+      feishuCfg = ready.feishu;
+      console.log(c.gray(`已加载配置: ${ready.envPath}`));
+    }
   } catch (err) {
     close();
     const message = err instanceof Error ? err.message : String(err);

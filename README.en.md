@@ -131,7 +131,7 @@ helios-task-agent-bot
 2. Open Platform: long connection + `im.message.receive_v1`  
 3. DM only (p2p); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
 
-**Reconfigure**: edit `~/.helios-task-agent/.env`. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — clear those vars first. Terminal has `/config`.
+**Reconfigure**: edit `~/.helios-task-agent/.env`. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
 
 ## Commands
 
@@ -139,7 +139,8 @@ helios-task-agent-bot
 |---------|---------|
 | `helios-task-agent` | Interactive terminal agent |
 | `helios-task-agent bot` | Feishu DM bot (wizard if unconfigured) |
-| `helios-task-agent-bot` | Same |
+| `helios-task-agent bot --rebind` | Rebind / switch the Feishu bot (Feishu credential wizard only) |
+| `helios-task-agent-bot` | Same as `bot` (also supports `--rebind`) |
 | `helios-task-agent help` / `-h` / `--help` | Help |
 | `helios-task-agent --version` / `-v` | Show version |
 
