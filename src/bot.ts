@@ -408,6 +408,10 @@ async function main(): Promise<void> {
 
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
+  /** 敲键盘表情回执是否因权限等原因不可用（失败后不再重试，降级为仅占位消息）。 */
+  let reactionUnsupported = false;
+  /** 每用户尚未移除的敲键盘表情（/stop 丢弃排队消息时回调不会执行，需兜底清理）。 */
+  const pendingTyping = new Map<string, { messageId: string; reactionId: string }[]>();
 
   // MCP 健康监督：60s 探测；连续失败才降级 hk_cli（避免瞬时抖动误报），
   // 自动重连（退避至 ~5 分钟），恢复后切回。有用户轮次进行中时不重连：
@@ -494,6 +498,12 @@ async function main(): Promise<void> {
       const ctl = running.get(msg.senderId);
       const gateCancelled = confirmations.cancel(msg.senderId);
       const dropped = router.cancelQueued(msg.senderId);
+      // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
+      const stray = pendingTyping.get(msg.senderId);
+      if (stray?.length) {
+        pendingTyping.delete(msg.senderId);
+        for (const r of stray) void channel.removeReaction(r.messageId, r.reactionId).catch(() => {});
+      }
       if (ctl) {
         ctl.abort();
         running.delete(msg.senderId);
@@ -574,7 +584,24 @@ async function main(): Promise<void> {
     } else if (router.busy(openId)) {
       await channel.reply(msg, '📥 已收到并排队：当前任务完成后依次处理。');
     }
-    await router.enqueue(openId, async () => {
+    // 即时回执：给用户消息加「敲键盘」表情（与 Hermes 一致），该条处理完成后移除；
+    // 排在队列里时表情先行，用户立刻知道消息已被收到。失败（如缺表情回复权限）降级为静默跳过。
+    let typingReactionId: string | undefined;
+    if (!reactionUnsupported) {
+      try {
+        typingReactionId = await channel.addReaction(fmsg.messageId, 'Typing');
+        if (typingReactionId) {
+          const list = pendingTyping.get(openId) || [];
+          list.push({ messageId: fmsg.messageId, reactionId: typingReactionId });
+          pendingTyping.set(openId, list);
+        }
+      } catch (err) {
+        reactionUnsupported = true;
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[feishu] 敲键盘表情回执不可用，已降级为仅占位消息: ${message}`);
+      }
+    }
+    const runQueued = async () => {
       const session = router.getOrCreate(openId);
 
       if (cmd === '/memory') {
@@ -633,6 +660,22 @@ async function main(): Promise<void> {
         }
       } finally {
         running.delete(openId);
+      }
+    };
+    await router.enqueue(openId, async () => {
+      try {
+        await runQueued();
+      } finally {
+        // 该条消息处理完毕（含 /memory、/clear、未知命令、中断、报错）即移除敲键盘表情
+        if (typingReactionId) {
+          await channel.removeReaction(fmsg.messageId, typingReactionId).catch(() => {});
+          const list = pendingTyping.get(openId);
+          if (list) {
+            const rest = list.filter((r) => r.reactionId !== typingReactionId);
+            if (rest.length) pendingTyping.set(openId, rest);
+            else pendingTyping.delete(openId);
+          }
+        }
       }
     });
   };

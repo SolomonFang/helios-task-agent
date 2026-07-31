@@ -309,6 +309,28 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
+  /** Add an emoji reaction to a message（如「Typing」敲键盘表情做即时回执）；returns reaction_id. */
+  async addReaction(messageId: string, emojiType: string): Promise<string | undefined> {
+    const res = await this.client.im.v1.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: emojiType } },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书添加表情回复失败: code=${res.code} msg=${res.msg}`);
+    }
+    return res.data?.reaction_id;
+  }
+
+  /** Remove a reaction previously added by addReaction. */
+  async removeReaction(messageId: string, reactionId: string): Promise<void> {
+    const res = await this.client.im.v1.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+    if (res.code !== 0) {
+      throw new Error(`飞书删除表情回复失败: code=${res.code} msg=${res.msg}`);
+    }
+  }
+
   async reply(msg: InboundMessage, text: string): Promise<void> {
     const chatId = msg.sessionId;
     if (!chatId) throw new Error('reply 缺少 chat_id (sessionId)');

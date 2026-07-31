@@ -194,7 +194,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 1. Company app → enable Bot  
 2. Events → **long connection** → `im.message.receive_v1`  
 3. (Optional) Callbacks → **long connection** → `card.action.trigger`  
-4. Permissions: read DMs, send as app → publish  
+4. Permissions: read DMs, send as app, add message reactions (typing ack; falls back to a text placeholder without it) → publish  
 5. Copy App ID / Secret  
 
 ## What you can say

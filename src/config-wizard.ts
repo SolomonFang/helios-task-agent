@@ -18,7 +18,7 @@ export function printFeishuSetupChecklist(): void {
   console.log(`  1. 打开 ${c.info('https://open.feishu.cn/')} → 创建企业自建应用`);
   console.log('  2. 应用能力 → 启用「机器人」');
   console.log('  3. 事件订阅 → 选「使用长连接接收事件」→ 添加 im.message.receive_v1');
-  console.log('  4. 权限：读取用户发给机器人的单聊消息 + 以应用身份发消息（按提示申请）');
+  console.log('  4. 权限：读取用户发给机器人的单聊消息 + 以应用身份发消息 + 添加消息表情回复（按提示申请）');
   console.log('  5. 发布应用版本；凭证页复制 App ID / App Secret');
   console.log(c.gray('  （与 Hermes 相同：凭证配好后，本机常驻进程即可收私聊）\n'));
 }
