@@ -146,6 +146,10 @@ helios-task-agent-bot
 
 Local: `npm start` / `npm run bot`.
 
+## Adding skills
+
+Doc-style skills: drop a `SKILL.md` (frontmatter + Markdown, same format as `skills/helios-kanban-remote/`) into `skills/<skill-name>/` — at startup every `skills/*/SKILL.md` is scanned and a digest is injected into the system prompt, no code change needed. The digest keeps only key sections (`Quick workflow`, `Safety rules`, …; otherwise truncated), so full docs stay on disk instead of being dumped every turn. Executable capabilities (new tools) still need registration in `src/tools.ts`.
+
 **Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up.
 
 ## Environment variables

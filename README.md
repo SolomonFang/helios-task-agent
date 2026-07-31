@@ -152,6 +152,10 @@ helios-task-agent-bot
 
 本地开发：`npm start` / `npm run bot`。
 
+## 添加技能
+
+文档型技能：在 `skills/<技能名>/` 下放一个 `SKILL.md`（带 frontmatter 的 Markdown，格式同 `skills/helios-kanban-remote/`）即可——启动时自动扫描所有 `skills/*/SKILL.md`，把摘要注入系统提示词，无需改代码。摘要只保留 `Quick workflow` / `Safety rules` 等关键章节（无匹配章节时截断注入），完整文档留在磁盘，避免每回合倾倒全文。可执行能力（新工具）仍需在 `src/tools.ts` 注册。
+
 **看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。
 
 ## 环境变量

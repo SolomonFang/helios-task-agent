@@ -2,30 +2,61 @@ import fs from 'fs';
 import path from 'path';
 import type { UserMemory } from './types';
 
-const SKILL_PATH = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'SKILL.md');
+const SKILLS_DIR = path.join(__dirname, '..', 'skills');
 
-/** Compact skill excerpt for the system prompt (avoids dumping INSTALL/full docs every turn). */
-export function loadSkillDigest(): string {
-  try {
-    const raw = fs.readFileSync(SKILL_PATH, 'utf8');
-    const body = raw.replace(/^---[\s\S]*?---\n*/, '');
-    const keep: string[] = [];
-    const sections = body.split(/\n(?=## )/);
-    for (const sec of sections) {
-      const title = (sec.match(/^## (.+)/) || [])[1] || '';
-      if (
-        /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Task priorities|Safety rules|Out of scope/i.test(
-          title,
-        )
-      ) {
-        keep.push(sec.trim());
-      }
-    }
-    if (keep.length) return keep.join('\n\n');
-    return body.slice(0, 3500);
-  } catch {
-    return '(内置技能 helios-kanban-remote/SKILL.md 读取失败)';
+/** 摘要保留的章节标题——完整文档留在磁盘上，只有这些章节进入系统提示词。 */
+const DIGEST_SECTION_RE =
+  /Quick workflow|Complete lifecycle|Defaults|cancel vs delete|Response format|Executor names|Task statuses|Task priorities|Safety rules|Out of scope/i;
+/** 无匹配章节时截断注入的长度上限（避免每个回合倾倒全文）。 */
+const DIGEST_MAX_LEN = 3500;
+
+export interface SkillDigest {
+  name: string;
+  digest: string;
+}
+
+function digestSkillBody(body: string): string {
+  const keep: string[] = [];
+  const sections = body.split(/\n(?=## )/);
+  for (const sec of sections) {
+    const title = (sec.match(/^## (.+)/) || [])[1] || '';
+    if (DIGEST_SECTION_RE.test(title)) keep.push(sec.trim());
   }
+  if (keep.length) return keep.join('\n\n');
+  return body.slice(0, DIGEST_MAX_LEN);
+}
+
+/**
+ * 扫描 skills/<name>/SKILL.md，为每个技能生成注入系统提示词的紧凑摘要。
+ * 新增技能 = 在 skills/ 下放一个含 SKILL.md 的目录，无需改代码。
+ */
+export function loadSkillDigests(): SkillDigest[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const digests: SkillDigest[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillFile = path.join(SKILLS_DIR, entry.name, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) continue;
+    try {
+      const raw = fs.readFileSync(skillFile, 'utf8');
+      const body = raw.replace(/^---[\s\S]*?---\n*/, '');
+      digests.push({ name: entry.name, digest: digestSkillBody(body) });
+    } catch {
+      digests.push({ name: entry.name, digest: `(技能 ${entry.name}/SKILL.md 读取失败)` });
+    }
+  }
+  return digests.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** 渲染系统提示词尾部的技能摘要区块（无技能时返回空串）。 */
+export function renderSkillsBlock(): string {
+  const digests = loadSkillDigests();
+  return digests.map((s) => `# 内置技能摘要：${s.name}\n\n${s.digest}`).join('\n\n');
 }
 
 export interface SystemPromptOpts {
@@ -159,8 +190,6 @@ ${defaultsBlock}
 
 ---
 
-# 内置技能摘要：helios-kanban-remote
-
-${loadSkillDigest()}
+${renderSkillsBlock()}
 `;
 }
