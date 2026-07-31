@@ -32,12 +32,15 @@ export const c: Record<string, ColorFn> & {
   err: ColorFn;
   info: ColorFn;
   strong: ColorFn;
+  gray: ColorFn;
 } = {
   ok: (t) => paint(t, 'green'),
   warn: (t) => paint(t, 'yellow'),
   err: (t) => paint(t, 'red'),
   info: (t) => paint(t, 'cyan'),
   strong: (t) => paint(t, 'bold'),
+  // 具名声明（下方循环会覆盖为同一实现）：让 c 可直接满足 commands.Paint
+  gray: (t) => paint(t, 'gray'),
 };
 
 for (const name of Object.keys(codes) as StyleName[]) {
@@ -91,13 +94,16 @@ export interface BannerStatus {
   version: string;
 }
 
+/** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用）。 */
+export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
+
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
   const mcpLine =
     status.mcp === 'ok'
       ? c.ok('●') + ` helios-kanban MCP  已连接（${status.mcpToolCount} 个工具）`
       : status.mcp === 'fail'
-        ? c.warn('●') + ' helios-kanban MCP  连接失败（已降级为 HTTP/hk.sh，功能不受影响）'
+        ? c.warn('●') + ` helios-kanban MCP  连接失败（${MCP_FALLBACK_TEXT}，功能不受影响）`
         : c.warn('●') + ' helios-kanban MCP  连接中…';
   const larkLine = status.larkOk
     ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
@@ -116,8 +122,9 @@ export function printBanner(status: BannerStatus): void {
     '',
     '  ' + mcpLine,
     '  ' + larkLine,
-    '  ' + c.ok('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
-    '  ' + c.ok('●') + ` kanban 地址      ${status.kanbanUrl}`,
+    // 模型与 kanban 地址只是配置展示（未做健康检查）：用中性灰点，避免与上面两行的「连接正常」绿点混淆
+    '  ' + c.gray('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
+    '  ' + c.gray('●') + ` kanban 地址      ${status.kanbanUrl}`,
     '',
     c.gray('  输入 /help 查看命令，/config 重新配置模型，/exit 退出'),
     '',
@@ -161,12 +168,42 @@ export class Spinner {
   }
 }
 
-/** Very light markdown render for terminal: code/inline-code/bold get color. */
+/** 简单 markdown 表格做列对齐渲染；结构不完整（缺分隔行 / 列数不齐）时原样返回。 */
+function renderTable(block: string): string {
+  const rows = block.split('\n');
+  if (rows.length < 2) return block;
+  const splitRow = (row: string) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+  const header = splitRow(rows[0]!);
+  const sep = splitRow(rows[1]!);
+  if (header.length < 2 || sep.length !== header.length || !sep.every((cell) => /^:?-{2,}:?$/.test(cell))) return block;
+  const body: string[][] = [];
+  for (const row of rows.slice(2)) {
+    const cells = splitRow(row);
+    if (cells.length !== header.length) return block; // 列数不齐：退化为原样
+    body.push(cells);
+  }
+  const widths = header.map((h, i) => Math.max(visibleLen(h), ...body.map((r) => visibleLen(r[i]!))));
+  const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - visibleLen(s)));
+  const line = (cells: string[]) => cells.map((cell, i) => pad(cell, widths[i]!)).join('  ');
+  return [c.strong(line(header)), line(widths.map((w) => '─'.repeat(w))), ...body.map(line)].join('\n');
+}
+
+/**
+ * Very light markdown render for terminal: code blocks原样保留（先抽占位），
+ * 标题加粗、行内代码/加粗上色、简单表格列对齐；列表保持原样。
+ */
 export function renderReply(text: string): string {
-  return String(text)
-    .replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang: string, code: string) => '\n' + c.gray(code.replace(/\n/g, '\n  ')) + '\n')
+  const blocks: string[] = [];
+  let out = String(text).replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang: string, code: string) => {
+    blocks.push('\n' + c.gray(code.replace(/\n/g, '\n  ')) + '\n');
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
+  out = out
+    .replace(/(\|[^\n]*\|)(\n\|[^\n]*\|)+/g, (table) => renderTable(table))
+    .replace(/^#{1,6}[ \t]+(.+?)[ \t]*$/gm, (_m, s: string) => c.strong(s))
     .replace(/`([^`\n]+)`/g, (_m, s: string) => c.info(s))
     .replace(/\*\*([^*]+)\*\*/g, (_m, s: string) => c.strong(s));
+  return out.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => blocks[Number(i)]!);
 }
 
 export interface SelectOption {

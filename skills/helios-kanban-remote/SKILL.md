@@ -159,6 +159,12 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 **Read and execute [INSTALL.md](INSTALL.md) first.**
 
+> 安装来源说明：npm 包名是 `helios-kanban`，但源码仓库是 `SolomonFang/vibe-kanban`（同一项目）；本 skill 目前只在该仓库的 **`hly-dev` 分支**上（默认分支没有），clone 时必须显式指定分支：
+>
+> ```bash
+> git clone --depth 1 -b hly-dev https://github.com/SolomonFang/vibe-kanban.git
+> ```
+
 ```
 请阅读并执行安装文档：
 https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md

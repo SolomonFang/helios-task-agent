@@ -170,6 +170,16 @@ export function classifyMcp(toolName: string): 'read' | 'write' {
   return 'write'; // unknown → safe default
 }
 
+// --- 「同类免问」批量判定（唯一来源，tools.ts 引用） ---
+
+/** 破坏性 / 高影响操作永不批量——每次都需单独确认（词表覆盖 MCP 写动词中的高危子集）。 */
+const NO_BATCH_RE = /delete|cancel|stop|deny|approve|start|archive|merge|push|execute/i;
+
+/** 该操作是否允许「同类免问」批量放行；破坏性操作（归档/合并/推送/执行等）一律逐次确认。 */
+export function isBatchable(toolName: string): boolean {
+  return !NO_BATCH_RE.test(toolName);
+}
+
 /** Short human summary for a kanban MCP write call. */
 export function summarizeMcp(toolName: string, args: Record<string, unknown>): string {
   const title = typeof args.title === 'string' ? args.title : '';

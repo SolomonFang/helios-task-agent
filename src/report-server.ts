@@ -1,8 +1,9 @@
 /**
- * 报告静态服务：把 reviews/ 目录下的 HTML 报告通过本机 HTTP 暴露，
+ * 报告静态服务：把报告目录下的 HTML 报告通过本机 HTTP 暴露，
  * 飞书只推一个链接即可查看完整内容（与看板 localhost 链接同 reachability）。
  *
- * 安全边界：仅服务指定目录内的 *.html；路径穿越一律 404；随机空闲端口。
+ * 安全边界：仅服务指定目录内的 *.html；路径穿越一律 404；随机空闲端口；
+ * 默认只绑回环（报告含代码 diff，绑 0.0.0.0 会暴露到局域网）。
  */
 
 import http from 'http';
@@ -24,8 +25,13 @@ function linkHost(kanbanUrl: string): string {
   }
 }
 
-export function startReportServer(dir: string, kanbanUrl: string): Promise<ReportServer> {
-  const root = path.resolve(dir);
+function isLoopback(host: string): boolean {
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+/** dirs：允许服务的报告目录（可多个，如 reviews/ 与 reports/）。 */
+export function startReportServer(dirs: string | string[], kanbanUrl: string): Promise<ReportServer> {
+  const roots = (Array.isArray(dirs) ? dirs : [dirs]).map((d) => path.resolve(d));
   const server = http.createServer((req, res) => {
     try {
       if (req.method !== 'GET') {
@@ -39,8 +45,9 @@ export function startReportServer(dir: string, kanbanUrl: string): Promise<Repor
         res.writeHead(404).end('not found');
         return;
       }
-      const file = path.join(root, name);
-      if (path.dirname(file) !== root || !fs.existsSync(file)) {
+      // 命中任一报告目录即服务；均不存在则 404
+      const file = roots.map((root) => path.join(root, name)).find((f) => fs.existsSync(f));
+      if (!file) {
         res.writeHead(404).end('not found');
         return;
       }
@@ -52,12 +59,18 @@ export function startReportServer(dir: string, kanbanUrl: string): Promise<Repor
   });
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    // 端口 0 = 随机空闲端口，避免与看板等本地服务冲突；绑 0.0.0.0 与看板默认 HOST 行为一致
-    server.listen(0, () => {
+    // 端口 0 = 随机空闲端口，避免与看板等本地服务冲突；
+    // 绑定地址跟随看板约定 HELIOS_KANBAN_HOST，默认回环（与看板默认 HOST 一致）
+    const bindHost = process.env.HELIOS_KANBAN_HOST || '127.0.0.1';
+    server.listen(0, bindHost, () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : 0;
+      // 链接主机：看板在本机时沿用其主机名（与既有看板链接同 reachability）；
+      // 看板是远程地址而报告服务绑在本机，则退回绑定地址，不编造局域网可达性
+      const kanbanHost = linkHost(kanbanUrl);
+      const host = isLoopback(kanbanHost) ? kanbanHost : bindHost;
       resolve({
-        baseUrl: `http://${linkHost(kanbanUrl)}:${port}`,
+        baseUrl: `http://${host}:${port}`,
         close: () => server.close(),
       });
     });

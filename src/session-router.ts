@@ -21,6 +21,7 @@ export class SessionRouter {
   private mcpOk: boolean;
   private readonly memory: MemoryStore;
   private readonly confirmFactory?: (openId: string) => ConfirmFn;
+  private readonly reportLinkBaseUrl?: string;
 
   constructor(
     cfg: AgentConfig,
@@ -28,12 +29,15 @@ export class SessionRouter {
     mcpOk: boolean,
     memory?: MemoryStore,
     confirmFactory?: (openId: string) => ConfirmFn,
+    /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
+    reportLinkBaseUrl?: string,
   ) {
     this.cfg = cfg;
     this.mcp = mcp;
     this.mcpOk = mcpOk;
     this.memory = memory || new MemoryStore();
     this.confirmFactory = confirmFactory;
+    this.reportLinkBaseUrl = reportLinkBaseUrl;
   }
 
   getOrCreate(openId: string): AgentSession {
@@ -57,6 +61,7 @@ export class SessionRouter {
       userId: openId,
       memory: this.memory,
       confirm: this.confirmFactory?.(openId),
+      reportLinkBaseUrl: this.reportLinkBaseUrl,
     });
     this.sessions.set(openId, session);
     return session;

@@ -37,6 +37,8 @@ export type AccessDecision = 'allow' | 'claim' | 'deny';
 export function createAccessChecker(initialAllowed: string[]): {
   check: (openId: string) => AccessDecision;
   list: () => string[];
+  /** 撤销运行时认领（owner 绑定未持久化时 fail-closed 用）。 */
+  unclaim: (openId: string) => void;
 } {
   const allowed = new Set(initialAllowed.filter(Boolean));
   let claimable = allowed.size === 0;
@@ -52,6 +54,9 @@ export function createAccessChecker(initialAllowed: string[]): {
     },
     list(): string[] {
       return [...allowed];
+    },
+    unclaim(openId: string): void {
+      if (allowed.delete(openId)) claimable = allowed.size === 0;
     },
   };
 }
@@ -148,10 +153,13 @@ export class FeishuChannel implements AgentChannel {
   private seenMessageIds = new Map<string, number>();
   private readonly seenTtlMs = 10 * 60 * 1000;
   private deniedNotified = new Set<string>();
+  /** owner 绑定写盘失败的用户（fail-closed）：重启前按拒绝处理，避免每条消息重试写盘。 */
+  private claimBlocked = new Set<string>();
   /** Card button callback (card.action.trigger); set by the bot layer. */
   onCardAction?: (data: FeishuCardAction) => void;
-  /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer. */
-  onOwnerClaim?: (openId: string) => void;
+  /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer.
+   *  返回 false（或抛错）= 绑定未持久化：channel 撤销内存放行并阻断重试（fail-closed）。 */
+  onOwnerClaim?: (openId: string) => boolean;
 
   constructor(cfg: FeishuBotConfig) {
     this.cfg = cfg;
@@ -200,23 +208,32 @@ export class FeishuChannel implements AgentChannel {
           const openId = sender?.sender_id?.open_id || '';
           if (!openId) return;
 
-          const access = this.access.check(openId);
-          if (access === 'deny') {
-            console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
-            if (!this.deniedNotified.has(openId)) {
-              this.deniedNotified.add(openId);
-              void this.notifyOpenId(openId, '抱歉，这是私人专用机器人实例，已绑定给其他用户。').catch(() => {});
-            }
-            return;
-          }
+          let access = this.access.check(openId);
           if (access === 'claim') {
             console.log(`[feishu] owner claimed by ${openId}`);
+            let persisted = false;
             try {
-              this.onOwnerClaim?.(openId);
+              persisted = this.onOwnerClaim ? this.onOwnerClaim(openId) : true;
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               console.error(`[feishu] owner claim hook error: ${msg}`);
             }
+            if (!persisted) {
+              // fail-closed：绑定未写回 .env，撤销内存放行并阻断重试（重启前该用户按拒绝处理）
+              this.access.unclaim(openId);
+              this.claimBlocked.add(openId);
+              console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${openId}`);
+              return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
+            }
+          }
+          if (this.claimBlocked.has(openId)) access = 'deny';
+          if (access === 'deny') {
+            console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
+            if (!this.deniedNotified.has(openId)) {
+              this.deniedNotified.add(openId);
+              void this.notifyOpenId(openId, '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系实例 owner 开通，或自行部署一个实例。').catch(() => {});
+            }
+            return;
           }
 
           if (this.seenMessageIds.has(message.message_id)) return;

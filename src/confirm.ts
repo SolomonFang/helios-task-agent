@@ -32,10 +32,23 @@ interface Pending {
   cardMessageId?: string;
 }
 
-// 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作
-const YES_RE = /^(确认|确认执行|同意|批准|执行|y|yes)$/i;
-const BATCH_RE = /^(都允许|同类免问|批量允许|以后都|batch|b)$/i;
-const NO_RE = /^(取消|算了|不用|否|拒绝|n|no)$/i;
+// 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作。
+// 词表为 CLI（readline 逐行）与飞书 bot（文本消息）共用：两端匹配方式可不同，词表必须一致。
+export const CONFIRM_YES_WORDS = ['确认', '确认执行', '同意', '批准', '执行', 'y', 'yes'];
+export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '批量允许', '以后都', '都', '免问', 'batch', 'b'];
+export const CONFIRM_NO_WORDS = ['取消', '算了', '不用', '否', '拒绝', 'n', 'no'];
+
+const wordsToRe = (words: string[]): RegExp => new RegExp(`^(?:${words.join('|')})$`, 'i');
+export const CONFIRM_YES_RE = wordsToRe(CONFIRM_YES_WORDS);
+export const CONFIRM_BATCH_RE = wordsToRe(CONFIRM_BATCH_WORDS);
+export const CONFIRM_NO_RE = wordsToRe(CONFIRM_NO_WORDS);
+
+/** kind 枚举 → 用户可见中文名（未知值回退原值，不把内部枚举漏给用户）。 */
+export function kindLabel(kind: string): string {
+  if (kind === 'lark') return '飞书';
+  if (kind === 'kanban' || kind === 'hk') return '看板';
+  return kind;
+}
 
 export class ConfirmationManager {
   private pendings = new Map<string, Pending>();
@@ -53,7 +66,7 @@ export class ConfirmationManager {
     private opts: {
       /** 非破坏性操作（可批量）的确认超时，默认 120s。 */
       timeoutMs?: number;
-      /** 破坏性操作（无 batchKey：删除/取消/停止/审批/启动及飞书写）的确认超时，默认 300s。 */
+      /** 破坏性操作（无 batchKey：删除/取消/停止/审批/启动/归档/合并/推送/执行及飞书写）的确认超时，默认 300s。 */
       destructiveTimeoutMs?: number;
       onTimeout?: (openId: string, req: ConfirmRequest) => void;
       /** 新写操作顶掉未应答的 pending 时通知（否则用户会以为是自己拒绝的）。 */
@@ -115,15 +128,15 @@ export class ConfirmationManager {
     const p = this.pendings.get(openId);
     if (!p) return 'ignored';
     const t = text.trim();
-    if (BATCH_RE.test(t) && p.req.batchKey) {
+    if (CONFIRM_BATCH_RE.test(t) && p.req.batchKey) {
       this.finish(openId, p, 'batch');
       return 'approved_batch';
     }
-    if (YES_RE.test(t)) {
+    if (CONFIRM_YES_RE.test(t)) {
       this.finish(openId, p, 'once');
       return 'approved';
     }
-    if (NO_RE.test(t)) {
+    if (CONFIRM_NO_RE.test(t)) {
       this.finish(openId, p, false);
       return 'denied';
     }
@@ -170,7 +183,7 @@ function detailCodeBlock(detail: string): string {
 /** Interactive card shown for a pending write operation (legacy card schema). */
 export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 120000): Record<string, unknown> {
   const isLark = req.kind === 'lark';
-  const kindLabel = isLark ? '飞书' : '看板';
+  const kindText = kindLabel(req.kind);
   const timeoutSec = Math.round(timeoutMs / 1000);
   const actions: Record<string, unknown>[] = [
     {
@@ -200,14 +213,14 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     config: { wide_screen_mode: true, enable_forward: false },
     header: {
       template: isLark ? 'blue' : 'orange',
-      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindLabel}写操作确认` },
+      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText}写操作确认` },
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
       {
         tag: 'div',
         fields: [
-          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindLabel}写操作` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText}写操作` } },
           { is_short: true, text: { tag: 'lark_md', content: `**裁决时效**\n${timeoutSec} 秒未操作自动拒绝` } },
         ],
       },
@@ -221,31 +234,31 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
 
 /** 决策/超时/作废后的终态卡片（原地替换确认卡片；无按钮，避免误点与"没反应"）。 */
 export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): Record<string, unknown> {
-  const kindLabel = req.kind === 'lark' ? '飞书' : '看板';
+  const kindText = kindLabel(req.kind);
   const meta: Record<ConfirmSettle, { template: string; title: string; note: string }> = {
     once: {
       template: 'green',
-      title: `✅ ${kindLabel}写操作已批准（仅此次）`,
+      title: `✅ ${kindText}写操作已批准（仅此次）`,
       note: '操作已放行，正在执行。',
     },
     batch: {
       template: 'green',
-      title: `🔁 ${kindLabel}写操作已批准（同类免问 10 分钟）`,
+      title: `🔁 ${kindText}写操作已批准（同类免问 10 分钟）`,
       note: '回复「恢复确认」可随时撤销免问。',
     },
     denied: {
       template: 'red',
-      title: `🚫 ${kindLabel}写操作已取消`,
+      title: `🚫 ${kindText}写操作已取消`,
       note: '操作未执行。',
     },
     timeout: {
       template: 'grey',
-      title: `⏰ ${kindLabel}写操作确认超时`,
+      title: `⏰ ${kindText}写操作确认超时`,
       note: '超时未处理，已自动拒绝，操作未执行。',
     },
     superseded: {
       template: 'grey',
-      title: `⚠️ ${kindLabel}写操作确认已作废`,
+      title: `⚠️ ${kindText}写操作确认已作废`,
       note: '该确认已被新的写操作确认替代，请以最新卡片为准。',
     },
   };

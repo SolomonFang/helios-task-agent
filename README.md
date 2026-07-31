@@ -2,17 +2,28 @@
 
 **中文** | [English](./README.en.md)
 
-终端 / 飞书私聊智能体：把飞书任务与文档整理进 [helios-kanban](https://github.com/SolomonFang/vibe-kanban)。
+终端 / 飞书私聊智能体：把飞书任务与文档整理进 [helios-kanban](https://github.com/SolomonFang/vibe-kanban)（npm 包名是 `helios-kanban`，GitHub 仓库名是 `SolomonFang/vibe-kanban`，同一个项目，搜仓库时请用后者）。
 
 **是否启动 coding agent、用哪个 executor，由你决定。**
 
-## 60 秒上手（终端，零配置）
+核心亮点：
+
+- **写操作安全闸门（代码强制，不靠 prompt 自觉）**：建/改/删任务、start/stop、审批、发飞书消息等，执行前必须确认——终端 `y/b/N`，飞书端确认卡片；闸门缺失时全部写操作失败关闭
+- **看板零预装**：本机 helios-kanban 不可达时自动拉起，马上就能建任务
+- **自然语言驱动**：「同步我的飞书任务」→「写进 helios-kanban」→「用 Claude 跑这个任务」，是否启动、用谁跑都听你的
+
+## 60 秒跑起来（只需一个 LLM API Key）
 
 ```bash
 npx helios-task-agent@latest
 ```
 
-向导只需选一个 LLM 预设并填 API Key（看板默认值可一路回车跳过）。看板**无需预装**，本机不可达时自动拉起——马上就能建任务、跑任务。飞书机器人是可选升级，见下文。
+向导只需选一个 LLM 预设并填 API Key（看板默认值可一路回车跳过）。看板**无需预装**，本机不可达时自动拉起——马上就能建任务、跑任务。飞书相关为可选升级：读飞书任务/文档需另装 lark-cli（约 2 分钟，见「安装」一节）；飞书私聊机器人见下文。
+
+## 两种形态：CLI 与飞书 bot
+
+- **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/b/N`）、看板操作全部可用。
+- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出三项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）。
 
 ## 安装
 
@@ -30,7 +41,7 @@ helios-task-agent bot    # 飞书私聊机器人
 helios-task-agent --version   # 查看版本
 ```
 
-**自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
+**自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会附变更记录（CHANGELOG）链接并请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
 
 **helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban@latest` 拉起（跟随最新版，需要钉版本时用 `HELIOS_KANBAN_PACKAGE` 覆盖；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
 
@@ -41,19 +52,6 @@ npm i -g @larksuite/cli && lark-cli auth login
 ```
 
 从源码开发：`npm install && npm start`。
-
-## 发布（维护者）
-
-打 tag 即触发 GitHub Action 自动发布（`.github/workflows/publish.yml`）：
-
-```bash
-npm version patch          # 或 minor / major，自动改 version 并打 tag
-git push --follow-tags     # 推送 commit + tag，触发发布
-```
-
-tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布版本（如 `1.1.0-beta.0`）自动发到 npm `next` 频道，正式版发到 `latest`。CI 发布前跑 typecheck + build（`prepublishOnly` / `prepack`）；smoke / e2e 依赖本机 helios-kanban，请在打 tag 前本地执行 `npm run verify`。
-
-需要在仓库 Secrets 配置 `NPM_TOKEN`（npm → Access Tokens → Granular Token，勾选 publish 权限）。
 
 ## 端到端主流程
 
@@ -78,8 +76,8 @@ tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布�
 
 | 机制 | 说明 |
 |------|------|
-| 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`b`（同类免问）/`N`；无超时（确认提示时 Ctrl+C = 拒绝）。飞书：确认卡片（仅非破坏性操作带「同类免问 10 分钟」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；可批量操作 120 秒、破坏性操作与飞书写操作 300 秒超时自动拒绝；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
-| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/审批/启动（approve/start）等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm on` 立即撤销 |
+| 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`b`（同类免问）/`N`（应答词表与飞书端一致：确认/批准/同意/执行、同类免问/批量允许 等）；可批量操作 120 秒、破坏性操作 300 秒未操作自动拒绝，确认提示时 Ctrl+C = 拒绝。飞书：确认卡片（仅非破坏性操作带「同类免问 10 分钟」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；超时策略与终端一致；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
+| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/审批/启动/归档/合并/推送/执行（delete/cancel/stop/approve/start/archive/merge/push/execute）等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm on` 立即撤销 |
 | 会话创建上限 | 单会话最多创建 **10** 个看板任务；超限需 `/clear` 后再建 |
 | 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
 | 防注入标记 | `lark_cli` / 看板工具（MCP、`hk_cli`）/ `repo_fs` 的读回内容，以及看板事件、AI 审查结果的会话注入，统一包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
@@ -154,7 +152,7 @@ helios-task-agent-bot
 
 ## 添加技能
 
-文档型技能：在 `skills/<技能名>/` 下放一个带 frontmatter 的 `SKILL.md` 即可——启动时自动扫描所有 `skills/*/SKILL.md`，无需改代码。frontmatter 就是技能契约：
+文档型技能：在 `<数据目录>/skills/<技能名>/` 下放一个带 frontmatter 的 `SKILL.md` 即可——启动时自动扫描，无需改代码。数据目录为 `HELIOS_TASK_AGENT_HOME` 或默认 `~/.helios-task-agent`（与 `.env`、记忆同级）；自定义技能放这里，`npm i -g` 升级不会被抹掉。扫描顺序：**用户数据目录优先，包内 `skills/` 作内置兜底**，同名技能以用户目录为准。frontmatter 就是技能契约：
 
 ```markdown
 ---
@@ -209,9 +207,9 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 ## 飞书 / 终端里可以说
 
-**终端命令**：`/help` `/config` `/status` `/tools` `/memory` `/clear` `/confirm`（查免问状态）`/confirm on`（撤销免问）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
+**终端命令**：`/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm`（查免问状态）`/confirm on`（撤销免问）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
 
-**飞书命令**：`/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
+**飞书命令**：`/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
 
 **自然语言示例**：
 
@@ -255,6 +253,19 @@ npm run build
 ```
 
 也可作为库嵌入（见 `src/index.ts` 导出）。
+
+## 发布（维护者）
+
+打 tag 即触发 GitHub Action 自动发布（`.github/workflows/publish.yml`）：
+
+```bash
+npm version patch          # 或 minor / major，自动改 version 并打 tag
+git push --follow-tags     # 推送 commit + tag，触发发布
+```
+
+tag 必须与 `package.json` 的 `version` 一致（CI 会校验）。预发布版本（如 `1.1.0-beta.0`）自动发到 npm `next` 频道，正式版发到 `latest`。CI 发布前跑 typecheck + build（`prepublishOnly` / `prepack`）；smoke / e2e 依赖本机 helios-kanban，请在打 tag 前本地执行 `npm run verify`。
+
+需要在仓库 Secrets 配置 `NPM_TOKEN`（npm → Access Tokens → Granular Token，勾选 publish 权限）。
 
 ## License
 

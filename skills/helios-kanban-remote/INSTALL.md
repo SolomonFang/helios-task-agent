@@ -15,10 +15,16 @@
 | **Repository** | https://github.com/SolomonFang/vibe-kanban |
 | **Clone URL** | `https://github.com/SolomonFang/vibe-kanban.git` |
 | **Skill path** | `skills/helios-kanban-remote/` |
-| **Default branch** | `hly-dev` |
+| **Skill branch** | `hly-dev`（**不是**仓库默认分支，clone 必须显式指定 `-b hly-dev`） |
 | **This document** | https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md |
 
 The skill is published **inside this repo**. Do not look for a separate package — clone or use this repository directly.
+
+> **命名与分支说明**：看板的 npm 包名是 `helios-kanban`，但源码仓库叫 `SolomonFang/vibe-kanban`（同一项目，历史命名）。本 skill 目前只存在于该仓库的 **`hly-dev` 分支**上，仓库默认分支里**没有** `skills/helios-kanban-remote/`——直接 `git clone`（不带 `-b`）拿到的默认分支装不到这个 skill。务必使用：
+>
+> ```bash
+> git clone --depth 1 -b hly-dev https://github.com/SolomonFang/vibe-kanban.git
+> ```
 
 ---
 
@@ -203,10 +209,11 @@ Tell any agent:
 https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md
 ```
 
-Or shorter:
+Or shorter (note the branch — the skill lives on `hly-dev`, not the repo default branch):
 
 ```
-安装 Helios Kanban 远程控制技能：https://github.com/SolomonFang/vibe-kanban
+安装 Helios Kanban 远程控制技能（在 hly-dev 分支上）：
+https://github.com/SolomonFang/vibe-kanban/tree/hly-dev
 ```
 
 Agent should fetch INSTALL.md from the repo, then run Steps 1–7.

@@ -2,17 +2,28 @@
 
 [中文](./README.md) | **English**
 
-Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanban](https://github.com/SolomonFang/vibe-kanban) cards.
+Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanban](https://github.com/SolomonFang/vibe-kanban) cards. (The npm package is `helios-kanban`; the GitHub repo is `SolomonFang/vibe-kanban` — same project, so search the repo by the latter name.)
 
 **Whether (and with which executor) to start a coding agent is always your choice.**
 
-## 60-second start (terminal, zero config)
+Highlights:
+
+- **Code-enforced write gate** (not prompt goodwill): create/update/delete tasks, start/stop, approvals, Feishu sends all require confirmation — `y/b/N` in the terminal, a confirm card in Feishu; if the gate is missing, every write fails closed
+- **Zero-install kanban**: the board auto-spawns when unreachable locally, so you can create tasks right away
+- **Natural-language driven**: "sync my Feishu tasks" → "write to helios-kanban" → "run it with Claude" — when to start, and with whom, is your call
+
+## 60-second start (just an LLM API key)
 
 ```bash
 npx helios-task-agent@latest
 ```
 
-The wizard only asks for one LLM preset + API key (kanban defaults can be skipped with Enter). No need to preinstall the kanban board — it auto-spawns if unreachable, so you can create and run tasks right away. The Feishu bot is an optional upgrade, see below.
+The wizard only asks for one LLM preset + API key (kanban defaults can be skipped with Enter). No need to preinstall the kanban board — it auto-spawns if unreachable, so you can create and run tasks right away. Feishu is an optional upgrade: reading Feishu tasks/docs needs lark-cli (~2 minutes, see Install below); the Feishu DM bot is described further down.
+
+## Two forms: CLI vs Feishu bot
+
+- **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/b/N`), and all kanban operations included.
+- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds three bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), and **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link).
 
 ## Install
 
@@ -30,7 +41,7 @@ helios-task-agent bot    # Feishu DM bot
 helios-task-agent --version   # show installed version
 ```
 
-**Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
+**Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place with a link to the changelog. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
 **No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (tracks the latest release — pin a version with `HELIOS_KANBAN_PACKAGE` if needed; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
@@ -41,19 +52,6 @@ npm i -g @larksuite/cli && lark-cli auth login
 ```
 
 From source: `npm install && npm start`.
-
-## Release (maintainers)
-
-Pushing a tag triggers the GitHub Action that publishes to npm (`.github/workflows/publish.yml`):
-
-```bash
-npm version patch          # or minor / major — bumps version and creates the tag
-git push --follow-tags     # pushes commit + tag, triggering the release
-```
-
-The tag must match `package.json` `version` (enforced in CI). Prerelease versions (e.g. `1.1.0-beta.0`) go to the npm `next` dist-tag; stable releases go to `latest`. CI runs typecheck + build before publishing (`prepublishOnly` / `prepack`). smoke / e2e need a local helios-kanban — run `npm run verify` locally before tagging.
-
-Requires an `NPM_TOKEN` repository secret (npm → Access Tokens → Granular Token with publish permission).
 
 ## End-to-end flow
 
@@ -77,8 +75,8 @@ Feishu Task Center / docs / group chats
 
 | Mechanism | Behavior |
 |-----------|----------|
-| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N`; no timeout (Ctrl+C at the prompt rejects). Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); timeouts 120s for batchable ops, 300s for destructive ops and Feishu writes; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
-| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start) always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
+| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N` (same answer vocabulary as Feishu: 确认/批准/同意/执行, 同类免问/批量允许, etc.); timeouts 120s for batchable ops, 300s for destructive ops; Ctrl+C at the prompt rejects. Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); same timeout policy; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
+| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
 | Untrusted wrap | External output (`lark_cli`, kanban MCP / `hk_cli`, `repo_fs`) plus kanban-event and AI-review context injections are wrapped UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
@@ -148,7 +146,7 @@ Local: `npm start` / `npm run bot`.
 
 ## Adding skills
 
-Doc-style skills: drop a `SKILL.md` with frontmatter into `skills/<skill-name>/` — at startup every `skills/*/SKILL.md` is scanned, no code change needed. The frontmatter is the skill contract:
+Doc-style skills: drop a `SKILL.md` with frontmatter into `<data-dir>/skills/<skill-name>/` — scanned at startup, no code change needed. The data dir is `HELIOS_TASK_AGENT_HOME` or `~/.helios-task-agent` (alongside `.env` and memory); custom skills live here so `npm i -g` upgrades never wipe them. Scan order: **user data dir first, bundled `skills/` as built-in fallback** — a same-named user skill wins. The frontmatter is the skill contract:
 
 ```markdown
 ---
@@ -201,9 +199,9 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 ## What you can say
 
-**Terminal**: `/help` `/config` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
+**Terminal**: `/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
 
-**Feishu**: `/help` `/status` `/tools` `/memory` `/clear` `/confirm` `/confirm on` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
+**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 
@@ -240,6 +238,19 @@ npm run build
 ```
 
 Embeddable via `src/index.ts` exports.
+
+## Release (maintainers)
+
+Pushing a tag triggers the GitHub Action that publishes to npm (`.github/workflows/publish.yml`):
+
+```bash
+npm version patch          # or minor / major — bumps version and creates the tag
+git push --follow-tags     # pushes commit + tag, triggering the release
+```
+
+The tag must match `package.json` `version` (enforced in CI). Prerelease versions (e.g. `1.1.0-beta.0`) go to the npm `next` dist-tag; stable releases go to `latest`. CI runs typecheck + build before publishing (`prepublishOnly` / `prepack`). smoke / e2e need a local helios-kanban — run `npm run verify` locally before tagging.
+
+Requires an `NPM_TOKEN` repository secret (npm → Access Tokens → Granular Token with publish permission).
 
 ## License
 

@@ -1,6 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { MCP_FALLBACK_TEXT } from '../ui';
 
 export class KanbanMcp {
   readonly command: string;
@@ -102,7 +103,7 @@ export function diagnoseMcpFailure(stderrTail: string): string | null {
     return (
       '提示：MCP 未能发现看板端口文件（vibe-kanban.port）。本机看板进程运行时间过长时，' +
       '该文件可能已被系统清理——重启 helios-kanban 后重新运行本程序即可恢复' +
-      '（当前已自动降级 hk_cli，看板功能不受影响）。'
+      `（当前${MCP_FALLBACK_TEXT}，看板功能不受影响）。`
     );
   }
   return null;

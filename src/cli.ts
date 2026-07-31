@@ -2,16 +2,24 @@ import readline from 'readline';
 import { type ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { c, printBanner, Spinner, renderReply, selectList, readSecret } from './ui';
+import { c, printBanner, Spinner, renderReply, selectList, readSecret, MCP_FALLBACK_TEXT } from './ui';
 import { ensureConfig } from './config-wizard';
-import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
-import { friendlyLlmError } from './llm-error';
-import { LOCAL_TOOL_SUMMARY } from './tools';
-import { loadSkillDigests } from './prompt';
+import {
+  buildMemoryLines,
+  buildSkillsLines,
+  buildStatusLines,
+  buildToolsLines,
+  CLEARED_TEXT,
+  confirmRevokedText,
+  confirmStateText,
+  connectMcp,
+  llmFailureParts,
+} from './commands';
+import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './confirm';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn, LlmPreset } from './types';
 
@@ -59,7 +67,7 @@ const HELP = `
   ${c.info('/help')}     显示帮助
   ${c.info('/config')}   重新配置模型 / kanban 地址
   ${c.info('/tools')}    列出当前可用的 kanban 工具
-  ${c.info('/skills')}   列出已安装技能（skills/ 目录）
+  ${c.info('/skills')}   列出已安装技能（数据目录 skills/ 优先，包内置底）
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
@@ -143,22 +151,11 @@ export async function main(): Promise<void> {
   }
 
   const boot = new Spinner('正在连接 helios-kanban MCP…').start();
-  const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
-  let mcpOk = true;
-  try {
-    await mcp.connect({ timeoutMs: 45000 });
-  } catch (err) {
-    mcpOk = false;
-    if (process.env.HTA_DEBUG) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      console.error(`\n[mcp] ${e.stack || e.message}`);
-    }
-  }
+  const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg);
   boot.stop();
   if (!mcpOk) {
-    console.log(c.warn('MCP 连接失败，已自动降级 hk_cli（看板功能不受影响）。'));
-    const hint = diagnoseMcpFailure(mcp.getStderrTail());
-    if (hint) console.log(c.warn(hint));
+    console.log(c.warn(`MCP 连接失败，${MCP_FALLBACK_TEXT}，看板功能不受影响。`));
+    if (mcpHint) console.log(c.warn(mcpHint));
   }
 
   const larkOk = checkLarkCli();
@@ -179,33 +176,58 @@ export async function main(): Promise<void> {
   /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
   let currentCtl: AbortController | null = null;
 
-  /** ask 的 abort 感知版：闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）。 */
-  const askWithAbort = (promptText: string): Promise<string | null> => {
+  /** 确认超时哨兵：与「用户留空 / Ctrl+C」区分，便于打印自动拒绝文案。 */
+  const ASK_TIMEOUT = Symbol('ask-timeout');
+
+  /**
+   * ask 的 abort/超时感知版：闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）；
+   * 超时未操作按拒绝处理（对齐飞书 bot：可批量 120s / 破坏性 300s）。
+   */
+  const askWithAbort = (promptText: string, timeoutMs?: number): Promise<string | null | typeof ASK_TIMEOUT> => {
     const ctl = currentCtl;
-    if (!ctl) return ask(promptText);
-    if (ctl.signal.aborted) return Promise.resolve(null);
+    if (!ctl && !timeoutMs) return ask(promptText);
+    if (ctl?.signal.aborted) return Promise.resolve(null);
     return new Promise((resolve) => {
-      const onAbort = () => resolve(null);
-      ctl.signal.addEventListener('abort', onAbort, { once: true });
-      void ask(promptText).then((a) => {
-        ctl.signal.removeEventListener('abort', onAbort);
-        resolve(a);
-      });
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const onAbort = () => finish(null);
+      const finish = (v: string | null | typeof ASK_TIMEOUT) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        ctl?.signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      };
+      ctl?.signal.addEventListener('abort', onAbort, { once: true });
+      if (timeoutMs) {
+        timer = setTimeout(() => finish(ASK_TIMEOUT), timeoutMs);
+        timer.unref();
+      }
+      void ask(promptText).then(finish);
     });
   };
 
-  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「b」开启同类免问；Ctrl+C 视为拒绝。
+  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「b」开启同类免问；Ctrl+C 视为拒绝；
+  // 超时自动拒绝（与飞书 bot 同语义：可批量 120s、破坏性 300s）。
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
     console.log('');
-    console.log(c.warn(`⚠️ 写操作请求（${req.kind}）：${req.summary}`));
+    console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
+    const timeoutMs = req.batchKey ? 120000 : 300000;
     const batchHint = req.batchKey ? '，b=同类免问10分钟' : '';
-    const ans = await askWithAbort(c.warn(`允许执行？[y=仅此次${batchHint} / N=拒绝] `));
-    const t = (ans || '').trim().toLowerCase();
-    const batch = Boolean(req.batchKey) && /^(b|batch|都|都允许|免问|同类免问)$/.test(t);
-    const once = !batch && /^(y|yes|确认|同意)$/.test(t);
+    const ans = await askWithAbort(
+      c.warn(`允许执行？[y=仅此次${batchHint} / N=取消]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
+      timeoutMs,
+    );
     spinner.start('思考中…（Ctrl+C 中断）');
+    if (ans === ASK_TIMEOUT) {
+      console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。'));
+      return false;
+    }
+    const t = (ans || '').trim().toLowerCase();
+    const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
+    const once = !batch && CONFIRM_YES_RE.test(t);
     if (batch) {
       console.log(c.ok('已批准；同类写操作 10 分钟内免问（/confirm on 撤销）。'));
       return 'batch';
@@ -214,7 +236,7 @@ export async function main(): Promise<void> {
       console.log(c.ok('已批准（仅此次），继续执行。'));
       return 'once';
     }
-    console.log(c.gray('已拒绝，操作未执行。'));
+    console.log(c.gray('已取消，操作未执行。'));
     return false;
   };
 
@@ -233,14 +255,18 @@ export async function main(): Promise<void> {
     rl.close();
     process.exit(0);
   };
-  process.on('SIGINT', () => {
+  const onSigint = () => {
     if (currentCtl) {
       currentCtl.abort();
       return;
     }
     console.log('\n' + c.gray('再见 👋'));
     void cleanup();
-  });
+  };
+  // terminal 模式下 readline 会拦截 ^C：rl 无 SIGINT listener 时默认 rl.close()，
+  // 任务运行中按 Ctrl+C 会关闭输入流而非中断当前任务；两级 handler 同一函数，天然幂等。
+  process.on('SIGINT', onSigint);
+  rl.on('SIGINT', onSigint);
 
   // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效，复用 cleanup 的看板处置）
   if (pendingUpdate) {
@@ -269,67 +295,63 @@ export async function main(): Promise<void> {
         console.log(HELP);
       } else if (cmd === '/clear') {
         session.clearHistory();
-        console.log(c.gray('对话历史已清空（记忆保留）。'));
+        console.log(c.gray(CLEARED_TEXT));
       } else if (cmd === '/confirm' || cmd === '/confirm on') {
         if (cmd === '/confirm on') {
           const n = session.revokeBatchApprovals();
           console.log(
-            n ? c.ok(`已恢复逐次确认（撤销 ${n} 类「同类免问」授权）。`) : c.gray('当前没有生效中的「同类免问」。'),
+            n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, '当前没有生效中的「同类免问」。')),
           );
         } else {
           const active = session.activeBatchApprovals();
           console.log(
-            active
-              ? c.warn(`当前有 ${active} 类写操作处于「同类免问」中；输入 /confirm on 恢复逐次确认。`)
-              : c.gray('当前没有生效中的「同类免问」（写操作逐次确认）。'),
+            active ? c.warn(confirmStateText(active, '输入 /confirm on 恢复逐次确认')) : c.gray(confirmStateText(0, '')),
           );
         }
       } else if (cmd === '/memory') {
-        console.log(c.strong('用户记忆') + c.gray(`  user=${session.memoryUserId}`));
-        console.log(session.formatMemory());
+        for (const l of buildMemoryLines(session, c.strong('用户记忆') + c.gray(`  user=${session.memoryUserId}`))) {
+          console.log(l);
+        }
         console.log('');
       } else if (cmd === '/tools') {
-        if (mcpOk) {
-          console.log(c.strong('kanban MCP 工具:'));
-          for (const t of mcp.tools) {
-            console.log(`  ${c.info('kanban_' + t.name)}  ${c.gray((t.description || '').split('\n')[0])}`);
-          }
-        } else {
-          console.log(c.warn('MCP 未连接（已降级 hk_cli，看板功能不受影响）。'));
-        }
-        console.log(c.strong('本地工具:'));
-        for (const t of LOCAL_TOOL_SUMMARY) {
-          console.log(`  ${c.info(t.name)}  ${c.gray(t.summary)}`);
+        for (const l of buildToolsLines(
+          {
+            mcpOk,
+            mcpTools: mcp.tools,
+            kanbanHeader: c.strong('kanban MCP 工具:'),
+            downNote: c.warn(`MCP 未连接（${MCP_FALLBACK_TEXT}，看板功能不受影响）。`),
+            localHeader: c.strong('本地工具:'),
+            bullet: '  ',
+          },
+          c,
+        )) {
+          console.log(l);
         }
       } else if (cmd === '/skills') {
-        const skills = loadSkillDigests();
-        if (!skills.length) {
-          console.log(c.gray('（skills/ 下没有已安装技能）'));
-        } else {
-          console.log(c.strong('已安装技能:'));
-          for (const s of skills) {
-            const brief = s.description.replace(/\s+/g, ' ').slice(0, 100);
-            console.log(`  ${c.info(s.name)}  ${c.gray(brief)}`);
-          }
-          console.log(c.gray('对话中可直接问「你有什么技能」；细节由 agent 用 skill_doc 按需读取。'));
+        for (const l of buildSkillsLines(
+          {
+            header: c.strong('已安装技能:'),
+            bullet: '  ',
+            footer: c.gray('对话中可直接问「你有什么技能」；细节由 agent 用 skill_doc 按需读取。'),
+          },
+          c,
+        )) {
+          console.log(l);
         }
       } else if (cmd === '/status') {
-        let kanbanHealth: string;
-        try {
-          const res = await fetch(`${cfg.kanbanUrl.replace(/\/+$/, '')}/api/health`, {
-            signal: AbortSignal.timeout(5000),
-          });
-          kanbanHealth = res.ok ? 'ok' : `HTTP ${res.status}`;
-        } catch {
-          kanbanHealth = '不可达';
-        }
-        console.log(c.strong('状态'));
-        console.log(`  模型: ${c.info(cfg.llmModel)}`);
-        console.log(`  kanban: ${kanbanHealth === 'ok' ? c.ok('ok') : c.warn(kanbanHealth)}（${cfg.kanbanUrl}）`);
-        console.log(
-          `  MCP: ${mcpOk ? c.ok(`ok（${mcp.tools.length} 个工具）`) : c.warn('连接失败（降级 hk_cli）')}`,
+        const lines = await buildStatusLines(
+          {
+            model: cfg.llmModel,
+            kanbanUrl: cfg.kanbanUrl,
+            mcpOk,
+            mcpToolCount: mcp.tools.length,
+            mcpDownNote: `连接失败（${MCP_FALLBACK_TEXT}）`,
+            larkOk,
+          },
+          c,
         );
-        console.log(`  lark-cli: ${larkOk ? c.ok('ok') : c.warn('未安装（飞书读取不可用）')}`);
+        console.log(c.strong('状态'));
+        for (const l of lines) console.log('  ' + l);
         console.log('');
       } else if (cmd === '/config') {
         try {
@@ -375,12 +397,10 @@ export async function main(): Promise<void> {
         console.log(c.gray('\n⏹ 已中断当前任务（进程未退出，可继续对话）。'));
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(c.err(`\n请求失败: ${message}`));
-        const friendly = friendlyLlmError(message);
-        if (friendly) console.error(c.warn(friendly));
-        console.error(
-          c.gray(`上一条内容「${line.slice(0, 60)}${line.length > 60 ? '…' : ''}」未发送成功，可修改后重发；也可用 /config 检查模型配置。\n`),
-        );
+        const parts = llmFailureParts(message, line, 'cli');
+        console.error(c.err(`\n${parts.head}`));
+        if (parts.friendly) console.error(c.warn(parts.friendly));
+        console.error(c.gray(parts.tail + '\n'));
       }
     } finally {
       currentCtl = null;

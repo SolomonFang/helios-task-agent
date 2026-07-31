@@ -3,6 +3,7 @@ import path from 'path';
 import { execFile, spawn } from 'child_process';
 import { defaultDataHome } from './memory';
 import { writeFilePrivateSync } from './private-file';
+import { CONFIRM_YES_RE } from './confirm';
 
 /**
  * npm 版本更新检查：启动时探测 registry 上的更新版本，发现后请示用户是否更新。
@@ -14,6 +15,8 @@ import { writeFilePrivateSync } from './private-file';
  */
 
 export const PKG_NAME = 'helios-task-agent';
+/** 更新提示附带的变更记录地址（评估是否升级的参考）。 */
+export const CHANGELOG_URL = 'https://github.com/SolomonFang/helios-task-agent/blob/main/CHANGELOG.md';
 const CACHE_FILE = 'update-check.json';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8000;
@@ -204,8 +207,8 @@ function defaultRunUpdate(tag: 'latest' | 'next'): Promise<boolean> {
 export async function promptVersionUpdate(deps: PromptUpdateDeps): Promise<UpdateOutcome> {
   const { info } = deps;
   const log = deps.log || (() => {});
-  const ans = (await deps.ask(`\n发现新版本 helios-task-agent ${info.latest}（当前 ${info.current}）。现在更新？[y/N] `)) || '';
-  if (!/^(y|yes)$/i.test(ans.trim())) {
+  const ans = (await deps.ask(`\n发现新版本 helios-task-agent ${info.latest}（当前 ${info.current}）。\n变更内容：${CHANGELOG_URL}\n现在更新？[y=更新 / N=跳过] `)) || '';
+  if (!CONFIRM_YES_RE.test(ans.trim())) {
     log(`已跳过更新；随时可手动执行：npm i -g ${PKG_NAME}@latest（HTA_UPDATE_CHECK=0 可关闭启动检查）`);
     return 'skipped';
   }

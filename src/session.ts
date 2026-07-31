@@ -20,6 +20,8 @@ export interface AgentSessionOptions {
   memory?: MemoryStore;
   /** 写操作确认通道（CLI y/n 或飞书卡片）；缺省时所有写操作被闸门阻止。 */
   confirm?: ConfirmFn;
+  /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
+  reportLinkBaseUrl?: string;
 }
 
 /**
@@ -33,6 +35,7 @@ export class AgentSession {
   private readonly userId: string;
   private readonly memory: MemoryStore;
   private readonly confirm?: ConfirmFn;
+  private readonly reportLinkBaseUrl?: string;
   private batchedConfirm?: BatchConfirmFn;
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
@@ -48,6 +51,7 @@ export class AgentSession {
     this.userId = opts.userId || 'local';
     this.memory = opts.memory || new MemoryStore();
     this.confirm = opts.confirm;
+    this.reportLinkBaseUrl = opts.reportLinkBaseUrl;
     const runtime = this.buildRuntime(cfg);
     this.client = runtime.client;
     this.openAiTools = runtime.openAiTools;
@@ -119,6 +123,7 @@ export class AgentSession {
       userId: this.userId,
       onMemoryChange: () => this.refreshSystemPrompt(),
       confirm: this.getConfirm(),
+      reportLinkBaseUrl: this.reportLinkBaseUrl,
     });
     const systemPrompt = buildSystemPrompt(this.promptOpts());
     return {

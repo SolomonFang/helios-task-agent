@@ -9,7 +9,6 @@ import readline from 'readline';
 import path from 'path';
 import { currentConfig, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config';
 import { ensureBotConfig, rebindFeishuBot } from './config-wizard';
-import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/feishu';
 import { SessionRouter } from './session-router';
@@ -18,16 +17,27 @@ import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './conf
 import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
 import { runAiReview } from './kanban/ai-review';
 import { isAllPass, reviewsDir, writeReviewReport } from './review-report';
+import { reportsDir } from './report';
 import { startReportServer, type ReportServer } from './report-server';
 import { checkLarkCli, checkOcrCli, kanbanPackageSpec, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
-import { friendlyLlmError } from './llm-error';
-import { LOCAL_TOOL_SUMMARY } from './tools';
-import { loadSkillDigests } from './prompt';
+import {
+  buildMemoryLines,
+  buildSkillsLines,
+  buildStatusLines,
+  buildToolsLines,
+  CLEARED_TEXT,
+  confirmRevokedText,
+  confirmStateText,
+  connectMcp,
+  llmFailureParts,
+  parseCommand,
+  plainPaint,
+} from './commands';
 import type { AskFn, ChooseFn, InboundMessage, ProgressInfo } from './types';
 import type { ChildProcess } from 'child_process';
-import { c, readSecret, selectList } from './ui';
+import { c, readSecret, selectList, MCP_FALLBACK_TEXT } from './ui';
 
 const BOT_HELP = `Helios Task Agent（飞书私聊）
 
@@ -35,7 +45,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /help     显示帮助
 /status   健康检查（kanban / MCP / lark-cli / 推送）
 /tools    列出当前可用工具
-/skills   列出已安装技能（skills/ 目录）
+/skills   列出已安装技能（数据目录 skills/ 优先，包内置底）
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
 /stop     中断当前任务（排队消息与待确认写操作一并取消）
@@ -45,7 +55,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
 · 「确认执行」仅此次有效；「同类免问 10 分钟」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
-· 普通写操作 120 秒、删除/取消/停止/审批/启动类 300 秒未操作自动拒绝
+· 普通写操作 120 秒、删除/取消/停止/审批/启动/归档/合并/推送/执行类 300 秒未操作自动拒绝
 
 可以说
 · 以后都从这个飞书地址同步任务：<链接>
@@ -54,12 +64,6 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 · 有哪些项目 / 创建一个任务：…
 · 用 Claude 跑这个任务（是否启用、用谁跑由你决定）
 · 总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）`;
-
-function isCommand(text: string): string | null {
-  const t = text.trim();
-  if (!t.startsWith('/')) return null;
-  return t.split(/\s+/)[0]!.toLowerCase();
-}
 
 function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: () => void } {
   const rl = readline.createInterface({
@@ -180,29 +184,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // AI 审查报告静态服务：报告写入数据目录 reviews/，飞书只推链接，避免长文本截断
+  // 报告静态服务：AI 审查（reviews/）与工作总结（reports/）两类报告都推 HTTP 链接，
+  // 避免长文本截断与本机路径在手机飞书打不开的问题
   let reportServer: ReportServer | null = null;
   try {
-    reportServer = await startReportServer(reviewsDir(), agentCfg.kanbanUrl);
-    console.log(c.gray(`审查报告服务: ${reportServer.baseUrl}`));
+    reportServer = await startReportServer([reviewsDir(), reportsDir()], agentCfg.kanbanUrl);
+    console.log(c.gray(`报告服务: ${reportServer.baseUrl}`));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(c.warn(`审查报告服务启动失败，AI 审查结果将回退为文本推送: ${message}`));
+    console.warn(c.warn(`报告服务启动失败，报告将回退为文本/本机路径推送: ${message}`));
   }
 
   const bootLabel = '正在连接 helios-kanban MCP…';
   process.stdout.write(c.gray(bootLabel));
-  const mcp = new KanbanMcp({ command: agentCfg.mcpCommand, args: agentCfg.mcpArgs });
-  let mcpOk = true;
-  try {
-    await mcp.connect({ timeoutMs: 45000 });
+  const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg);
+  if (mcpOk) {
     process.stdout.write(c.ok(`\rMCP 已连接（${mcp.tools.length} 个工具）          \n`));
-  } catch (err) {
-    mcpOk = false;
-    const message = err instanceof Error ? err.message : String(err);
-    process.stdout.write(c.warn(`\rMCP 连接失败，降级 hk_cli：${message}\n`));
-    const hint = diagnoseMcpFailure(mcp.getStderrTail());
-    if (hint) process.stdout.write(c.warn(`${hint}\n`));
+  } else {
+    process.stdout.write(c.warn(`\rMCP 连接失败，${MCP_FALLBACK_TEXT}：${mcpError}\n`));
+    if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
   const memory = new MemoryStore();
@@ -271,18 +271,31 @@ async function main(): Promise<void> {
     else void channel.notifyOpenId(openId, '该确认已处理或已过期，无需重复操作。').catch(() => {});
   };
 
-  // 白名单为空时：首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）
+  // 白名单为空时：首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）。
+  // 写盘失败返回 false：channel 撤销内存放行（fail-closed），避免重启后任何人可再 claim。
   channel.onOwnerClaim = (openId) => {
     try {
       writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
       console.log(c.ok(`首个私聊用户已成为 owner 并写入白名单: ${openId}`));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[owner] 白名单写入失败: ${message}`);
+      console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）: ${message}`);
+      void channel
+        .notifyOpenId(
+          openId,
+          `⚠️ owner 绑定失败：白名单写入 .env 未成功，本次绑定未持久化，你暂时无法使用本机器人。` +
+            `请检查 ${userEnvPath()} 及所在目录的写权限，修复后重启机器人再私聊。`,
+        )
+        .catch(() => {});
+      return false;
     }
     void channel
-      .notifyOpenId(openId, '👋 你已成为本机器人实例的 owner（已写入白名单），其他私聊用户将被拒绝。')
+      .notifyOpenId(
+        openId,
+        '👋 你已成为本机器人实例的 owner（已写入白名单），其他私聊用户将被拒绝。发送 /help 查看我能做什么。',
+      )
       .catch(() => {});
+    return true;
   };
 
   // 注意：router 始终持有 mcp 对象（即使启动时降级），supervisor 重连后可热切换回来
@@ -292,6 +305,7 @@ async function main(): Promise<void> {
     mcpOk,
     memory,
     (openId) => (req) => confirmations.request(openId, req),
+    reportServer?.baseUrl,
   );
 
   /** 执行 AI 审查（open-code-review）并把结果推回飞书；同时注入会话上下文便于追问/修复。 */
@@ -359,6 +373,7 @@ async function main(): Promise<void> {
                     ? '已注入会话上下文，可直接继续追问。'
                     : '已注入会话上下文，可直接回复「按审查意见修一下」。',
                 },
+                { tag: 'plain_text', content: '报告链接仅在运行本机器人的电脑上可达，进程重启后失效。' },
               ],
             },
           ],
@@ -420,8 +435,8 @@ async function main(): Promise<void> {
           if (mcpAlive && mcpFailures >= MCP_FAIL_THRESHOLD) {
             mcpAlive = false;
             router.setMcpOk(false);
-            console.log(c.warn('MCP 连接丢失，降级 hk_cli，将自动重连…'));
-            notifyOwners('⚠️ 看板 MCP 连接丢失，已自动降级 hk_cli（恢复后自动切回）');
+            console.log(c.warn(`MCP 连接丢失，${MCP_FALLBACK_TEXT}，将自动重连…`));
+            notifyOwners(`⚠️ 看板 MCP 连接丢失，${MCP_FALLBACK_TEXT}（恢复后自动切回）`);
           }
           if (!mcpAlive && running.size === 0 && (mcpFailures <= 3 || mcpFailures % 5 === 0)) {
             try {
@@ -468,7 +483,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const cmd = isCommand(text);
+    const cmd = parseCommand(text);
     if (cmd === '/help') {
       await channel.reply(msg, BOT_HELP);
       return;
@@ -502,62 +517,50 @@ async function main(): Promise<void> {
         const n = session.revokeBatchApprovals();
         await channel.reply(
           msg,
-          n ? `✅ 已恢复逐次确认（撤销 ${n} 类「同类免问」授权）。` : '当前没有生效中的「同类免问」，无需撤销。',
+          n ? `✅ ${confirmRevokedText(n, '')}` : confirmRevokedText(0, '当前没有生效中的「同类免问」，无需撤销。'),
         );
       } else {
-        const active = session.activeBatchApprovals();
-        await channel.reply(
-          msg,
-          active
-            ? `当前有 ${active} 类写操作处于「同类免问」中；回复「恢复确认」撤销。`
-            : '当前没有生效中的「同类免问」（写操作逐次确认）。',
-        );
+        await channel.reply(msg, confirmStateText(session.activeBatchApprovals(), '回复「恢复确认」撤销'));
       }
       return;
     }
     if (cmd === '/status') {
-      let kanbanHealth: string;
-      try {
-        const res = await fetch(`${agentCfg.kanbanUrl.replace(/\/+$/, '')}/api/health`, {
-          signal: AbortSignal.timeout(5000),
-        });
-        kanbanHealth = res.ok ? 'ok' : `HTTP ${res.status}`;
-      } catch {
-        kanbanHealth = '不可达';
-      }
-      const lines = [
-        `模型: ${agentCfg.llmModel}`,
-        `kanban: ${kanbanHealth}（${agentCfg.kanbanUrl}）`,
-        `MCP: ${mcpAlive ? `ok（${mcp.tools.length} 个工具）` : '降级 hk_cli（自动重连中）'}`,
-        `lark-cli: ${checkLarkCli() ? 'ok' : '未安装（飞书读取不可用）'}`,
-        `ocr: ${checkOcrCli() ? 'ok' : '未安装（AI 审查首次点击自动 npx 拉取）'}`,
-        `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
-      ];
+      const lines = await buildStatusLines(
+        {
+          model: agentCfg.llmModel,
+          kanbanUrl: agentCfg.kanbanUrl,
+          mcpOk: mcpAlive,
+          mcpToolCount: mcp.tools.length,
+          mcpDownNote: `${MCP_FALLBACK_TEXT}，自动重连中`,
+          larkOk: checkLarkCli(),
+          extra: [
+            `ocr: ${checkOcrCli() ? 'ok' : '未安装（AI 审查首次点击自动 npx 拉取）'}`,
+            `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
+          ],
+        },
+        plainPaint,
+      );
       await channel.reply(msg, lines.join('\n'));
       return;
     }
     if (cmd === '/tools') {
-      const lines: string[] = [];
-      if (mcpAlive && mcp.tools.length) {
-        lines.push(`看板工具（MCP，${mcp.tools.length} 个）`);
-        for (const t of mcp.tools) {
-          const desc = (t.description || '').split('\n')[0];
-          lines.push(`· kanban_${t.name}${desc ? `  ${desc}` : ''}`);
-        }
-      } else {
-        lines.push('看板工具：MCP 未连接（已自动降级 hk_cli，功能不受影响）');
-      }
-      lines.push('本地工具');
-      for (const t of LOCAL_TOOL_SUMMARY) lines.push(`· ${t.name}  ${t.summary}`);
+      const lines = buildToolsLines(
+        {
+          mcpOk: mcpAlive && mcp.tools.length > 0,
+          mcpTools: mcp.tools,
+          kanbanHeader: `看板工具（MCP，${mcp.tools.length} 个）`,
+          downNote: `看板工具：MCP 未连接（${MCP_FALLBACK_TEXT}，功能不受影响）`,
+          localHeader: '本地工具',
+          bullet: '· ',
+        },
+        plainPaint,
+      );
       await channel.reply(msg, lines.join('\n'));
       return;
     }
     if (cmd === '/skills') {
-      const skills = loadSkillDigests();
-      const lines = skills.length
-        ? skills.map((s) => `· ${s.name}  ${s.description.replace(/\s+/g, ' ').slice(0, 100)}`)
-        : ['（skills/ 下没有已安装技能）'];
-      await channel.reply(msg, ['已安装技能', ...lines].join('\n'));
+      const lines = buildSkillsLines({ header: '已安装技能', bullet: '· ', headerWhenEmpty: true }, plainPaint);
+      await channel.reply(msg, lines.join('\n'));
       return;
     }
 
@@ -575,12 +578,12 @@ async function main(): Promise<void> {
       const session = router.getOrCreate(openId);
 
       if (cmd === '/memory') {
-        await channel.reply(msg, `你的记忆\n${session.formatMemory()}`);
+        await channel.reply(msg, buildMemoryLines(session, '你的记忆').join('\n'));
         return;
       }
       if (cmd === '/clear') {
         session.clearHistory();
-        await channel.reply(msg, '对话历史已清空（记忆保留）。');
+        await channel.reply(msg, CLEARED_TEXT);
         return;
       }
       if (cmd) {
@@ -625,11 +628,8 @@ async function main(): Promise<void> {
           await channel.reply(msg, '⏹ 已中断。');
         } else {
           const message = err instanceof Error ? err.message : String(err);
-          const friendly = friendlyLlmError(message, { channel: 'bot' });
-          await channel.reply(
-            msg,
-            `请求失败: ${message}${friendly ? `\n${friendly}` : ''}\n你的上一条消息未处理：「${text.slice(0, 60)}${text.length > 60 ? '…' : ''}」，可修改后重发。`,
-          );
+          const parts = llmFailureParts(message, text, 'bot');
+          await channel.reply(msg, [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n'));
         }
       } finally {
         running.delete(openId);

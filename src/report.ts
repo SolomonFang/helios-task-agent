@@ -276,6 +276,11 @@ export interface SummaryReportPaths {
   mdPath?: string;
 }
 
+/** 工作总结报告输出目录（数据目录 reports/；report-server 会把它纳入静态服务）。 */
+export function reportsDir(): string {
+  return path.join(defaultDataHome(), 'reports');
+}
+
 function sanitizeName(s: string): string {
   return s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'report';
 }
@@ -285,7 +290,7 @@ export function writeSummaryReports(
   opts: WriteSummaryReportsOptions = {},
 ): SummaryReportPaths {
   const format = opts.format ?? 'both';
-  const dir = opts.dir ?? path.join(defaultDataHome(), 'reports');
+  const dir = opts.dir ?? reportsDir();
   fs.mkdirSync(dir, { recursive: true });
   const stamp = data.iteration?.trim()
     ? data.iteration.trim()
@@ -309,11 +314,19 @@ export function writeSummaryReports(
   return out;
 }
 
-/** 工具结果用的紧凑文本：文件路径 + 总量概览 + 最多 5 条任务标题。 */
-export function summarizeForChat(data: WorkSummaryData, paths: SummaryReportPaths): string {
+/** 工具结果用的紧凑文本：文件路径（或 HTTP 链接）+ 总量概览 + 最多 5 条任务标题。 */
+export function summarizeForChat(
+  data: WorkSummaryData,
+  paths: SummaryReportPaths,
+  opts: { linkBaseUrl?: string } = {},
+): string {
   const { totals } = data;
   const lines: string[] = [`📊 工作总结报告已生成（${data.sinceLabel}）`];
-  if (paths.htmlPath) lines.push(`- HTML：${paths.htmlPath}`);
+  if (paths.htmlPath) {
+    // bot 场景给 HTTP 链接（本机路径手机飞书打不开）；CLI 保留本机路径
+    if (opts.linkBaseUrl) lines.push(`- HTML：${opts.linkBaseUrl}/${path.basename(paths.htmlPath)}`);
+    else lines.push(`- HTML：${paths.htmlPath}`);
+  }
   if (paths.mdPath) lines.push(`- Markdown：${paths.mdPath}`);
   lines.push(
     '',

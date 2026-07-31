@@ -10,11 +10,20 @@ import {
   classifyHk,
   classifyLark,
   classifyMcp,
+  isBatchable,
   looksLikeStrongFailure,
   withBatchApproval,
   type ConfirmRequest,
 } from '../src/guard';
-import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from '../src/confirm';
+import {
+  ConfirmationManager,
+  buildConfirmCard,
+  buildResolvedCard,
+  CONFIRM_YES_RE,
+  CONFIRM_BATCH_RE,
+  CONFIRM_NO_RE,
+  kindLabel,
+} from '../src/confirm';
 import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/llm';
 import { createAccessChecker, parsePostContent, splitText } from '../src/channels/feishu';
 import { extractSourceUrls, SourceRegistry } from '../src/source-registry';
@@ -22,13 +31,13 @@ import { MemoryStore } from '../src/memory';
 import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
 import { writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
-import { parseFrontmatter, loadSkillDigests, readSkillDoc, renderSkillsBlock, validateSkills } from '../src/prompt';
+import { parseFrontmatter, loadSkillDigests, readSkillDoc, renderSkillsBlock, userSkillsDir, validateSkills, buildSystemPrompt } from '../src/prompt';
 import { auditLog } from '../src/audit';
 import { SessionRouter } from '../src/session-router';
 import { AgentSession } from '../src/session';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import { compareVersions, checkForUpdate, promptVersionUpdate, type DistTags } from '../src/update-check';
+import { compareVersions, checkForUpdate, promptVersionUpdate, CHANGELOG_URL, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
 import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
@@ -37,6 +46,20 @@ import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
 import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
 import { startReportServer } from '../src/report-server';
+import { summarizeForChat } from '../src/report';
+import {
+  parseCommand,
+  buildToolsLines,
+  buildSkillsLines,
+  plainPaint,
+  confirmStateText,
+  confirmRevokedText,
+  llmFailureParts,
+  CLEARED_TEXT,
+} from '../src/commands';
+import { renderReply, MCP_FALLBACK_TEXT } from '../src/ui';
+import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import type { WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 
 let failures = 0;
@@ -1282,6 +1305,364 @@ async function main(): Promise<void> {
     assert.ok(openAiTools.some((t) => t.function.name === 'skill_doc'), 'skill_doc 应注册');
     const out = await handlers.get('skill_doc')!({}, undefined);
     assert.ok(out.includes('helios-kanban-remote'), '省略 name 应返回技能清单');
+  });
+
+  // ---------- 批量判定唯一来源：归档/合并/推送/执行类永不批量 ----------
+  check('isBatchable：delete/archive/merge/push/execute 等不批量，create/update 可批量', (() => {
+    return (
+      !isBatchable('archive_task') &&
+      !isBatchable('merge_workspace') &&
+      !isBatchable('push_changes') &&
+      !isBatchable('execute_command') &&
+      !isBatchable('delete_task') &&
+      !isBatchable('stop_workspace') &&
+      !isBatchable('approve') &&
+      isBatchable('create_task') &&
+      isBatchable('update_task')
+    );
+  })());
+
+  await checkAsync('闸门 batchKey：kanban_archive_* 不产生 batchKey（同类免问不适用）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-nobatch-'));
+    const fakeMcp = {
+      connected: true,
+      tools: [
+        { name: 'archive_task', description: '', inputSchema: { type: 'object', properties: {} } },
+        { name: 'create_task', description: '', inputSchema: { type: 'object', properties: {} } },
+      ],
+      callTool: async () => '{"success":true}',
+    } as unknown as KanbanMcp;
+    const seen: Array<string | undefined> = [];
+    const { handlers } = buildTools({
+      mcp: fakeMcp,
+      kanbanUrl: 'http://localhost:1',
+      confirm: async (req) => {
+        seen.push(req.batchKey);
+        return 'once';
+      },
+      registry: new SourceRegistry(tmp),
+      auditHome: tmp,
+    });
+    await handlers.get('kanban_archive_task')!({ task_id: 'x' });
+    await handlers.get('kanban_create_task')!({ title: 't' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    assert.deepEqual(seen, [undefined, 'kanban:create_task']);
+  });
+
+  // ---------- 确认应答词表：两端共用同一份（并集） ----------
+  check('确认词表：批准/免问/拒绝关键词条在列，随口应答不算批准', (() => {
+    return (
+      CONFIRM_YES_RE.test('确认') &&
+      CONFIRM_YES_RE.test('批准') && // 原 CLI 缺这个词
+      CONFIRM_YES_RE.test('执行') &&
+      CONFIRM_YES_RE.test('y') &&
+      CONFIRM_BATCH_RE.test('同类免问') &&
+      CONFIRM_BATCH_RE.test('批量允许') &&
+      CONFIRM_BATCH_RE.test('都') &&
+      CONFIRM_BATCH_RE.test('免问') &&
+      CONFIRM_BATCH_RE.test('b') &&
+      CONFIRM_NO_RE.test('取消') &&
+      CONFIRM_NO_RE.test('拒绝') &&
+      !CONFIRM_YES_RE.test('好') &&
+      !CONFIRM_YES_RE.test('可以') &&
+      !CONFIRM_YES_RE.test('批准一下') // 必须整词匹配
+    );
+  })());
+
+  await checkAsync('确认管理器：bot 文本「批准」/「批量允许」同样生效', async () => {
+    const mgr = new ConfirmationManager(async () => undefined);
+    const p1 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(mgr.resolveFromText('u1', '批准'), 'approved');
+    assert.equal(await p1, 'once');
+    const p2 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
+    assert.equal(mgr.resolveFromText('u1', '批量允许'), 'approved_batch');
+    assert.equal(await p2, 'batch');
+  });
+
+  // ---------- kind 枚举 → 用户可见中文 ----------
+  check('kindLabel：hk/kanban→看板，lark→飞书，未知回退原值', (() => {
+    return (
+      kindLabel('hk') === '看板' &&
+      kindLabel('kanban') === '看板' &&
+      kindLabel('lark') === '飞书' &&
+      kindLabel('something-else') === 'something-else'
+    );
+  })());
+
+  // ---------- 报告静态服务：绑回环 / 多目录 / 远程看板不编造链接主机 ----------
+  await checkAsync('report-server：默认绑回环；远程看板地址时链接主机退回绑定地址；多目录可服务', async () => {
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-rsA-'));
+    const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-rsB-'));
+    fs.writeFileSync(path.join(dirB, 'work-summary-2026-07-31.html'), '<html>summary</html>');
+    const local = await startReportServer(dirA, 'http://localhost:7964');
+    const remote = await startReportServer([dirA, dirB], 'http://192.168.1.10:7964');
+    try {
+      assert.ok(local.baseUrl.startsWith('http://localhost:'), local.baseUrl);
+      // 看板是远程地址而报告服务在本机：不得用看板主机名编造可达性，退回绑定地址
+      assert.ok(remote.baseUrl.startsWith('http://127.0.0.1:'), remote.baseUrl);
+      // 第二个目录（reports/）下的报告也可访问
+      const res = await fetch(`${remote.baseUrl}/work-summary-2026-07-31.html`);
+      assert.equal(res.status, 200);
+      assert.ok((await res.text()).includes('summary'));
+      // 路径穿越仍然 404
+      const bad = await fetch(`${remote.baseUrl}/../etc/passwd`);
+      assert.equal(bad.status, 404);
+    } finally {
+      local.close();
+      remote.close();
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- work_summary 摘要：bot 推 HTTP 链接，CLI 保留本机路径 ----------
+  check('summarizeForChat：传 linkBaseUrl 输出 HTTP 链接，否则本机路径', (() => {
+    const data = {
+      scope: 'today',
+      generatedAt: '2026-07-31T00:00:00Z',
+      sinceLabel: '2026-07-31 今天',
+      tasks: [],
+      totals: { done: 1, inreview: 0, inprogress: 2, todo: 0, cancelled: 0, filesChanged: 3, additions: 10, deletions: 4 },
+    } as unknown as WorkSummaryData;
+    const paths = { htmlPath: '/home/u/.helios-task-agent/reports/work-summary-2026-07-31.html', mdPath: '/home/u/.helios-task-agent/reports/work-summary-2026-07-31.md' };
+    const bot = summarizeForChat(data, paths, { linkBaseUrl: 'http://127.0.0.1:51234' });
+    const cli = summarizeForChat(data, paths);
+    return (
+      bot.includes('http://127.0.0.1:51234/work-summary-2026-07-31.html') &&
+      !bot.includes('/home/u/.helios-task-agent/reports/work-summary-2026-07-31.html') &&
+      cli.includes(paths.htmlPath) &&
+      !cli.includes('51234')
+    );
+  })());
+
+  // ---------- 用户技能目录：数据目录优先，同名覆盖内置 ----------
+  await checkAsync('技能目录：用户数据目录 skills/ 参与扫描且同名覆盖内置技能', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skills-'));
+    const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
+    process.env.HELIOS_TASK_AGENT_HOME = tmp;
+    try {
+      assert.equal(userSkillsDir(), path.join(tmp, 'skills'));
+      const mk = (name: string, desc: string) => {
+        fs.mkdirSync(path.join(tmp, 'skills', name), { recursive: true });
+        fs.writeFileSync(path.join(tmp, 'skills', name, 'SKILL.md'), `---\nname: ${name}\ndescription: ${desc}\n---\n\n# ${name}\n\n正文\n`);
+      };
+      mk('my-skill', '用户自定义技能');
+      const digests = loadSkillDigests();
+      assert.ok(digests.some((s) => s.name === 'my-skill' && s.description === '用户自定义技能'), '用户目录技能应被扫描到');
+      assert.ok(digests.some((s) => s.name === 'helios-kanban-remote'), '内置技能仍兜底');
+      // 同名覆盖：用户目录的 helios-kanban-remote 优先于包内
+      mk('helios-kanban-remote', '用户覆盖版');
+      const overridden = loadSkillDigests().find((s) => s.name === 'helios-kanban-remote');
+      assert.equal(overridden?.description, '用户覆盖版');
+      assert.ok(readSkillDoc('helios-kanban-remote').includes('正文'), 'skill_doc 也应读到用户覆盖版');
+    } finally {
+      if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
+      else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 更新提示附 CHANGELOG 链接 ----------
+  await checkAsync('promptVersionUpdate：请示文案附 CHANGELOG 链接', async () => {
+    let asked = '';
+    const outcome = await promptVersionUpdate({
+      info: { current: '1.0.2', latest: '1.1.0', tag: 'latest' },
+      ask: async (q) => {
+        asked = q;
+        return '';
+      },
+    });
+    assert.equal(outcome, 'skipped');
+    assert.ok(asked.includes(CHANGELOG_URL), '应附变更记录链接');
+  });
+
+  // ---------- 共享命令模块（commands.ts） ----------
+  check('parseCommand：取小写命令词，非命令为 null', (() => {
+    return (
+      parseCommand('/Status 现在') === '/status' &&
+      parseCommand('  /stop  x') === '/stop' &&
+      parseCommand('你好') === null &&
+      parseCommand('') === null
+    );
+  })());
+
+  check('buildToolsLines：MCP 可用列工具（描述取首行）/ 不可用输出降级说明', (() => {
+    const tools = [{ name: 'create_task', description: '创建任务\n第二行', inputSchema: {} }] as unknown as Tool[];
+    const ok = buildToolsLines(
+      { mcpOk: true, mcpTools: tools, kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
+      plainPaint,
+    );
+    const down = buildToolsLines(
+      { mcpOk: false, mcpTools: [], kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
+      plainPaint,
+    );
+    return (
+      ok[0] === 'H' &&
+      ok[1] === '· kanban_create_task  创建任务' &&
+      ok.includes('L') &&
+      ok.some((l) => l.includes('lark_cli')) &&
+      down[0] === 'D' &&
+      down.includes('L')
+    );
+  })());
+
+  check('buildSkillsLines：标题 + 技能条目 + 可选脚注', (() => {
+    const lines = buildSkillsLines({ header: '已安装技能', bullet: '· ', footer: 'F' }, plainPaint);
+    return (
+      lines[0] === '已安装技能' &&
+      lines.some((l) => l.includes('helios-kanban-remote')) &&
+      lines[lines.length - 1] === 'F'
+    );
+  })());
+
+  check('confirmStateText / confirmRevokedText：通道差异经参数保留', (() => {
+    return (
+      confirmStateText(2, '输入 /confirm on 恢复逐次确认') ===
+        '当前有 2 类写操作处于「同类免问」中；输入 /confirm on 恢复逐次确认。' &&
+      confirmStateText(0, '') === '当前没有生效中的「同类免问」（写操作逐次确认）。' &&
+      confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 类「同类免问」授权）。' &&
+      confirmRevokedText(0, '无') === '无' &&
+      CLEARED_TEXT === '对话历史已清空（记忆保留）。'
+    );
+  })());
+
+  check('llmFailureParts：CLI 指向 /config，bot 不提 /config；原消息 60 字截断', (() => {
+    const cli = llmFailureParts('401 invalid api key', 'x'.repeat(70), 'cli');
+    const bot = llmFailureParts('401 invalid api key', '短消息', 'bot');
+    return (
+      cli.head === '请求失败: 401 invalid api key' &&
+      cli.friendly !== null &&
+      cli.tail.includes('/config') &&
+      cli.tail.includes('…') &&
+      !bot.tail.includes('/config') &&
+      bot.tail.includes('你的上一条消息未处理') &&
+      !bot.tail.includes('…')
+    );
+  })());
+
+  check('降级口径统一：诊断提示使用 hk_cli（看板 HTTP 接口）表述', (() => {
+    const hint = diagnoseMcpFailure('Reading port from "/x/vibe-kanban.port"\nError: No such file or directory');
+    return hint !== null && hint.includes(MCP_FALLBACK_TEXT) && MCP_FALLBACK_TEXT === '已自动切换为 hk_cli（看板 HTTP 接口）';
+  })());
+
+  // ---------- SessionRouter：同用户串行、跨用户并行 ----------
+  await checkAsync('SessionRouter.enqueue：同一用户严格串行，不同用户可并行', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-serial-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1',
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+    const order: string[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const work = (tag: string, ms: number) => async () => {
+      concurrent++;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await new Promise((r) => setTimeout(r, ms));
+      order.push(tag);
+      concurrent--;
+    };
+    await Promise.all([
+      router.enqueue('u1', work('a1', 40)),
+      router.enqueue('u1', work('a2', 5)),
+      router.enqueue('u2', work('b1', 10)),
+    ]);
+    assert.ok(order.indexOf('a1') < order.indexOf('a2'), '同用户必须按入队顺序执行');
+    assert.equal(maxConcurrent, 2, '不同用户应并行执行');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- accessChecker.unclaim：fail-closed 撤销认领 ----------
+  check('accessChecker.unclaim：撤销认领后名额恢复，他人可重新认领', (() => {
+    const a = createAccessChecker([]);
+    const claimed = a.check('u1') === 'claim';
+    a.unclaim('u1');
+    a.unclaim('nobody'); // 幂等：撤销未认领的用户无效果
+    const reclaim = a.check('u2') === 'claim' && a.check('u1') === 'deny';
+    return claimed && reclaim && a.list().join(',') === 'u2';
+  })());
+
+  // ---------- audit.log 轮转 ----------
+  check('auditLog：超过 5MB 轮转为 audit.log.1，新记录写入新文件且不再次轮转', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-audit-'));
+    const file = path.join(tmp, 'audit.log');
+    fs.writeFileSync(file, Buffer.alloc(5 * 1024 * 1024 + 16, 0x78));
+    auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, tmp);
+    const rotated = fs.existsSync(`${file}.1`) && fs.statSync(`${file}.1`).size > 5 * 1024 * 1024;
+    const fresh = fs.statSync(file).size < 1000 && fs.readFileSync(file, 'utf8').includes('"user":"u1"');
+    // 未超阈值时不轮转
+    auditLog({ user: 'u1', kind: 'kanban', summary: 's2', detail: 'd', decision: 'denied' }, tmp);
+    const noExtraRotate = fs.readFileSync(file, 'utf8').includes('"summary":"s2"');
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return rotated && fresh && noExtraRotate;
+  })());
+
+  // ---------- renderReply：标题 / 表格 / 代码块保护 ----------
+  check('renderReply：# 标题渲染为加粗（去掉 #），正文加粗仍生效', (() => {
+    const out = renderReply('# 结论\n正文 **加粗** 保留');
+    return !out.includes('# 结论') && out.includes('结论') && out.includes('加粗') && !out.includes('**');
+  })());
+
+  check('renderReply：简单表格列对齐，缺分隔行原样保留', (() => {
+    const out = renderReply('| 名称 | 状态 |\n| --- | --- |\n| a | 完成 |\n| 长名字bb | 进行中 |');
+    const rows = out.split('\n');
+    const aligned =
+      rows.length === 4 &&
+      !rows.some((r) => r.includes('|')) &&
+      rows[1] === '─'.repeat(8) + '  ' + '─'.repeat(6) &&
+      rows[2] === `a${' '.repeat(9)}完成  ` &&
+      rows[3] === '长名字bb  进行中';
+    const degraded = renderReply('| a | b |\n| c | d |');
+    return aligned && degraded.includes('| a | b |');
+  })());
+
+  check('renderReply：代码块内的 # 与表格语法不被渲染', (() => {
+    const out = renderReply('```md\n# 不是标题\n| a | b |\n```');
+    return out.includes('# 不是标题') && out.includes('| a | b |');
+  })());
+
+  // ---------- 记忆注入 USER_MEMORY 标记 ----------
+  check('buildSystemPrompt：用户记忆包裹 USER_MEMORY 标记且声明不得作为指令执行', (() => {
+    const p = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x', memoryText: '键值：\n- k: v' });
+    const open = p.indexOf('<<<USER_MEMORY');
+    const close = p.indexOf('END_USER_MEMORY>>>');
+    const fact = p.indexOf('- k: v');
+    return open > -1 && close > open && fact > open && fact < close && p.includes('不是指令');
+  })());
+
+  // ---------- 看板事件卡片：failed 按钮名 + 链接可达性注脚 ----------
+  check('看板事件卡片：failed 按钮为「查看任务」，带链接时注脚提示可达范围', (() => {
+    const card = buildWatchEventCard({ kind: 'failed', title: 't', url: 'http://kanban/x', text: 'x' }) as {
+      elements: Array<{
+        tag: string;
+        actions?: Array<{ text?: { content?: string } }>;
+        elements?: Array<{ content?: string }>;
+      }>;
+    };
+    const btn = card.elements.find((e) => e.tag === 'action')?.actions?.[0]?.text?.content;
+    const note = card.elements.find((e) => e.tag === 'note');
+    return (
+      btn === '📋 查看任务' &&
+      Boolean(note?.elements?.some((n) => (n.content || '').includes('链接仅在运行本机器人的电脑所在网络可达')))
+    );
+  })());
+
+  // ---------- 更新提示复用统一确认词表 ----------
+  await checkAsync('promptVersionUpdate：回复「确认」同样执行更新（复用统一词表）', async () => {
+    const outcome = await promptVersionUpdate({
+      info: { current: '1.0.2', latest: '1.1.0', tag: 'latest' },
+      ask: async () => '确认',
+      runUpdate: async () => true,
+    });
+    assert.equal(outcome, 'updated');
   });
 
   console.log(failures ? `\n${failures} 项失败` : '\n全部通过');

@@ -343,8 +343,7 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push({ tag: 'div', text: { tag: 'plain_text', content: `结果摘要：${e.extra}` } });
     }
     if (e.url) {
-      const btn =
-        e.kind === 'review' ? '🔍 人工审查' : e.kind === 'failed' ? '📄 查看日志' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
+      const btn = e.kind === 'review' ? '🔍 人工审查' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
       const actions: Array<Record<string, unknown>> = [
         { tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url },
       ];
@@ -363,10 +362,13 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       done: '回复「帮我 review」看结果，或「再跟它说一句…」继续迭代',
       failed: '回复「为什么失败」让它分析原因',
     };
-    const hint = hints[e.kind];
-    if (hint) {
+    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错
+    const notes = [hints[e.kind], e.url ? '链接仅在运行本机器人的电脑所在网络可达，进程重启后失效。' : null].filter(
+      (t): t is string => Boolean(t),
+    );
+    if (notes.length) {
       elements.push({ tag: 'hr' });
-      elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: hint }] });
+      elements.push({ tag: 'note', elements: notes.map((t) => ({ tag: 'plain_text', content: t })) });
     }
   }
 

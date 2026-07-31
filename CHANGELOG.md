@@ -6,11 +6,102 @@
 
 ## [Unreleased]
 
+### Added
+
+- 文档型技能系统：扫描 `skills/*/SKILL.md`（用户数据目录优先、包内内置兜底），frontmatter（`name` / `description` / `digest_sections`）即技能契约，摘要注入系统提示词；`skill_doc` 工具按需读取全文（渐进式披露）；`/skills` 命令（CLI 与飞书 bot）列出已安装技能；`validateSkills()` 契约校验纳入单元测试
+- 配置向导统一交互：模型预设箭头选择列表 + API Key 掩码输入（CLI 与 bot 一致）
+- `audit.log` 大小轮转：超过 5MB 自动轮转为 `audit.log.1`（只保留 1 代），长驻 bot 不再无限累积审计日志；审计写入仍永不抛出
+- 看板事件卡片与 AI 审查完成卡片注明链接可达范围（仅在运行 bot 的电脑/所在网络可达，进程重启后失效）
+- owner 绑定成功欢迎语补「发送 /help 查看我能做什么」引导；非白名单用户被拒文案补充「联系实例 owner 开通或自行部署」说明
+
+### Fixed
+
+- CLI 任务运行中按 Ctrl+C 现在正确中断当前 LLM 请求/工具：terminal 模式下 readline 会拦截 ^C，补挂 rl 级 SIGINT handler（此前无 listener 时默认 `rl.close()`，直接关闭输入流而非中断任务）
+- 归档/合并/推送/执行类看板操作不再被「同类免问」批量放行：批量判定收进 `guard.isBatchable()`（唯一来源），词表补上 `archive|merge|push|execute`，与写操作分类词表对齐
+- 报告静态服务默认绑定回环地址 `127.0.0.1`（原 `0.0.0.0` 会把含代码 diff 的报告暴露到局域网）；跟随看板的 `HELIOS_KANBAN_HOST` 约定
+- CLI 写操作确认增加超时自动拒绝（可批量 120s / 破坏性 300s，与飞书 bot 语义一致），用户离开后 agent 不再永久挂起；Ctrl+C 中断仍即时生效
+- CLI 确认提示不再把内部 `kind` 枚举（`hk`/`lark`）原样输出，统一复用 bot 的「看板/飞书」映射
+- 飞书端 `work_summary` 报告改推 HTTP 链接（原输出运行机器的本机路径，手机飞书打不开）；报告静态服务纳入 `reports/` 目录，CLI 场景保留本机路径
+- 失败任务事件卡片按钮「📄 查看日志」实际链到任务页，更名「📋 查看任务」
+- Banner 中模型与 kanban 地址两行改用中性灰点（仅为配置展示、未做健康检查，原绿点易被误读为「连接正常」）
+- npm 更新提示复用统一确认词表（「确认 / 同意 / 批准 / y」等均接受），默认仍为否
+
+### Changed
+
+- 确认应答词表两端统一：批准/同类免问/拒绝词表抽为共享常量（`confirm.ts`），CLI 与飞书 bot 取并集后引用同一词表（CLI 现在也认「批准」「执行」「批量允许」等）
+- 用户自定义技能目录迁出 npm 包安装目录：改为 `<数据目录>/skills/`（`HELIOS_TASK_AGENT_HOME` 或 `~/.helios-task-agent/skills`），`npm i -g` 升级不再抹掉自定义技能；同名技能用户目录优先
+- 版本更新提示附 CHANGELOG 链接，升级前可查看变更内容
+- CLI 与飞书 bot 入口壳层去重：MCP 连接与降级诊断、`/status`、`/tools`、`/skills`、`/memory`、`/clear`、「同类免问」查询/撤销、LLM 失败回复（friendlyLlmError + 原消息截断）抽为共享模块 `src/commands.ts`，通道差异经 Paint/文案参数保留（纯重构，两端文案、顺序与降级逻辑不变）
+- MCP 降级术语统一为「已自动切换为 hk_cli（看板 HTTP 接口）」（原「降级 hk_cli」「已自动降级 hk_cli」「已降级为 HTTP/hk.sh」三种写法并存）
+- 主动取消措辞两端统一为「已取消，操作未执行」（CLI 原「已拒绝」）；超时仍保留「已自动拒绝」以区分主动/被动
+- `renderReply` 终端渲染增强：`#` 标题渲染为加粗、简单 markdown 表格列对齐（结构不完整的表格退化为原样）、代码块内容先抽占位不再被标题/表格规则误渲染
+
+### Security
+
+- owner 白名单写回 `.env` 失败时 fail-closed：撤销内存放行并阻断该用户重试（重启前按拒绝处理），同时向其发送「绑定未持久化、检查 .env 写权限」告警；此前写失败仅打日志，内存 access checker 已放行，重启后任何人可重新认领 owner
+- 用户记忆注入系统提示词加 `USER_MEMORY` 包裹标记（与 `guard.wrapUntrusted` 同一思路），明确声明记忆内容由历史对话生成、不得作为指令执行，堵住持久化 prompt 注入通道；`memory_set` 工具描述同步提示只保存事实性偏好
+
+## [1.0.13] - 2026-07-30
+
+仅版本号发布，无代码变更。
+
+## [1.0.12] - 2026-07-30
+
 ### Changed
 
 - helios-kanban 的 npx 包规格默认改为 `@latest` 跟随最新版（原钉 `0.1.36`），需要钉版本时仍可用 `HELIOS_KANBAN_PACKAGE` 覆盖
 
-- AI 审查结果改为中文 HTML 报告：`--background` 注入简体中文输出要求；完整结果渲染为自包含 HTML（轻量 markdown：标题/列表/代码围栏/行内格式，全量转义防注入），写入数据目录 `reviews/`（30 天自动清理），由 bot 内置静态服务托管（随机空闲端口、仅服务目录内 `*.html`、路径穿越 404，链接主机名取 `HELIOS_KANBAN_URL`），飞书推送带「查看完整报告」按钮的卡片直达报告页，长结果不再按 4000 字符截断；审查全部通过时报告页展示绿色庆祝横幅（随机夸赞语）；报告服务启动失败时回退原文本推送
+## [1.0.11] - 2026-07-30
+
+### Changed
+
+- AI 审查完成后推送带「📄 查看完整报告」按钮的卡片，一键直达静态报告页（不再只发文本链接）
+
+## [1.0.10] - 2026-07-30
+
+### Changed
+
+- 审查 HTML 报告结构化渲染：ocr 输出解析为「概览 + 分级卡片 + diff 高亮」（按类别/严重度分组统计），识别不到结构时回退扁平 markdown 渲染
+- 审查全部通过时报告页展示绿色庆祝横幅（随机夸赞语）
+
+## [1.0.9] - 2026-07-30
+
+### Changed
+
+- AI 审查结果改为中文 HTML 报告：`--background` 注入简体中文输出要求；完整结果渲染为自包含 HTML（轻量 markdown：标题/列表/代码围栏/行内格式，全量转义防注入），写入数据目录 `reviews/`（30 天自动清理），由 bot 内置静态服务托管（随机空闲端口、仅服务目录内 `*.html`、路径穿越 404，链接主机名取 `HELIOS_KANBAN_URL`），长结果不再按 4000 字符截断；报告服务启动失败时回退原文本推送
+- 看板事件 / AI 审查结果注入会话上下文改为轮边界注入（`injectSystemNote`），不再打断进行中的 tool 配对
+
+### Security
+
+- 自动拉起的 helios-kanban 默认绑定回环地址（`HOST=127.0.0.1`，可用 `HELIOS_KANBAN_HOST` 覆盖）：看板 Web/API 无鉴权，绑 `0.0.0.0` 会暴露到局域网
+
+## [1.0.8] - 2026-07-30
+
+### Added
+
+- 待审阅卡片新增「🤖 AI 审查」按钮（原「查看 Diff」改名「🔍 人工审查」）：点击后 bot 调 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr review`）审查该 attempt 的 diff——自动定位 workspace 仓库目录（`container_ref`+`agent_working_dir`，兜底看板注册仓库 path），按 merge-base(target_branch)..attempt 分支取 diff（与看板 diff 视图同口径），任务标题作为 `--background` 传入；结果推回飞书并注入会话上下文便于追问/修复；`ocr` 未安装时自动 `npx` 拉取，LLM 默认复用机器人模型配置（显式 `OCR_LLM_*` 或已有 `~/.opencodereview/config.json` 优先），整体超时 15 分钟、按 attempt 去重防连点；`/status` 与启动日志增加 ocr 可用性检查
+
+## [1.0.7] - 2026-07-30
+
+### Fixed
+
+- 全触点 UED 审查修复：配置向导改用箭头选择列表与密钥掩码输入（bot 与终端体验对齐）；有未处理确认卡片 / 任务进行中时新消息即时回执（不再「发出去没反应」）；`SessionRouter.busy` 清理失效修复（原任务完成后永真，影响排队回执与 LRU 淘汰）；`/stop` 一并丢弃排队消息；LLM 错误指引按通道区分（bot 不再提示不存在的 `/config`，改为指向 `.env`）
+
+## [1.0.6] - 2026-07-29
+
+### Changed
+
+- 看板状态变更通知从纯文本改为飞书交互卡片（沿用确认卡片风格）：任务待审阅/完成/失败卡片化，待审阅卡片带「查看 Diff」按钮直达看板 diff 视图
+
+## [1.0.5] - 2026-07-29
+
+### Added
+
+- 创建/更新任务支持优先级（urgent / high / medium / low，省略默认 medium）：用户说「紧急」→ urgent、「高优」→ high；确认卡片与回复模板同步展示优先级
+
+## [1.0.4] - 2026-07-29
+
+### Changed
 
 - 确认卡片视觉重设计：头部按通道区分颜色与图标（看板 🔧 橙 / 飞书 ✉️ 蓝），操作类型与裁决时效改为 fields 双栏，命令详情改为等宽代码块，提示文本下沉为 note 小号字；终态卡同样式并附时间戳；卡片禁止转发（enable_forward=false）
 - 批量免问的广告回复词统一为「同类免问」（原「都允许」歧义——像「全部放行」——且与按钮/「恢复确认」术语不一致）；「都允许」作为旧同义词仍兼容可用，终端同时接受输入「同类免问」
@@ -20,7 +111,6 @@
 
 ### Added
 
-- 待审阅卡片新增「🤖 AI 审查」按钮（原「查看 Diff」改名「🔍 人工审查」）：点击后 bot 调 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr review`）审查该 attempt 的 diff——自动定位 workspace 仓库目录（`container_ref`+`agent_working_dir`，兜底看板注册仓库 path），按 merge-base(target_branch)..attempt 分支取 diff（与看板 diff 视图同口径），任务标题作为 `--background` 传入；结果推回飞书并注入会话上下文便于追问/修复；`ocr` 未安装时自动 `npx` 拉取，LLM 默认复用机器人模型配置（显式 `OCR_LLM_*` 或已有 `~/.opencodereview/config.json` 优先），整体超时 15 分钟、按 attempt 去重防连点；`/status` 与启动日志增加 ocr 可用性检查
 - 模型返回「上下文超限」错误时自动恢复：逐级丢弃最旧对话轮次并重试（最多 3 次），不再直接把 400 抛给用户（不可恢复时保留原有友好指引）
 - MCP 连接失败时捕获子进程 stderr 并诊断已知模式：识别「看板端口文件（vibe-kanban.port）被系统清理」场景，提示重启看板即可恢复（此前只有裸 `Connection closed`，无从下手）
 - `helios-task-agent --version` / `-v`（及 `version` 子命令）查看版本；bot 启动日志显示版本号
