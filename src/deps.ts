@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 
 /** Shared dependency probe: is lark-cli installed and runnable? */
 export function checkLarkCli(): boolean {
@@ -8,6 +8,49 @@ export function checkLarkCli(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * 异步探测（/status 等事件循环内路径用）：与同步版同一组命令，
+ * 但不阻塞事件循环——同步探测串起来最坏阻塞十几秒，飞书回调/心跳全被卡住。
+ */
+function probeAsync(cmd: string, args: string[], timeoutMs = 5000): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 }, (err, stdout) => {
+      resolve(err ? null : String(stdout ?? ''));
+    });
+  });
+}
+
+export async function checkLarkCliAsync(): Promise<boolean> {
+  return (await probeAsync('lark-cli', ['--version'])) !== null;
+}
+
+/** probeLarkCliAuth 的异步版。 */
+export async function probeLarkCliAuthAsync(): Promise<'unauthorized' | 'ok'> {
+  const out = await probeAsync('lark-cli', ['auth', 'status'], 3000);
+  if (out === null) return 'unauthorized';
+  try {
+    const parsed = JSON.parse(out) as { identities?: Record<string, { available?: boolean }> };
+    const identities = Object.values(parsed?.identities ?? {});
+    return identities.some((i) => i?.available === true) ? 'ok' : 'unauthorized';
+  } catch {
+    return 'unauthorized';
+  }
+}
+
+/** checkOcrCli 的异步版。 */
+export async function checkOcrCliAsync(): Promise<boolean> {
+  return (await probeAsync('ocr', ['version'])) !== null;
+}
+
+/** checkHkDeps 的异步版（jq/curl 并发探测）。 */
+export async function checkHkDepsAsync(): Promise<string[]> {
+  const [jq, curl] = await Promise.all([probeAsync('jq', ['--version']), probeAsync('curl', ['--version'])]);
+  const missing: string[] = [];
+  if (jq === null) missing.push('jq');
+  if (curl === null) missing.push('curl');
+  return missing;
 }
 
 /** lark-cli 缺失时的引导文案（安装 + 授权；不装则飞书读取不可用，看板功能不受影响）。 */

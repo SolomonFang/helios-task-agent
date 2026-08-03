@@ -5,7 +5,7 @@
  */
 
 import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
-import { probeLarkCliAuth, checkHkDeps, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
+import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
 import { LOCAL_TOOL_SUMMARY } from './tools';
 import { loadSkillDigests } from './prompt';
 import { friendlyLlmError } from './llm-error';
@@ -78,11 +78,12 @@ export async function buildStatusLines(
   },
   p: Paint,
 ): Promise<string[]> {
+  // 探测全部走异步版：/status 在 bot 事件循环里执行，同步 execFileSync 串行探测最坏阻塞十几秒
   const health = await fetchKanbanHealth(opts.kanbanUrl);
   // hk_cli 降级链依赖（jq/curl）：MCP 掉线时 hk.sh 才能兜底，缺失则降级链是断的
-  const hkMissing = checkHkDeps();
+  const hkMissing = await checkHkDepsAsync();
   // larkOk 只代表二进制存在，补探测授权态，区分未安装/未授权/可用
-  const larkAuthed = opts.larkOk ? probeLarkCliAuth() === 'ok' : false;
+  const larkAuthed = opts.larkOk ? (await probeLarkCliAuthAsync()) === 'ok' : false;
   const mcpText = opts.mcpOk
     ? p.ok(`ok（${opts.mcpToolCount} 个工具）`)
     : p.warn(

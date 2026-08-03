@@ -63,7 +63,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   const model = modelInput || preset.model;
   if (!model) throw new Error('模型名不能为空');
 
-  // 联网预检模型配置：Key 无效在向导里暴露（可重输）；端点不支持预检/网络不通则提示后可仍保存
+  // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key 或 Base URL）；端点不支持预检/网络不通则提示后可仍保存
   for (;;) {
     console.log(c.gray('正在联网校验模型配置…'));
     const check = await verifyLlmConfig(baseUrl, apiKey);
@@ -73,15 +73,21 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     }
     if (check.uncertain) {
       console.log(c.warn(`无法预检：${check.message}`));
-      const keep = (await need('仍然保存？[Y/n]（n = 重新输入 API Key）: ')).toLowerCase();
+      const keep = (await need('仍然保存？[Y/n]（n = 修改配置）: ')).toLowerCase();
       if (keep !== 'n' && keep !== 'no' && keep !== '否') break;
     } else {
       console.log(c.err(`模型配置校验失败：${check.message}`));
-      const retry = (await need('重新输入 API Key？[Y/n]（n = 仍然保存）: ')).toLowerCase();
+      const retry = (await need('修改配置重试？[Y/n]（n = 仍然保存）: ')).toLowerCase();
       if (retry === 'n' || retry === 'no' || retry === '否') break;
     }
-    apiKey = await needSecret('API Key (sk-...，输入显示为 *): ');
-    if (!apiKey) throw new Error('API Key 不能为空');
+    const which = (await need('修改哪项？[k=API Key（默认）/ b=Base URL]: ')).toLowerCase();
+    if (which === 'b' || which === 'base' || which === 'url') {
+      baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+      if (!baseUrl) throw new Error('Base URL 不能为空');
+    } else {
+      apiKey = await needSecret('API Key (sk-...，输入显示为 *): ');
+      if (!apiKey) throw new Error('API Key 不能为空');
+    }
   }
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
   const kanbanUrl = (await need(`helios-kanban 地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;

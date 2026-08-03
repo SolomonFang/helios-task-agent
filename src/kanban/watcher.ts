@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { writeFilePrivateSync } from '../private-file';
+import { apiGet, taskPageUrl, attemptDiffUrl, pickLatestAttempt } from './http';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -276,41 +277,23 @@ export class KanbanWatcher {
   }
 
   private taskUrl(projectId: string, taskId: string): string {
-    const base = this.opts.kanbanUrl.replace(/\/+$/, '');
-    return `${base}/local-projects/${projectId}/tasks/${taskId}`;
+    return taskPageUrl(this.opts.kanbanUrl, projectId, taskId);
   }
 
-  /** 最新 attempt 的 diff 视图地址与 attempt id（优先未归档、按创建时间取最新）；取不到 attempt 时回退任务页。 */
+  /** 最新 attempt 的 diff 视图地址与 attempt id；取不到 attempt 时回退任务页。 */
   private async reviewTarget(projectId: string, taskId: string): Promise<{ url: string; attemptId?: string }> {
     const base = this.taskUrl(projectId, taskId);
     try {
-      const list = (await this.api(`/task-attempts?task_id=${taskId}`)) as Array<{
-        id?: string;
-        archived?: boolean;
-        created_at?: string;
-      } | null>;
-      if (!Array.isArray(list)) return { url: base };
-      const rows = list.filter((a): a is { id: string; archived?: boolean; created_at?: string } =>
-        Boolean(a && a.id),
-      );
-      const live = rows.filter((a) => !a.archived);
-      const pool = live.length ? live : rows;
-      if (!pool.length) return { url: base };
-      pool.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
-      const latest = pool[pool.length - 1]!.id;
-      return { url: `${base}/attempts/${latest}?view=diffs`, attemptId: latest };
+      const latest = pickLatestAttempt(await this.api(`/task-attempts?task_id=${taskId}`));
+      if (!latest) return { url: base };
+      return { url: attemptDiffUrl(base, latest.id), attemptId: latest.id };
     } catch {
       return { url: base }; // attempts 拉取失败不阻断通知，回退任务页
     }
   }
 
   private async api(p: string): Promise<unknown> {
-    const base = this.opts.kanbanUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/api${p}`, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { success?: boolean; data?: unknown; message?: string };
-    if (json && json.success === true) return json.data;
-    throw new Error(json?.message || 'kanban api error');
+    return apiGet(this.opts.kanbanUrl, p);
   }
 }
 

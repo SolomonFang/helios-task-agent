@@ -3,6 +3,8 @@
  * (e.g. base_branch fell back to "main" but the repo has no main → UI infinite loading).
  */
 
+import { apiGet } from './http';
+
 export type RepoStartInput = {
   repo_id: string;
   base_branch?: string | null;
@@ -80,28 +82,20 @@ export function formatWorkspaceSetupFailure(opts: {
   );
 }
 
-async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
-  const res = await fetch(url, { signal: signal ?? AbortSignal.timeout(8000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
 /** Load default_target_branch for each repo_id (best-effort; missing → null). */
 export async function fetchRepoDefaultBranches(
   kanbanUrl: string,
   repoIds: string[],
   signal?: AbortSignal,
 ): Promise<Record<string, string | null>> {
-  const base = kanbanUrl.replace(/\/+$/, '');
   const out: Record<string, string | null> = {};
   await Promise.all(
     repoIds.map(async (id) => {
       try {
-        const json = (await fetchJson(`${base}/api/repos/${id}`, signal)) as {
-          data?: { default_target_branch?: string | null };
+        const json = (await apiGet(kanbanUrl, `/repos/${id}`, { timeoutMs: 8000, signal })) as {
           default_target_branch?: string | null;
-        };
-        const branch = json?.data?.default_target_branch ?? json?.default_target_branch ?? null;
+        } | null;
+        const branch = json?.default_target_branch ?? null;
         out[id] = typeof branch === 'string' && branch.trim() ? branch.trim() : null;
       } catch {
         out[id] = null;
@@ -116,18 +110,14 @@ export async function fetchWorkspaceSnapshot(
   workspaceId: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceSnapshot | null> {
-  const base = kanbanUrl.replace(/\/+$/, '');
   try {
-    const json = (await fetchJson(`${base}/api/task-attempts/${workspaceId}`, signal)) as {
-      data?: WorkspaceSnapshot;
-      container_ref?: string | null;
-      setup_completed_at?: string | null;
-    };
-    const data = json?.data ?? json;
+    const data = (await apiGet(kanbanUrl, `/task-attempts/${workspaceId}`, { timeoutMs: 8000, signal })) as
+      | WorkspaceSnapshot
+      | null;
     if (!data || typeof data !== 'object') return null;
     return {
-      container_ref: (data as WorkspaceSnapshot).container_ref ?? null,
-      setup_completed_at: (data as WorkspaceSnapshot).setup_completed_at ?? null,
+      container_ref: data.container_ref ?? null,
+      setup_completed_at: data.setup_completed_at ?? null,
     };
   } catch {
     return null;
@@ -139,13 +129,11 @@ export async function fetchWorkspaceTargetBranches(
   workspaceId: string,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const base = kanbanUrl.replace(/\/+$/, '');
   try {
-    const json = (await fetchJson(`${base}/api/task-attempts/${workspaceId}/repos`, signal)) as {
-      data?: Array<{ target_branch?: string }>;
-    };
-    const rows = json?.data || [];
-    return rows.map((r) => r.target_branch).filter((b): b is string => Boolean(b));
+    const rows = (await apiGet(kanbanUrl, `/task-attempts/${workspaceId}/repos`, { timeoutMs: 8000, signal })) as Array<{
+      target_branch?: string;
+    }> | null;
+    return (rows || []).map((r) => r.target_branch).filter((b): b is string => Boolean(b));
   } catch {
     return [];
   }

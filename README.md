@@ -169,7 +169,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 正文……未声明的章节不进提示词，agent 需要细节时会用 `skill_doc` 工具按需读取全文（渐进式披露）。
 ```
 
-- `name` / `description` 缺失或 `digest_sections` 匹配不到章节时，`validateSkills()`（单元测试覆盖）会报出契约问题——问题在测试期暴露，而不是静默降级。
+- `name` / `description` 缺失或 `digest_sections` 匹配不到章节时，`validateSkills()` 会报出契约问题——启动时即告警（CLI 与 bot 都会打印），并有单元测试覆盖，而不是静默降级。
 - 用户侧可用 `/skills`（CLI 与飞书 bot 一致）或直接问「你有什么技能」查看已安装技能。
 - 可执行能力（新工具）仍需在 `src/tools.ts` 注册。
 

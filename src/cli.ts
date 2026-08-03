@@ -7,6 +7,7 @@ import { ensureConfig } from './config-wizard';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT } from './deps';
+import { validateSkills } from './prompt';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
 import {
   buildMemoryLines,
@@ -171,6 +172,8 @@ export async function main(): Promise<void> {
   });
   if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));
   else if (larkStatus === 'unauthorized') console.log(c.warn(LARK_CLI_AUTH_HINT));
+  // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
+  for (const problem of validateSkills()) console.log(c.warn(`技能契约: ${problem}`));
 
   const spinner = new Spinner('思考中…');
 

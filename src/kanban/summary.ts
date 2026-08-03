@@ -4,6 +4,8 @@
  * Read-only; individual fetch failures never abort the whole collection.
  */
 
+import { apiGet, apiPost, taskPageUrl, attemptDiffUrl, sortTaskAttempts } from './http';
+
 export type WorkSummaryScope = 'iteration' | 'today' | 'all';
 
 export interface WorkSummaryTask {
@@ -74,29 +76,6 @@ interface DiffStats {
 const MAX_TASKS = 50;
 /** 任务详情并发上限。 */
 const CONCURRENCY = 5;
-
-async function apiGet(kanbanUrl: string, p: string): Promise<unknown> {
-  const base = kanbanUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/api${p}`, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = (await res.json()) as { success?: boolean; data?: unknown; message?: string };
-  if (json && json.success === true) return json.data;
-  throw new Error(json?.message || 'kanban api error');
-}
-
-async function apiPost(kanbanUrl: string, p: string, body: unknown): Promise<unknown> {
-  const base = kanbanUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/api${p}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = (await res.json()) as { success?: boolean; data?: unknown; message?: string };
-  if (json && json.success === true) return json.data;
-  throw new Error(json?.message || 'kanban api error');
-}
 
 /** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
 function pickAttemptSummary(detail: unknown): string | undefined {
@@ -195,7 +174,6 @@ function startOfToday(): number {
 export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promise<WorkSummaryData> {
   const { kanbanUrl, scope } = opts;
   const iteration = (opts.iteration || '').trim();
-  const base = kanbanUrl.replace(/\/+$/, '');
 
   const projects = await resolveProjects(kanbanUrl, opts.projectId);
 
@@ -236,7 +214,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
 
   const enrich = async ({ row, project }: { row: TaskRow; project: ProjectRef }): Promise<WorkSummaryTask> => {
     const taskId = String(row.id);
-    const pageUrl = `${base}/local-projects/${project.id}/tasks/${taskId}`;
+    const pageUrl = taskPageUrl(kanbanUrl, project.id, taskId);
     const task: WorkSummaryTask = {
       id: taskId,
       title: String(row.title || ''),
@@ -253,31 +231,19 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
       /* 详情拉取失败不阻断 */
     }
     try {
-      const attempts = (await apiGet(kanbanUrl, `/task-attempts?task_id=${taskId}`)) as Array<{
-        id?: string;
-        archived?: boolean;
-        created_at?: string;
-      } | null>;
-      if (Array.isArray(attempts)) {
-        const rows2 = attempts.filter((a): a is { id: string; archived?: boolean; created_at?: string } =>
-          Boolean(a && a.id),
-        );
-        const live = rows2.filter((a) => !a.archived);
-        const pool = live.length ? live : rows2;
-        pool.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
-        // 从新到旧找第一份有 diff 统计的 attempt
-        for (let i = pool.length - 1; i >= 0; i--) {
-          const stats = statsLookup.get(pool[i]!.id);
-          if (i === pool.length - 1) {
-            task.diffUrl = `${pageUrl}/attempts/${pool[i]!.id}?view=diffs`;
-          }
-          if (stats) {
-            if (stats.filesChanged !== undefined) task.filesChanged = stats.filesChanged;
-            if (stats.additions !== undefined) task.additions = stats.additions;
-            if (stats.deletions !== undefined) task.deletions = stats.deletions;
-            if (stats.changedFiles?.length) task.changedFiles = stats.changedFiles.slice(0, 10);
-            break;
-          }
+      const pool = sortTaskAttempts(await apiGet(kanbanUrl, `/task-attempts?task_id=${taskId}`));
+      // 从新到旧找第一份有 diff 统计的 attempt
+      for (let i = pool.length - 1; i >= 0; i--) {
+        const stats = statsLookup.get(pool[i]!.id);
+        if (i === pool.length - 1) {
+          task.diffUrl = attemptDiffUrl(pageUrl, pool[i]!.id);
+        }
+        if (stats) {
+          if (stats.filesChanged !== undefined) task.filesChanged = stats.filesChanged;
+          if (stats.additions !== undefined) task.additions = stats.additions;
+          if (stats.deletions !== undefined) task.deletions = stats.deletions;
+          if (stats.changedFiles?.length) task.changedFiles = stats.changedFiles.slice(0, 10);
+          break;
         }
       }
     } catch {

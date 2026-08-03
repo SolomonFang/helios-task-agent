@@ -25,6 +25,7 @@ import {
   CONFIRM_YES_RE,
   CONFIRM_BATCH_RE,
   CONFIRM_NO_RE,
+  isConfirmWord,
   kindLabel,
 } from '../src/confirm';
 import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/llm';
@@ -44,6 +45,8 @@ import { compareVersions, checkForUpdate, promptVersionUpdate, CHANGELOG_URL, ty
 import { friendlyLlmError } from '../src/llm-error';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
 import { buildWatchEventCard, isLoopbackUrl, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
+import { apiGet, apiPost, taskPageUrl, attemptDiffUrl, pickLatestAttempt, sortTaskAttempts } from '../src/kanban/http';
+import { McpSupervisor } from '../src/bot/supervisor';
 import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
 import { minimalChildEnv } from '../src/proc-env';
 import {
@@ -1452,6 +1455,154 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- kanban/http：统一信封解析 ----------
+  await checkAsync('kanban http：信封成功取 data、失败抛 message、无信封宽松回退、HTTP 错误抛状态码', async () => {
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (payload: unknown, code = 200) => {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+      if (url === '/api/ok') return json({ success: true, data: { v: 1 } });
+      if (url === '/api/fail') return json({ success: false, message: 'boom' });
+      if (url === '/api/envelope-less-data') return json({ data: [1, 2] }); // 无 success 字段：宽松取 data
+      if (url === '/api/raw') return json([3, 4]); // 无信封裸数据：原样返回
+      if (url === '/api/echo' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => json({ success: true, data: JSON.parse(body) }));
+        return;
+      }
+      res.writeHead(500);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      assert.deepEqual(await apiGet(base, '/ok'), { v: 1 });
+      await assert.rejects(() => apiGet(base, '/fail'), /boom/);
+      assert.deepEqual(await apiGet(base, '/envelope-less-data'), [1, 2]);
+      assert.deepEqual(await apiGet(base, '/raw'), [3, 4]);
+      await assert.rejects(() => apiGet(base, '/missing'), /HTTP 500/);
+      assert.deepEqual(await apiPost(base, '/echo', { a: 'b' }), { a: 'b' });
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  // ---------- kanban/http：URL 拼接与最新 attempt ----------
+  check('kanban http：任务页/diff URL 拼接去尾斜杠，最新 attempt 优先未归档按创建时间', (() => {
+    const page = taskPageUrl('http://k:7964/', 'p1', 't1');
+    const attempts = [
+      { id: 'a-new-archived', archived: true, created_at: '2026-03-01' },
+      { id: 'a-old', created_at: '2026-01-01' },
+      { id: 'a-new', created_at: '2026-02-01' },
+      { id: null }, // 无效行被过滤
+    ];
+    const latest = pickLatestAttempt(attempts);
+    return (
+      page === 'http://k:7964/local-projects/p1/tasks/t1' &&
+      attemptDiffUrl(page, 'a1') === `${page}/attempts/a1?view=diffs` &&
+      latest?.id === 'a-new' && // 有未归档时忽略归档行（即使更新）
+      pickLatestAttempt([{ id: 'a-arch', archived: true }])?.id === 'a-arch' && // 全归档回退归档池
+      pickLatestAttempt('not-array') === null &&
+      pickLatestAttempt([]) === null &&
+      sortTaskAttempts(attempts).map((a) => a.id).join(',') === 'a-old,a-new'
+    );
+  })());
+
+  // ---------- McpSupervisor：失败阈值 / 降级与恢复 ----------
+  await checkAsync('McpSupervisor：连续失败达阈值才降级，恢复后回调切回', async () => {
+    let pingOk = false;
+    const mcp = {
+      tools: [],
+      ping: async () => {
+        if (!pingOk) throw new Error('down');
+      },
+      reconnect: async () => {},
+    } as unknown as KanbanMcp;
+    let lost = 0;
+    let recovered = 0;
+    const sup = new McpSupervisor({
+      mcp,
+      initiallyAlive: true,
+      onLost: () => lost++,
+      onRecovered: () => recovered++,
+    });
+    await sup.tick(); // 第 1 次失败：未达阈值，不降级
+    assert.equal(lost, 0);
+    assert.equal(sup.isAlive, true);
+    await sup.tick(); // 第 2 次失败：达阈值降级（failures<=3，本轮即触发重连尝试）
+    assert.equal(lost, 1);
+    assert.equal(sup.isAlive, false);
+    await sup.tick(); // 已降级：onLost 不重复
+    assert.equal(lost, 1);
+    pingOk = true;
+    await sup.tick(); // 恢复：切回并回调一次
+    assert.equal(recovered, 1);
+    assert.equal(sup.isAlive, true);
+    await sup.tick(); // 健康期：无重复回调
+    assert.equal(recovered, 1);
+    assert.equal(lost, 1);
+  });
+
+  // ---------- McpSupervisor：有轮次在跑不重连；轮次归零后补重连 ----------
+  await checkAsync('McpSupervisor：in-flight 轮次期间跳过重连，轮次结束后下一轮重连', async () => {
+    let reconnectCalls = 0;
+    const mcp = {
+      tools: [],
+      ping: async () => {
+        throw new Error('down');
+      },
+      reconnect: async () => {
+        reconnectCalls++;
+      },
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({ mcp, initiallyAlive: true, failThreshold: 1 });
+    await sup.enterTurn();
+    await sup.tick(); // 达阈值降级，但有轮次在跑 → 不重连（close 会杀 in-flight 调用）
+    assert.equal(reconnectCalls, 0);
+    await sup.tick(); // 轮次仍在：退避节奏命中也不重连
+    assert.equal(reconnectCalls, 0);
+    sup.exitTurn();
+    await sup.tick(); // 轮次归零：补重连
+    assert.equal(reconnectCalls, 1);
+  });
+
+  // ---------- McpSupervisor：重连期间新轮次等待重连结束（竞态关闭） ----------
+  await checkAsync('McpSupervisor：重连进行中 enterTurn 阻塞，重连结束后才放行', async () => {
+    let releaseReconnect!: () => void;
+    let reconnectCalls = 0;
+    const mcp = {
+      tools: [],
+      ping: async () => {
+        throw new Error('down');
+      },
+      reconnect: async () => {
+        reconnectCalls++;
+        await new Promise<void>((r) => (releaseReconnect = r));
+      },
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({ mcp, initiallyAlive: false });
+    const tickDone = sup.tick(); // 失败 → 触发重连（挂起，直到 releaseReconnect）
+    for (let i = 0; i < 10; i++) await Promise.resolve(); // 让 tick 推进到 reconnect 内
+    assert.equal(reconnectCalls, 1);
+    let entered = false;
+    const entering = sup.enterTurn().then(() => {
+      entered = true;
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    assert.equal(entered, false); // 重连未完成：新轮次不得开始（否则 close 杀 in-flight）
+    releaseReconnect();
+    await tickDone;
+    await entering;
+    assert.equal(entered, true);
+    assert.equal(sup.turnCount, 1);
+    sup.exitTurn();
+    assert.equal(sup.turnCount, 0);
+  });
+
   // ---------- fetchHealth：2xx + kanban 信封才算健康 ----------
   await checkAsync('fetchHealth：404 / HTML 占端口不再误判为「看板已在运行」', async () => {
     const mk = async (handler: http.RequestListener) => {
@@ -1822,7 +1973,9 @@ async function main(): Promise<void> {
       CONFIRM_YES_RE.test('y') &&
       CONFIRM_BATCH_RE.test('同类免问') &&
       CONFIRM_BATCH_RE.test('批量允许') &&
-      CONFIRM_BATCH_RE.test('都') &&
+      CONFIRM_BATCH_RE.test('都允许') &&
+      CONFIRM_BATCH_RE.test('以后都') &&
+      !CONFIRM_BATCH_RE.test('都') && // 单字「都」随口误批准 10 分钟免问，已移除
       CONFIRM_BATCH_RE.test('免问') &&
       CONFIRM_BATCH_RE.test('b') &&
       CONFIRM_NO_RE.test('取消') &&
@@ -1830,6 +1983,22 @@ async function main(): Promise<void> {
       !CONFIRM_YES_RE.test('好') &&
       !CONFIRM_YES_RE.test('可以') &&
       !CONFIRM_YES_RE.test('批准一下') // 必须整词匹配
+    );
+  })());
+
+  // ---------- isConfirmWord：无 pending 时的即时提示判定（排除单字母） ----------
+  check('isConfirmWord：确认词命中，单字母 y/n/b 与随口应答不命中', (() => {
+    return (
+      isConfirmWord('确认') &&
+      isConfirmWord(' 取消 ') &&
+      isConfirmWord('yes') &&
+      isConfirmWord('同类免问') &&
+      !isConfirmWord('y') && // 单字母不排除会误伤正常对话
+      !isConfirmWord('n') &&
+      !isConfirmWord('b') &&
+      !isConfirmWord('好') &&
+      !isConfirmWord('帮我看看任务') &&
+      !isConfirmWord('')
     );
   })());
 

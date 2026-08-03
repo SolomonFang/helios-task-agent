@@ -89,11 +89,14 @@ Feishu Task Center / docs / group chats
 
 Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failure, new approvals — and injects session context so you can reply in-thread.
 
+In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the kanban diff view; "🤖 AI 审查" (AI review) calls [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) on that attempt's diff (same scope as the kanban diff view: merge-base(target)..attempt branch), requires Simplified-Chinese output, renders the full result as an HTML report (written to the data dir `reviews/`, hosted by the bot's built-in static server), and pushes only the report link to Feishu (long results are no longer truncated) — the result is also injected into the session, so you can reply "按审查意见修一下" (fix per the review).
+
 - First poll is baseline only (`watch-state.json`)  
 - Does **not** notify on brand-new tasks  
 - Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
 - With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
 - `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
+- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*`), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
 
 > **Phone reachability**: the kanban links and AI-review report links in pushed cards point at the machine running the bot. With the default `HELIOS_KANBAN_URL=http://localhost:7964`, these links **only work on that machine — they are dead links on your phone** (the bot logs a warning about this at startup). To review from your phone, set `HELIOS_KANBAN_URL` to the machine's LAN IP or Tailscale address (the board and report server must be reachable at that address). Report URLs carry a random token, and the report server binds `127.0.0.1` by default — set `HELIOS_REPORT_HOST` explicitly only if you really need to expose it.
 
@@ -164,7 +167,7 @@ Body… undeclared sections stay out of the prompt; the agent reads the full doc
 via the `skill_doc` tool (progressive disclosure).
 ```
 
-- Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` (covered by unit tests) — contract problems surface at test time instead of silently degrading.
+- Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` — surfaced as **startup warnings** (CLI and bot) and covered by unit tests, instead of silently degrading.
 - Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
 - Executable capabilities (new tools) still need registration in `src/tools.ts`.
 

@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { ocrPackageSpec } from '../deps';
 import { minimalChildEnv } from '../proc-env';
+import { apiGet } from './http';
 
 /**
  * AI 审查（open-code-review）：根据看板 attempt 定位代码目录，调用 ocr CLI
@@ -49,15 +50,6 @@ export interface OcrCommand {
   cmd: string;
   prefixArgs: string[];
   via: 'path' | 'npx';
-}
-
-async function apiGet(kanbanUrl: string, p: string): Promise<unknown> {
-  const base = kanbanUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/api${p}`, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = (await res.json()) as { success?: boolean; data?: unknown; message?: string };
-  if (json && json.success === true) return json.data;
-  throw new Error(json?.message || 'kanban api error');
 }
 
 function isGitRepo(dir: string): boolean {

@@ -18,6 +18,20 @@
 
 ### Fixed
 
+- 配置向导模型校验失败后可选修改 Base URL（此前只能重输 API Key，Base URL 填错只能退出重来）
+- 确认已超时/已处理后回复「确认」「取消」等确认词，立即提示「当前没有待确认的写操作」，不再落入普通对话发给 LLM（单字母 y/n/b 不拦截，避免误伤正常对话）
+- `/status` 的依赖探测（lark-cli 授权态、jq、curl、ocr）全部改异步：此前 `execFileSync` 串在 bot 事件循环里，最坏阻塞十几秒，飞书回调/心跳全被卡住
+- MCP 自动重连竞态：决定重连后即同步占位，新轮次一律等重连结束再开始，「无进行中轮次」检查与 `close()` 之间不再可能插入新轮次而杀掉 in-flight 工具调用；重连逻辑抽为 `McpSupervisor`（`src/bot/supervisor.ts`）并补全单元测试（此前零覆盖）
+- 确认词表移除单字「都」（随口一个字即批准 10 分钟「同类免问」太危险）；「以后都」「都允许」仍覆盖该意图
+- `helios-task-agent-bot` 对 `--help` 与未知参数给出帮助/报错并非零退出（此前乱参数直接启动 bot）
+- 用户自建技能契约问题（缺 `name`/`description`、`digest_sections` 匹配不到章节）启动时即告警（CLI 与 bot 一致），不再只在测试期暴露
+- README.en 补齐 AI 审查整段说明（双语漂移）
+
+### Changed
+
+- 看板 HTTP 层收口为 `src/kanban/http.ts`：信封解析（`success` 校验策略统一：存在则必须为 true，无信封宽松回退 `data ?? 原始 JSON`）、任务页/diff URL 拼接、最新 attempt 挑选（优先未归档按创建时间）全部共享，watcher / summary / ai-review / workspace-ready 四处的 6+ 份重复实现删除
+- `bot.ts`（765 行上帝文件）拆分：MCP supervisor（`src/bot/supervisor.ts`）、消息路由与卡片回调（`src/bot/handler.ts`），bootstrap 留在 `bot.ts`
+
 - 自动拉起看板失败时快速报错：补挂子进程 `error` 监听，npx 缺失/不可执行不再抛未捕获异常或白等 90 秒，错误信息指向真实原因
 - 看板启动失败的 CLI 手动提示去掉 `HOST=0.0.0.0`（与看板无鉴权、只应绑回环的安全警告自相矛盾），改随 `HELIOS_KANBAN_PACKAGE` 输出正确的包规格，并提示「多数情况是首次下载慢，重新运行即可」；CLI 与 bot 共用同一文案
 - `SourceRegistry` / `MemoryStore` 写盘前先读盘合并：CLI 与 bot 并发、bot 多会话实例之间不再互相覆盖丢失数据（去重注册表丢失会导致重复创建看板任务）；`MemoryStore.persist` 失败不再抛给调用方
