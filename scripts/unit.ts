@@ -1662,16 +1662,14 @@ async function main(): Promise<void> {
 
   // ---------- ensureKanbanRunning：onSpawn 拉起即回调 + detached 进程组超时清理 ----------
   await checkAsync('ensureKanbanRunning：onSpawn 回调拿到 child，超时后进程组被清理', async () => {
-    // 注意：本环境直接 exec 新建 shebang 脚本会挂起，假 npx 用系统二进制的符号链接（yes = 常驻进程）
-    const yes = '/usr/bin/yes';
-    if (!fs.existsSync(yes)) return; // 无 yes 的平台跳过
-    // 先占后放一个确定空闲的端口（yes 不会监听，health 永不通）
+    // 假 npx = 常驻脚本：忽略 -y 等参数直接 sleep，health 永不通，走超时路径。
+    // （不能用系统二进制符号链接：GNU yes/sleep 会把 spawn 的 -y 当非法选项直接退出，Linux CI 上假 npx 秒退）
     const probe = http.createServer();
     await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
     const port = (probe.address() as AddressInfo).port;
     await new Promise((r) => probe.close(r));
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-'));
-    fs.symlinkSync(yes, path.join(bin, 'npx'));
+    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\nexec /bin/sleep 60\n', { mode: 0o755 });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
     let spawned: import('child_process').ChildProcess | null = null;
