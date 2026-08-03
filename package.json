@@ -1,6 +1,6 @@
 {
   "name": "helios-task-agent",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "Terminal agent that turns Lark/Feishu content into helios-kanban tasks",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
