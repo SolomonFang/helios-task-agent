@@ -4,7 +4,7 @@
  * enforcement behind "先确认再执行" — the model cannot bypass it via prompt.
  */
 
-export type ConfirmKind = 'kanban' | 'lark' | 'hk';
+export type ConfirmKind = 'kanban' | 'lark' | 'hk' | 'memory';
 
 export interface ConfirmRequest {
   kind: ConfirmKind;
@@ -149,14 +149,25 @@ export function classifyLark(args: string[]): 'read' | 'write' {
 // --- hk.sh classification ---
 
 const HK_WRITE_COMMANDS = new Set(['start', 'create-and-start', 'follow-up', 'stop', 'approve', 'deny']);
+const HK_READ_COMMANDS = new Set(['health', 'info', 'repos', 'branches', 'status', 'workspaces', 'tags', 'approvals']);
 const HK_WRITE_TASK_SUBS = new Set(['create', 'update', 'delete', 'cancel']);
+const HK_READ_TASK_SUBS = new Set(['list', 'get']);
 
 export function classifyHk(args: string[]): 'read' | 'write' {
   const [cmd, sub] = args;
   if (!cmd || cmd === '--help' || cmd === '-h') return 'read';
-  if (cmd === 'tasks') return HK_WRITE_TASK_SUBS.has(sub || '') ? 'write' : 'read';
-  if (cmd === 'projects') return sub === 'update' || sub === 'create' ? 'write' : 'read';
-  return HK_WRITE_COMMANDS.has(cmd) ? 'write' : 'read';
+  if (cmd === 'tasks') {
+    if (HK_WRITE_TASK_SUBS.has(sub || '')) return 'write';
+    // 已知只读子命令 → read；未知子命令 → write（fail-closed，同 classifyLark/classifyMcp）
+    return HK_READ_TASK_SUBS.has(sub || '') ? 'read' : 'write';
+  }
+  if (cmd === 'projects') {
+    if (sub === 'update' || sub === 'create') return 'write';
+    // 无子命令 = 列表 → read；未知子命令 → write
+    return !sub ? 'read' : 'write';
+  }
+  if (HK_WRITE_COMMANDS.has(cmd)) return 'write';
+  return HK_READ_COMMANDS.has(cmd) ? 'read' : 'write';
 }
 
 // --- kanban MCP classification (tool names are server-defined) ---

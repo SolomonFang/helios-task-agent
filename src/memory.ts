@@ -22,6 +22,14 @@ function emptyFile(): MemoryFile {
 export class MemoryStore {
   readonly filePath: string;
   private data: MemoryFile;
+  /**
+   * Journal of this instance's own mutations since the last persist:
+   * fact upserts/deletes (null = deleted) and appended notes, per user.
+   * persist() replays only these onto a fresh disk read, so stale in-memory
+   * copies can neither clobber nor resurrect keys changed by other instances.
+   */
+  private changedFacts = new Map<string, Map<string, string | null>>();
+  private addedNotes = new Map<string, string[]>();
 
   constructor(homeDir?: string) {
     const root = homeDir || defaultDataHome();
@@ -43,12 +51,51 @@ export class MemoryStore {
     }
   }
 
+  private journalFact(userId: string, key: string, value: string | null): void {
+    let journal = this.changedFacts.get(userId);
+    if (!journal) this.changedFacts.set(userId, (journal = new Map()));
+    journal.set(key, value);
+  }
+
+  /**
+   * Reload disk, replay this instance's journaled mutations onto it, then
+   * write. The file is shared between the CLI, the bot, and concurrent bot
+   * sessions, so a blind full-file overwrite would lose updates from other
+   * instances; replaying only our own changes means a key another instance
+   * wrote survives, and a key this instance deleted is applied as a delete
+   * (never resurrected by stale memory). Best-effort: never throws.
+   */
   private persist(): void {
-    const dir = path.dirname(this.filePath);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${this.filePath}.${process.pid}.tmp`;
-    writeFilePrivateSync(tmp, JSON.stringify(this.data, null, 2) + '\n');
-    fs.renameSync(tmp, this.filePath);
+    try {
+      const merged = this.load();
+      for (const [uid, journal] of this.changedFacts) {
+        const user = merged.users[uid] || (merged.users[uid] = emptyUser());
+        for (const [key, value] of journal) {
+          if (value === null) delete user.facts[key];
+          else user.facts[key] = value;
+        }
+        user.updatedAt = new Date().toISOString();
+      }
+      for (const [uid, notes] of this.addedNotes) {
+        const user = merged.users[uid] || (merged.users[uid] = emptyUser());
+        const existing = new Set(user.notes);
+        for (const note of notes) {
+          if (!existing.has(note)) user.notes.push(note);
+        }
+        if (user.notes.length > MAX_NOTES) user.notes = user.notes.slice(-MAX_NOTES);
+        user.updatedAt = new Date().toISOString();
+      }
+      const dir = path.dirname(this.filePath);
+      fs.mkdirSync(dir, { recursive: true });
+      const tmp = `${this.filePath}.${process.pid}.tmp`;
+      writeFilePrivateSync(tmp, JSON.stringify(merged, null, 2) + '\n');
+      fs.renameSync(tmp, this.filePath);
+      this.data = merged;
+      this.changedFacts.clear();
+      this.addedNotes.clear();
+    } catch {
+      /* best-effort */
+    }
   }
 
   private touch(userId: string): UserMemory {
@@ -81,6 +128,7 @@ export class MemoryStore {
     if (!k) throw new Error('key 不能为空');
     const user = this.touch(userId);
     user.facts[k] = String(value);
+    this.journalFact(userId, k, String(value));
     this.persist();
     return this.getUser(userId);
   }
@@ -90,6 +138,7 @@ export class MemoryStore {
     if (!user || !(key in user.facts)) return false;
     delete user.facts[key];
     user.updatedAt = new Date().toISOString();
+    this.journalFact(userId, key, null);
     this.persist();
     return true;
   }
@@ -100,6 +149,9 @@ export class MemoryStore {
     const user = this.touch(userId);
     user.notes.push(note);
     if (user.notes.length > MAX_NOTES) user.notes = user.notes.slice(-MAX_NOTES);
+    const pending = this.addedNotes.get(userId);
+    if (pending) pending.push(note);
+    else this.addedNotes.set(userId, [note]);
     this.persist();
     return this.getUser(userId);
   }

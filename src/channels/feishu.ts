@@ -150,6 +150,8 @@ export class FeishuChannel implements AgentChannel {
   private readonly client: Lark.Client;
   private readonly access: ReturnType<typeof createAccessChecker>;
   private wsClient: Lark.WSClient | null = null;
+  /** 最近一次收到长连接事件（消息/卡片回传）的时间（ms；0 = 尚未收到），/status 探活用。 */
+  private lastEventAtMs = 0;
   private seenMessageIds = new Map<string, number>();
   private readonly seenTtlMs = 10 * 60 * 1000;
   private deniedNotified = new Set<string>();
@@ -157,6 +159,8 @@ export class FeishuChannel implements AgentChannel {
   private claimBlocked = new Set<string>();
   /** Card button callback (card.action.trigger); set by the bot layer. */
   onCardAction?: (data: FeishuCardAction) => void;
+  /** WS 长连接状态变化钩子（进入重连/重连成功/重连耗尽），由 bot 层接告警。 */
+  onWsStateChange?: (state: 'reconnecting' | 'reconnected' | 'failed', err?: Error) => void;
   /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer.
    *  返回 false（或抛错）= 绑定未持久化：channel 撤销内存放行并阻断重试（fail-closed）。 */
   onOwnerClaim?: (openId: string) => boolean;
@@ -176,6 +180,16 @@ export class FeishuChannel implements AgentChannel {
     return this.access.list();
   }
 
+  /** 最近一次收到长连接事件的时间（ms；0 = 尚未收到）。 */
+  lastEventAt(): number {
+    return this.lastEventAtMs;
+  }
+
+  /** SDK WSClient 连接状态快照（未启动返回 null）。 */
+  connectionState(): Lark.WSConnectionState | null {
+    return this.wsClient?.getConnectionStatus().state ?? null;
+  }
+
   private pruneSeen(now: number): void {
     for (const [id, ts] of this.seenMessageIds) {
       if (now - ts > this.seenTtlMs) this.seenMessageIds.delete(id);
@@ -187,12 +201,26 @@ export class FeishuChannel implements AgentChannel {
       appId: this.cfg.appId,
       appSecret: this.cfg.appSecret,
       loggerLevel: Lark.LoggerLevel.info,
+      // 断线监测：SDK 负责重连，这里只透传状态给 bot 层做日志/告警，避免"进程活着但收不到消息"的僵尸态无人察觉
+      onReconnecting: () => {
+        console.warn('[feishu] 长连接断开，正在自动重连…');
+        this.onWsStateChange?.('reconnecting');
+      },
+      onReconnected: () => {
+        console.log('[feishu] 长连接已恢复');
+        this.onWsStateChange?.('reconnected');
+      },
+      onError: (err) => {
+        console.error(`[feishu] 长连接重连失败（SDK 已放弃重试）: ${err.message}`);
+        this.onWsStateChange?.('failed', err);
+      },
     });
 
     await this.wsClient.start({
       eventDispatcher: new Lark.EventDispatcher({}).register({
         'im.message.receive_v1': async (data: FeishuReceivePayload) => {
           const now = Date.now();
+          this.lastEventAtMs = now;
           this.pruneSeen(now);
 
           const message = data.message;
@@ -265,6 +293,14 @@ export class FeishuChannel implements AgentChannel {
         // 卡片按钮回传（需在开放平台「回调订阅」配置长连接 + 卡片回传交互）
         'card.action.trigger': async (data: FeishuCardAction) => {
           try {
+            const openId = data.operator?.open_id || '';
+            // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮，
+            // 不过白名单会让陌生人触发 AI 审查（耗 LLM 配额、读本机仓库 diff）
+            if (!openId || !this.access.list().includes(openId)) {
+              console.warn(`[feishu] ignore card action from open_id not in allowlist: ${openId || '(unknown)'}`);
+              return;
+            }
+            this.lastEventAtMs = Date.now();
             this.onCardAction?.(data);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);

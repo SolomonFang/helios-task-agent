@@ -5,6 +5,7 @@
  */
 
 import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
+import { probeLarkCliAuth, checkHkDeps, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
 import { LOCAL_TOOL_SUMMARY } from './tools';
 import { loadSkillDigests } from './prompt';
 import { friendlyLlmError } from './llm-error';
@@ -78,11 +79,28 @@ export async function buildStatusLines(
   p: Paint,
 ): Promise<string[]> {
   const health = await fetchKanbanHealth(opts.kanbanUrl);
+  // hk_cli 降级链依赖（jq/curl）：MCP 掉线时 hk.sh 才能兜底，缺失则降级链是断的
+  const hkMissing = checkHkDeps();
+  // larkOk 只代表二进制存在，补探测授权态，区分未安装/未授权/可用
+  const larkAuthed = opts.larkOk ? probeLarkCliAuth() === 'ok' : false;
+  const mcpText = opts.mcpOk
+    ? p.ok(`ok（${opts.mcpToolCount} 个工具）`)
+    : p.warn(
+        hkMissing.length
+          ? `${opts.mcpDownNote}；但 hk_cli 缺少 ${hkMissing.join('、')}，降级链不可用（${HK_CLI_INSTALL_HINT}）`
+          : opts.mcpDownNote,
+      );
+  const larkText = !opts.larkOk
+    ? p.warn('未安装（飞书读取不可用）')
+    : larkAuthed
+      ? p.ok('ok')
+      : p.warn(`未授权（${LARK_CLI_AUTH_HINT}）`);
   const lines = [
     `模型: ${p.info(opts.model)}`,
     `kanban: ${health === 'ok' ? p.ok('ok') : p.warn(health)}（${opts.kanbanUrl}）`,
-    `MCP: ${opts.mcpOk ? p.ok(`ok（${opts.mcpToolCount} 个工具）`) : p.warn(opts.mcpDownNote)}`,
-    `lark-cli: ${opts.larkOk ? p.ok('ok') : p.warn('未安装（飞书读取不可用）')}`,
+    `MCP: ${mcpText}`,
+    `lark-cli: ${larkText}`,
+    `hk_cli: ${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('ok')}`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }

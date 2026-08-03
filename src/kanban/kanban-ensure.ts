@@ -3,6 +3,7 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 import { kanbanPackageSpec } from '../deps';
+import { minimalChildEnv } from '../proc-env';
 
 export interface KanbanEnsureResult {
   /** True if we spawned a new process. */
@@ -75,10 +76,13 @@ export async function ensureKanbanRunning(
     autoStart = process.env.HELIOS_KANBAN_AUTO_START !== '0',
     waitMs = 90000,
     onLog,
+    onSpawn,
   }: {
     autoStart?: boolean;
     waitMs?: number;
     onLog?: (msg: string) => void;
+    /** 子进程一拉起即回调（就绪前收到退出信号时，调用方需要拿到 child 才能清理）。 */
+    onSpawn?: (child: ChildProcess) => void;
   } = {},
 ): Promise<KanbanEnsureResult> {
   const url = kanbanUrl || 'http://localhost:7964';
@@ -109,17 +113,26 @@ export async function ensureKanbanRunning(
 
   log(`未检测到看板，正在启动 npx ${kanbanPackageSpec()}（PORT=${port}）…`);
   const child = spawn('npx', ['-y', kanbanPackageSpec()], {
-    env: {
-      ...process.env,
+    // 最小环境（见 proc-env.ts）：npx 只需 PATH/HOME 与代理/registry，不继承敏感变量
+    env: minimalChildEnv({
       // 默认只监听回环：看板 Web/API 无鉴权，绑定 0.0.0.0 会暴露到局域网
       HOST: process.env.HELIOS_KANBAN_HOST || '127.0.0.1',
       PORT: port,
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false,
+    // 自成进程组：stopKanbanChild 按组杀，npx 拉起的看板孙进程（真正的监听者）才能一并退出
+    detached: true,
   });
+  onSpawn?.(child);
 
   let stderrBuf = '';
+  // spawn 失败（如 npx 不存在）时 'error' 事件没有监听者会直接抛未捕获异常使进程崩溃；
+  // 且此时 exitCode 恒为 null，仅靠轮询 exitCode 会白等满 waitMs。记录后在循环里快速失败。
+  // 用对象持有避免 TS 把闭包内赋值的变量窄化为 null。
+  const spawnFailure: { err: Error | null } = { err: null };
+  child.on('error', (err) => {
+    spawnFailure.err = err;
+  });
   child.stderr?.on('data', (chunk: Buffer) => {
     stderrBuf += chunk.toString();
     if (process.env.HTA_DEBUG) process.stderr.write(`[kanban] ${chunk}`);
@@ -130,6 +143,13 @@ export async function ensureKanbanRunning(
 
   const startedAt = Date.now();
   while (Date.now() - startedAt < waitMs) {
+    // 拷贝到局部变量：TS 会把闭包内才赋值的属性窄化为 null，分支内变成 never
+    const spawnErr: Error | null = spawnFailure.err;
+    if (spawnErr) {
+      throw new Error(
+        `无法启动 helios-kanban：执行 npx 失败（npx 不可执行或未安装 Node.js/npm）: ${spawnErr.message}`,
+      );
+    }
     if (child.exitCode !== null) {
       throw new Error(
         `helios-kanban 进程已退出（code=${child.exitCode}）\n${stderrBuf.slice(-800) || '(无 stderr)'}`,
@@ -142,13 +162,38 @@ export async function ensureKanbanRunning(
     await sleep(800);
   }
 
-  child.kill('SIGTERM');
+  await stopKanbanChild(child);
   throw new Error(`等待 helios-kanban 就绪超时（${waitMs}ms）：${url}`);
+}
+
+/** 按进程组发信号（spawn 时 detached: true）；组杀失败（如平台不支持负 pid）回退只杀 child。 */
+function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-child.pid!, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      /* 已退出 */
+    }
+  }
+}
+
+/** 进程组是否还有存活成员（npx 壳退出后，被 reparent 的看板孙进程仍在组里）。 */
+function treeAlive(child: ChildProcess): boolean {
+  try {
+    process.kill(-child.pid!, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function stopKanbanChild(child: ChildProcess | null): Promise<void> {
   if (!child || child.exitCode !== null) return;
-  child.kill('SIGTERM');
+  // 按进程组杀：npx 只是壳，看板服务是其子进程，只杀 npx 会让看板成为孤儿继续占端口
+  killTree(child, 'SIGTERM');
   await sleep(500);
-  if (child.exitCode === null) child.kill('SIGKILL');
+  // 看板进程对首轮 SIGTERM 可能不敏感（父进程死后才响应）：组内还有活口就补 SIGKILL
+  if (treeAlive(child)) killTree(child, 'SIGKILL');
 }

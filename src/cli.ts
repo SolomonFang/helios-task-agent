@@ -6,7 +6,7 @@ import { c, printBanner, Spinner, renderReply, selectList, readSecret, MCP_FALLB
 import { ensureConfig } from './config-wizard';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
-import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT } from './deps';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
 import {
   buildMemoryLines,
@@ -145,7 +145,7 @@ export async function main(): Promise<void> {
     bootKanban.stop();
     const message = err instanceof Error ? err.message : String(err);
     console.error(c.err(`看板不可用: ${message}`));
-    console.error(c.gray('可手动: HOST=0.0.0.0 PORT=7964 npx -y helios-kanban'));
+    console.error(c.gray(kanbanManualStartHint()));
     rl.close();
     process.exit(1);
   }
@@ -158,7 +158,7 @@ export async function main(): Promise<void> {
     if (mcpHint) console.log(c.warn(mcpHint));
   }
 
-  const larkOk = checkLarkCli();
+  const larkStatus = checkLarkCliStatus();
 
   printBanner({
     version: pkg.version,
@@ -167,9 +167,10 @@ export async function main(): Promise<void> {
     kanbanUrl: cfg.kanbanUrl,
     mcp: mcpOk ? 'ok' : 'fail',
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
-    larkOk,
+    larkOk: larkStatus !== 'missing',
   });
-  if (!larkOk) console.log(c.warn(LARK_CLI_INSTALL_HINT));
+  if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));
+  else if (larkStatus === 'unauthorized') console.log(c.warn(LARK_CLI_AUTH_HINT));
 
   const spinner = new Spinner('思考中…');
 
@@ -346,7 +347,7 @@ export async function main(): Promise<void> {
             mcpOk,
             mcpToolCount: mcp.tools.length,
             mcpDownNote: `连接失败（${MCP_FALLBACK_TEXT}）`,
-            larkOk,
+            larkOk: larkStatus !== 'missing',
           },
           c,
         );

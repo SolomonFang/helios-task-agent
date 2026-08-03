@@ -445,6 +445,11 @@ cmd_tasks_list() {
       *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
   done
+  # limit 直接拼入 jq 程序（.[0:N]），必须校验为纯数字，防止注入 jq 代码
+  if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+    echo "error: invalid --limit '$limit' (must be a non-negative integer)" >&2
+    exit 1
+  fi
   local data
   data=$(api GET "/tasks?project_id=${project_id}")
   local filter='.'

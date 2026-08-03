@@ -1,5 +1,7 @@
 import readline from 'readline';
 
+import { probeLarkCliAuth, checkHkDeps, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
+
 const ESC = '\u001b';
 
 const codes = {
@@ -99,15 +101,31 @@ export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口
 
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
+  // 探测 hk_cli 降级链依赖（jq/curl）：缺失时 MCP 掉线文案的「已自动切换为 hk_cli」不成立，必须警示
+  const hkMissing = checkHkDeps();
+  const mcpSuffix =
+    status.mcp === 'fail'
+      ? hkMissing.length
+        ? `（${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，降级链不可用）`
+        : `（${MCP_FALLBACK_TEXT}，功能不受影响）`
+      : '';
   const mcpLine =
     status.mcp === 'ok'
       ? c.ok('●') + ` helios-kanban MCP  已连接（${status.mcpToolCount} 个工具）`
       : status.mcp === 'fail'
-        ? c.warn('●') + ` helios-kanban MCP  连接失败（${MCP_FALLBACK_TEXT}，功能不受影响）`
+        ? c.warn('●') + ` helios-kanban MCP  连接失败${mcpSuffix}`
         : c.warn('●') + ' helios-kanban MCP  连接中…';
-  const larkLine = status.larkOk
-    ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
-    : c.warn('●') + ' lark-cli         未找到，飞书能力不可用（可选，见下方安装提示）';
+  // larkOk 只代表二进制存在（调用方传 checkLarkCli()），在此补探测授权态，区分未安装/未授权/可用
+  const larkAuthed = status.larkOk ? probeLarkCliAuth() === 'ok' : false;
+  const larkLine = !status.larkOk
+    ? c.warn('●') + ' lark-cli         未找到，飞书能力不可用（可选，见下方安装提示）'
+    : larkAuthed
+      ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
+      : c.warn('●') + ` lark-cli         未授权，飞书能力不可用（${LARK_CLI_AUTH_HINT}）`;
+  const hkLine =
+    hkMissing.length > 0
+      ? ['  ' + c.warn('●') + ` hk_cli 降级链    缺少 ${hkMissing.join('、')}，MCP 掉线时无法降级（${HK_CLI_INSTALL_HINT}）`]
+      : [];
   const lines = [
     '',
     c.strong(c.info('  ██╗  ██╗███████╗██╗     ██╗ ██████╗ ███████╗')),
@@ -122,6 +140,7 @@ export function printBanner(status: BannerStatus): void {
     '',
     '  ' + mcpLine,
     '  ' + larkLine,
+    ...hkLine,
     // 模型与 kanban 地址只是配置展示（未做健康检查）：用中性灰点，避免与上面两行的「连接正常」绿点混淆
     '  ' + c.gray('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
     '  ' + c.gray('●') + ` kanban 地址      ${status.kanbanUrl}`,

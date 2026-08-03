@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import { defaultDataHome } from './memory';
+import { writeFilePrivateSync } from './private-file';
 import { kanbanPackageSpec } from './deps';
 import type { AgentConfig, FeishuBotConfig, LlmPreset } from './types';
 
@@ -19,8 +20,23 @@ export function projectEnvPath(): string {
  * Load env files: project first, then cwd, then user home (later overrides).
  * 用户目录是向导/owner 认领的写入目标（resolveEnvWritePath），必须最后加载
  * 才能保证写入的配置真实生效；HELIOS_TASK_AGENT_ENV 强制路径优先级最高。
+ * cwd .env 的高危键（见 CWD_RESTRICTED_KEYS）不参与覆盖，只由 home/项目/shell 提供。
  * Returns the path preferred for writes (existing cwd/project if present, else user home).
  */
+/**
+ * cwd .env 不允许覆盖的高危键：用户在含恶意 .env 的目录（如下载的样例仓库）
+ * 启动时，LLM_BASE_URL 指向攻击者端点会导致 Authorization: Bearer <LLM_API_KEY>
+ * 被外发；飞书凭证与 owner 白名单同理。这些键只接受 shell 环境、项目 .env、
+ * 用户 home .env（及 HELIOS_TASK_AGENT_ENV 强制路径）的值。
+ */
+const CWD_RESTRICTED_KEYS = new Set([
+  'LLM_BASE_URL',
+  'LLM_API_KEY',
+  'FEISHU_APP_ID',
+  'FEISHU_APP_SECRET',
+  'FEISHU_ALLOWED_OPEN_IDS',
+]);
+
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   const loaded: string[] = [];
   const home = userEnvPath();
@@ -32,7 +48,19 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
     loaded.push(project);
   }
   if (fs.existsSync(cwd) && path.resolve(cwd) !== path.resolve(project)) {
-    dotenv.config({ path: cwd, override: true });
+    // 不用 dotenv.config(override)：先解析再过滤高危键，其余键仍覆盖项目 .env。
+    const parsed = dotenv.parse(fs.readFileSync(cwd));
+    const dropped: string[] = [];
+    for (const [k, v] of Object.entries(parsed)) {
+      if (CWD_RESTRICTED_KEYS.has(k)) {
+        dropped.push(k);
+        continue;
+      }
+      process.env[k] = v;
+    }
+    if (dropped.length) {
+      console.warn(`[config] cwd .env 中的高危键已被忽略（改由用户 home .env 提供）: ${dropped.join(', ')}`);
+    }
     loaded.push(cwd);
   }
   if (fs.existsSync(home) && !loaded.some((p) => path.resolve(p) === path.resolve(home))) {
@@ -194,13 +222,12 @@ export function writeEnvFile(
   ];
   const keys = [...preferredOrder.filter((k) => k in map), ...Object.keys(map).filter((k) => !preferredOrder.includes(k))];
   const body = keys.map((k) => `${k}=${map[k]}`).join('\n') + '\n';
-  // 含 LLM_API_KEY / FEISHU_APP_SECRET 等凭证：仅属主可读写（mode 仅对新建生效，故对已存在文件再 chmod）
-  fs.writeFileSync(filePath, body, { encoding: 'utf8', mode: 0o600 });
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    /* best-effort（如 Windows 或不支持的文件系统） */
-  }
+  // 原子写：tmp + rename（与 memory.ts / source-registry.ts 同一模式），
+  // 避免写盘中途被杀导致 .env 截断、凭证丢失；rename 后目标一定是新建的
+  // 0600 文件（writeFilePrivateSync 内含 chmod），权限处理保持不变。
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  writeFilePrivateSync(tmp, body);
+  fs.renameSync(tmp, filePath);
   applyProcessEnv(map);
   return filePath;
 }

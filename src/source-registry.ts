@@ -70,17 +70,32 @@ export class SourceRegistry {
     }
   }
 
+  /**
+   * Reload disk and fold in keys written by other instances (CLI vs bot vs
+   * sibling sessions share the file); our in-memory view wins on conflicts.
+   */
+  private mergeFromDisk(): void {
+    const disk = this.load();
+    for (const [uid, entries] of Object.entries(disk)) {
+      this.data[uid] = { ...entries, ...(this.data[uid] || {}) };
+    }
+  }
+
   lookup(userId: string, url: string): SyncedSource | undefined {
     return this.data[userId]?.[url];
   }
 
   record(userId: string, url: string, entry: SyncedSource): void {
+    this.mergeFromDisk();
     if (!this.data[userId]) this.data[userId] = {};
     this.data[userId]![url] = entry;
     this.persist();
   }
 
   remove(userId: string, url: string): void {
+    // Merge first so persist does not stomp other instances' keys; deleting
+    // after the merge guarantees the removed key cannot be resurrected by it.
+    this.mergeFromDisk();
     if (this.data[userId] && url in this.data[userId]!) {
       delete this.data[userId]![url];
       this.persist();

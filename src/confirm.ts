@@ -47,6 +47,7 @@ export const CONFIRM_NO_RE = wordsToRe(CONFIRM_NO_WORDS);
 export function kindLabel(kind: string): string {
   if (kind === 'lark') return '飞书';
   if (kind === 'kanban' || kind === 'hk') return '看板';
+  if (kind === 'memory') return '记忆';
   return kind;
 }
 

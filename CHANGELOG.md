@@ -6,6 +6,33 @@
 
 ## [Unreleased]
 
+### Security
+
+- `hk.sh` 的 `tasks list --limit` 参数强制纯数字校验：此前该值直接拼入 jq 程序字符串，恶意值可注入 jq 程序读取子进程环境变量（含 `LLM_API_KEY` 等）
+- 子进程环境变量收敛为最小白名单（`src/proc-env.ts`）：lark-cli、hk.sh、npx 拉起的看板/OCR 不再无条件继承完整 `process.env`，`LLM_API_KEY`、`FEISHU_APP_SECRET` 等密钥不再暴露给第三方 CLI 与 npx 拉取的包；OCR 仅保留显式派生的 `OCR_LLM_*`
+- 看板写操作闸门改为 fail-closed：`classifyHk` 对未知 hk 子命令默认按写操作处理（此前默认放行），hk.sh 新增写子命令不会再绕过确认
+- cwd `.env` 不再允许覆盖 `LLM_BASE_URL` / `LLM_API_KEY` / `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_ALLOWED_OPEN_IDS`：在含恶意 `.env` 的目录启动不再能把 LLM 请求劫持到攻击者端点（非受限键优先级不变）
+- `memory_set` / `memory_delete` / `memory_note` 接入写确认闸门（确认类型「记忆」，逐次确认、不参与「同类免问」）：堵住经持久化记忆回注系统提示词的跨会话 prompt 注入通道
+- AI 审查报告与工作报告文件权限收紧为 0600；报告 URL 带 128-bit 随机 token（无 token / 错 token 一律 404）；报告服务监听地址独立为 `HELIOS_REPORT_HOST`（默认仍 `127.0.0.1`），不再跟随 `HELIOS_KANBAN_HOST`——避免看板绑 `0.0.0.0` 时含代码 diff 的报告连带暴露局域网
+- 飞书卡片按钮回调增加白名单校验：非白名单用户点击「AI 审查」等按钮直接忽略，不再消耗 LLM 配额读取本机仓库 diff
+
+### Fixed
+
+- 自动拉起看板失败时快速报错：补挂子进程 `error` 监听，npx 缺失/不可执行不再抛未捕获异常或白等 90 秒，错误信息指向真实原因
+- 看板启动失败的 CLI 手动提示去掉 `HOST=0.0.0.0`（与看板无鉴权、只应绑回环的安全警告自相矛盾），改随 `HELIOS_KANBAN_PACKAGE` 输出正确的包规格，并提示「多数情况是首次下载慢，重新运行即可」；CLI 与 bot 共用同一文案
+- `SourceRegistry` / `MemoryStore` 写盘前先读盘合并：CLI 与 bot 并发、bot 多会话实例之间不再互相覆盖丢失数据（去重注册表丢失会导致重复创建看板任务）；`MemoryStore.persist` 失败不再抛给调用方
+- `.env` 写盘原子化（tmp + rename）：写盘中途被杀不再截断凭证文件，历史 0644 的 `.env` 重写后收敛为 0600
+- bot 退出可靠性：SIGINT/SIGTERM handler 提到启动流程最前（启动中途收信号也能正确清理），`shutdown()` 幂等防重入并加 8 秒强制退出兜底；自动拉起的看板改按进程组管理，bot 退出不再留下占端口的孤儿进程（npx 壳与真正的看板孙进程一并回收）
+- 飞书长连接可观测：接入 SDK 的断线/重连事件，断开与恢复均通知 owner；`/status` 显示连接状态与最近事件时间，告别「进程活着但收不到消息」的静默僵尸态
+- 手机可达性：`HELIOS_KANBAN_URL` 为 loopback 时 bot 启动即警告「推送链接在手机上不可达」；看板事件卡片注脚区分「仅本机」与「同网络」两种情形（原注脚对 loopback 地址的可达性描述是错的）
+- 依赖检查升级为能力探测：lark-cli 区分「未安装 / 未授权 / 可用」三态（未授权直接提示 `lark-cli auth login`，不再绿点误导）；新增 hk_cli 降级链的 jq/curl 检查，MCP 掉线且 jq 缺失时 banner 与 `/status` 明确警示「降级链不可用」（原宣称「功能不受影响」）
+
+## [1.0.15] - 2026-08-03
+
+仅版本号发布，无代码变更。
+
+## [1.0.14] - 2026-07-31
+
 ### Added
 
 - 文档型技能系统：扫描 `skills/*/SKILL.md`（用户数据目录优先、包内内置兜底），frontmatter（`name` / `description` / `digest_sections`）即技能契约，摘要注入系统提示词；`skill_doc` 工具按需读取全文（渐进式披露）；`/skills` 命令（CLI 与飞书 bot）列出已安装技能；`validateSkills()` 契约校验纳入单元测试

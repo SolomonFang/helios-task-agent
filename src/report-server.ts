@@ -3,12 +3,20 @@
  * 飞书只推一个链接即可查看完整内容（与看板 localhost 链接同 reachability）。
  *
  * 安全边界：仅服务指定目录内的 *.html；路径穿越一律 404；随机空闲端口；
- * 默认只绑回环（报告含代码 diff，绑 0.0.0.0 会暴露到局域网）。
+ * 默认只绑回环（报告含代码 diff，绑 0.0.0.0 会暴露到局域网）；
+ * 报告文件名带 128-bit 随机 token（foo.<token>.html）作为访问凭证：
+ * 服务不做目录列举，文件名不完全匹配即 404，猜不到 token 就拉不到报告。
  */
 
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+
+/** 报告访问 token：128-bit 随机 hex，由报告写入方拼进文件名（见 writeReviewReport / writeSummaryReports）。 */
+export function newReportToken(): string {
+  return crypto.randomBytes(16).toString('hex');
+}
 
 export interface ReportServer {
   /** 报告基地址，如 http://localhost:51234（拼上 /文件名 即完整链接）。 */
@@ -60,8 +68,9 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     // 端口 0 = 随机空闲端口，避免与看板等本地服务冲突；
-    // 绑定地址跟随看板约定 HELIOS_KANBAN_HOST，默认回环（与看板默认 HOST 一致）
-    const bindHost = process.env.HELIOS_KANBAN_HOST || '127.0.0.1';
+    // 绑定地址默认仅回环，且独立于看板的 HELIOS_KANBAN_HOST：
+    // 报告含代码 diff，暴露到局域网必须显式设 HELIOS_REPORT_HOST
+    const bindHost = process.env.HELIOS_REPORT_HOST || '127.0.0.1';
     server.listen(0, bindHost, () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : 0;

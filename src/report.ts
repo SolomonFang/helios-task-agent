@@ -6,6 +6,8 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from './memory';
+import { writeFilePrivateSync } from './private-file';
+import { newReportToken } from './report-server';
 import type { WorkSummaryData, WorkSummaryTask } from './kanban/summary';
 
 export function escapeHtml(s: string): string {
@@ -304,12 +306,13 @@ export function writeSummaryReports(
   const base = path.join(dir, `work-summary-${sanitizeName(stamp)}`);
   const out: SummaryReportPaths = {};
   if (format === 'both' || format === 'html') {
-    out.htmlPath = `${base}.html`;
-    fs.writeFileSync(out.htmlPath, renderHtml(data), 'utf8');
+    // HTML 走 report-server HTTP 访问：文件名带随机 token 作为访问凭证（含任务 diff 数据，0600 写入）
+    out.htmlPath = `${base}.${newReportToken()}.html`;
+    writeFilePrivateSync(out.htmlPath, renderHtml(data));
   }
   if (format === 'both' || format === 'md') {
     out.mdPath = `${base}.md`;
-    fs.writeFileSync(out.mdPath, renderMarkdown(data), 'utf8');
+    writeFilePrivateSync(out.mdPath, renderMarkdown(data));
   }
   return out;
 }

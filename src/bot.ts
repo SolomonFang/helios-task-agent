@@ -14,12 +14,12 @@ import { FeishuChannel, splitText, type FeishuInboundMessage } from './channels/
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
-import { KanbanWatcher, buildWatchEventCard } from './kanban/watcher';
+import { KanbanWatcher, buildWatchEventCard, isLoopbackUrl } from './kanban/watcher';
 import { runAiReview } from './kanban/ai-review';
 import { isAllPass, reviewsDir, writeReviewReport } from './review-report';
 import { reportsDir } from './report';
 import { startReportServer, type ReportServer } from './report-server';
-import { checkLarkCli, checkOcrCli, kanbanPackageSpec, LARK_CLI_INSTALL_HINT, OCR_INSTALL_HINT } from './deps';
+import { checkLarkCli, checkLarkCliStatus, checkOcrCli, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import {
@@ -109,6 +109,42 @@ async function main(): Promise<void> {
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
 
+  // 信号处理尽早注册：向导/更新检查/看板拉起（最长 90s）/MCP 连接期间收到 SIGTERM
+  // 走默认终止会让自动拉起的看板子进程成孤儿；这里保证已建立的资源都被清理。
+  // 资源随着启动推进逐个登记进 cleanup，shutdown 只清理已登记的部分。
+  const cleanup: {
+    channel: FeishuChannel | null;
+    mcp: { close(): Promise<void> } | null;
+    watcher: KanbanWatcher | null;
+    kanbanChild: ChildProcess | null;
+    mcpTimer: NodeJS.Timeout | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, mcpTimer: null };
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return; // 幂等：二次 Ctrl+C / SIGINT+SIGTERM 不重入
+    shuttingDown = true;
+    // 整体超时兜底：channel.stop / mcp.close 挂住时强制退出，避免进程永不退
+    const forceTimer = setTimeout(() => {
+      console.error(c.err('退出清理超时，强制结束进程'));
+      process.exit(1);
+    }, 8000);
+    forceTimer.unref();
+    console.log('\n' + c.gray('正在退出…'));
+    try {
+      if (cleanup.mcpTimer) clearInterval(cleanup.mcpTimer);
+      cleanup.watcher?.stop();
+      await cleanup.channel?.stop();
+      await cleanup.mcp?.close();
+      await stopKanbanChild(cleanup.kanbanChild);
+    } catch {
+      /* 尽力清理，任何一步失败都继续退出 */
+    }
+    clearTimeout(forceTimer);
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
+
   // helios-task-agent bot --rebind：换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
   const rebind = process.argv.slice(2).some((a) => a === 'rebind' || a === '--rebind');
 
@@ -158,29 +194,42 @@ async function main(): Promise<void> {
   }
 
   console.log(c.gray(`模型: ${agentCfg.llmModel}  kanban: ${agentCfg.kanbanUrl}`));
+  if (isLoopbackUrl(agentCfg.kanbanUrl)) {
+    console.log(
+      c.warn(
+        `kanban 地址为本机回环地址（${agentCfg.kanbanUrl}）：推送卡片里的看板/报告链接在手机上不可达，` +
+          '如需手机查看请把 HELIOS_KANBAN_URL 配置为局域网 IP 或 Tailscale 地址。',
+      ),
+    );
+  }
   if (feishuCfg.allowedOpenIds.length) {
     console.log(c.gray(`允许 open_id: ${feishuCfg.allowedOpenIds.join(', ')}`));
   } else {
     console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：首个私聊用户将自动成为 owner 并写入白名单'));
   }
-  if (!checkLarkCli()) {
+  const larkStatus = checkLarkCliStatus();
+  if (larkStatus === 'missing') {
     console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}`));
+  } else if (larkStatus === 'unauthorized') {
+    console.log(c.warn(`lark-cli 已安装但未授权。${LARK_CLI_AUTH_HINT}`));
   }
   if (!checkOcrCli()) {
     console.log(c.warn(`未检测到 ocr（AI 审查）。${OCR_INSTALL_HINT}`));
   }
 
-  let kanbanChild: ChildProcess | null = null;
   try {
     const ensured = await ensureKanbanRunning(agentCfg.kanbanUrl, {
       onLog: (msg) => console.log(c.gray(msg)),
+      // 就绪等待期间（最长 90s）收到退出信号时，shutdown 需要拿到 child 才能清理
+      onSpawn: (child) => {
+        cleanup.kanbanChild = child;
+      },
     });
-    kanbanChild = ensured.child;
+    cleanup.kanbanChild = ensured.child;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(c.err(`看板启动失败: ${message}`));
-    console.error(c.gray(`可手动执行: PORT=7964 npx -y ${kanbanPackageSpec()}`));
-    console.error(c.gray('或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。'));
+    console.error(c.gray(kanbanManualStartHint()));
     process.exit(1);
   }
 
@@ -198,6 +247,7 @@ async function main(): Promise<void> {
   const bootLabel = '正在连接 helios-kanban MCP…';
   process.stdout.write(c.gray(bootLabel));
   const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg);
+  cleanup.mcp = mcp;
   if (mcpOk) {
     process.stdout.write(c.ok(`\rMCP 已连接（${mcp.tools.length} 个工具）          \n`));
   } else {
@@ -207,7 +257,7 @@ async function main(): Promise<void> {
 
   const memory = new MemoryStore();
   const channel = new FeishuChannel(feishuCfg);
-  let watcher: KanbanWatcher | null = null;
+  cleanup.channel = channel;
 
   // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）；
   // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
@@ -456,6 +506,7 @@ async function main(): Promise<void> {
     })();
   }, 60000);
   mcpTimer.unref();
+  cleanup.mcpTimer = mcpTimer;
 
   const handle = async (msg: InboundMessage) => {
     const fmsg = msg as FeishuInboundMessage;
@@ -535,6 +586,7 @@ async function main(): Promise<void> {
       return;
     }
     if (cmd === '/status') {
+      const lastEventAt = channel.lastEventAt();
       const lines = await buildStatusLines(
         {
           model: agentCfg.llmModel,
@@ -546,6 +598,9 @@ async function main(): Promise<void> {
           extra: [
             `ocr: ${checkOcrCli() ? 'ok' : '未安装（AI 审查首次点击自动 npx 拉取）'}`,
             `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
+            `飞书长连接: ${channel.connectionState() ?? '未启动'}，最近事件 ${
+              lastEventAt ? new Date(lastEventAt).toLocaleString('zh-CN') : '暂无'
+            }`,
           ],
         },
         plainPaint,
@@ -680,18 +735,6 @@ async function main(): Promise<void> {
     });
   };
 
-  const shutdown = async () => {
-    console.log('\n' + c.gray('正在退出…'));
-    clearInterval(mcpTimer);
-    watcher?.stop();
-    await channel.stop();
-    await mcp.close();
-    await stopKanbanChild(kanbanChild);
-    process.exit(0);
-  };
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
-
   console.log(c.gray('正在建立飞书长连接…'));
   try {
     await channel.start(handle);
@@ -703,15 +746,23 @@ async function main(): Promise<void> {
       c.gray(`改凭证请直接编辑 ${userEnvPath()}；或清空其中 FEISHU_APP_ID / FEISHU_APP_SECRET 后重新运行（会重新进入配置向导）。`),
     );
     await mcp.close();
-    await stopKanbanChild(kanbanChild);
+    await stopKanbanChild(cleanup.kanbanChild);
     process.exit(1);
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
+  // 长连接断线告警：重连交给 SDK，这里只在状态变化时通知 owner，
+  // 避免"进程活着但收不到消息"的僵尸态无人察觉（断线期间的消息由飞书侧补投）
+  channel.onWsStateChange = (state) => {
+    if (state === 'reconnecting') notifyOwners('⚠️ 飞书长连接断开，正在自动重连…（若长时间未恢复请重启机器人）');
+    else if (state === 'reconnected') notifyOwners('✅ 飞书长连接已恢复');
+    else notifyOwners('❌ 飞书长连接重连失败，机器人已收不到消息，请重启机器人。');
+  };
+
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {
     const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
-    watcher = new KanbanWatcher({
+    const watcher = new KanbanWatcher({
       kanbanUrl: agentCfg.kanbanUrl,
       projectId: agentCfg.kanbanProjectId || undefined,
       intervalMs: intervalSec * 1000,
@@ -748,6 +799,7 @@ async function main(): Promise<void> {
       },
       log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
     });
+    cleanup.watcher = watcher;
     watcher.start();
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
   }

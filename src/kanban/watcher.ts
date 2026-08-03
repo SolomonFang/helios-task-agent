@@ -314,6 +314,16 @@ export class KanbanWatcher {
   }
 }
 
+/** 判断 URL 主机是否为 loopback（localhost / 127.x / ::1）：推送链接在手机上不可达的场景识别用。 */
+export function isLoopbackUrl(raw: string): boolean {
+  try {
+    const h = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    return h === 'localhost' || h === '::1' || h.startsWith('127.');
+  } catch {
+    return false;
+  }
+}
+
 /** 看板事件通知的飞书卡片（legacy schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
 export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
   const meta: Record<WatchEventKind, { template: string; title: string }> = {
@@ -362,8 +372,13 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       done: '回复「帮我 review」看结果，或「再跟它说一句…」继续迭代',
       failed: '回复「为什么失败」让它分析原因',
     };
-    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错
-    const notes = [hints[e.kind], e.url ? '链接仅在运行本机器人的电脑所在网络可达，进程重启后失效。' : null].filter(
+    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
+    // loopback（localhost/127.x/::1）连同一局域网都不可达，注脚需区分
+    const linkNote =
+      e.url && isLoopbackUrl(e.url)
+        ? '链接仅在运行本机器人的电脑上可达（本机地址，手机/局域网打不开），进程重启后失效。'
+        : '链接仅在运行本机器人的电脑所在网络可达，进程重启后失效。';
+    const notes = [hints[e.kind], e.url ? linkNote : null].filter(
       (t): t is string => Boolean(t),
     );
     if (notes.length) {

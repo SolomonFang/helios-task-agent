@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { ocrPackageSpec } from '../deps';
+import { minimalChildEnv } from '../proc-env';
 
 /**
  * AI 审查（open-code-review）：根据看板 attempt 定位代码目录，调用 ocr CLI
@@ -131,7 +132,8 @@ export function ocrConfigHasProvider(home = os.homedir()): boolean {
 }
 
 /**
- * 组装 ocr 子进程环境：显式 OCR_LLM_URL / 已有 OCR 配置文件优先；
+ * 组装 ocr 子进程环境：最小环境（见 proc-env.ts，不继承 LLM_API_KEY 等敏感变量）
+ * + 显式 OCR_* 变量；显式 OCR_LLM_URL / 已有 OCR 配置文件优先；
  * 否则把机器人的 OpenAI 兼容配置派生为 OCR_LLM_*（OCR 环境变量优先级高于其配置文件）。
  */
 export function buildOcrEnv(
@@ -139,7 +141,12 @@ export function buildOcrEnv(
   env: NodeJS.ProcessEnv = process.env,
   home = os.homedir(),
 ): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = { ...env, NO_COLOR: '1' };
+  // OCR_* 是 ocr 的预期配置接口，显式放行；OCR_LLM_* 派生副本属预期用途，保留
+  const explicit: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith('OCR_')) explicit[key] = value;
+  }
+  const out: NodeJS.ProcessEnv = { ...minimalChildEnv(explicit, env), NO_COLOR: '1' };
   if (out.OCR_LLM_URL || ocrConfigHasProvider(home)) return out;
   if (llm.baseUrl && llm.apiKey && llm.model) {
     out.OCR_LLM_URL = /\/(chat\/completions|messages)\/?$/.test(llm.baseUrl)

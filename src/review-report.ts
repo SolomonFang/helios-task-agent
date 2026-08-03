@@ -15,6 +15,8 @@ import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from './memory';
 import { escapeHtml } from './report';
+import { writeFilePrivateSync } from './private-file';
+import { newReportToken } from './report-server';
 
 export interface ReviewReportData {
   /** 任务标题。 */
@@ -646,11 +648,11 @@ function pruneOldReports(dir: string, keepDays = 30): void {
   }
 }
 
-/** 渲染并写入 HTML 报告，返回文件名（不含目录）。 */
+/** 渲染并写入 HTML 报告（0600），返回文件名（不含目录）；文件名带随机 token 作为访问凭证。 */
 export function writeReviewReport(data: ReviewReportData, dir = reviewsDir()): string {
   fs.mkdirSync(dir, { recursive: true });
   pruneOldReports(dir);
-  const name = `review-${sanitizeName(data.title).slice(0, 40)}-${sanitizeName(data.attemptId).slice(0, 24)}-${Date.now()}.html`;
-  fs.writeFileSync(path.join(dir, name), renderReviewHtml(data), 'utf8');
+  const name = `review-${sanitizeName(data.title).slice(0, 40)}-${newReportToken()}-${sanitizeName(data.attemptId).slice(0, 24)}-${Date.now()}.html`;
+  writeFilePrivateSync(path.join(dir, name), renderReviewHtml(data));
   return name;
 }

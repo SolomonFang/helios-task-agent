@@ -1,6 +1,7 @@
 // Unit tests: pure logic only — no LLM, no kanban, no network. Run: npm test
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -13,6 +14,8 @@ import {
   isBatchable,
   looksLikeStrongFailure,
   withBatchApproval,
+  DENIED_MESSAGE,
+  NO_GATE_MESSAGE,
   type ConfirmRequest,
 } from '../src/guard';
 import {
@@ -25,11 +28,11 @@ import {
   kindLabel,
 } from '../src/confirm';
 import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/llm';
-import { createAccessChecker, parsePostContent, splitText } from '../src/channels/feishu';
+import { createAccessChecker, FeishuChannel, parsePostContent, splitText } from '../src/channels/feishu';
 import { extractSourceUrls, SourceRegistry } from '../src/source-registry';
 import { MemoryStore } from '../src/memory';
 import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
-import { writeEnvFile } from '../src/config';
+import { loadEnvFiles, writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
 import { parseFrontmatter, loadSkillDigests, readSkillDoc, renderSkillsBlock, userSkillsDir, validateSkills, buildSystemPrompt } from '../src/prompt';
 import { auditLog } from '../src/audit';
@@ -40,15 +43,27 @@ import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, CHANGELOG_URL, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
-import { buildWatchEventCard, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
-import { fetchHealth } from '../src/kanban/kanban-ensure';
-import { kanbanPackageSpec, ocrPackageSpec } from '../src/deps';
+import { buildWatchEventCard, isLoopbackUrl, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
+import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
+import { minimalChildEnv } from '../src/proc-env';
+import {
+  checkCurl,
+  checkHkDeps,
+  checkJq,
+  checkLarkCli,
+  checkLarkCliStatus,
+  probeLarkCliAuth,
+  kanbanPackageSpec,
+  ocrPackageSpec,
+  LARK_CLI_AUTH_HINT,
+} from '../src/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
 import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
-import { startReportServer } from '../src/report-server';
-import { summarizeForChat } from '../src/report';
+import { startReportServer, newReportToken } from '../src/report-server';
+import { summarizeForChat, writeSummaryReports } from '../src/report';
 import {
   parseCommand,
+  buildStatusLines,
   buildToolsLines,
   buildSkillsLines,
   plainPaint,
@@ -57,7 +72,7 @@ import {
   llmFailureParts,
   CLEARED_TEXT,
 } from '../src/commands';
-import { renderReply, MCP_FALLBACK_TEXT } from '../src/ui';
+import { renderReply, printBanner, MCP_FALLBACK_TEXT } from '../src/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
@@ -145,6 +160,22 @@ async function main(): Promise<void> {
       classifyLark(['--help']) === 'read',
   );
   check('classifyHk 读写分类', classifyHk(['tasks', 'create', 't']) === 'write' && classifyHk(['tasks', 'list']) === 'read' && classifyHk(['start', 'id']) === 'write' && classifyHk(['health']) === 'read');
+  check('classifyHk fail-closed：未知命令/未知子命令一律判写，已知读命令仍放行', (() => {
+    return (
+      classifyHk(['frobnicate']) === 'write' && // 未知命令（此前默认 read）
+      classifyHk(['tasks', 'frobnicate']) === 'write' && // tasks 未知子命令
+      classifyHk(['tasks']) === 'write' && // tasks 无子命令（未知）
+      classifyHk(['projects', 'frobnicate']) === 'write' && // projects 未知子命令
+      classifyHk(['projects', 'update', 'p1']) === 'write' &&
+      classifyHk(['projects', 'create', 'n']) === 'write' &&
+      classifyHk(['projects']) === 'read' && // projects 无子命令 = 列表
+      classifyHk(['tasks', 'list']) === 'read' &&
+      classifyHk(['tasks', 'get', 't1']) === 'read' &&
+      ['health', 'info', 'repos', 'branches', 'status', 'workspaces', 'tags', 'approvals'].every(
+        (c) => classifyHk([c]) === 'read',
+      )
+    );
+  })());
   check('classifyMcp 读写分类', classifyMcp('list_projects') === 'read' && classifyMcp('create_task') === 'write' && classifyMcp('xyzzy') === 'write');
 
   // ---------- 强失败判定 ----------
@@ -479,6 +510,29 @@ async function main(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  // ---------- 来源查重：跨实例写盘前合并（mergeFromDisk） ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-regmerge-'));
+    const a = new SourceRegistry(tmp);
+    const b = new SourceRegistry(tmp);
+    a.record('u1', 'https://a.feishu.cn/docx/1', { taskId: 't-1', title: 'T1', createdAt: 'x' });
+    b.record('u1', 'https://a.feishu.cn/docx/2', { taskId: 't-2', title: 'T2', createdAt: 'x' });
+    const onDisk = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 跨实例合并：两个实例各写的 key 都在盘上',
+      onDisk.lookup('u1', 'https://a.feishu.cn/docx/1')?.taskId === 't-1' &&
+        onDisk.lookup('u1', 'https://a.feishu.cn/docx/2')?.taskId === 't-2',
+    );
+    a.remove('u1', 'https://a.feishu.cn/docx/1');
+    const after = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 跨实例合并：A 删除不复活且不波及 B 的 key',
+      after.lookup('u1', 'https://a.feishu.cn/docx/1') === undefined &&
+        after.lookup('u1', 'https://a.feishu.cn/docx/2')?.taskId === 't-2',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
   // ---------- 记忆 ----------
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-mem-'));
@@ -496,6 +550,108 @@ async function main(): Promise<void> {
     check('MemoryStore 删除事实', reloaded.deleteFact('u1', 'feishu_task_source') && new MemoryStore(tmp).getFact('u1', 'feishu_task_source') === undefined);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+
+  // ---------- 记忆：变更日志语义（跨实例合并且删除不复活） ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memmerge-'));
+    const a = new MemoryStore(tmp);
+    a.setFact('u1', 'ka', '1');
+    const b = new MemoryStore(tmp); // B 此时已看到 ka
+    b.setFact('u1', 'kb', '2');
+    a.deleteFact('u1', 'ka');
+    // B 内存陈旧（仍持有 ka），再写别的 key 不得复活 ka
+    b.setFact('u1', 'kc', '3');
+    const fresh = new MemoryStore(tmp);
+    check(
+      'MemoryStore 变更日志：跨实例写入合并，陈旧实例不覆盖、删除不复活',
+      fresh.getFact('u1', 'ka') === undefined &&
+        fresh.getFact('u1', 'kb') === '2' &&
+        fresh.getFact('u1', 'kc') === '3',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  await checkAsync('MemoryStore.persist：目录不可写时容错不抛出，内存态仍可用', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memro-'));
+    fs.writeFileSync(path.join(tmp, 'blocker'), 'x'); // 占住路径，使 mkdir 必然 ENOTDIR
+    const mem = new MemoryStore(path.join(tmp, 'blocker', 'sub'));
+    mem.setFact('u1', 'k', 'v'); // persist 内部写盘失败，但不得抛出
+    mem.addNote('u1', 'n1');
+    assert.equal(mem.getFact('u1', 'k'), 'v');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------- memory 写工具过确认闸门：无通道/拒绝不落盘，批准才写入 ----------
+  await checkAsync('memory 闸门：无 confirm 通道拒绝且不落盘，memory_get 只读免闸门', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memgate-'));
+    try {
+      const mem = new MemoryStore(tmp);
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        memory: mem,
+        userId: 'u1',
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+      });
+      const r = await handlers.get('memory_set')!({ key: 'k', value: 'v' });
+      assert.equal(r, NO_GATE_MESSAGE);
+      assert.equal(mem.getFact('u1', 'k'), undefined);
+      assert.equal(new MemoryStore(tmp).getFact('u1', 'k'), undefined); // 盘上也没有
+      // memory_get 只读：无 confirm 通道仍可用
+      const g = JSON.parse(await handlers.get('memory_get')!({}));
+      assert.deepEqual(g.facts, {});
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('memory 闸门：拒绝不落盘，批准才写入；kind=memory 且无 batchKey', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memgate2-'));
+    try {
+      const mem = new MemoryStore(tmp);
+      const seen: Array<{ kind: string; batchKey: string | undefined }> = [];
+      const denying = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        memory: mem,
+        userId: 'u1',
+        confirm: async (req) => {
+          seen.push({ kind: req.kind, batchKey: req.batchKey });
+          return false;
+        },
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+      });
+      const r1 = await denying.handlers.get('memory_set')!({ key: 'k', value: 'v' });
+      const r2 = await denying.handlers.get('memory_delete')!({ key: 'k' });
+      const r3 = await denying.handlers.get('memory_note')!({ text: 'n' });
+      for (const r of [r1, r2, r3]) assert.equal(r, DENIED_MESSAGE);
+      assert.equal(mem.getFact('u1', 'k'), undefined);
+      assert.equal(new MemoryStore(tmp).getUser('u1').notes.length, 0);
+      // 记忆永不批量免问：三次都过闸门且不带 batchKey
+      assert.equal(seen.length, 3);
+      assert.ok(seen.every((s) => s.kind === 'memory' && s.batchKey === undefined));
+
+      const approving = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        memory: mem,
+        userId: 'u1',
+        confirm: async () => 'once',
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+      });
+      const ok = JSON.parse(await approving.handlers.get('memory_set')!({ key: 'k', value: 'v' }));
+      assert.equal(ok.ok, true);
+      assert.equal(new MemoryStore(tmp).getFact('u1', 'k'), 'v'); // 落盘
+      const okDel = JSON.parse(await approving.handlers.get('memory_delete')!({ key: 'k' }));
+      assert.equal(okDel.ok, true);
+      assert.equal(new MemoryStore(tmp).getFact('u1', 'k'), undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   // ---------- repo_fs 边界 ----------
   {
@@ -536,8 +692,50 @@ async function main(): Promise<void> {
     const content = fs.readFileSync(envPath, 'utf8');
     check('.env 新建与重写均为 0600', mode1 === 0o600 && mode2 === 0o600, `mode=${mode1.toString(8)}/${mode2.toString(8)}`);
     check('.env 合并写保留既有键', content.includes('LLM_API_KEY=sk-test') && content.includes('LLM_BASE_URL=https://x'));
+    check('.env 原子写无 tmp 残留', fs.readdirSync(tmp).filter((f) => f.endsWith('.tmp')).length === 0);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+
+  // ---------- loadEnvFiles：cwd .env 高危键不生效，非受限键仍覆盖 ----------
+  await checkAsync('loadEnvFiles：cwd .env 受限键（LLM/飞书凭证/白名单）被忽略，非受限键仍生效', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-envhome-'));
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-envcwd-'));
+    fs.writeFileSync(path.join(tmpHome, '.env'), 'LLM_API_KEY=home-key\nLLM_BASE_URL=https://home\n');
+    fs.writeFileSync(
+      path.join(tmpCwd, '.env'),
+      'LLM_API_KEY=evil-key\nLLM_BASE_URL=https://evil\nFEISHU_APP_SECRET=evil-secret\nHTA_UNIT_NONRESTRICTED=from-cwd\n',
+    );
+    const ENV_KEYS = ['HELIOS_TASK_AGENT_HOME', 'LLM_API_KEY', 'LLM_BASE_URL', 'FEISHU_APP_SECRET', 'HTA_UNIT_NONRESTRICTED'];
+    const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
+    const prevCwd = process.cwd();
+    // 静默丢弃提示（[config] cwd .env 中的高危键已被忽略…），不打断测试输出
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      process.env.HELIOS_TASK_AGENT_HOME = tmpHome;
+      // shell 已提供的受限键：cwd 不得覆盖，最终须等于 home 值（home 最后 override 加载）
+      process.env.LLM_API_KEY = 'shell-key';
+      process.chdir(tmpCwd);
+      // macOS 上 os.tmpdir()（/var/…）chdir 后 process.cwd() 会解析为 /private/var/…，以 cwd 为准
+      const cwdEnv = path.join(process.cwd(), '.env');
+      const { primaryWritePath, loaded } = loadEnvFiles();
+      assert.equal(process.env.LLM_API_KEY, 'home-key');
+      assert.equal(process.env.LLM_BASE_URL, 'https://home');
+      assert.notEqual(process.env.FEISHU_APP_SECRET, 'evil-secret');
+      assert.equal(process.env.HTA_UNIT_NONRESTRICTED, 'from-cwd');
+      assert.equal(primaryWritePath, cwdEnv);
+      assert.ok(loaded.some((p) => path.resolve(p) === path.resolve(cwdEnv)));
+    } finally {
+      console.warn = origWarn;
+      process.chdir(prevCwd);
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
 
   // ---------- 数据文件权限 0600 ----------
   {
@@ -835,6 +1033,47 @@ async function main(): Promise<void> {
     return derivedOk && fullOk && explicitOk && respectOk;
   })());
 
+  check('buildOcrEnv：LLM_API_KEY 等敏感变量不泄漏到 OCR 环境', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-ocrleak-'));
+    const out = buildOcrEnv(
+      { baseUrl: 'https://api.example.com/v1', apiKey: 'sk-x', model: 'm1' },
+      { PATH: '/usr/bin', HOME: tmp, LLM_API_KEY: 'sk-leak', FEISHU_APP_SECRET: 'fs-leak', AWS_SECRET: 'aws-leak', OCR_DEBUG: '1' },
+      tmp,
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return (
+      !('LLM_API_KEY' in out) &&
+      !('FEISHU_APP_SECRET' in out) &&
+      !('AWS_SECRET' in out) &&
+      out.OCR_DEBUG === '1' && // OCR_ 前缀显式放行
+      out.PATH === '/usr/bin' &&
+      out.OCR_LLM_TOKEN === 'sk-x' // 派生配置仍生效
+    );
+  })());
+
+  // ---------- 子进程最小环境（proc-env） ----------
+  check('minimalChildEnv：敏感变量不带入 / PATH、HOME 保留 / extra 显式生效且 undefined 被过滤', (() => {
+    const base = {
+      PATH: '/usr/bin:/bin',
+      HOME: '/home/tester',
+      LLM_API_KEY: 'sk-leak',
+      FEISHU_APP_SECRET: 'fs-leak',
+      AWS_SECRET: 'aws-leak',
+      LC_ALL: 'zh_CN.UTF-8',
+    };
+    const env = minimalChildEnv({ CUSTOM_FLAG: '1', DROP_ME: undefined, HOME: undefined }, base);
+    return (
+      env.PATH === '/usr/bin:/bin' &&
+      !('HOME' in env) && // extra 里 undefined 可删除 base 的放行项
+      !('LLM_API_KEY' in env) &&
+      !('FEISHU_APP_SECRET' in env) &&
+      !('AWS_SECRET' in env) &&
+      env.LC_ALL === 'zh_CN.UTF-8' && // LC_* 前缀放行
+      env.CUSTOM_FLAG === '1' &&
+      !('DROP_ME' in env)
+    );
+  })());
+
   check('findOcrCommand：PATH 无 ocr 时回退 npx', (() => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-ocrpath-'));
     const cmd = findOcrCommand({ PATH: tmp });
@@ -989,7 +1228,15 @@ async function main(): Promise<void> {
     );
     const server = await startReportServer(tmp, 'http://127.0.0.1:7964');
     try {
+      // 既有命名契约：token 在 attemptId 之前
       assert.match(name, /^review-.*-att-9-\d+\.html$/);
+      // 文件名带 128-bit token（访问凭证），且符合服务端白名单正则（否则 404 服务不到）
+      assert.match(name, /^review-.*-[0-9a-f]{32}-att-9-\d+\.html$/);
+      assert.match(name, /^[\w.-]+\.html$/);
+      assert.match(newReportToken(), /^[0-9a-f]{32}$/);
+      assert.notEqual(newReportToken(), newReportToken());
+      // 报告含代码 diff：写盘必须 0600
+      assert.equal(fs.statSync(path.join(tmp, name)).mode & 0o777, 0o600);
       assert.ok(server.baseUrl.startsWith('http://127.0.0.1:'));
       const ok = await fetch(`${server.baseUrl}/${name}`);
       const body = await ok.text();
@@ -1241,6 +1488,103 @@ async function main(): Promise<void> {
     await close(notFound.s);
   });
 
+  // ---------- ensureKanbanRunning：spawn 失败快速报错（child.on('error')） ----------
+  await checkAsync('ensureKanbanRunning：npx 不可执行时快速失败，不白等 waitMs', async () => {
+    // 先占后放一个确定空闲的端口
+    const probe = http.createServer();
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise((r) => probe.close(r));
+    const prevPath = process.env.PATH;
+    // PATH 指向不存在目录 → spawn('npx') ENOENT（minimalChildEnv 从 process.env 取 PATH）
+    process.env.PATH = path.join(os.tmpdir(), 'hta-nonexistent-dir-no-npx');
+    const startedAt = Date.now();
+    try {
+      await assert.rejects(() => ensureKanbanRunning(`http://127.0.0.1:${port}`, { waitMs: 30000 }), /npx/);
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 10_000, `spawn 失败应快速报错，实际耗时 ${elapsed}ms`);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+    }
+  });
+
+  // ---------- ensureKanbanRunning：onSpawn 拉起即回调 + detached 进程组超时清理 ----------
+  await checkAsync('ensureKanbanRunning：onSpawn 回调拿到 child，超时后进程组被清理', async () => {
+    // 注意：本环境直接 exec 新建 shebang 脚本会挂起，假 npx 用系统二进制的符号链接（yes = 常驻进程）
+    const yes = '/usr/bin/yes';
+    if (!fs.existsSync(yes)) return; // 无 yes 的平台跳过
+    // 先占后放一个确定空闲的端口（yes 不会监听，health 永不通）
+    const probe = http.createServer();
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise((r) => probe.close(r));
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-'));
+    fs.symlinkSync(yes, path.join(bin, 'npx'));
+    const prevPath = process.env.PATH;
+    process.env.PATH = bin;
+    let spawned: import('child_process').ChildProcess | null = null;
+    let groupAliveAtSpawn = false;
+    try {
+      await assert.rejects(
+        () =>
+          ensureKanbanRunning(`http://127.0.0.1:${port}`, {
+            waitMs: 3000,
+            onSpawn: (ch) => {
+              spawned = ch;
+              // detached: true → child 是进程组组长，拉起即刻负 pid 可探测到组
+              try {
+                process.kill(-ch.pid!, 0);
+                groupAliveAtSpawn = true;
+              } catch {
+                groupAliveAtSpawn = false;
+              }
+            },
+          }),
+        /等待 helios-kanban 就绪超时/,
+      );
+      assert.ok(spawned, 'onSpawn 必须在等待就绪前回调');
+      assert.ok(typeof spawned.pid === 'number' && groupAliveAtSpawn, 'child 应为独立进程组组长');
+      // 超时路径 ensure 内部调 stopKanbanChild：组杀后不留孤儿
+      assert.throws(() => process.kill(-spawned!.pid!, 0));
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- hk.sh：tasks list --limit 非纯数字直接拒绝（jq 注入防护） ----------
+  await checkAsync('hk.sh：tasks list --limit 注入串在 API 调用前报错退出', async () => {
+    let jqOk = true;
+    try {
+      execFileSync('jq', ['--version'], { stdio: 'ignore' });
+    } catch {
+      jqOk = false;
+    }
+    assert.ok(jqOk, '本测试需要 jq（hk.sh 依赖）');
+    const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+    let code = 0;
+    let stderr = '';
+    try {
+      execFileSync('bash', [hk, 'tasks', 'list', '--limit', '1] + [env.X] | .[0:99'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          HELIOS_KANBAN_PROJECT_ID: 'p-test', // 先过 project_id 检查；校验发生在 API 调用之前，无需真实看板
+          HELIOS_KANBAN_URL: 'http://127.0.0.1:1',
+        },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stderr?: string };
+      code = e.status ?? -1;
+      stderr = String(e.stderr || '');
+    }
+    assert.notEqual(code, 0, '非法 --limit 应非零退出');
+    assert.match(stderr, /invalid --limit/);
+  });
+
   // ---------- npx 包规格：kanban 跟随最新版 / ocr 钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
@@ -1251,6 +1595,126 @@ async function main(): Promise<void> {
       ocrPackageSpec({ OCR_PACKAGE: 'x@1' }) === 'x@1'
     );
   })());
+
+  // ---------- deps：lark-cli 三态与 hk 降级链依赖探测（临时 PATH 注入假二进制，不依赖本机真实环境） ----------
+  await checkAsync('deps：checkLarkCliStatus 三态 / probeLarkCliAuth 保守判失败 / checkHkDeps 缺失项', async () => {
+    // 本环境直接 exec 新建 shebang 脚本会挂起，假命令一律用系统二进制的符号链接：
+    // true = 退出 0 无输出（模拟「已安装但 auth status 输出异常」），false = 命令失败，
+    // node 符号链接 + NODE_OPTIONS --require 让 auth status 输出指定 JSON（模拟已授权）。
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-deps-'));
+    const prevPath = process.env.PATH;
+    const prevNodeOptions = process.env.NODE_OPTIONS;
+    const link = (name: string, target: string) => {
+      const p = path.join(bin, name);
+      if (fs.existsSync(p)) fs.rmSync(p);
+      fs.symlinkSync(target, p);
+    };
+    try {
+      // 空 PATH：全部 missing
+      process.env.PATH = bin;
+      assert.equal(checkLarkCli(), false);
+      assert.equal(checkLarkCliStatus(), 'missing');
+      assert.equal(checkJq(), false);
+      assert.equal(checkCurl(), false);
+      assert.deepEqual(checkHkDeps(), ['jq', 'curl']);
+      // 已安装但 auth status 输出为空 → 保守判未授权（不误报可用）
+      link('lark-cli', '/usr/bin/true');
+      assert.equal(checkLarkCli(), true);
+      assert.equal(checkLarkCliStatus(), 'unauthorized');
+      // auth status 命令失败 → 同样保守判未授权
+      link('lark-cli', '/usr/bin/false');
+      assert.equal(probeLarkCliAuth(), 'unauthorized');
+      // 已授权：auth status 输出 identities.available=true 的 JSON
+      const probeJs = path.join(bin, 'probe.js');
+      fs.writeFileSync(
+        probeJs,
+        'process.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");process.exit(0);\n',
+      );
+      link('lark-cli', process.execPath);
+      process.env.NODE_OPTIONS = `--require ${probeJs}`;
+      assert.equal(checkLarkCliStatus(), 'ok');
+      delete process.env.NODE_OPTIONS;
+      // jq 装了、curl 没装 → 缺 curl
+      link('jq', '/usr/bin/true');
+      assert.equal(checkJq(), true);
+      assert.deepEqual(checkHkDeps(), ['curl']);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      if (prevNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = prevNodeOptions;
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- banner：lark 三态与 hk 降级链状态写进文案 ----------
+  await checkAsync('printBanner：lark 未授权/未安装与 hk 缺失（jq/curl）体现在文案', async () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-banner-'));
+    const prevPath = process.env.PATH;
+    const capture = (fn: () => void): string => {
+      const out: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => out.push(args.map(String).join(' '));
+      try {
+        fn();
+      } finally {
+        console.log = origLog;
+      }
+      return out.join('\n');
+    };
+    const base = { version: '0.0.0', model: 'm', baseUrl: 'https://x', kanbanUrl: 'http://localhost:7964' };
+    try {
+      // lark 已安装未授权（true：--version 退出 0，auth status 无输出 → 保守判未授权）+ jq/curl 缺失 + MCP 掉线
+      fs.symlinkSync('/usr/bin/true', path.join(bin, 'lark-cli'));
+      process.env.PATH = bin;
+      const unauth = capture(() => printBanner({ ...base, mcp: 'fail', mcpToolCount: 0, larkOk: true }));
+      assert.ok(unauth.includes('lark-cli') && unauth.includes('未授权') && unauth.includes(LARK_CLI_AUTH_HINT));
+      assert.ok(unauth.includes('缺少 jq、curl') && unauth.includes('降级链不可用'));
+      // lark 未安装（larkOk=false）→ 不探测授权，直接「未找到」
+      const missing = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: false }));
+      assert.ok(missing.includes('未找到') && !missing.includes('未授权'));
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- /status 状态行：lark 三态与 hk 降级链 ----------
+  await checkAsync('buildStatusLines：lark 未授权/未安装/ok 与 hk 缺失写入状态行', async () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-status-'));
+    const prevPath = process.env.PATH;
+    const prevNodeOptions = process.env.NODE_OPTIONS;
+    const opts = { model: 'm', kanbanUrl: 'http://127.0.0.1:1', mcpOk: false, mcpToolCount: 0, mcpDownNote: 'MCP 不可用' };
+    try {
+      // 未授权：lark-cli = true（--version 退出 0；auth status 无输出 → 保守判未授权），PATH 无 jq/curl
+      fs.symlinkSync('/usr/bin/true', path.join(bin, 'lark-cli'));
+      process.env.PATH = bin;
+      const unauth = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
+      assert.ok(unauth.includes('lark-cli: 未授权') && unauth.includes(LARK_CLI_AUTH_HINT));
+      assert.ok(unauth.includes('hk_cli: 缺少 jq、curl'));
+      assert.ok(unauth.includes('降级链不可用')); // MCP 掉线且 hk 缺依赖时必须警示
+      const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
+      assert.ok(missing.includes('lark-cli: 未安装'));
+      // 已授权：node 符号链接 + NODE_OPTIONS --require 输出 available=true
+      const probeJs = path.join(bin, 'probe.js');
+      fs.writeFileSync(
+        probeJs,
+        'process.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");process.exit(0);\n',
+      );
+      fs.rmSync(path.join(bin, 'lark-cli'));
+      fs.symlinkSync(process.execPath, path.join(bin, 'lark-cli'));
+      process.env.NODE_OPTIONS = `--require ${probeJs}`;
+      const okLines = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
+      assert.ok(okLines.includes('lark-cli: ok'));
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      if (prevNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = prevNodeOptions;
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
 
   // ---------- 技能机制：frontmatter 解析 / 摘要 / 按需读取 / 契约校验 ----------
   await checkAsync('parseFrontmatter：标量 / 折叠块 / 列表', async () => {
@@ -1380,11 +1844,12 @@ async function main(): Promise<void> {
   });
 
   // ---------- kind 枚举 → 用户可见中文 ----------
-  check('kindLabel：hk/kanban→看板，lark→飞书，未知回退原值', (() => {
+  check('kindLabel：hk/kanban→看板，lark→飞书，memory→记忆，未知回退原值', (() => {
     return (
       kindLabel('hk') === '看板' &&
       kindLabel('kanban') === '看板' &&
       kindLabel('lark') === '飞书' &&
+      kindLabel('memory') === '记忆' &&
       kindLabel('something-else') === 'something-else'
     );
   })());
@@ -1434,6 +1899,32 @@ async function main(): Promise<void> {
       !cli.includes('51234')
     );
   })());
+
+  // ---------- 工作总结报告：html 文件名带 token 且 0600 ----------
+  await checkAsync('writeSummaryReports：html 带 128-bit token 且 0600，md 不带 token', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-summary-'));
+    try {
+      const data = {
+        scope: 'today',
+        generatedAt: '2026-07-31T00:00:00Z',
+        sinceLabel: '2026-07-31 今天',
+        tasks: [],
+        totals: { done: 1, inreview: 0, inprogress: 2, todo: 0, cancelled: 0, filesChanged: 3, additions: 10, deletions: 4 },
+      } as unknown as WorkSummaryData;
+      const paths = writeSummaryReports(data, { dir: tmp });
+      assert.ok(paths.htmlPath && paths.mdPath);
+      const htmlName = path.basename(paths.htmlPath!);
+      // token 是访问凭证：必须符合服务端白名单正则，且md（本机路径用）不带
+      assert.match(htmlName, /^work-summary-2026-07-31\.[0-9a-f]{32}\.html$/);
+      assert.match(htmlName, /^[\w.-]+\.html$/);
+      assert.equal(path.basename(paths.mdPath!), 'work-summary-2026-07-31.md');
+      for (const f of [paths.htmlPath!, paths.mdPath!]) {
+        assert.equal(fs.statSync(f).mode & 0o777, 0o600, f);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   // ---------- 用户技能目录：数据目录优先，同名覆盖内置 ----------
   await checkAsync('技能目录：用户数据目录 skills/ 参与扫描且同名覆盖内置技能', async () => {
@@ -1590,6 +2081,18 @@ async function main(): Promise<void> {
     return claimed && reclaim && a.list().join(',') === 'u2';
   })());
 
+  // ---------- FeishuChannel：白名单快照与连接状态 API（卡片回调过滤共用同一 access） ----------
+  check('FeishuChannel：allowedOpenIds/lastEventAt/connectionState 初始态', (() => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: ['ou_owner'] });
+    // 卡片回调按 access.list() 过滤：allowedOpenIds() 即该名单的对外快照
+    return (
+      ch.allowedOpenIds().join(',') === 'ou_owner' &&
+      !ch.allowedOpenIds().includes('ou_stranger') &&
+      ch.lastEventAt() === 0 &&
+      ch.connectionState() === null // 未 start()
+    );
+  })());
+
   // ---------- audit.log 轮转 ----------
   check('auditLog：超过 5MB 轮转为 audit.log.1，新记录写入新文件且不再次轮转', (() => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-audit-'));
@@ -1652,6 +2155,41 @@ async function main(): Promise<void> {
     return (
       btn === '📋 查看任务' &&
       Boolean(note?.elements?.some((n) => (n.content || '').includes('链接仅在运行本机器人的电脑所在网络可达')))
+    );
+  })());
+
+  // ---------- isLoopbackUrl：loopback 各形态 true，局域网/公网/非法 URL false ----------
+  check('isLoopbackUrl：localhost/127.x/[::1] 为 true，局域网 IP 与非法 URL 为 false', (() => {
+    return (
+      isLoopbackUrl('http://localhost:7964/x') &&
+      isLoopbackUrl('http://127.0.0.1:7964') &&
+      isLoopbackUrl('http://127.0.1.2') &&
+      isLoopbackUrl('http://[::1]:8080/') &&
+      !isLoopbackUrl('http://192.168.1.10:7964') &&
+      !isLoopbackUrl('http://10.0.0.5') &&
+      !isLoopbackUrl('https://kanban.example.com') &&
+      !isLoopbackUrl('not a url') &&
+      !isLoopbackUrl('')
+    );
+  })());
+
+  // ---------- 看板事件卡片：loopback 链接注脚区分本机/局域网可达 ----------
+  check('看板事件卡片：loopback 链接注脚提示仅本机可达（手机/局域网打不开）', (() => {
+    const noteOf = (url: string) =>
+      (buildWatchEventCard({ kind: 'done', title: 't', url, text: 'x' }) as {
+        elements: Array<{ tag: string; elements?: Array<{ content?: string }> }>;
+      }).elements
+        .find((e) => e.tag === 'note')
+        ?.elements?.map((n) => n.content || '')
+        .join('\n') || '';
+    const loop = noteOf('http://127.0.0.1:7964/tasks/1');
+    const lan = noteOf('http://192.168.1.10:7964/tasks/1');
+    return (
+      loop.includes('链接仅在运行本机器人的电脑上可达') &&
+      loop.includes('手机/局域网打不开') &&
+      !loop.includes('所在网络可达') &&
+      lan.includes('链接仅在运行本机器人的电脑所在网络可达') &&
+      !lan.includes('手机/局域网打不开')
     );
   })());
 
