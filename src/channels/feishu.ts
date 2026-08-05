@@ -259,7 +259,11 @@ export class FeishuChannel implements AgentChannel {
             console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
             if (!this.deniedNotified.has(openId)) {
               this.deniedNotified.add(openId);
-              void this.notifyOpenId(openId, '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系实例 owner 开通，或自行部署一个实例。').catch(() => {});
+              void this.notifyOpenId(
+                openId,
+                '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系实例 owner 开通，或自行部署一个实例。\n' +
+                  `若你就是本实例的部署者，请把本账号的 open_id 加入部署目录 .env 的 FEISHU_ALLOWED_OPEN_IDS 后重启机器人：\n${openId}`,
+              ).catch(() => {});
             }
             return;
           }

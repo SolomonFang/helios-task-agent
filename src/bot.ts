@@ -25,7 +25,7 @@ import { startReportServer, type ReportServer } from './report-server';
 import { checkLarkCliStatus, checkOcrCli, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
-import { connectMcp } from './commands';
+import { connectMcp, TRY_EXAMPLES } from './commands';
 import { validateSkills } from './prompt';
 import { McpSupervisor } from './bot/supervisor';
 import { createBotHandlers } from './bot/handler';
@@ -43,7 +43,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
 /stop     中断当前任务（排队消息与待确认写操作一并取消）
-/confirm  查看「同类免问」状态；/confirm on 或回复「恢复确认」撤销免问
+/confirm  查看「同类免问」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
@@ -52,12 +52,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 · 普通写操作 120 秒、删除/取消/停止/审批/启动/归档/合并/推送/执行类 300 秒未操作自动拒绝
 
 可以说
-· 以后都从这个飞书地址同步任务：<链接>
-· 同步/列出我的任务（含链接会展开详情）
-· 写进 helios-kanban（确认后再创建，不自动启动）
-· 有哪些项目 / 创建一个任务：…
-· 用 Claude 跑这个任务（是否启用、用谁跑由你决定）
-· 总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）`;
+${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
 
 function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: () => void } {
   const rl = readline.createInterface({
@@ -85,7 +80,10 @@ function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: 
   const choose: ChooseFn = async (presets) => {
     rl.pause();
     try {
-      return await selectList({ title: '配置模型（OpenAI 兼容协议）：', options: presets });
+      // 与 CLI 一致：重配时在标题里给出当前模型
+      const current = currentConfig().llmModel;
+      const title = `配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：`;
+      return await selectList({ title, options: presets });
     } finally {
       rl.resume();
     }
@@ -192,7 +190,7 @@ async function main(): Promise<void> {
     console.log(
       c.warn(
         `kanban 地址为本机回环地址（${agentCfg.kanbanUrl}）：推送卡片里的看板/报告链接在手机上不可达，` +
-          '如需手机查看请把 HELIOS_KANBAN_URL 配置为局域网 IP 或 Tailscale 地址。',
+          `如需手机查看请在 ${userEnvPath()} 中把 HELIOS_KANBAN_URL 配置为局域网 IP 或 Tailscale 地址。`,
       ),
     );
   }
@@ -208,7 +206,7 @@ async function main(): Promise<void> {
     console.log(c.warn(`lark-cli 已安装但未授权。${LARK_CLI_AUTH_HINT}`));
   }
   if (!checkOcrCli()) {
-    console.log(c.warn(`未检测到 ocr（AI 审查）。${OCR_INSTALL_HINT}`));
+    console.log(c.warn(`未检测到代码审查工具 open-code-review（AI 审查功能）。${OCR_INSTALL_HINT}`));
   }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   for (const problem of validateSkills()) {
@@ -270,9 +268,14 @@ async function main(): Promise<void> {
         }
       }
       const batchHint = req.batchKey ? '，「同类免问」10 分钟内同类操作免问' : '';
+      // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
+      const detailBlock = req.detail
+        .split('\n')
+        .map((l) => `  ${l}`)
+        .join('\n');
       await channel.notifyOpenId(
         openId,
-        `⚠️ 写操作确认\n${req.summary}\n${req.detail}\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
+        `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
       );
       return undefined;
     },

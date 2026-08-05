@@ -76,7 +76,7 @@ Feishu Task Center / docs / group chats
 | Mechanism | Behavior |
 |-----------|----------|
 | Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N` (same answer vocabulary as Feishu: 确认/批准/同意/执行, 同类免问/批量允许, etc.); timeouts 120s for batchable ops, 300s for destructive ops; Ctrl+C at the prompt rejects. Feishu: confirm card (the “allow-similar 10 min” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); same timeout policy; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
-| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) always re-ask. **Feishu writes never batch.** `/confirm on` or 恢复确认 revokes |
+| Batch approval | “Allow similar” for 10 minutes on the same write class; plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) always re-ask. **Feishu writes never batch.** `/confirm revoke` or 恢复确认 revokes (`/confirm on` kept as a legacy alias) |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
 | Untrusted wrap | External output (`lark_cli`, kanban MCP / `hk_cli`, `repo_fs`) plus kanban-event and AI-review context injections are wrapped UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
@@ -104,7 +104,7 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 
 ~60s probe. Degrades to `hk_cli` only after consecutive probe failures (no flapping on transient jitter); auto-reconnect with backoff (down to ~every 5 min), skipped while a task is running so in-flight calls aren't killed; on recover: switch back (all transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
 
-## Config home (Hermes-style)
+## Config home
 
 ```text
 ~/.helios-task-agent/.env
@@ -205,9 +205,9 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 ## What you can say
 
-**Terminal**: `/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
+**Terminal**: `/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` (`/confirm on` legacy alias) `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
 
-**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
+**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 

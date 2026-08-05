@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { probeLarkCliAuth, checkHkDeps, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
+import { probeLarkCliAuth, checkHkDeps, HK_CLI_INSTALL_HINT } from './deps';
 
 const ESC = '\u001b';
 
@@ -77,10 +77,12 @@ function visibleLen(s: string): number {
 }
 
 export function box(lines: string[], { width = 64 }: { width?: number } = {}): string {
-  const top = '┌' + '─'.repeat(width) + '┐';
-  const bottom = '└' + '─'.repeat(width) + '┘';
+  // 自适应加宽：长行（如 hk_cli 降级链提示）不能顶破右边框；终端更窄时只能任由终端换行
+  const w = Math.max(width, ...lines.map((l) => visibleLen(l) + 2));
+  const top = '┌' + '─'.repeat(w) + '┐';
+  const bottom = '└' + '─'.repeat(w) + '┘';
   const rows = lines.map((line) => {
-    const pad = Math.max(0, width - visibleLen(line));
+    const pad = Math.max(0, w - visibleLen(line));
     return `│ ${line}${' '.repeat(Math.max(0, pad - 1))}│`;
   });
   return [top, ...rows, bottom].join('\n');
@@ -106,8 +108,8 @@ export function printBanner(status: BannerStatus): void {
   const mcpSuffix =
     status.mcp === 'fail'
       ? hkMissing.length
-        ? `（${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，降级链不可用）`
-        : `（${MCP_FALLBACK_TEXT}，功能不受影响）`
+        ? `，${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，降级链不可用`
+        : `，${MCP_FALLBACK_TEXT}，功能不受影响`
       : '';
   const mcpLine =
     status.mcp === 'ok'
@@ -121,7 +123,7 @@ export function printBanner(status: BannerStatus): void {
     ? c.warn('●') + ' lark-cli         未找到，飞书能力不可用（可选，见下方安装提示）'
     : larkAuthed
       ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
-      : c.warn('●') + ` lark-cli         未授权，飞书能力不可用（${LARK_CLI_AUTH_HINT}）`;
+      : c.warn('●') + ' lark-cli         未授权，飞书能力不可用（运行 lark-cli auth login 完成授权）';
   const hkLine =
     hkMissing.length > 0
       ? ['  ' + c.warn('●') + ` hk_cli 降级链    缺少 ${hkMissing.join('、')}，MCP 掉线时无法降级（${HK_CLI_INSTALL_HINT}）`]
@@ -213,8 +215,9 @@ function renderTable(block: string): string {
  */
 export function renderReply(text: string): string {
   const blocks: string[] = [];
+  // 代码块只上色不缩进：缩进会污染用户复制出来的内容，终端里颜色已是足够的边界提示
   let out = String(text).replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang: string, code: string) => {
-    blocks.push('\n' + c.gray(code.replace(/\n/g, '\n  ')) + '\n');
+    blocks.push('\n' + c.gray(code) + '\n');
     return `\u0000${blocks.length - 1}\u0000`;
   });
   out = out

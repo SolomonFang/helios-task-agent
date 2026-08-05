@@ -4,9 +4,10 @@ import fs from 'fs';
 import path from 'path';
 import { c, printBanner, Spinner, renderReply, selectList, readSecret, MCP_FALLBACK_TEXT } from './ui';
 import { ensureConfig } from './config-wizard';
+import { currentConfig } from './config';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
-import { checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT } from './deps';
+import { checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT } from './deps';
 import { validateSkills } from './prompt';
 import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
 import {
@@ -19,6 +20,7 @@ import {
   confirmStateText,
   connectMcp,
   llmFailureParts,
+  TRY_EXAMPLES,
 } from './commands';
 import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './confirm';
 import type { ConfirmFn } from './guard';
@@ -72,17 +74,11 @@ const HELP = `
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
-  ${c.info('/confirm')}  查看「同类免问」状态；/confirm on 撤销免问、恢复逐次确认
+  ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（任务运行中按 Ctrl+C 只中断不退出）
 
   ${c.strong('试试对我说')}
-  · 以后都从这个飞书地址同步任务：<链接>
-  · 同步/列出我的任务（含链接会展开详情）
-  · 写进 helios-kanban（确认后再创建，不自动启动）
-  · 有哪些项目 / 创建一个任务：修复登录页样式 bug
-  · 用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）
-  · 把 xx 群最近的聊天整理成任务
-  · 总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）
+${TRY_EXAMPLES.map((e) => `  · ${e}`).join('\n')}
 `;
 
 export async function main(): Promise<void> {
@@ -101,7 +97,10 @@ export async function main(): Promise<void> {
   const choose = async (presets: LlmPreset[]) => {
     rl.pause();
     try {
-      return await selectList({ title: '配置模型（OpenAI 兼容协议）：', options: presets });
+      // 重配（/config）时在标题里给出当前模型，避免用户忘记自己之前选的是什么
+      const current = currentConfig().llmModel;
+      const title = `配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：`;
+      return await selectList({ title, options: presets });
     } finally {
       rl.resume();
       nextLine.drain();
@@ -170,8 +169,8 @@ export async function main(): Promise<void> {
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
     larkOk: larkStatus !== 'missing',
   });
+  // banner 状态行已含未授权/未找到说明；这里只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
   if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));
-  else if (larkStatus === 'unauthorized') console.log(c.warn(LARK_CLI_AUTH_HINT));
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   for (const problem of validateSkills()) console.log(c.warn(`技能契约: ${problem}`));
 
@@ -219,7 +218,7 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.batchKey ? 120000 : 300000;
-    const batchHint = req.batchKey ? '，b=同类免问10分钟' : '';
+    const batchHint = req.batchKey ? '，b=同类免问 10 分钟' : '';
     const ans = await askWithAbort(
       c.warn(`允许执行？[y=仅此次${batchHint} / N=取消]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
       timeoutMs,
@@ -233,7 +232,7 @@ export async function main(): Promise<void> {
     const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
     const once = !batch && CONFIRM_YES_RE.test(t);
     if (batch) {
-      console.log(c.ok('已批准；同类写操作 10 分钟内免问（/confirm on 撤销）。'));
+      console.log(c.ok('已批准；同类写操作 10 分钟内免问（/confirm revoke 撤销）。'));
       return 'batch';
     }
     if (once) {
@@ -245,6 +244,9 @@ export async function main(): Promise<void> {
   };
 
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local', confirm: confirmWrite });
+
+  /** MCP 实例绑定的看板地址：/config 改地址后 MCP 不会重连，/status 据此持续警示，直到重启。 */
+  const mcpBoundKanbanUrl = cfg.kanbanUrl;
 
   const cleanup = async () => {
     spinner.stop();
@@ -300,8 +302,9 @@ export async function main(): Promise<void> {
       } else if (cmd === '/clear') {
         session.clearHistory();
         console.log(c.gray(CLEARED_TEXT));
-      } else if (cmd === '/confirm' || cmd === '/confirm on') {
-        if (cmd === '/confirm on') {
+      } else if (cmd === '/confirm' || cmd === '/confirm revoke' || cmd === '/confirm on') {
+        // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）
+        if (cmd !== '/confirm') {
           const n = session.revokeBatchApprovals();
           console.log(
             n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, '当前没有生效中的「同类免问」。')),
@@ -309,7 +312,9 @@ export async function main(): Promise<void> {
         } else {
           const active = session.activeBatchApprovals();
           console.log(
-            active ? c.warn(confirmStateText(active, '输入 /confirm on 恢复逐次确认')) : c.gray(confirmStateText(0, '')),
+            active
+              ? c.warn(confirmStateText(active, '输入 /confirm revoke 恢复逐次确认'))
+              : c.gray(confirmStateText(0, '')),
           );
         }
       } else if (cmd === '/memory') {
@@ -351,6 +356,15 @@ export async function main(): Promise<void> {
             mcpToolCount: mcp.tools.length,
             mcpDownNote: `连接失败（${MCP_FALLBACK_TEXT}）`,
             larkOk: larkStatus !== 'missing',
+            // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启
+            extra:
+              cfg.kanbanUrl !== mcpBoundKanbanUrl
+                ? [
+                    c.warn(
+                      `注意：MCP 仍连接旧看板 ${mcpBoundKanbanUrl}，kanban_* 工具操作的是旧实例；/exit 重启后才会连接新地址。`,
+                    ),
+                  ]
+                : undefined,
           },
           c,
         );

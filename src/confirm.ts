@@ -192,6 +192,11 @@ function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
 }
 
+/** 嵌入 lark_md 的用户数据（任务标题等）：星号全角化，避免 `**` 误触加粗切换破坏排版。 */
+function mdSafe(s: string): string {
+  return s.replace(/\*/g, '＊');
+}
+
 /** Interactive card shown for a pending write operation (legacy card schema). */
 export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 120000): Record<string, unknown> {
   const isLark = req.kind === 'lark';
@@ -215,25 +220,25 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   actions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: '✖️ 取消' },
-    type: 'danger',
+    // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
     value: { hta_confirm: id, decision: 'no' },
   });
   const replyHint = req.batchKey
-    ? '或回复文本：「确认」仅此次 ·「同类免问」10 分钟 ·「取消」'
-    : '或回复文本：「确认」·「取消」';
+    ? '或回复文本：「确认」仅此次 · 「同类免问」10 分钟 · 「取消」'
+    : '或回复文本：「确认」 · 「取消」';
   return {
     config: { wide_screen_mode: true, enable_forward: false },
     header: {
       template: isLark ? 'blue' : 'orange',
-      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText}写操作确认` },
+      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认` },
     },
     elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
+      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
       {
         tag: 'div',
         fields: [
-          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText}写操作` } },
-          { is_short: true, text: { tag: 'lark_md', content: `**裁决时效**\n${timeoutSec} 秒未操作自动拒绝` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText} · 写操作` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**确认有效期**\n${timeoutSec} 秒未操作自动拒绝` } },
         ],
       },
       { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
@@ -250,27 +255,27 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
   const meta: Record<ConfirmSettle, { template: string; title: string; note: string }> = {
     once: {
       template: 'green',
-      title: `✅ ${kindText}写操作已批准（仅此次）`,
+      title: `✅ ${kindText} · 写操作已批准（仅此次）`,
       note: '操作已放行，正在执行。',
     },
     batch: {
       template: 'green',
-      title: `🔁 ${kindText}写操作已批准（同类免问 10 分钟）`,
+      title: `🔁 ${kindText} · 写操作已批准（同类免问 10 分钟）`,
       note: '回复「恢复确认」可随时撤销免问。',
     },
     denied: {
       template: 'red',
-      title: `🚫 ${kindText}写操作已取消`,
+      title: `🚫 ${kindText} · 写操作已取消`,
       note: '操作未执行。',
     },
     timeout: {
       template: 'grey',
-      title: `⏰ ${kindText}写操作确认超时`,
+      title: `⏰ ${kindText} · 写操作确认超时`,
       note: '超时未处理，已自动拒绝，操作未执行。',
     },
     superseded: {
       template: 'grey',
-      title: `⚠️ ${kindText}写操作确认已作废`,
+      title: `⚠️ ${kindText} · 写操作确认已作废`,
       note: '该确认已被新的写操作确认替代，请以最新卡片为准。',
     },
   };
@@ -283,7 +288,7 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
       title: { tag: 'plain_text', content: m.title },
     },
     elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**${req.summary}**` } },
+      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
       { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
       { tag: 'note', elements: [{ tag: 'plain_text', content: `${m.note} · ${time}` }] },
     ],

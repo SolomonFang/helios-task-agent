@@ -100,7 +100,7 @@ export function checkOcrCli(): boolean {
 
 /** ocr 缺失时的提示文案（AI 审查仍可走 npx 兜底，仅首次较慢）。 */
 export const OCR_INSTALL_HINT =
-  '安装：npm i -g @alibaba-group/open-code-review；未安装时点击「AI 审查」会自动 npx 拉取（首次较慢）。LLM 默认复用机器人模型配置，也可用 ocr config provider 单独配置。';
+  '安装：npm i -g @alibaba-group/open-code-review；未安装时点击「AI 审查」会自动 npx 拉取（首次较慢）。LLM 默认复用机器人模型配置，也可用 ocr config provider 单独配置（ocr 是 open-code-review 的命令名）。';
 
 /** jq 是否可用：hk_cli 降级链（hk.sh）解析 API 响应所必需，缺失时 hk.sh 直接退出。 */
 export function checkJq(): boolean {

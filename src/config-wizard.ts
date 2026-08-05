@@ -20,7 +20,7 @@ export function printFeishuSetupChecklist(): void {
   console.log('  3. 事件订阅 → 选「使用长连接接收事件」→ 添加 im.message.receive_v1');
   console.log('  4. 权限：读取用户发给机器人的单聊消息 + 以应用身份发消息 + 添加消息表情回复（按提示申请）');
   console.log('  5. 发布应用版本；凭证页复制 App ID / App Secret');
-  console.log(c.gray('  （与 Hermes 相同：凭证配好后，本机常驻进程即可收私聊）\n'));
+  console.log(c.gray('  凭证配好后，本机常驻进程即可接收私聊消息。\n'));
 }
 
 async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
@@ -56,14 +56,15 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   if (!baseUrl) {
     baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
   }
-  const apiKeyInput = await needSecret('API Key (sk-...，输入显示为 *): ');
+  const apiKeyInput = await needSecret('API Key（输入显示为 *）: ');
   if (!apiKeyInput) throw new Error('API Key 不能为空');
   let apiKey = apiKeyInput;
   const modelInput = await need(`模型名（默认 ${preset.model || '必填'}）: `);
-  const model = modelInput || preset.model;
+  let model = modelInput || preset.model;
   if (!model) throw new Error('模型名不能为空');
 
-  // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key 或 Base URL）；端点不支持预检/网络不通则提示后可仍保存
+  // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
+  // 两个失败分支的默认动作统一为「修改重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
   for (;;) {
     console.log(c.gray('正在联网校验模型配置…'));
     const check = await verifyLlmConfig(baseUrl, apiKey);
@@ -73,19 +74,20 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     }
     if (check.uncertain) {
       console.log(c.warn(`无法预检：${check.message}`));
-      const keep = (await need('仍然保存？[Y/n]（n = 修改配置）: ')).toLowerCase();
-      if (keep !== 'n' && keep !== 'no' && keep !== '否') break;
     } else {
       console.log(c.err(`模型配置校验失败：${check.message}`));
-      const retry = (await need('修改配置重试？[Y/n]（n = 仍然保存）: ')).toLowerCase();
-      if (retry === 'n' || retry === 'no' || retry === '否') break;
     }
-    const which = (await need('修改哪项？[k=API Key（默认）/ b=Base URL]: ')).toLowerCase();
+    const save = (await need('回车 = 修改配置重试；输入 s = 仍然保存: ')).toLowerCase();
+    if (save === 's' || save === 'save' || save === '保存') break;
+    const which = (await need('修改哪项？[k=API Key（默认）/ b=Base URL / m=模型名]: ')).toLowerCase();
     if (which === 'b' || which === 'base' || which === 'url') {
       baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
       if (!baseUrl) throw new Error('Base URL 不能为空');
+    } else if (which === 'm' || which === 'model') {
+      model = await need('模型名: ');
+      if (!model) throw new Error('模型名不能为空');
     } else {
-      apiKey = await needSecret('API Key (sk-...，输入显示为 *): ');
+      apiKey = await needSecret('API Key（输入显示为 *）: ');
       if (!apiKey) throw new Error('API Key 不能为空');
     }
   }
@@ -98,7 +100,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     (await need(`默认仓库 ID（可选，回车跳过${old.kanbanRepoId ? `，当前 ${old.kanbanRepoId}` : ''}）: `)) ||
     old.kanbanRepoId;
   const kanbanIteration =
-    (await need(`默认迭代（可选，如 260717，回车跳过${old.kanbanIteration ? `，当前 ${old.kanbanIteration}` : ''}）: `)) ||
+    (await need(`默认迭代（可选，与看板 Web UI 的迭代名一致，如 260717；回车跳过${old.kanbanIteration ? `，当前 ${old.kanbanIteration}` : ''}）: `)) ||
     old.kanbanIteration;
 
   const cfg: AgentConfig = {

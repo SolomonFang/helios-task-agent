@@ -25,8 +25,8 @@ export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } 
     return `排查建议：模型名不存在或当前 Key 无权访问。${modelHint}`;
   }
   if (/econnrefused|enotfound|fetch failed|network|timed out|etimedout|socket hang up/.test(s)) {
-    const baseHint = opts.channel === 'bot' ? `检查 ${envFile} 的 LLM_BASE_URL` : '检查 LLM_BASE_URL（可用 /config）';
-    return `排查建议：无法连接模型服务。${baseHint}与网络（代理）后重试。`;
+    const baseHint = opts.channel === 'bot' ? `检查 ${envFile} 的 LLM_BASE_URL` : '检查 LLM_BASE_URL（可用 /config 修改）';
+    return `排查建议：无法连接模型服务。请${baseHint}，并确认网络/代理可用后重试。`;
   }
   return null;
 }

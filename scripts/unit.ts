@@ -1817,7 +1817,8 @@ async function main(): Promise<void> {
       fs.symlinkSync('/usr/bin/true', path.join(bin, 'lark-cli'));
       process.env.PATH = bin;
       const unauth = capture(() => printBanner({ ...base, mcp: 'fail', mcpToolCount: 0, larkOk: true }));
-      assert.ok(unauth.includes('lark-cli') && unauth.includes('未授权') && unauth.includes(LARK_CLI_AUTH_HINT));
+      // banner 行内联精简指引（不重复 LARK_CLI_AUTH_HINT 全句，避免「未授权」出现两次）
+      assert.ok(unauth.includes('lark-cli') && unauth.includes('未授权') && unauth.includes('lark-cli auth login'));
       assert.ok(unauth.includes('缺少 jq、curl') && unauth.includes('降级链不可用'));
       // lark 未安装（larkOk=false）→ 不探测授权，直接「未找到」
       const missing = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: false }));

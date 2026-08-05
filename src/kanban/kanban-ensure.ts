@@ -163,7 +163,7 @@ export async function ensureKanbanRunning(
   }
 
   await stopKanbanChild(child);
-  throw new Error(`等待 helios-kanban 就绪超时（${waitMs}ms）：${url}`);
+  throw new Error(`等待 helios-kanban 就绪超时（${Math.round(waitMs / 1000)} 秒）：${url}。多数是首次 npx 下载慢，重试或手动启动后再试。`);
 }
 
 /** 按进程组发信号（spawn 时 detached: true）；组杀失败（如平台不支持负 pid）回退只杀 child。 */

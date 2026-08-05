@@ -77,7 +77,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 | 机制 | 说明 |
 |------|------|
 | 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`b`（同类免问）/`N`（应答词表与飞书端一致：确认/批准/同意/执行、同类免问/批量允许 等）；可批量操作 120 秒、破坏性操作 300 秒未操作自动拒绝，确认提示时 Ctrl+C = 拒绝。飞书：确认卡片（仅非破坏性操作带「同类免问 10 分钟」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；超时策略与终端一致；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
-| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/审批/启动/归档/合并/推送/执行（delete/cancel/stop/approve/start/archive/merge/push/execute）等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm on` 立即撤销 |
+| 批量确认 | 「同类免问」后 10 分钟内同类型写操作自动放行；「确认」默认**仅此次**。删除/取消/停止/审批/启动/归档/合并/推送/执行（delete/cancel/stop/approve/start/archive/merge/push/execute）等破坏性操作始终逐次确认。**飞书写操作不支持同类免问**。回复「恢复确认」或 `/confirm revoke` 立即撤销（`/confirm on` 为兼容别名） |
 | 会话创建上限 | 单会话最多创建 **10** 个看板任务；超限需 `/clear` 后再建 |
 | 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
 | 防注入标记 | `lark_cli` / 看板工具（MCP、`hk_cli`）/ `repo_fs` 的读回内容，以及看板事件、AI 审查结果的会话注入，统一包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
@@ -88,7 +88,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 ## 看板状态推送（bot）
 
-约每 60s 轮询看板（可调）。任务进入待审阅（`inreview`，附 diff 直链）/完成（附摘要）/取消、执行失败、新待审批 → 推送飞书并注入会话上下文，可直接回「这个怎么样 / 帮我 review」。
+约每 60s 轮询看板（可调）。任务进入待审阅（`inreview`，附 diff 直链）/完成（附摘要）/取消、执行失败、新待审批 → 推送飞书并注入会话上下文，可直接回「这个怎么样 / 帮我审一下」。
 
 待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），结果要求简体中文输出，完整内容渲染为 HTML 报告（写入数据目录 `reviews/`，由 bot 内置静态服务托管），飞书只推报告链接（长结果不再截断），同时注入会话（可直接回「按审查意见修一下」）。
 
@@ -105,7 +105,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 约每 60s 探测 MCP：连续探测失败才降级 `hk_cli`（避免瞬时抖动误报）并自动重连（退避至约 5 分钟一次；有任务执行中不重连，避免打断进行中的工具调用），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.sh`）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
 
-## 配置目录（Hermes 风格）
+## 配置目录
 
 ```text
 ~/.helios-task-agent/.env
@@ -210,9 +210,9 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 ## 飞书 / 终端里可以说
 
-**终端命令**：`/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm`（查免问状态）`/confirm on`（撤销免问）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
+**终端命令**：`/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm`（查免问状态）`/confirm revoke`（撤销免问；`/confirm on` 为兼容别名）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
 
-**飞书命令**：`/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm on` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
+**飞书命令**：`/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
 
 **自然语言示例**：
 

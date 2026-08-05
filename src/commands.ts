@@ -23,6 +23,17 @@ export interface Paint {
 
 export const plainPaint: Paint = { ok: String, warn: String, info: String, strong: String, gray: String };
 
+/** 「试试对我说」示例：CLI /help 与 bot /help 共用唯一来源，避免两端文案漂移。 */
+export const TRY_EXAMPLES: string[] = [
+  '以后都从这个飞书地址同步任务：<链接>',
+  '同步/列出我的任务（含链接会展开详情）',
+  '写进 helios-kanban（确认后再创建，不自动启动）',
+  '有哪些项目 / 创建一个任务：修复登录页样式 bug',
+  '用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）',
+  '把 xx 群最近的聊天整理成任务',
+  '总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）',
+];
+
 /** 斜杠命令解析：返回小写命令词（如 '/status'），非命令返回 null。 */
 export function parseCommand(text: string): string | null {
   const t = text.trim();

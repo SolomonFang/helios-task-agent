@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- UED 全面审查与体验修复（明细见 `docs/ued-issues.md`，五轮 30 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
+
 ### Security
 
 - `hk.sh` 的 `tasks list --limit` 参数强制纯数字校验：此前该值直接拼入 jq 程序字符串，恶意值可注入 jq 程序读取子进程环境变量（含 `LLM_API_KEY` 等）

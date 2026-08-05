@@ -71,7 +71,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     try {
       await channel.notifyOpenId(
         openId,
-        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用可能需下载 ocr，耗时稍长）。`,
+        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用需自动下载代码审查工具，耗时稍长）。`,
       );
       const result = await runAiReview({
         kanbanUrl: cfg.kanbanUrl,
@@ -177,7 +177,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const fmsg = msg as FeishuInboundMessage;
 
     if (fmsg.messageType && fmsg.messageType !== 'text' && fmsg.messageType !== 'post') {
-      await channel.reply(msg, '暂只支持文字与富文本（post）消息。');
+      await channel.reply(msg, '暂只支持文字消息：图片/文件等内容，请把关键信息打字或粘贴成文字发给我。');
       return;
     }
 
@@ -244,7 +244,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 「同类免问」查询/撤销：即时生效（若进串行队列，等当前任务结束才撤销就晚了）
     if (cmd === '/confirm' || text === '恢复确认') {
       const session = router.getOrCreate(msg.senderId);
-      if (text === '恢复确认' || text.toLowerCase() === '/confirm on') {
+      // /confirm on 是历史别名；语义化写法 /confirm revoke
+      if (text === '恢复确认' || cmd === '/confirm revoke' || text.toLowerCase() === '/confirm on') {
         const n = session.revokeBatchApprovals();
         await channel.reply(
           msg,
@@ -268,7 +269,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           mcpDownNote: `${MCP_FALLBACK_TEXT}，自动重连中`,
           larkOk,
           extra: [
-            `ocr: ${ocrOk ? 'ok' : '未安装（AI 审查首次点击自动 npx 拉取）'}`,
+            `代码审查工具: ${ocrOk ? 'ok' : '未安装（点「AI 审查」时自动 npx 拉取，首次较慢）'}`,
             `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
             `飞书长连接: ${channel.connectionState() ?? '未启动'}，最近事件 ${
               lastEventAt ? new Date(lastEventAt).toLocaleString('zh-CN') : '暂无'
@@ -368,7 +369,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       await supervisor.enterTurn();
       try {
         const reply = await session.handleUserMessage(text, onProgress, ctl.signal);
-        const chunks = splitText(reply || '(无回复)');
+        const chunks = splitText(reply || '（无回复）');
         if (progressId) {
           try {
             await channel.updateText(progressId, chunks[0]!);
@@ -377,7 +378,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           }
           for (const chunk of chunks.slice(1)) await channel.sendText(msg.sessionId, chunk);
         } else {
-          await channel.reply(msg, reply || '(无回复)');
+          await channel.reply(msg, reply || '（无回复）');
         }
       } catch (err) {
         if (ctl.signal.aborted) {

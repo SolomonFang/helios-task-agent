@@ -149,13 +149,13 @@ export class KanbanWatcher {
             transition,
             url: review.url,
             attemptId: review.attemptId,
-            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工 review diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
+            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工审查 diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
           });
           continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
         }
         if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
           const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
-          const hint = cur.status === 'done' ? '\n回复「帮我 review」看结果，或「再跟它说一句…」继续迭代' : '';
+          const hint = cur.status === 'done' ? '\n回复「帮我审一下」看结果，或「再跟它说一句…」继续迭代' : '';
           let extra = '';
           let link = url;
           if (cur.status === 'done') {
@@ -325,7 +325,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     elements.push({ tag: 'hr' });
     elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '回复「待审批」处理' }] });
   } else {
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**《${e.title}》**` } });
+    // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
     if (e.transition) {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${e.transition}\`` } });
     }
@@ -352,7 +353,7 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
       review: '「AI 审查」让 AI 先过一遍 diff；没问题回复「标记完成」，要继续改直接说',
-      done: '回复「帮我 review」看结果，或「再跟它说一句…」继续迭代',
+      done: '回复「帮我审一下」看结果，或「再跟它说一句…」继续迭代',
       failed: '回复「为什么失败」让它分析原因',
     };
     // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
