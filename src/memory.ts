@@ -5,7 +5,13 @@ import { writeFilePrivateSync } from './private-file';
 import type { MemoryFile, UserMemory } from './types';
 
 const MAX_NOTES = 50;
+/** 单条 fact value / note 的长度上限：记忆每轮回注系统提示词，无上限会被超长文本撑爆上下文。 */
+const MAX_ENTRY_LEN = 1000;
 const FILE_VERSION = 1;
+
+function clampEntry(s: string): string {
+  return s.length > MAX_ENTRY_LEN ? `${s.slice(0, MAX_ENTRY_LEN)}…（已截断）` : s;
+}
 
 export function defaultDataHome(): string {
   return process.env.HELIOS_TASK_AGENT_HOME || path.join(os.homedir(), '.helios-task-agent');
@@ -126,9 +132,10 @@ export class MemoryStore {
   setFact(userId: string, key: string, value: string): UserMemory {
     const k = key.trim();
     if (!k) throw new Error('key 不能为空');
+    const v = clampEntry(String(value));
     const user = this.touch(userId);
-    user.facts[k] = String(value);
-    this.journalFact(userId, k, String(value));
+    user.facts[k] = v;
+    this.journalFact(userId, k, v);
     this.persist();
     return this.getUser(userId);
   }
@@ -144,7 +151,7 @@ export class MemoryStore {
   }
 
   addNote(userId: string, text: string): UserMemory {
-    const note = text.trim();
+    const note = clampEntry(text.trim());
     if (!note) throw new Error('note 不能为空');
     const user = this.touch(userId);
     user.notes.push(note);

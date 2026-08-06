@@ -2023,7 +2023,7 @@ async function main(): Promise<void> {
       CONFIRM_BATCH_RE.test('以后都') &&
       !CONFIRM_BATCH_RE.test('都') && // 单字「都」随口误批准 10 分钟免问，已移除
       CONFIRM_BATCH_RE.test('免问') &&
-      CONFIRM_BATCH_RE.test('b') &&
+      !CONFIRM_BATCH_RE.test('b') && // 单字母「b」随口误批准 10 分钟免问，已移除
       CONFIRM_NO_RE.test('取消') &&
       CONFIRM_NO_RE.test('拒绝') &&
       !CONFIRM_YES_RE.test('好') &&

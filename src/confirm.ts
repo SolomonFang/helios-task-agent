@@ -33,10 +33,10 @@ interface Pending {
 }
 
 // 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作。
-// 单字「都」不在词表：随口一个字就批准 10 分钟免问太危险；「以后都」「都允许」仍覆盖该意图。
+// 单字「都」/「b」不在词表：随口一个字就批准 10 分钟免问太危险；「以后都」「都允许」「batch」仍覆盖该意图。
 // 词表为 CLI（readline 逐行）与飞书 bot（文本消息）共用：两端匹配方式可不同，词表必须一致。
 export const CONFIRM_YES_WORDS = ['确认', '确认执行', '同意', '批准', '执行', 'y', 'yes'];
-export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '批量允许', '以后都', '免问', 'batch', 'b'];
+export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '批量允许', '以后都', '免问', 'batch'];
 export const CONFIRM_NO_WORDS = ['取消', '算了', '不用', '否', '拒绝', 'n', 'no'];
 
 const wordsToRe = (words: string[]): RegExp => new RegExp(`^(?:${words.join('|')})$`, 'i');

@@ -210,7 +210,7 @@ export async function main(): Promise<void> {
     });
   };
 
-  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「b」开启同类免问；Ctrl+C 视为拒绝；
+  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「batch」开启同类免问；Ctrl+C 视为拒绝；
   // 超时自动拒绝（与飞书 bot 同语义：可批量 120s、破坏性 300s）。
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
@@ -218,7 +218,7 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.batchKey ? 120000 : 300000;
-    const batchHint = req.batchKey ? '，b=同类免问 10 分钟' : '';
+    const batchHint = req.batchKey ? '，batch=同类免问 10 分钟' : '';
     const ans = await askWithAbort(
       c.warn(`允许执行？[y=仅此次${batchHint} / N=取消]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
       timeoutMs,
