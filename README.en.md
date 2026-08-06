@@ -18,7 +18,7 @@ Highlights:
 npx helios-task-agent@latest
 ```
 
-The wizard only asks for one LLM preset + API key (kanban defaults can be skipped with Enter). No need to preinstall the kanban board — it auto-spawns if unreachable, so you can create and run tasks right away. Feishu is an optional upgrade: reading Feishu tasks/docs needs lark-cli (~2 minutes, see Install below); the Feishu DM bot is described further down.
+The wizard only asks for one LLM preset + API key (kanban defaults can be skipped with Enter). No need to preinstall the kanban board — it auto-spawns if unreachable, so you can create and run tasks right away. The first auto-spawn downloads the helios-kanban package via npx (takes tens of seconds; on a slow network just run it again). Feishu is an optional upgrade: reading Feishu tasks/docs needs lark-cli (~2 minutes, see Install below); the Feishu DM bot is described further down.
 
 ## Two forms: CLI vs Feishu bot
 
@@ -43,7 +43,7 @@ helios-task-agent --version   # show installed version
 
 **Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place with a link to the changelog. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
-**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (tracks the latest release — pin a version with `HELIOS_KANBAN_PACKAGE` if needed; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@0.1.39` (pinned by default — override with `HELIOS_KANBAN_PACKAGE`, e.g. `@latest`; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
 **Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
 
@@ -134,7 +134,7 @@ helios-task-agent-bot
 2. Open Platform: long connection + `im.message.receive_v1`  
 3. DM only (p2p); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
 
-**Reconfigure**: edit `~/.helios-task-agent/.env`. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
+**Reconfigure**: to switch model / Base URL / API key, run `helios-task-agent bot --reconfig` to re-run the full config wizard — no hand-editing of `.env` needed; editing `~/.helios-task-agent/.env` directly also works. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
 
 ## Commands
 
@@ -143,7 +143,8 @@ helios-task-agent-bot
 | `helios-task-agent` | Interactive terminal agent |
 | `helios-task-agent bot` | Feishu DM bot (wizard if unconfigured) |
 | `helios-task-agent bot --rebind` | Rebind / switch the Feishu bot (Feishu credential wizard only) |
-| `helios-task-agent-bot` | Same as `bot` (also supports `--rebind`) |
+| `helios-task-agent bot --reconfig` | Re-run the full config wizard (model / Base URL / API key) |
+| `helios-task-agent-bot` | Same as `bot` (also supports `--rebind` / `--reconfig`) |
 | `helios-task-agent help` / `-h` / `--help` | Help |
 | `helios-task-agent --version` / `-v` | Show version |
 
@@ -182,8 +183,8 @@ via the `skill_doc` tool (progressive disclosure).
 | `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
-| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
-| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, defaults to `@latest`; set `helios-kanban@x.y.z` to pin |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@0.1.39 --mcp` |
+| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, default pinned `helios-kanban@0.1.39`; set `@latest` or another version to override |
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |

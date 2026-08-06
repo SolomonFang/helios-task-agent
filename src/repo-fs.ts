@@ -34,8 +34,23 @@ export function resolveUnderRoot(
   return { ok: true, abs: target };
 }
 
-export async function fetchRepoPath(
-  kanbanUrl: string,
+/**
+ * 敏感文件 denylist：read/grep 的输出会发给第三方 LLM API，
+ * .env、私钥、.npmrc 等命中时 read 拒绝、grep 跳过，不返回任何内容
+ * （与 proc-env.ts 不向子进程泄露敏感变量同一思路）。
+ */
+const SENSITIVE_FILE_RE =
+  /^(?:\.env(?:\..+)?|\.npmrc|\.netrc|id_rsa.*|id_ed25519.*|.+\.(?:pem|key|p12|keystore))$/i;
+
+function isSensitiveFile(fileAbs: string): boolean {
+  return SENSITIVE_FILE_RE.test(path.basename(fileAbs));
+}
+
+function sensitiveFileDenied(fileAbs: string): string {
+  return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会通过本工具发送给 LLM；如需查看请在本机直接打开。`;
+}
+
+export async function fetchRepoPath(  kanbanUrl: string,
   repoId: string,
 ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
   const base = kanbanUrl.replace(/\/$/, '');
@@ -153,6 +168,7 @@ export function repoFsRead(root: string, relPath: string): string {
   if (!relPath?.trim()) return '参数错误：read 需要 path（相对仓库根的文件路径）';
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
+  if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
   if (!fs.existsSync(resolved.abs)) return `文件不存在: ${relPath}`;
   const st = fs.statSync(resolved.abs);
   if (!st.isFile()) return `不是文件: ${relPath}`;
@@ -194,6 +210,7 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
 
   const scanFile = (fileAbs: string) => {
     if (hits.length >= MAX_GREP_HITS) return;
+    if (isSensitiveFile(fileAbs)) return; // 敏感文件不参与 grep（同 read 的 denylist）
     const rel = path.relative(root, fileAbs);
     if (!matchesGlob(path.basename(fileAbs), rel, globHint)) return;
     let content: string;
@@ -233,8 +250,11 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
   };
 
   const startSt = fs.statSync(resolved.abs);
-  if (startSt.isFile()) scanFile(resolved.abs);
-  else walk(resolved.abs);
+  if (startSt.isFile()) {
+    // 直接对敏感文件 grep 时给出明确拒绝说明（树扫描场景则静默跳过）
+    if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
+    scanFile(resolved.abs);
+  } else walk(resolved.abs);
 
   if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n(无命中)`);
   const more = hits.length >= MAX_GREP_HITS ? `\n…（已达 ${MAX_GREP_HITS} 条上限）` : '';

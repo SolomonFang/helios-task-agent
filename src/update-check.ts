@@ -3,7 +3,6 @@ import path from 'path';
 import { execFile, spawn } from 'child_process';
 import { defaultDataHome } from './memory';
 import { writeFilePrivateSync } from './private-file';
-import { CONFIRM_YES_RE } from './confirm';
 
 /**
  * npm 版本更新检查：启动时探测 registry 上的更新版本，发现后请示用户是否更新。
@@ -184,6 +183,13 @@ export async function checkForUpdate(deps: CheckForUpdateDeps): Promise<UpdateIn
 
 export type UpdateOutcome = 'updated' | 'skipped' | 'failed';
 
+/**
+ * 更新确认词表：独立于写操作闸门（confirm.ts 的 CONFIRM_YES_RE）。
+ * 「执行」「批准」这类写操作批准词不应触发全局 npm i -g，词表只覆盖更新意图。
+ */
+export const UPDATE_YES_WORDS = ['更新', '确认更新', '升级', '确认', 'update', 'y', 'yes'];
+export const UPDATE_YES_RE = new RegExp(`^(?:${UPDATE_YES_WORDS.join('|')})$`, 'i');
+
 export interface PromptUpdateDeps {
   info: UpdateInfo;
   ask: (question: string) => Promise<string | null>;
@@ -208,7 +214,7 @@ export async function promptVersionUpdate(deps: PromptUpdateDeps): Promise<Updat
   const { info } = deps;
   const log = deps.log || (() => {});
   const ans = (await deps.ask(`\n发现新版本 helios-task-agent ${info.latest}（当前 ${info.current}）。\n变更内容：${CHANGELOG_URL}\n现在更新？[y=更新 / N=跳过] `)) || '';
-  if (!CONFIRM_YES_RE.test(ans.trim())) {
+  if (!UPDATE_YES_RE.test(ans.trim())) {
     log(`已跳过更新；随时可手动执行：npm i -g ${PKG_NAME}@latest（HTA_UPDATE_CHECK=0 可关闭启动检查）`);
     return 'skipped';
   }

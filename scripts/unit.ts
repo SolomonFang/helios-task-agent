@@ -969,7 +969,7 @@ async function main(): Promise<void> {
   });
 
   // ---------- LLM 错误指引按通道区分 ----------
-  check('friendlyLlmError：bot 通道不提不存在的 /config，指向 .env', (() => {
+  check('friendlyLlmError：bot 通道不提不存在的 /config，首选 bot --reconfig，.env 手编为备选', (() => {
     const cliHint = friendlyLlmError('401 invalid api key', { channel: 'cli' }) || '';
     const botHint = friendlyLlmError('401 invalid api key', { channel: 'bot' }) || '';
     const defaultHint = friendlyLlmError('401 invalid api key') || '';
@@ -978,7 +978,9 @@ async function main(): Promise<void> {
       cliHint.includes('/config') &&
       defaultHint.includes('/config') &&
       !botHint.includes('/config') &&
-      botHint.includes('.env') &&
+      botHint.includes('helios-task-agent bot --reconfig') &&
+      botHint.includes('.env') && // 手编 .env 仍作为备选保留
+      botNet.includes('helios-task-agent bot --reconfig') &&
       botNet.includes('.env')
     );
   })());
@@ -1456,6 +1458,60 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- KanbanWatcher：owners + notifyOwner 按 (事件, owner) 粒度追踪 ----------
+  await checkAsync('KanbanWatcher：按 owner 粒度送达追踪，失败 owner 单独重投且不连累他人、不重复', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-watch-owner-'));
+    let taskStatus = 'inprogress';
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/tasks?')) return json([{ id: 't1', title: '任务1', status: taskStatus }]);
+      if (url.startsWith('/api/task-attempts')) return json([]);
+      if (url.startsWith('/api/tasks/')) return json({ last_attempt_summary: '摘要' });
+      if (url.startsWith('/api/approvals')) return json([]);
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const delivered: string[] = [];
+      let failOwner2 = true;
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        owners: () => ['ou_1', 'ou_2'],
+        notifyOwner: async (e, owner) => {
+          if (owner === 'ou_2' && failOwner2) throw new Error('feishu down');
+          delivered.push(`${e.kind}@${owner}`);
+        },
+        // owners/notifyOwner 齐备时 notify 不应被调用
+        notify: async () => {
+          throw new Error('不应走整批回退');
+        },
+      });
+      const tick = (watcher as unknown as { tick: () => Promise<void> }).tick.bind(watcher);
+      await tick(); // 基线，不通知
+      assert.equal(delivered.length, 0);
+      taskStatus = 'done';
+      await tick(); // ou_1 送达，ou_2 失败 → 仅 (事件, ou_2) 记入待重投
+      assert.deepEqual(delivered, ['done@ou_1']);
+      failOwner2 = false;
+      await tick(); // 恢复后仅重投 ou_2，ou_1 不重复
+      assert.deepEqual(delivered, ['done@ou_1', 'done@ou_2']);
+      await tick(); // 全员送达后不再重复
+      assert.equal(delivered.length, 2);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- kanban/http：统一信封解析 ----------
   await checkAsync('kanban http：信封成功取 data、失败抛 message、无信封宽松回退、HTTP 错误抛状态码', async () => {
     const server = http.createServer((req, res) => {
@@ -1781,10 +1837,10 @@ async function main(): Promise<void> {
     assert.match(stderr, /invalid --limit/);
   });
 
-  // ---------- npx 包规格：kanban 跟随最新版 / ocr 钉版本，env 均可覆盖 ----------
+  // ---------- npx 包规格：kanban 与 ocr 均钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
-      kanbanPackageSpec({}) === 'helios-kanban@latest' &&
+      /^helios-kanban@\d+\.\d+\.\d+$/.test(kanbanPackageSpec({})) &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36' &&
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&
@@ -2390,6 +2446,86 @@ async function main(): Promise<void> {
     return rotated && fresh && noExtraRotate;
   })());
 
+  // ---------- 读路径审计：lark_cli 读命令记 lark_read，不记读回内容 ----------
+  await checkAsync('读审计：lark_cli 读路径记 lark_read（只记命令，不写 resultSnippet）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-larkaudit-'));
+    try {
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        userId: 'u1',
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+      });
+      // lark-cli 不存在/输出异常 run 也不抛异常，读审计必须照常落盘
+      await handlers.get('lark_cli')!({ args: ['--help'] });
+      const recs = fs
+        .readFileSync(path.join(tmp, 'audit.log'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const rec = recs.find((r) => r.kind === 'lark_read');
+      assert.ok(rec, '应有 lark_read 审计记录');
+      assert.equal(rec.user, 'u1');
+      assert.equal(rec.decision, 'approved');
+      assert.ok(String(rec.summary).includes('lark-cli'));
+      assert.equal(rec.resultSnippet, undefined, '读审计不得记录读回内容');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 读路径审计：repo_fs 记 repo_fs_read；敏感文件 denylist 拒绝记 denied ----------
+  await checkAsync('读审计：repo_fs 读记 repo_fs_read，denylist 拒绝记 denied 且审计文件不含读回内容', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fsaudit-'));
+    const auditTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fsaudit-log-'));
+    const repo = path.join(tmp, 'repo');
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'hello');
+    fs.writeFileSync(path.join(repo, '.env'), 'LLM_API_KEY=sk-should-not-leak');
+    const server = http.createServer((req, res) => {
+      if (req.url === '/api/repos') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: [{ path: repo }] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: base,
+        userId: 'u1',
+        registry: new SourceRegistry(auditTmp),
+        auditHome: auditTmp,
+      });
+      const okOut = await handlers.get('repo_fs')!({ action: 'read', root: repo, path: 'a.txt' });
+      assert.ok(okOut.includes('hello'));
+      const denyOut = await handlers.get('repo_fs')!({ action: 'read', root: repo, path: '.env' });
+      assert.ok(denyOut.includes('已拒绝读取'), `敏感文件应被拒绝，实际：${denyOut.slice(0, 120)}`);
+      const raw = fs.readFileSync(path.join(auditTmp, 'audit.log'), 'utf8');
+      const reads = raw
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((r) => r.kind === 'repo_fs_read');
+      assert.equal(reads.length, 2);
+      assert.equal(reads[0]!.decision, 'approved');
+      assert.equal(reads[1]!.decision, 'denied'); // denylist 拒绝的尝试最值得留痕
+      assert.ok(String(reads[1]!.summary).includes('.env'), '被拒记录应包含目标路径');
+      assert.ok(reads.every((r) => r.resultSnippet === undefined), '读审计不得记录读回内容');
+      assert.ok(!raw.includes('sk-should-not-leak'), '审计文件不得包含敏感文件内容');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(auditTmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- renderReply：标题 / 表格 / 代码块保护 ----------
   check('renderReply：# 标题渲染为加粗（去掉 #），正文加粗仍生效', (() => {
     const out = renderReply('# 结论\n正文 **加粗** 保留');
@@ -2475,8 +2611,8 @@ async function main(): Promise<void> {
     );
   })());
 
-  // ---------- 更新提示复用统一确认词表 ----------
-  await checkAsync('promptVersionUpdate：回复「确认」同样执行更新（复用统一词表）', async () => {
+  // ---------- 更新提示使用独立确认词表（UPDATE_YES_RE） ----------
+  await checkAsync('promptVersionUpdate：回复「确认」同样执行更新（更新专用词表）', async () => {
     const outcome = await promptVersionUpdate({
       info: { current: '1.0.2', latest: '1.1.0', tag: 'latest' },
       ask: async () => '确认',

@@ -44,6 +44,49 @@ export function formatMissingBaseBranchError(repoIds: string[]): string {
   );
 }
 
+/**
+ * hk start 分支补全：缺分支的仓库回填看板配置的 default_target_branch，回填不了返回错误消息
+ * （否则 hk / MCP 会静默回退 main，仓库没有 main 时 workspace 创建失败且 UI 一直 loading）。
+ * 两种载体共用同一套回填语义：
+ * - argv（string[]，hk_cli start）：扫描 `--repo <id>`，无 :branch 的原地改写为 `<id>:<branch>`；
+ * - repos（RepoStartInput[]，MCP start_workspace_session）：缺 base_branch 的原地回填。
+ * 没有任何待补全项时返回 noRepoError（未传则视为无需补全，返回 null）。
+ */
+export async function fillHkStartBranches(
+  target: string[] | RepoStartInput[],
+  kanbanUrl: string,
+  { signal, noRepoError }: { signal?: AbortSignal; noRepoError?: string } = {},
+): Promise<string | null> {
+  const isArgv = target.length === 0 || typeof target[0] === 'string';
+  let repos: RepoStartInput[];
+  let repoArgs: number[] = [];
+  if (isArgv) {
+    const argv = target as string[];
+    argv.forEach((a, i) => {
+      if (a === '--repo' && typeof argv[i + 1] === 'string' && !argv[i + 1]!.includes(':')) repoArgs.push(i + 1);
+    });
+    repos = repoArgs.map((i) => ({ repo_id: argv[i]! }));
+  } else {
+    repos = target as RepoStartInput[];
+  }
+  if (!repos.length) return noRepoError ?? null;
+  const defaults = await fetchRepoDefaultBranches(
+    kanbanUrl,
+    repos.map((r) => r.repo_id),
+    signal,
+  );
+  const { repos: filled, unresolved } = applyRepoBaseBranches(repos, defaults);
+  if (unresolved.length) return formatMissingBaseBranchError(unresolved);
+  if (isArgv) {
+    const argv = target as string[];
+    for (const i of repoArgs) argv[i] = `${argv[i]}:${defaults[argv[i]!]}`;
+  } else {
+    const out = target as RepoStartInput[];
+    for (let i = 0; i < out.length; i++) out[i] = filled[i]!;
+  }
+  return null;
+}
+
 /** Prefer workspace_id field when present (start returns both task_id and workspace_id). */
 export function extractWorkspaceId(startResult: string): string | null {
   try {

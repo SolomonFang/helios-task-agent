@@ -1,5 +1,5 @@
 /**
- * Feishu bot entry (Hermes-style): run → wizard if needed → long-connection DM.
+ * Feishu bot entry: run → wizard if needed → long-connection DM.
  *
  *   helios-task-agent bot
  *   helios-task-agent-bot
@@ -12,13 +12,13 @@
 import readline from 'readline';
 import path from 'path';
 import { currentConfig, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config';
-import { ensureBotConfig, rebindFeishuBot } from './config-wizard';
+import { ensureBotConfig, ensureConfig, rebindFeishuBot } from './config-wizard';
 import { MemoryStore, defaultDataHome } from './memory';
 import { FeishuChannel } from './channels/feishu';
 import { SessionRouter } from './session-router';
 import { ensureKanbanRunning, stopKanbanChild } from './kanban/kanban-ensure';
 import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
-import { KanbanWatcher, buildWatchEventCard, isLoopbackUrl } from './kanban/watcher';
+import { KanbanWatcher, buildWatchEventCard, isLoopbackUrl, type WatchEvent } from './kanban/watcher';
 import { reviewsDir } from './review-report';
 import { reportsDir } from './report';
 import { startReportServer, type ReportServer } from './report-server';
@@ -54,6 +54,18 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 可以说
 ${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
+
+/**
+ * bot 子命令参数解析：
+ * --rebind   换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
+ * --reconfig 重跑模型配置向导（换模型 / Base URL / API Key，保留飞书凭证）
+ */
+export function parseBotArgs(argv: string[]): { rebind: boolean; reconfig: boolean } {
+  return {
+    rebind: argv.some((a) => a === 'rebind' || a === '--rebind'),
+    reconfig: argv.some((a) => a === 'reconfig' || a === '--reconfig'),
+  };
+}
 
 function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: () => void } {
   const rl = readline.createInterface({
@@ -112,7 +124,8 @@ async function main(): Promise<void> {
     kanbanChild: ChildProcess | null;
     supervisor: McpSupervisor | null;
     wsAlerter: WsAlerter | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null };
+    reportServer: ReportServer | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null };
   let shuttingDown = false;
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return; // 幂等：二次 Ctrl+C / SIGINT+SIGTERM 不重入
@@ -128,6 +141,7 @@ async function main(): Promise<void> {
       cleanup.supervisor?.stop();
       cleanup.wsAlerter?.stop();
       cleanup.watcher?.stop();
+      cleanup.reportServer?.close();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
       await stopKanbanChild(cleanup.kanbanChild);
@@ -140,8 +154,8 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 
-  // helios-task-agent bot --rebind：换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
-  const rebind = process.argv.slice(2).some((a) => a === 'rebind' || a === '--rebind');
+  // helios-task-agent bot --rebind / --reconfig：见 parseBotArgs 注释
+  const { rebind, reconfig } = parseBotArgs(process.argv.slice(2));
 
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
@@ -152,8 +166,12 @@ async function main(): Promise<void> {
       agentCfg = currentConfig();
       feishuCfg = rb.feishu;
       console.log(c.gray(`已加载配置: ${rb.envPath}`));
+    } else if (reconfig && isConfigured() && isFeishuBotConfigured()) {
+      // 只重跑模型向导：writeEnv 合并写保留飞书凭证；看板默认值在向导中回显当前值
+      agentCfg = await ensureConfig(ask, { force: true, choose, askSecret });
+      feishuCfg = feishuBotConfig();
     } else {
-      if (rebind) console.log(c.gray('配置尚不完整，进入完整配置向导。'));
+      if (rebind || reconfig) console.log(c.gray('配置尚不完整，进入完整配置向导。'));
       const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
       agentCfg = ready.agent;
       feishuCfg = ready.feishu;
@@ -237,6 +255,7 @@ async function main(): Promise<void> {
   let reportServer: ReportServer | null = null;
   try {
     reportServer = await startReportServer([reviewsDir(), reportsDir()], agentCfg.kanbanUrl);
+    cleanup.reportServer = reportServer;
     console.log(c.gray(`报告服务: ${reportServer.baseUrl}`));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -402,39 +421,54 @@ async function main(): Promise<void> {
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {
     const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
+    // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
+    // （重投时 injectSystemNote 自身去重，不会因重试而重复注入）
+    const notifyWatchOwner = async (event: WatchEvent, oid: string): Promise<void> => {
+      let sendErr: unknown = null;
+      try {
+        await channel.notifyCardOpenId(oid, buildWatchEventCard(event));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[watch] 卡片推送失败(${oid}): ${message}，降级纯文本`);
+        try {
+          await channel.notifyOpenId(oid, event.text);
+        } catch (err2) {
+          const msg2 = err2 instanceof Error ? err2.message : String(err2);
+          console.error(`[watch] 推送失败(${oid}): ${msg2}`);
+          sendErr = err2;
+        }
+      }
+      // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
+      // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
+      //   注入发生在轮边界，不会打断进行中的 tool 配对）
+      try {
+        router
+          .getOrCreate(oid)
+          .injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`);
+      } catch {
+        /* ignore */
+      }
+      // 发送失败抛出：watcher 把该 (事件, owner) 记入待重投，下轮仅重投未送达的 owner
+      if (sendErr) throw sendErr;
+    };
     const watcher = new KanbanWatcher({
       kanbanUrl: agentCfg.kanbanUrl,
       projectId: agentCfg.kanbanProjectId || undefined,
       intervalMs: intervalSec * 1000,
       statePath: path.join(defaultDataHome(), 'watch-state.json'),
+      owners: () => channel.allowedOpenIds(),
+      notifyOwner: notifyWatchOwner,
+      // owners/notifyOwner 均已提供 → 启用 (事件, owner) 粒度送达追踪；
+      // notify 仅作缺任一时的旧整批回退路径
       notify: async (event) => {
         let firstErr: unknown = null;
         for (const oid of channel.allowedOpenIds()) {
           try {
-            await channel.notifyCardOpenId(oid, buildWatchEventCard(event));
+            await notifyWatchOwner(event, oid);
           } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            console.error(`[watch] 卡片推送失败(${oid}): ${message}，降级纯文本`);
-            try {
-              await channel.notifyOpenId(oid, event.text);
-            } catch (err2) {
-              const msg2 = err2 instanceof Error ? err2.message : String(err2);
-              console.error(`[watch] 推送失败(${oid}): ${msg2}`);
-              firstErr = err2;
-            }
-          }
-          // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
-          // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
-          //   注入发生在轮边界，不会打断进行中的 tool 配对）
-          try {
-            router
-              .getOrCreate(oid)
-              .injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`);
-          } catch {
-            /* ignore */
+            firstErr = err;
           }
         }
-        // 有 owner 未送达时抛出：watcher 据此不推进状态快照，下轮重试（事件不丢）
         if (firstErr) throw firstErr;
       },
       log: (msg) => console.log(c.gray(`[watch] ${msg}`)),

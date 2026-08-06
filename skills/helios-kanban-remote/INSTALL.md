@@ -1,30 +1,25 @@
 # Agent Self-Install Guide — Helios Kanban Remote Skill
 
-> **Audience**: AI agents (Cursor, Claude Code, Hermes, Codex, etc.)
+> **Audience**: AI agents (Cursor, Claude Code, Codex, etc.)
 >
 > **Trigger**: User says "安装 helios-kanban-remote 技能", "install helios kanban skill", or gives you this repo / INSTALL.md URL.
 >
-> **Goal**: Clone this GitHub repo, install the skill, configure, and verify — **without human manual steps**. Execute every shell command yourself. Ask the user only when information is missing.
+> **Goal**: Install the skill from the helios-task-agent npm package (built-in copy), configure, and verify — **without human manual steps**. Execute every shell command yourself. Ask the user only when information is missing.
 
 ---
 
-## Source (this repository)
+## Source (single source of truth)
 
 | Item | Value |
 |------|-------|
-| **Repository** | https://github.com/SolomonFang/vibe-kanban |
-| **Clone URL** | `https://github.com/SolomonFang/vibe-kanban.git` |
+| **唯一安装源** | npm 包 `helios-task-agent` 内置副本：`node_modules/helios-task-agent/skills/helios-kanban-remote/` |
+| **备选来源** | 本仓库默认分支：https://github.com/SolomonFang/helios-task-agent |
 | **Skill path** | `skills/helios-kanban-remote/` |
-| **Skill branch** | `hly-dev`（**不是**仓库默认分支，clone 必须显式指定 `-b hly-dev`） |
-| **This document** | https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md |
+| **This document** | https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-remote/INSTALL.md |
 
-The skill is published **inside this repo**. Do not look for a separate package — clone or use this repository directly.
+The skill ships **inside the `helios-task-agent` npm package** (`files` includes `skills/`). Do not clone any branch — copy the bundled files, or fetch them from this repo's default branch as a fallback.
 
-> **命名与分支说明**：看板的 npm 包名是 `helios-kanban`，但源码仓库叫 `SolomonFang/vibe-kanban`（同一项目，历史命名）。本 skill 目前只存在于该仓库的 **`hly-dev` 分支**上，仓库默认分支里**没有** `skills/helios-kanban-remote/`——直接 `git clone`（不带 `-b`）拿到的默认分支装不到这个 skill。务必使用：
->
-> ```bash
-> git clone --depth 1 -b hly-dev https://github.com/SolomonFang/vibe-kanban.git
-> ```
+> **命名说明**：看板的 npm 包名是 `helios-kanban`，源码仓库叫 `SolomonFang/vibe-kanban`（同一项目，历史命名）；而本 skill 属于 agent 侧，随 `helios-task-agent`（仓库 `SolomonFang/helios-task-agent`）一起发布。安装一律以 `helios-task-agent` npm 包内的副本为准，不依赖任何 git 分支。
 
 ---
 
@@ -58,42 +53,41 @@ Determine agent type and `SKILLS_ROOT`:
 | Cursor (global) | `$HOME/.cursor/skills` |
 | Claude Code | `$HOME/.claude/skills` |
 | Cursor (project) | `<workspace>/.cursor/skills` |
-| Hermes / other | user-provided, or `$HOME/.cursor/skills` |
+| Other agents | user-provided, or `$HOME/.cursor/skills` |
 
 ```bash
 SKILLS_ROOT="$HOME/.cursor/skills"   # adjust per table
 SKILL_DIR="$SKILLS_ROOT/helios-kanban-remote"
-REPO_URL="https://github.com/SolomonFang/vibe-kanban.git"
-BRANCH="hly-dev"
-REPO_DIR=""   # set in Step 2
+SRC_DIR=""   # set in Step 2
 ```
 
 **Do not** install into `~/.cursor/skills-cursor/` (reserved by Cursor).
 
 ---
 
-### Step 2: Get skill files from this repo
+### Step 2: Get skill files (npm package copy is the install source)
 
-**Option A — already inside this repository** (e.g. workspace is `vibe-kanban`):
+**Option A — copy from the installed npm package** (default):
 
 ```bash
-REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-test -f "$REPO_DIR/skills/helios-kanban-remote/SKILL.md" || {
-  echo "error: skill not found in current repo"; exit 1
+PKG_DIR="$(npm root -g)/helios-task-agent"
+test -f "$PKG_DIR/skills/helios-kanban-remote/SKILL.md" || {
+  echo "helios-task-agent 未全局安装，先执行: npm i -g helios-task-agent"; exit 1
 }
-echo "Using local repo: $REPO_DIR"
+SRC_DIR="$PKG_DIR/skills/helios-kanban-remote"
+echo "Using bundled skill: $SRC_DIR"
 ```
 
-**Option B — not in repo, clone from GitHub** (default):
+**Option B — fallback: fetch from this repo's default branch** (no npm access):
 
 ```bash
-REPO_DIR="${TMPDIR:-/tmp}/vibe-kanban"
-rm -rf "$REPO_DIR"
-git clone --depth 1 -b "$BRANCH" "$REPO_URL" "$REPO_DIR"
-test -f "$REPO_DIR/skills/helios-kanban-remote/SKILL.md" || {
-  echo "error: clone succeeded but skill path missing"; exit 1
-}
-echo "Cloned repo to: $REPO_DIR"
+RAW="https://raw.githubusercontent.com/SolomonFang/helios-task-agent/main/skills/helios-kanban-remote"
+SRC_DIR="${TMPDIR:-/tmp}/helios-kanban-remote"
+rm -rf "$SRC_DIR" && mkdir -p "$SRC_DIR/scripts"
+for f in SKILL.md INSTALL.md reference.md examples.md scripts/hk.sh; do
+  curl -fsSL "$RAW/$f" -o "$SRC_DIR/$f" || { echo "error: fetch failed: $f"; exit 1; }
+done
+echo "Fetched skill to: $SRC_DIR"
 ```
 
 ---
@@ -103,7 +97,7 @@ echo "Cloned repo to: $REPO_DIR"
 ```bash
 mkdir -p "$SKILLS_ROOT"
 rm -rf "$SKILL_DIR"
-cp -r "$REPO_DIR/skills/helios-kanban-remote" "$SKILL_DIR"
+cp -r "$SRC_DIR" "$SKILL_DIR"
 chmod +x "$SKILL_DIR/scripts/hk.sh"
 HK="$SKILL_DIR/scripts/hk.sh"
 
@@ -185,7 +179,7 @@ If failed → check URL, kanban process, network (Tailscale). Do not claim insta
 ```markdown
 ## Helios Kanban Remote 技能已安装
 
-- **来源仓库**: https://github.com/SolomonFang/vibe-kanban
+- **来源**: npm 包 `helios-task-agent` 内置副本
 - **安装路径**: `{SKILL_DIR}`
 - **CLI**: `{SKILL_DIR}/scripts/hk.sh`
 - **Kanban 地址**: `{HELIOS_KANBAN_URL}`
@@ -206,22 +200,15 @@ Tell any agent:
 
 ```
 请阅读并执行安装文档，完成 helios-kanban-remote 技能安装：
-https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md
+https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-remote/INSTALL.md
 ```
 
-Or shorter (note the branch — the skill lives on `hly-dev`, not the repo default branch):
-
-```
-安装 Helios Kanban 远程控制技能（在 hly-dev 分支上）：
-https://github.com/SolomonFang/vibe-kanban/tree/hly-dev
-```
-
-Agent should fetch INSTALL.md from the repo, then run Steps 1–7.
+Agent should fetch INSTALL.md from the repo's default branch, then run Steps 1–7.
 
 Raw URL for fetching:
 
 ```
-https://raw.githubusercontent.com/SolomonFang/vibe-kanban/hly-dev/skills/helios-kanban-remote/INSTALL.md
+https://raw.githubusercontent.com/SolomonFang/helios-task-agent/main/skills/helios-kanban-remote/INSTALL.md
 ```
 
 ---
@@ -229,8 +216,8 @@ https://raw.githubusercontent.com/SolomonFang/vibe-kanban/hly-dev/skills/helios-
 ## Update
 
 ```bash
-cd "$REPO_DIR" && git pull origin hly-dev   # if local clone exists
-# or re-clone (Step 2 Option B) and re-copy (Step 3)
+npm i -g helios-task-agent@latest   # 升级 npm 包后重跑 Step 2 Option A + Step 3
+# 或重新拉取默认分支文件（Step 2 Option B）并重新拷贝（Step 3）
 ```
 
 ---
@@ -247,7 +234,7 @@ rm -rf "$SKILL_DIR"
 
 | Symptom | Action |
 |---------|--------|
-| `git clone` fails | Check network and repo URL |
+| npm 包内找不到 skill | 确认 `npm i -g helios-task-agent` 成功；或改用 Step 2 Option B |
 | `health` connection refused | Kanban not running or wrong `HELIOS_KANBAN_URL` |
 | API 403 | Set `VK_ALLOWED_ORIGINS` on kanban server (reverse proxy) |
 | Skill not loading | Confirm `$SKILL_DIR/SKILL.md` exists; restart agent session |

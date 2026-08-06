@@ -1,7 +1,7 @@
 {
   "name": "helios-task-agent",
   "version": "1.0.18",
-  "description": "Terminal agent that turns Lark/Feishu content into helios-kanban tasks",
+  "description": "从飞书消息/文档到 helios-kanban 任务的终端与私聊 agent",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
-    "test": "tsx scripts/unit.ts",
+    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",

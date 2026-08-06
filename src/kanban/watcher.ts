@@ -22,9 +22,17 @@ interface WatchApproval {
   label: string;
 }
 
+/** 待重投事件：事件载荷 + 已送达 owner 集合（单通道回调用占位 owner ''）。 */
+interface PendingWatchEvent {
+  event: WatchEvent;
+  delivered: string[];
+}
+
 interface WatchState {
   tasks: Record<string, WatchTaskState>;
   approvals: WatchApproval[];
+  /** 未全员送达的事件：eventId → 送达进度，随 state 文件持久化，下轮仅重投未送达组合。 */
+  pending?: Record<string, PendingWatchEvent>;
 }
 
 interface KanbanTaskRow {
@@ -63,6 +71,10 @@ export interface KanbanWatcherOptions {
   intervalMs?: number;
   statePath: string;
   notify: (event: WatchEvent) => Promise<void>;
+  /** 可选：推送目标 owner 列表。与 notifyOwner 同时提供时启用 (事件, owner) 粒度送达追踪。 */
+  owners?: () => string[];
+  /** 可选：单 owner 推送。缺省时回退 notify 整批推送（事件粒度追踪，占位 owner ''）。 */
+  notifyOwner?: (event: WatchEvent, owner: string) => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -92,8 +104,9 @@ export class KanbanWatcher {
   private load(): WatchState | null {
     try {
       if (!fs.existsSync(this.opts.statePath)) return null;
-      const raw = JSON.parse(fs.readFileSync(this.opts.statePath, 'utf8')) as Omit<WatchState, 'approvals'> & {
+      const raw = JSON.parse(fs.readFileSync(this.opts.statePath, 'utf8')) as Omit<WatchState, 'approvals' | 'pending'> & {
         approvals?: Array<string | WatchApproval>;
+        pending?: Record<string, { event: WatchEvent; delivered?: unknown }>;
       };
       if (!raw || typeof raw !== 'object' || !raw.tasks) return null;
       // 兼容旧格式（approvals 为 string[]）
@@ -102,7 +115,20 @@ export class KanbanWatcher {
             .map((a) => (typeof a === 'string' ? { id: a, label: a } : a))
             .filter((a) => a && typeof a.id === 'string' && a.id)
         : [];
-      return { tasks: raw.tasks, approvals };
+      // 兼容旧格式（无 pending 字段）；逐条宽松校验，坏条目丢弃（重推由旧快照 diff 兜底）
+      let pending: WatchState['pending'];
+      if (raw.pending && typeof raw.pending === 'object') {
+        pending = {};
+        for (const [id, p] of Object.entries(raw.pending)) {
+          if (!p || typeof p !== 'object' || !p.event) continue;
+          pending[id] = {
+            event: p.event,
+            delivered: Array.isArray(p.delivered) ? p.delivered.filter((o): o is string => typeof o === 'string') : [],
+          };
+        }
+        if (!Object.keys(pending).length) pending = undefined;
+      }
+      return pending ? { tasks: raw.tasks, approvals, pending } : { tasks: raw.tasks, approvals };
     } catch {
       return null;
     }
@@ -131,7 +157,7 @@ export class KanbanWatcher {
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
         return;
       }
-      const events: WatchEvent[] = [];
+      const events: Array<{ id: string; event: WatchEvent }> = [];
       for (const [id, cur] of Object.entries(current.tasks)) {
         const old = prev.tasks[id];
         if (!old) continue; // 新任务不打扰（创建流程本身已有反馈）
@@ -144,12 +170,15 @@ export class KanbanWatcher {
           const transition = enteredReview ? `${old.status} → ${cur.status}` : '跟进执行完成';
           const review = await this.reviewTarget(cur.projectId, id);
           events.push({
-            kind: 'review',
-            title: cur.title,
-            transition,
-            url: review.url,
-            attemptId: review.attemptId,
-            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工审查 diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
+            id: `review:${id}:${transition}`,
+            event: {
+              kind: 'review',
+              title: cur.title,
+              transition,
+              url: review.url,
+              attemptId: review.attemptId,
+              text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工审查 diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
+            },
           });
           continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
         }
@@ -167,20 +196,26 @@ export class KanbanWatcher {
             }
           }
           events.push({
-            kind: cur.status === 'done' ? 'done' : 'cancelled',
-            title: cur.title,
-            transition: `${old.status} → ${cur.status}`,
-            url: link,
-            extra: extra || undefined,
-            text: `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
+            id: `${cur.status}:${id}`,
+            event: {
+              kind: cur.status === 'done' ? 'done' : 'cancelled',
+              title: cur.title,
+              transition: `${old.status} → ${cur.status}`,
+              url: link,
+              extra: extra || undefined,
+              text: `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
+            },
           });
         }
         if (old.running && !cur.running && cur.failed) {
           events.push({
-            kind: 'failed',
-            title: cur.title,
-            url,
-            text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
+            id: `failed:${id}`,
+            event: {
+              kind: 'failed',
+              title: cur.title,
+              url,
+              text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
+            },
           });
         }
       }
@@ -191,30 +226,52 @@ export class KanbanWatcher {
           .map((a) => `· ${a.label}`)
           .join('\n');
         events.push({
-          kind: 'approvals',
-          title: '',
-          items: newApprovals.slice(0, 5).map((a) => a.label),
-          text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
+          id: `approvals:${newApprovals.map((a) => a.id).join(',')}`,
+          event: {
+            kind: 'approvals',
+            title: '',
+            items: newApprovals.slice(0, 5).map((a) => a.label),
+            text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
+          },
         });
       }
-      // 推送失败不推进 state：下一轮基于旧快照重新 diff，事件不丢。
-      // 代价是部分送达的事件可能重复推送——重复优于丢失。
-      let delivered = true;
-      for (const e of events) {
-        try {
-          await this.opts.notify(e);
-        } catch (err) {
-          delivered = false;
-          this.opts.log?.(
-            `事件推送失败（${e.kind}《${e.title}》）: ${err instanceof Error ? err.message : String(err)}`,
-          );
+      // 事件粒度送达追踪：快照每轮都推进，未送达的 (事件, owner) 组合记入 pending 并随
+      // state 文件持久化，下轮只重投未送达组合——一个 owner 长期不可达不再连累其他 owner
+      // 被整批重推刷屏。进程重启后 pending 从 state 文件恢复继续重投；若写盘失败，盘上
+      // 旧快照会在下次启动后重新 diff 出这些事件——重复优于丢失。
+      const pending: Record<string, PendingWatchEvent> = { ...(prev.pending ?? {}) };
+      for (const { id, event } of events) {
+        // 同 id 已在重投队列（极少见：同一迁移在 pending 期间再次发生）：保留送达进度，刷新载荷
+        pending[id] = { event, delivered: pending[id]?.delivered ?? [] };
+      }
+      const perOwner = Boolean(this.opts.notifyOwner && this.opts.owners);
+      const ownerList = perOwner ? this.opts.owners!() : [''];
+      let failed = 0;
+      for (const p of Object.values(pending)) {
+        for (const owner of ownerList) {
+          if (p.delivered.includes(owner)) continue;
+          try {
+            if (perOwner) await this.opts.notifyOwner!(p.event, owner);
+            else await this.opts.notify(p.event);
+            p.delivered.push(owner);
+          } catch (err) {
+            failed++;
+            this.opts.log?.(
+              `事件推送失败（${p.event.kind}《${p.event.title}》${owner ? ` → ${owner}` : ''}）: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
       }
-      if (delivered) {
-        this.state = current;
-        this.persist();
-      } else {
-        this.opts.log?.('存在推送失败，状态快照未推进，下轮将重试未送达事件');
+      const next: WatchState = { ...current };
+      const pendingOut: Record<string, PendingWatchEvent> = {};
+      for (const [id, p] of Object.entries(pending)) {
+        if (!ownerList.every((o) => p.delivered.includes(o))) pendingOut[id] = p;
+      }
+      if (Object.keys(pendingOut).length) next.pending = pendingOut;
+      this.state = next;
+      this.persist();
+      if (failed) {
+        this.opts.log?.(`${failed} 个 (事件, owner) 组合推送失败，已记入待重投队列，下轮仅重试未送达组合`);
       }
     } catch (err) {
       this.opts.log?.(`轮询失败: ${err instanceof Error ? err.message : String(err)}`);

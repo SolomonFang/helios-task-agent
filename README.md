@@ -18,7 +18,7 @@
 npx helios-task-agent@latest
 ```
 
-向导只需选一个 LLM 预设并填 API Key（看板默认值可一路回车跳过）。看板**无需预装**，本机不可达时自动拉起——马上就能建任务、跑任务。飞书相关为可选升级：读飞书任务/文档需另装 lark-cli（约 2 分钟，见「安装」一节）；飞书私聊机器人见下文。
+向导只需选一个 LLM 预设并填 API Key（看板默认值可一路回车跳过）。看板**无需预装**，本机不可达时自动拉起——马上就能建任务、跑任务。首次自动拉起看板时 npx 需下载 helios-kanban 组件（约几十秒，网络慢时重试即可）。飞书相关为可选升级：读飞书任务/文档需另装 lark-cli（约 2 分钟，见「安装」一节）；飞书私聊机器人见下文。
 
 ## 两种形态：CLI 与飞书 bot
 
@@ -43,7 +43,7 @@ helios-task-agent --version   # 查看版本
 
 **自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会附变更记录（CHANGELOG）链接并请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
 
-**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban@latest` 拉起（跟随最新版，需要钉版本时用 `HELIOS_KANBAN_PACKAGE` 覆盖；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
+**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban@0.1.39` 拉起（默认钉版本，`HELIOS_KANBAN_PACKAGE` 可覆盖为其他版本或 `@latest`；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
 
 **飞书读取需另装 lark-cli**（不装则飞书任务/文档读取不可用，看板功能不受影响）：
 
@@ -137,7 +137,7 @@ helios-task-agent-bot
 
 无需公网 Webhook。进程在线才能收消息；常驻运行可用 `pm2 start helios-task-agent -- bot`（或任何进程守护方式）。
 
-**改配置**：编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——绑错机器人要换绑时用 `helios-task-agent bot --rebind`（只重跑飞书凭证向导，模型/看板配置保留；白名单可输入 `-` 清除）。终端可用 `/config` 改模型与看板地址。
+**改配置**：换模型 / Base URL / API Key 用 `helios-task-agent bot --reconfig` 重跑完整配置向导，不用手编 `.env`；也可直接编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——绑错机器人要换绑时用 `helios-task-agent bot --rebind`（只重跑飞书凭证向导，模型/看板配置保留；白名单可输入 `-` 清除）。终端可用 `/config` 改模型与看板地址。
 
 ## 命令
 
@@ -146,7 +146,8 @@ helios-task-agent-bot
 | `helios-task-agent` | 交互式终端 Agent |
 | `helios-task-agent bot` | 飞书私聊机器人（缺凭证则向导） |
 | `helios-task-agent bot --rebind` | 换绑飞书机器人（只重跑飞书凭证向导） |
-| `helios-task-agent-bot` | 同 `bot`（同样支持 `--rebind`） |
+| `helios-task-agent bot --reconfig` | 重跑完整配置向导（换模型/Base URL/Key 不用手编 `.env`） |
+| `helios-task-agent-bot` | 同 `bot`（同样支持 `--rebind` / `--reconfig`） |
 | `helios-task-agent help` / `-h` / `--help` | 帮助 |
 | `helios-task-agent --version` / `-v` | 查看版本 |
 
@@ -184,8 +185,8 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；**留空则首个私聊用户成为 owner** |
 | `HELIOS_KANBAN_URL` | 看板地址，默认 `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | 默认开；本机看板未就绪时自动拉起；`0` 关闭 |
-| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@latest --mcp` |
-| `HELIOS_KANBAN_PACKAGE` | 自动拉起 / MCP 默认的 helios-kanban 包规格，默认 `@latest` 跟随最新版，可设为 `helios-kanban@x.y.z` 钉版本 |
+| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@0.1.39 --mcp` |
+| `HELIOS_KANBAN_PACKAGE` | 自动拉起 / MCP 默认的 helios-kanban 包规格，默认钉版本 `helios-kanban@0.1.39`，可改为 `@latest` 或其他版本 |
 | `HELIOS_KANBAN_HOST` | 自动拉起看板的监听地址，默认 `127.0.0.1`（看板 Web/API 无鉴权，谨慎改为 `0.0.0.0`） |
 | `HELIOS_REPORT_HOST` | AI 审查报告静态服务的监听地址，默认 `127.0.0.1`（**不跟随** `HELIOS_KANBAN_HOST`；报告含代码 diff，确需对外暴露才改） |
 | `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |

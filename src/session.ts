@@ -159,7 +159,12 @@ export class AgentSession {
     this.pendingNotes.push(note);
   }
 
-  /** 把待注入的后台事件落到历史里（仅允许在轮边界调用）。 */
+  /**
+   * 把待注入的后台事件落到历史里（仅允许在轮边界调用）。
+   * 存储侧保持 system 角色（紧跟 system prompt 的上下文注记）；真正发给模型时由
+   * llm.downgradeSystemNotes 降级为 user + UNTRUSTED 包裹——部分 OpenAI 兼容网关
+   * 对非首位/多条 system 消息直接 400。
+   */
   private flushPendingNotes(): void {
     if (!this.pendingNotes.length) return;
     for (const note of this.pendingNotes) this.messages.push({ role: 'system', content: note });

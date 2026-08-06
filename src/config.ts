@@ -6,7 +6,7 @@ import { writeFilePrivateSync } from './private-file';
 import { kanbanPackageSpec } from './deps';
 import type { AgentConfig, FeishuBotConfig, LlmPreset } from './types';
 
-/** User-level config (Hermes-style). Wizards write here. */
+/** User-level config. Wizards write here. */
 export function userEnvPath(): string {
   return path.join(defaultDataHome(), '.env');
 }
@@ -25,9 +25,14 @@ export function projectEnvPath(): string {
  */
 /**
  * cwd .env 不允许覆盖的高危键：用户在含恶意 .env 的目录（如下载的样例仓库）
- * 启动时，LLM_BASE_URL 指向攻击者端点会导致 Authorization: Bearer <LLM_API_KEY>
- * 被外发；飞书凭证与 owner 白名单同理。这些键只接受 shell 环境、项目 .env、
- * 用户 home .env（及 HELIOS_TASK_AGENT_ENV 强制路径）的值。
+ * 启动时，威胁分两类——
+ * 1) 凭证外泄：LLM_BASE_URL 指向攻击者端点会导致 Authorization: Bearer <LLM_API_KEY>
+ *    被外发；飞书凭证与 owner 白名单同理；
+ * 2) 命令注入：HELIOS_KANBAN_MCP_COMMAND/ARGS 直接成为 MCP StdioClientTransport
+ *    spawn 的命令，HELIOS_KANBAN_PACKAGE / OCR_PACKAGE 会被 npx -y 自动执行，
+ *    HELIOS_KANBAN_URL 决定看板地址，HELIOS_TASK_AGENT_HOME 决定数据目录。
+ * 这些键只接受 shell 环境、项目 .env、用户 home .env（及 HELIOS_TASK_AGENT_ENV
+ * 强制路径）的值。
  */
 const CWD_RESTRICTED_KEYS = new Set([
   'LLM_BASE_URL',
@@ -35,6 +40,12 @@ const CWD_RESTRICTED_KEYS = new Set([
   'FEISHU_APP_ID',
   'FEISHU_APP_SECRET',
   'FEISHU_ALLOWED_OPEN_IDS',
+  'HELIOS_KANBAN_MCP_COMMAND',
+  'HELIOS_KANBAN_MCP_ARGS',
+  'HELIOS_KANBAN_PACKAGE',
+  'OCR_PACKAGE',
+  'HELIOS_KANBAN_URL',
+  'HELIOS_TASK_AGENT_HOME',
 ]);
 
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
@@ -175,15 +186,30 @@ function parseEnvFile(filePath: string): Record<string, string> {
     if (eq <= 0) continue;
     const key = trimmed.slice(0, eq).trim();
     let val = trimmed.slice(eq + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
+    if (val.startsWith('"') && val.endsWith('"')) {
+      // 双引号值按 serializeEnvValue 的写法对称反转义（单趟扫描，\\ 最后判定）
+      val = val
+        .slice(1, -1)
+        .replace(/\\(.)/gs, (_, c: string) =>
+          c === 'n' ? '\n' : c === 'r' ? '\r' : c === '"' || c === '\\' ? c : `\\${c}`,
+        );
+    } else if (val.startsWith("'") && val.endsWith("'")) {
       val = val.slice(1, -1);
     }
     out[key] = val;
   }
   return out;
+}
+
+/**
+ * 写 .env 时的值序列化：不含空白/#/引号/换行时直写（保持既有输出风格）；
+ * 否则双引号包裹并转义，避免含 " #" 的值被 dotenv 当注释截断。
+ * 注意 dotenv@16 的 parse 只展开双引号内的 \n/\r、不反转义 \" \\，含双引号或
+ * 反斜杠的值以本文件 parseEnvFile 读回为准（本项目写入的均为 URL/key/id 等简单值）。
+ */
+function serializeEnvValue(v: string): string {
+  if (v !== '' && !/[\s#"'\\]/.test(v)) return v;
+  return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
 }
 
 function applyProcessEnv(map: Record<string, string>): void {
@@ -221,7 +247,7 @@ export function writeEnvFile(
     'HELIOS_TASK_AGENT_HOME',
   ];
   const keys = [...preferredOrder.filter((k) => k in map), ...Object.keys(map).filter((k) => !preferredOrder.includes(k))];
-  const body = keys.map((k) => `${k}=${map[k]}`).join('\n') + '\n';
+  const body = keys.map((k) => `${k}=${serializeEnvValue(map[k])}`).join('\n') + '\n';
   // 原子写：tmp + rename（与 memory.ts / source-registry.ts 同一模式），
   // 避免写盘中途被杀导致 .env 截断、凭证丢失；rename 后目标一定是新建的
   // 0600 文件（writeFilePrivateSync 内含 chmod），权限处理保持不变。

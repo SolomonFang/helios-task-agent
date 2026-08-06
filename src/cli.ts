@@ -75,7 +75,7 @@ const HELP = `
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
   ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
-  ${c.info('/exit')}     退出（任务运行中按 Ctrl+C 只中断不退出）
+  ${c.info('/exit')}     退出（/quit 同效；任务运行中按 Ctrl+C 只中断不退出）
 
   ${c.strong('试试对我说')}
 ${TRY_EXAMPLES.map((e) => `  · ${e}`).join('\n')}

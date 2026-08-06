@@ -298,8 +298,8 @@ export class FeishuChannel implements AgentChannel {
         'card.action.trigger': async (data: FeishuCardAction) => {
           try {
             const openId = data.operator?.open_id || '';
-            // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮，
-            // 不过白名单会让陌生人触发 AI 审查（耗 LLM 配额、读本机仓库 diff）
+            // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮；
+            // 不过滤白名单会让陌生人触发 AI 审查（耗 LLM 配额、读本机仓库 diff）
             if (!openId || !this.access.list().includes(openId)) {
               console.warn(`[feishu] ignore card action from open_id not in allowlist: ${openId || '(unknown)'}`);
               return;
@@ -433,7 +433,9 @@ export class FeishuChannel implements AgentChannel {
   }
 
   async stop(): Promise<void> {
-    // WSClient has no public stop in older SDK versions; process exit tears down the socket.
+    // 当前 SDK（≥1.71）WSClient 提供 close()：主动断开长连接并停掉重连/保活定时器，
+    // 不再只靠进程退出回收 socket（bot 的 8s 强退兜底仍保留）。
+    this.wsClient?.close();
     this.wsClient = null;
   }
 }

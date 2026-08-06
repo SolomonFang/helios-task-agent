@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
+import { UNTRUSTED_OPEN, wrapUntrusted } from './guard';
 import type {
   ChatMessage,
   LlmClientConfig,
@@ -26,7 +27,10 @@ export function createClient(cfg: LlmClientConfig): OpenAiClient {
     baseURL: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
     timeout: 120000,
-    maxRetries: 1,
+    // SDK 内建指数退避（0.5s→1s→2s，封顶 8s）已覆盖 408/409/429/5xx 与连接错误：
+    // 长工具链（最多 25 轮）中途的瞬时限流/抖动自动重试，不再整轮报废。
+    // abort 信号不走重试（APIUserAbortError），/stop 仍即时生效。
+    maxRetries: 3,
   });
 }
 
@@ -85,6 +89,20 @@ export function trimHistory(
 /** 模型返回的上下文超限错误特征（用于自动恢复重试）。 */
 const CONTEXT_OVERFLOW_RE =
   /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|reduce the length|exceed.{0,20}token|token.{0,10}exceed/i;
+
+/**
+ * 发送前把非首位的 system 消息（flushPendingNotes 注入的后台事件通知）降级为 user 角色。
+ * 部分 OpenAI 兼容网关对非首位/多条 system 消息直接 400；降级后语义为「外部事件通知，
+ * 非用户指令、非系统指令」，并确保 UNTRUSTED 包裹（调用方已包裹的保持原样，不重复包裹）。
+ * 只作用于请求载荷，会话内存储的消息角色不变。
+ */
+export function downgradeSystemNotes(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m, i) => {
+    if (i === 0 || m.role !== 'system') return m;
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    return { role: 'user', content: content.includes(UNTRUSTED_OPEN) ? content : wrapUntrusted(content) };
+  });
+}
 
 /**
  * Repair orphaned assistant `tool_calls` (e.g. left by an interrupted turn in
@@ -157,7 +175,7 @@ export async function runAgentTurn({
       client.chat.completions.create(
         {
           model,
-          messages,
+          messages: downgradeSystemNotes(messages),
           tools: tools.length ? tools : undefined,
           tool_choice: tools.length ? 'auto' : undefined,
           temperature: 0.3,

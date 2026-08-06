@@ -312,7 +312,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     } else if (router.busy(openId)) {
       await channel.reply(msg, '📥 已收到并排队：当前任务完成后依次处理。');
     }
-    // 即时回执：给用户消息加「敲键盘」表情（与 Hermes 一致），该条处理完成后移除；
+    // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
     // 排在队列里时表情先行，用户立刻知道消息已被收到。失败（如缺表情回复权限）降级为静默跳过。
     let typingReactionId: string | undefined;
     if (!reactionUnsupported) {

@@ -134,10 +134,12 @@ export function checkHkDeps(): string[] {
 export const HK_CLI_INSTALL_HINT = 'macOS: brew install jq curl；Linux: 用包管理器安装 jq curl';
 
 /**
- * 运行时 npx 拉取的 helios-kanban 包规格。默认跟随最新版（@latest），
- * 需要钉版本时可用 HELIOS_KANBAN_PACKAGE 覆盖（如 helios-kanban@0.1.36）。
+ * 运行时 npx 拉取的 helios-kanban 包规格，钉版本（同下方 OCR 包）：
+ * 默认跟随 @latest 会让「自动启动看板」变成每次拉取并执行未审核的新版本，
+ * 供应链风险过大。当前值来自 2026-08-06 `npm view helios-kanban version` = 0.1.39，
+ * 升级时手动跟进；HELIOS_KANBAN_PACKAGE 仍可覆盖（如 helios-kanban@0.1.36）。
  */
-export const DEFAULT_KANBAN_PACKAGE = 'helios-kanban@latest';
+export const DEFAULT_KANBAN_PACKAGE = 'helios-kanban@0.1.39';
 
 export function kanbanPackageSpec(env: NodeJS.ProcessEnv = process.env): string {
   return env.HELIOS_KANBAN_PACKAGE || DEFAULT_KANBAN_PACKAGE;

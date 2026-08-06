@@ -6,7 +6,7 @@ description: >-
   Use when the user wants to control kanban from phone/chat, mentions Helios
   Kanban / helios-kanban / vibe-kanban remotely, or asks to create tasks, start
   agents, or check progress on a running instance. If the skill is not installed
-  yet, read and follow INSTALL.md to self-install from GitHub first.
+  yet, read and follow INSTALL.md to self-install first.
 digest_sections:
   - Quick workflow
   - Complete lifecycle
@@ -20,7 +20,7 @@ digest_sections:
 
 # Helios Kanban Remote Control
 
-Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) instance over HTTP. Designed for chat bots (e.g. Hermes on phone) that can run shell commands or HTTP requests on a host with network access to the kanban server.
+Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) instance over HTTP. Designed for chat agents (e.g. helios-task-agent on phone) that can run shell commands or HTTP requests on a host with network access to the kanban server.
 
 ## Prerequisites
 
@@ -159,15 +159,11 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 **Read and execute [INSTALL.md](INSTALL.md) first.**
 
-> 安装来源说明：npm 包名是 `helios-kanban`，但源码仓库是 `SolomonFang/vibe-kanban`（同一项目）；本 skill 目前只在该仓库的 **`hly-dev` 分支**上（默认分支没有），clone 时必须显式指定分支：
->
-> ```bash
-> git clone --depth 1 -b hly-dev https://github.com/SolomonFang/vibe-kanban.git
-> ```
+> 安装来源说明：本 skill 随 npm 包 `helios-task-agent` 一起发布，包内 `skills/helios-kanban-remote/` 为唯一安装源（详见 INSTALL.md）；也可从仓库 `SolomonFang/helios-task-agent` 默认分支获取。看板本身是另一个项目：npm 包 `helios-kanban`，源码仓库 `SolomonFang/vibe-kanban`。
 
 ```
 请阅读并执行安装文档：
-https://github.com/SolomonFang/vibe-kanban/blob/hly-dev/skills/helios-kanban-remote/INSTALL.md
+https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-remote/INSTALL.md
 ```
 
 ## MCP (same machine) vs this skill (remote)

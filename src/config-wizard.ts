@@ -153,8 +153,9 @@ async function promptFeishuConfig(
       break;
     }
     console.log(c.err(`凭证校验失败：${check.message}`));
-    const retry = (await need('重新输入？[Y/n]（n = 仍然保存）: ')).toLowerCase();
-    if (retry === 'n' || retry === 'no' || retry === '否') break;
+    // 与模型校验分支统一交互：回车 = 重试；保存必须显式输入 s
+    const save = (await need('回车 = 重新输入；输入 s = 仍然保存: ')).toLowerCase();
+    if (save === 's' || save === 'save' || save === '保存') break;
   }
   const allowedPrompt = existing.allowedOpenIds.length
     ? `允许的 open_id（可选，逗号分隔；回车=保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
@@ -200,7 +201,7 @@ export async function rebindFeishuBot(
 }
 
 /**
- * Hermes-style bot onboarding: print checklist, collect Feishu (+ LLM if missing), save, ready to connect.
+ * Bot onboarding: print checklist, collect Feishu (+ LLM if missing), save, ready to connect.
  */
 export async function ensureBotConfig(
   ask: AskFn,

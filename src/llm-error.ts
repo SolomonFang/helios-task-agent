@@ -1,17 +1,20 @@
 /**
  * LLM 请求失败的友好指引：把原始 API 错误映射为可操作的排查建议。
  * 命中返回提示文案；未命中返回 null（展示原始错误）。
- * channel：终端有 /config；bot 没有该命令，只能改 .env 后重启——建议必须指向存在的操作。
+ * channel：终端有 /config；bot 没有该命令，首选 helios-task-agent bot --reconfig 重配，也可改 .env 后重启——建议必须指向存在的操作。
  */
 export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } = {}): string | null {
   const s = raw.toLowerCase();
   const envFile = '~/.helios-task-agent/.env';
+  const reconfig = 'helios-task-agent bot --reconfig';
   const keyHint =
     opts.channel === 'bot'
-      ? `编辑 ${envFile} 的 LLM_API_KEY 后重启 bot。`
+      ? `运行 ${reconfig} 重新配置（推荐），或编辑 ${envFile} 的 LLM_API_KEY 后重启 bot。`
       : `用 /config 重新配置，或检查 ${envFile} 的 LLM_API_KEY。`;
   const modelHint =
-    opts.channel === 'bot' ? `编辑 ${envFile} 的 LLM_MODEL 后重启 bot。` : '用 /config 检查 LLM_MODEL。';
+    opts.channel === 'bot'
+      ? `运行 ${reconfig} 检查 LLM_MODEL（推荐），或编辑 ${envFile} 后重启 bot。`
+      : '用 /config 检查 LLM_MODEL。';
   if (/\b401\b|unauthorized|invalid[_ ]api[_ ]key|incorrect api key|authentication/.test(s)) {
     return `排查建议：API Key 无效或已过期。${keyHint}`;
   }
@@ -25,7 +28,10 @@ export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } 
     return `排查建议：模型名不存在或当前 Key 无权访问。${modelHint}`;
   }
   if (/econnrefused|enotfound|fetch failed|network|timed out|etimedout|socket hang up/.test(s)) {
-    const baseHint = opts.channel === 'bot' ? `检查 ${envFile} 的 LLM_BASE_URL` : '检查 LLM_BASE_URL（可用 /config 修改）';
+    const baseHint =
+      opts.channel === 'bot'
+        ? `运行 ${reconfig} 检查 LLM_BASE_URL（或编辑 ${envFile} 后重启 bot）`
+        : '检查 LLM_BASE_URL（可用 /config 修改）';
     return `排查建议：无法连接模型服务。请${baseHint}，并确认网络/代理可用后重试。`;
   }
   return null;

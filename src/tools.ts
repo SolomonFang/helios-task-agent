@@ -23,6 +23,7 @@ import {
   applyRepoBaseBranches,
   extractWorkspaceId,
   fetchRepoDefaultBranches,
+  fillHkStartBranches,
   formatMissingBaseBranchError,
   waitForWorkspaceReady,
   type RepoStartInput,
@@ -142,17 +143,9 @@ async function prepareMcpStartArgs(
 ): Promise<string | null> {
   const repos = parseMcpStartRepos(args);
   if (!repos) return null;
-  const defaults = await fetchRepoDefaultBranches(
-    kanbanUrl,
-    repos.map((r) => r.repo_id),
-    signal,
-  );
-  const { repos: filled, unresolved } = applyRepoBaseBranches(repos, defaults);
-  if (unresolved.length) return formatMissingBaseBranchError(unresolved);
-  args.repos = filled.map((r) => ({
-    repo_id: r.repo_id,
-    ...(r.base_branch ? { base_branch: r.base_branch } : {}),
-  }));
+  const error = await fillHkStartBranches(repos, kanbanUrl, { signal });
+  if (error) return error;
+  args.repos = repos;
   return null;
 }
 
@@ -584,6 +577,19 @@ export function buildTools({
       return wrapUntrusted(out);
     }
     const out = await run('lark-cli', argv, { signal: ctx?.signal });
+    // 读审计：飞书数据外发给 LLM 的动作留痕；只记目标命令，不写 resultSnippet（读回内容），
+    // 避免审计文件变成敏感数据副本（见 audit.ts 的 kind 约定）
+    auditLog(
+      {
+        user: uid,
+        kind: 'lark_read',
+        summary: `飞书读操作：lark-cli ${argv.slice(0, 3).join(' ')}`,
+        detail: `lark-cli ${argv.join(' ')}`.slice(0, 800),
+        decision: 'approved',
+        ok: !looksLikeStrongFailure(out),
+      },
+      auditHome,
+    );
     return wrapUntrusted(out);
   });
 
@@ -633,47 +639,23 @@ export function buildTools({
         if (branch) argv.push('--branch', branch);
       } else {
         // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk.sh 静默回退 main
-        const repoArgs: number[] = [];
-        argv.forEach((a, i) => {
-          if (a === '--repo' && typeof argv[i + 1] === 'string' && !argv[i + 1]!.includes(':')) repoArgs.push(i + 1);
-        });
-        if (!repoArgs.length) {
-          auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
-          return (
+        const error = await fillHkStartBranches(argv, kanbanUrl, {
+          signal: ctx?.signal,
+          noRepoError:
             '无法启动 workspace：未指定 --branch / --repo ID:branch，且未配置 HELIOS_KANBAN_REPO_ID。\n' +
-            '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。'
-          );
-        }
-        const ids = repoArgs.map((i) => argv[i]!);
-        const defaults = await fetchRepoDefaultBranches(kanbanUrl, ids, ctx?.signal);
-        const { unresolved } = applyRepoBaseBranches(
-          ids.map((id) => ({ repo_id: id })),
-          defaults,
-        );
-        if (unresolved.length) {
+            '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。',
+        });
+        if (error) {
           auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
-          return formatMissingBaseBranchError(unresolved);
+          return error;
         }
-        for (const i of repoArgs) argv[i] = `${argv[i]}:${defaults[argv[i]!]}`;
       }
     } else if (isStart && !argv.includes('--branch')) {
       // 混合形态：部分 --repo 已带 :branch，其余未带的也要补默认分支，不能静默回退 main
-      const repoArgs: number[] = [];
-      argv.forEach((a, i) => {
-        if (a === '--repo' && typeof argv[i + 1] === 'string' && !argv[i + 1]!.includes(':')) repoArgs.push(i + 1);
-      });
-      if (repoArgs.length) {
-        const ids = repoArgs.map((i) => argv[i]!);
-        const defaults = await fetchRepoDefaultBranches(kanbanUrl, ids, ctx?.signal);
-        const { unresolved } = applyRepoBaseBranches(
-          ids.map((id) => ({ repo_id: id })),
-          defaults,
-        );
-        if (unresolved.length) {
-          auditLog({ user: uid, kind: 'hk', summary, detail: `hk ${argv.join(' ')}`.slice(0, 800), decision: 'error' }, auditHome);
-          return formatMissingBaseBranchError(unresolved);
-        }
-        for (const i of repoArgs) argv[i] = `${argv[i]}:${defaults[argv[i]!]}`;
+      const error = await fillHkStartBranches(argv, kanbanUrl, { signal: ctx?.signal });
+      if (error) {
+        auditLog({ user: uid, kind: 'hk', summary, detail: `hk ${argv.join(' ')}`.slice(0, 800), decision: 'error' }, auditHome);
+        return error;
       }
     }
     detail = `hk ${argv.join(' ')}`.slice(0, 800);
@@ -695,6 +677,7 @@ export function buildTools({
 
   handlers.set('repo_fs', async (raw) => {
     const action = typeof raw.action === 'string' ? raw.action : '';
+    const relPath = typeof raw.path === 'string' ? raw.path : '.';
     // 仓库代码属外部内容（可能含注释型注入）：UNTRUSTED 包裹
     const out = await runRepoFs(kanbanUrl, {
       action,
@@ -704,6 +687,28 @@ export function buildTools({
       pattern: typeof raw.pattern === 'string' ? raw.pattern : undefined,
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
     });
+    // 读审计：仓库代码外发 LLM 留痕；只记 action/目标路径，不记读回内容。
+    // 被敏感文件 denylist / 仓库白名单拒绝的尝试最值得记（探测行为的信号），记 decision: 'denied'
+    const denied = out.startsWith('已拒绝读取') || out.includes('已拒绝访问');
+    auditLog(
+      {
+        user: uid,
+        kind: 'repo_fs_read',
+        summary: `仓库读操作：repo_fs ${action || '?'} ${relPath}`,
+        detail:
+          `repo_fs(${JSON.stringify({
+            action,
+            root: raw.root,
+            repo_id: raw.repo_id,
+            path: raw.path,
+            pattern: raw.pattern,
+            glob: raw.glob,
+          })})`.slice(0, 800),
+        decision: denied ? 'denied' : 'approved',
+        ok: !denied,
+      },
+      auditHome,
+    );
     return wrapUntrusted(out);
   });
 

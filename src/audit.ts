@@ -5,6 +5,13 @@ import { appendFilePrivateSync } from './private-file';
 
 export type AuditDecision = 'approved' | 'denied' | 'blocked_dup' | 'no_gate' | 'error';
 
+/**
+ * kind 取值约定：kanban / hk / lark / memory / skill 为写闸门决策记录；
+ * lark_read / repo_fs_read 为读路径外发审计（数据发给 LLM 的动作留痕）——只记 summary/目标，
+ * 绝不写 resultSnippet（读回内容），避免审计文件变成敏感数据副本；
+ * 被敏感文件 denylist / 仓库白名单拒绝的读尝试记 decision: 'denied'。
+ * kind 为自由字符串，新增取值向后兼容：旧审计文件无需迁移即可继续读取。
+ */
 export interface AuditEntry {
   user: string;
   kind: string;

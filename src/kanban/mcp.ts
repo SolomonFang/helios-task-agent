@@ -1,7 +1,10 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { MCP_FALLBACK_TEXT } from '../ui';
+
+// MCP 降级口径文案：与 src/ui.ts 的 MCP_FALLBACK_TEXT 保持一致。
+// kanban 层不反向依赖 ui 层，故此处保留内联副本；改动文案时两处需同步。
+const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
 
 export class KanbanMcp {
   readonly command: string;

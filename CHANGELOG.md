@@ -9,10 +9,48 @@
 ### Added
 
 - 新增 `skill_exec` 工具：技能目录内脚本（node/shell/python 等）可直接运行——此前技能只有文档注入（`skill_doc`），带脚本的技能除硬编码的 `hk_cli` 外无任何执行通道。脚本路径限定在技能目录内（realpath 校验，拒绝 `..`/绝对路径/符号链接逃逸），按扩展名推断解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录；执行任意脚本不可预判读写，每次调用逐次弹用户确认（不参与「同类免问」，无确认通道 fail-closed），子进程沿用最小环境变量并写审计日志
+- `helios-task-agent bot --reconfig`：凭证已存在时重跑完整配置向导（换模型 / Base URL / API Key 不用再手编 `.env`）；`--rebind` 仍只重跑飞书凭证向导
+- 审计增加 read 类记录：`lark_cli` 读路径、`repo_fs` 读取及敏感文件 denylist 拒绝均写入 `audit.log`（此前只有写操作与拦截有审计）
+- 新增单元测试 `scripts/unit-safety.ts` / `unit-kanban.ts` / `unit-resilience.ts` / `unit-bot.ts` / `unit-handler.ts`（覆盖安全闸门、看板进程回收、LLM 重试与事件推送、bot 产品交互、消息路由）
+
+### Changed
+
+- 发往 LLM 网关的非首位 system 注入降级为 user 消息 + UNTRUSTED 包裹（此前部分网关不接受多条 system 消息）
+- 配置向导飞书凭证分支校验失败的默认动作统一为「回车=重试、`s`=保存」（与模型分支一致）
+- npm 更新确认词表独立为 `UPDATE_YES_RE`，不再复用写闸门确认词表
+- bot 看板事件 watcher 按 owner 粒度接线
+- hk_cli 启动分支补全的三份拷贝下沉为 `workspace-ready.ts` 的 `fillHkStartBranches`（单一实现）
+- `mcp.ts` 去掉对 `ui` 的分层倒挂 import
+
+### Security
+
+- cwd `.env` 高危键扩展：`HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` / `HELIOS_KANBAN_PACKAGE` / `OCR_PACKAGE` / `HELIOS_KANBAN_URL` / `HELIOS_TASK_AGENT_HOME` 不再允许 cwd `.env` 覆盖——此前在含恶意 `.env` 的目录启动可借这些键注入子进程命令、重定向看板地址或数据目录
+- `repo_fs` 增加敏感文件 denylist：`.env*` / 私钥 / `.npmrc` 等路径直接拒绝读取（此前只靠仓库边界，仓库内的密钥文件可被读回）
+- helios-kanban 默认包钉版本 `helios-kanban@0.1.39`（此前默认 `@latest` 跟随最新版，供应链风险过大）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖
+
+### Fixed
+
+- 自动拉起看板的子进程回收：`stopKanbanChild` 去掉 exitCode 短路，npx 壳已退出时进程组内的看板孙进程也能被回收（此前壳一死孙进程即成孤儿占端口）
+- `.env` 写盘值安全序列化：含 `#` / 空格 / 引号的值 round-trip 不再被截断
+- LLM 请求 `maxRetries` 1→3：SDK 内建退避覆盖 429 / 5xx / 连接错误，瞬时抖动不再直接抛给用户
+- 看板事件推送改为按事件粒度追踪送达：一批事件中部分推送失败不再导致已送达事件重复推送
+- 飞书长连接断线告警刷屏：SDK 每次网络抖动都触发 reconnecting/reconnected，原实现对每次状态变化成对通知 owner；改为 `WsAlerter`（`src/bot/ws-alerter.ts`）宽限期静默——3 分钟内恢复不打扰（覆盖 SDK 一个完整重连周期：首试 0~30s，重试间隔 120s），持续断线超时告警一次、重连彻底失败（SDK 终态）只报一次
+- `FeishuChannel.stop()` 实际调用 `wsClient.close()`（此前长连接不断开）
+- 报告静态服务纳入 bot shutdown 清理
+- LLM 失败回复的 bot 指引补 `--reconfig`（此前只指向手编 `.env`）
+- 「Hermes」内部代号残留清理
+
+## [1.0.18] - 2026-08-05
 
 ### Changed
 
 - UED 全面审查与体验修复（明细见 `docs/ued-issues.md`，五轮 30 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
+
+## [1.0.17] - 2026-08-03
+
+仅版本号发布，无代码变更。
+
+## [1.0.16] - 2026-08-03
 
 ### Security
 
@@ -33,7 +71,6 @@
 - 确认词表移除单字「都」（随口一个字即批准 10 分钟「同类免问」太危险）；「以后都」「都允许」仍覆盖该意图
 - `helios-task-agent-bot` 对 `--help` 与未知参数给出帮助/报错并非零退出（此前乱参数直接启动 bot）
 - 用户自建技能契约问题（缺 `name`/`description`、`digest_sections` 匹配不到章节）启动时即告警（CLI 与 bot 一致），不再只在测试期暴露
-- 飞书长连接断线告警刷屏：SDK 每次网络抖动都触发 reconnecting/reconnected，原实现对每次状态变化成对通知 owner；改为 `WsAlerter`（`src/bot/ws-alerter.ts`）宽限期静默——3 分钟内恢复不打扰（覆盖 SDK 一个完整重连周期：首试 0~30s，重试间隔 120s），持续断线超时告警一次、重连彻底失败（SDK 终态）只报一次
 - README.en 补齐 AI 审查整段说明（双语漂移）
 
 ### Changed

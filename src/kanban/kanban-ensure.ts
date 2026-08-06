@@ -190,7 +190,10 @@ function treeAlive(child: ChildProcess): boolean {
 }
 
 export async function stopKanbanChild(child: ChildProcess | null): Promise<void> {
-  if (!child || child.exitCode !== null) return;
+  if (!child) return;
+  // exitCode 不能作短路条件：npx 壳退出后，被 reparent 的看板孙进程仍在进程组里，
+  // 直接返回会让看板成为孤儿继续占端口。组内无活口才真的无事可做。
+  if (!treeAlive(child)) return;
   // 按进程组杀：npx 只是壳，看板服务是其子进程，只杀 npx 会让看板成为孤儿继续占端口
   killTree(child, 'SIGTERM');
   await sleep(500);
