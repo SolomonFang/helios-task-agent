@@ -2168,6 +2168,73 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- skill_exec：运行技能目录内脚本（确认闸门 + 路径限定） ----------
+  await checkAsync('skill_exec 工具：闸门、解释器推断与路径限定', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skillexec-'));
+    const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
+    process.env.HELIOS_TASK_AGENT_HOME = tmp;
+    try {
+      const skillDir = path.join(tmp, 'skills', 'scripted-skill');
+      fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: scripted-skill\ndescription: 带脚本技能\n---\n\n# scripted-skill\n');
+      fs.writeFileSync(path.join(skillDir, 'scripts', 'run.sh'), '#!/bin/sh\necho "sh:$1"\necho ran > marker.txt\n');
+      fs.writeFileSync(path.join(skillDir, 'scripts', 'run.js'), 'console.log("js:" + process.argv[2]);\n');
+      fs.writeFileSync(path.join(skillDir, 'scripts', 'data.txt'), 'not a script\n');
+      // 技能目录外的文件：用于验证 ../ 逃逸被拒绝
+      fs.writeFileSync(path.join(tmp, 'skills', 'escape.sh'), '#!/bin/sh\necho escaped\n');
+
+      const make = (confirm?: () => Promise<boolean>) =>
+        buildTools({ mcp: null, kanbanUrl: 'http://127.0.0.1:1', confirm });
+
+      // 注册
+      const { openAiTools } = make();
+      assert.ok(openAiTools.some((t) => t.function.name === 'skill_exec'), 'skill_exec 应注册');
+
+      // 无确认通道：fail closed
+      const noGate = await make().handlers.get('skill_exec')!({ skill: 'scripted-skill', script: 'scripts/run.sh' }, undefined);
+      assert.equal(noGate, NO_GATE_MESSAGE);
+
+      // 用户拒绝：不执行（无副作用文件）
+      const denied = await make(async () => false).handlers.get('skill_exec')!(
+        { skill: 'scripted-skill', script: 'scripts/run.sh' },
+        undefined,
+      );
+      assert.equal(denied, DENIED_MESSAGE);
+      assert.ok(!fs.existsSync(path.join(skillDir, 'marker.txt')), '拒绝后脚本不应执行');
+
+      // 确认后执行：.sh → bash，参数透传，cwd 为技能目录
+      const ok = await make(async () => true).handlers.get('skill_exec')!(
+        { skill: 'scripted-skill', script: 'scripts/run.sh', args: ['world'] },
+        undefined,
+      );
+      assert.ok(ok.includes('sh:world'), `应返回脚本输出，实际：${ok}`);
+      assert.ok(fs.existsSync(path.join(skillDir, 'marker.txt')), '脚本副作用（cwd=技能目录）应生效');
+      assert.ok(ok.includes('UNTRUSTED'), '输出应被 UNTRUSTED 包裹');
+
+      // .js → node
+      const js = await make(async () => true).handlers.get('skill_exec')!(
+        { skill: 'scripted-skill', script: 'scripts/run.js', args: ['n1'] },
+        undefined,
+      );
+      assert.ok(js.includes('js:n1'), `.js 应走 node，实际：${js}`);
+
+      // 路径逃逸 / 绝对路径 / 未知技能 / 未知扩展名 / 非法解释器
+      const h = make(async () => true).handlers.get('skill_exec')!;
+      assert.ok((await h({ skill: 'scripted-skill', script: '../escape.sh' }, undefined)).includes('越出技能目录'));
+      assert.ok((await h({ skill: 'scripted-skill', script: '/etc/hosts' }, undefined)).includes('相对技能目录'));
+      assert.ok((await h({ skill: 'no-such-skill', script: 'x.sh' }, undefined)).includes('未找到技能'));
+      assert.ok((await h({ skill: 'scripted-skill', script: 'scripts/data.txt' }, undefined)).includes('无法按扩展名推断'));
+      assert.ok(
+        (await h({ skill: 'scripted-skill', script: 'scripts/run.sh', interpreter: 'ruby' }, undefined)).includes('不支持的解释器'),
+      );
+      assert.ok((await h({ skill: '../etc', script: 'x.sh' }, undefined)).includes('非法技能名'));
+    } finally {
+      if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
+      else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- 更新提示附 CHANGELOG 链接 ----------
   await checkAsync('promptVersionUpdate：请示文案附 CHANGELOG 链接', async () => {
     let asked = '';

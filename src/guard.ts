@@ -4,7 +4,7 @@
  * enforcement behind "先确认再执行" — the model cannot bypass it via prompt.
  */
 
-export type ConfirmKind = 'kanban' | 'lark' | 'hk' | 'memory';
+export type ConfirmKind = 'kanban' | 'lark' | 'hk' | 'memory' | 'skill';
 
 export interface ConfirmRequest {
   kind: ConfirmKind;

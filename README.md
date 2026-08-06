@@ -171,7 +171,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 - `name` / `description` 缺失或 `digest_sections` 匹配不到章节时，`validateSkills()` 会报出契约问题——启动时即告警（CLI 与 bot 都会打印），并有单元测试覆盖，而不是静默降级。
 - 用户侧可用 `/skills`（CLI 与飞书 bot 一致）或直接问「你有什么技能」查看已安装技能。
-- 可执行能力（新工具）仍需在 `src/tools.ts` 注册。
+- 技能自带脚本（node/shell/python 等）可直接运行：在 SKILL.md 里写明用法，agent 会用 `skill_exec` 工具执行——脚本路径限定在技能目录内（拒绝 `..`/绝对路径/符号链接逃逸），按扩展名自动选解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录，**每次执行都向用户弹确认**（任意代码执行，不参与「同类免问」），子进程只继承最小环境变量。
 
 **看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。
 

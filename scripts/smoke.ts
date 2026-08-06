@@ -47,6 +47,8 @@ async function main(): Promise<void> {
     kanbanUrl: cfg.kanbanUrl,
     memory,
     userId: 'local',
+    // memory_set 已接入写闸门（fail-closed）：冒烟环境自动放行
+    confirm: async () => true,
   });
   check(
     '工具注册（含 lark_cli/hk_cli/repo_fs/memory_*）',

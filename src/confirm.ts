@@ -59,6 +59,7 @@ export function kindLabel(kind: string): string {
   if (kind === 'lark') return '飞书';
   if (kind === 'kanban' || kind === 'hk') return '看板';
   if (kind === 'memory') return '记忆';
+  if (kind === 'skill') return '技能脚本';
   return kind;
 }
 

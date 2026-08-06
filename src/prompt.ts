@@ -144,7 +144,7 @@ export function validateSkills(): string[] {
 }
 
 /** 定位技能目录：用户目录优先，包内兜底；不存在返回 null。 */
-function resolveSkillDir(dirName: string): string | null {
+export function resolveSkillDir(dirName: string): string | null {
   for (const base of [userSkillsDir(), SKILLS_DIR]) {
     const dir = path.join(base, dirName);
     if (fs.existsSync(path.join(dir, 'SKILL.md'))) return dir;
@@ -180,7 +180,8 @@ export function renderSkillsBlock(): string {
   if (!digests.length) return '';
   const header =
     '# 已安装技能\n\n' +
-    '以下技能已安装（用户目录 skills/ 优先，包内内置兜底）。此处只含 description 与关键章节摘要；需要完整细节时用 `skill_doc` 工具读取全文，不要臆造用法。';
+    '以下技能已安装（用户目录 skills/ 优先，包内内置兜底）。此处只含 description 与关键章节摘要；需要完整细节时用 `skill_doc` 工具读取全文，不要臆造用法。' +
+    '技能若自带脚本（node/shell/python 等），按文档说明用 `skill_exec` 工具运行（每次执行都会向用户弹确认）。';
   const blocks = digests.map((s) =>
     [
       `## 技能：${s.name}`,

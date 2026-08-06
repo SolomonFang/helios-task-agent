@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'fs';
 import { execFile } from 'child_process';
 import type { KanbanMcp } from './kanban/mcp';
 import type { MemoryStore } from './memory';
@@ -28,12 +29,24 @@ import {
 } from './kanban/workspace-ready';
 import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
 import { summarizeForChat, writeSummaryReports } from './report';
-import { readSkillDoc } from './prompt';
+import { readSkillDoc, resolveSkillDir } from './prompt';
 import { minimalChildEnv } from './proc-env';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
 const EXEC_TIMEOUT = 60000;
+
+/** 技能脚本解释器：按扩展名推断（未命中的扩展名需显式传 interpreter）。 */
+const SCRIPT_INTERPRETERS: Record<string, string> = {
+  '.sh': 'bash',
+  '.js': 'node',
+  '.mjs': 'node',
+  '.cjs': 'node',
+  '.py': 'python3',
+};
+
+/** 显式指定的解释器白名单。 */
+const ALLOWED_INTERPRETERS = new Set(['bash', 'sh', 'node', 'python3', 'python']);
 
 function truncate(s: unknown): string {
   const str = String(s);
@@ -43,18 +56,18 @@ function truncate(s: unknown): string {
 function run(
   command: string,
   args: string[],
-  { env, signal }: { env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
+  { env, signal, cwd }: { env?: NodeJS.ProcessEnv; signal?: AbortSignal; cwd?: string } = {},
 ): Promise<string> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve('（命令已被用户中断）');
       return;
     }
-    // 最小环境（见 proc-env.ts）：不向 lark-cli / hk.sh 泄露 LLM_API_KEY 等敏感变量
+    // 最小环境（见 proc-env.ts）：不向 lark-cli / hk.sh / 技能脚本泄露 LLM_API_KEY 等敏感变量
     execFile(
       command,
       args,
-      { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: minimalChildEnv(env), signal },
+      { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: minimalChildEnv(env), signal, cwd },
       (error, stdout, stderr) => {
         if (signal?.aborted) {
           resolve('（命令已被用户中断）');
@@ -281,6 +294,34 @@ const LOCAL_TOOLS: OpenAiTool[] = [
   {
     type: 'function',
     function: {
+      name: 'skill_exec',
+      description:
+        '运行已安装技能目录内的脚本（node/shell/python 等）。技能文档（skill_doc 读取）里说明的脚本用法通过此工具执行。' +
+        'script 为相对技能目录的路径（如 scripts/foo.py）；按扩展名自动选择解释器（.sh→bash、.js/.mjs/.cjs→node、.py→python3），' +
+        '其他扩展名需显式传 interpreter（bash/sh/node/python3/python）。' +
+        '执行任意脚本无法预判读写，每次调用都会触发用户确认闸门。',
+      parameters: {
+        type: 'object',
+        properties: {
+          skill: { type: 'string', description: '技能名（如 helios-kanban-remote）' },
+          script: { type: 'string', description: '相对技能目录的脚本路径，如 scripts/run.sh' },
+          args: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '传给脚本的参数数组',
+          },
+          interpreter: {
+            type: 'string',
+            description: '可选；显式解释器（bash/sh/node/python3/python），缺省按扩展名推断',
+          },
+        },
+        required: ['skill', 'script'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'work_summary',
       description:
         '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
@@ -313,6 +354,7 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
   { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
   { name: 'work_summary', summary: '生成工作总结报告（HTML/MD）' },
   { name: 'skill_doc', summary: '按需读取已安装技能完整文档（SKILL.md）' },
+  { name: 'skill_exec', summary: '运行技能目录内脚本（每次需用户确认）' },
   { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' },
 ];
 
@@ -669,6 +711,56 @@ export function buildTools({
     const name = typeof raw.name === 'string' ? raw.name : '';
     // 技能文档是本仓库自带内容（非外部注入），无需 UNTRUSTED 包裹
     return truncate(readSkillDoc(name));
+  });
+
+  handlers.set('skill_exec', async (raw, ctx) => {
+    const skill = typeof raw.skill === 'string' ? raw.skill.trim() : '';
+    const script = typeof raw.script === 'string' ? raw.script.trim() : '';
+    if (!skill || !script) return '参数错误：skill 与 script 均必填';
+    if (!/^[\w][\w.-]*$/.test(skill)) return `参数错误：非法技能名「${skill}」`;
+    if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.some((a) => typeof a !== 'string'))) {
+      return '参数错误：args 必须是字符串数组';
+    }
+    const argv = (raw.args as string[] | undefined) || [];
+    const dir = resolveSkillDir(skill);
+    if (!dir) return `未找到技能「${skill}」。先用 skill_doc（空 name）列出已安装技能。`;
+    if (path.isAbsolute(script)) return `参数错误：script 必须是相对技能目录的路径：「${script}」`;
+    // 防路径逃逸：realpath 后必须仍在技能目录内（覆盖 ../ 与符号链接两种形态）
+    const rootReal = fs.realpathSync(dir);
+    let scriptReal: string;
+    try {
+      scriptReal = fs.realpathSync(path.join(rootReal, script));
+    } catch {
+      return `技能「${skill}」内不存在脚本「${script}」`;
+    }
+    if (!scriptReal.startsWith(rootReal + path.sep)) {
+      return `参数错误：脚本路径越出技能目录：「${script}」`;
+    }
+    let interpreter = typeof raw.interpreter === 'string' ? raw.interpreter.trim() : '';
+    if (interpreter) {
+      if (!ALLOWED_INTERPRETERS.has(interpreter)) {
+        return `参数错误：不支持的解释器「${interpreter}」（仅允许 ${[...ALLOWED_INTERPRETERS].join('/')}）`;
+      }
+    } else {
+      interpreter = SCRIPT_INTERPRETERS[path.extname(scriptReal).toLowerCase()] || '';
+      if (!interpreter) {
+        return `参数错误：无法按扩展名推断「${script}」的解释器，请显式传 interpreter（bash/sh/node/python3/python）`;
+      }
+    }
+    const summary = `执行技能脚本：${skill}/${script}`;
+    const detail = `${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`.slice(0, 800);
+    // 执行任意脚本 = 任意代码执行，无法可靠分类读写：一律逐次确认（不传 batchKey）
+    const gate = await passGate({ kind: 'skill', summary, detail }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    const out = await run(interpreter, [scriptReal, ...argv], { signal: ctx?.signal, cwd: rootReal });
+    auditLog(
+      { user: uid, kind: 'skill', summary, detail, decision: 'approved', ok: !looksLikeStrongFailure(out), resultSnippet: out },
+      auditHome,
+    );
+    return wrapUntrusted(out);
   });
 
   handlers.set('work_summary', async (raw) => {

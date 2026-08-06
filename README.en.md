@@ -169,7 +169,7 @@ via the `skill_doc` tool (progressive disclosure).
 
 - Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` — surfaced as **startup warnings** (CLI and bot) and covered by unit tests, instead of silently degrading.
 - Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
-- Executable capabilities (new tools) still need registration in `src/tools.ts`.
+- Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution never joins batch approvals), and the child process inherits only a minimal environment.
 
 **Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up.
 
