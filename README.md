@@ -155,7 +155,9 @@ helios-task-agent-bot
 
 ## 添加技能
 
-文档型技能：在 `<数据目录>/skills/<技能名>/` 下放一个带 frontmatter 的 `SKILL.md` 即可——启动时自动扫描，无需改代码。数据目录为 `HELIOS_TASK_AGENT_HOME` 或默认 `~/.helios-task-agent`（与 `.env`、记忆同级）；自定义技能放这里，`npm i -g` 升级不会被抹掉。扫描顺序：**用户数据目录优先，包内 `skills/` 作内置兜底**，同名技能以用户目录为准。frontmatter 就是技能契约：
+文档型技能：在 `<数据目录>/skills/<技能名>/` 下放一个带 frontmatter 的 `SKILL.md` 即可——启动时自动扫描，无需改代码。数据目录为 `HELIOS_TASK_AGENT_HOME` 或默认 `~/.helios-task-agent`（与 `.env`、记忆同级）；自定义技能放这里，`npm i -g` 升级不会被抹掉。扫描顺序：**用户数据目录优先，包内 `skills/` 作内置兜底**，同名技能以用户目录为准。
+
+安装与卸载有正式入口（CLI 与飞书 bot 一致）：`/skills install <技能目录路径>` 把本地技能目录复制进数据目录（同名覆盖即更新），`/skills uninstall <技能名>` 卸载（包内内置技能不可卸载）。**不要**把自定义技能放进包内 `skills/`（npm 安装目录，升级会被整目录替换）——历史误放的技能会在启动时自动迁移到数据目录并打印提示。frontmatter 就是技能契约：
 
 ```markdown
 ---

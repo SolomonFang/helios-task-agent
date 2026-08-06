@@ -5,11 +5,100 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { loadSkill, loadSkillDigests, parseFrontmatter, userSkillsDir } from './prompt';
 
 /** 包内内置技能目录（兜底；npm 全局安装目录，用户不应往里放自定义技能）。 */
 export const SKILLS_DIR = path.join(__dirname, '..', 'skills');
+
+/** 随包发布的内置技能目录名：启动迁移时跳过；发布新内置技能时需加入此列表。 */
+const BUILTIN_SKILLS = ['helios-kanban-remote'];
+
+/** 技能目录名规则（与 readSkillDoc 的参数校验一致，同时保证无路径分隔符）。 */
+const SKILL_NAME_RE = /^[\w][\w.-]*$/;
+
+/**
+ * 安装技能：把含 SKILL.md 的本地目录复制到数据目录 skills/（npm 升级不受影响，永久保留）。
+ * 已存在同名技能时整目录替换（即技能更新）；先复制到临时目录再原子改名，中途失败旧版本还在。
+ * 支持 ~/ 前缀。源与目标相同或互相嵌套时拒绝（先删后拷会把源一起删掉）。
+ */
+export function installSkill(srcPath: string): { name: string; dir: string; replaced: boolean } {
+  const expanded = srcPath.trim().replace(/^~(?=$|\/)/, os.homedir());
+  const src = path.resolve(expanded);
+  if (!fs.existsSync(src) || !fs.statSync(src).isDirectory()) {
+    throw new Error(`路径不存在或不是目录：${srcPath}`);
+  }
+  if (!fs.existsSync(path.join(src, 'SKILL.md'))) {
+    throw new Error(`该目录下没有 SKILL.md（技能入口文件）：${src}`);
+  }
+  const name = path.basename(src);
+  if (!SKILL_NAME_RE.test(name)) throw new Error(`非法技能目录名「${name}」（仅允许字母数字、_、-、.）`);
+  const dest = path.join(userSkillsDir(), name);
+  // 源 == 目标（重装已安装技能）或一方在另一方内部：先删后拷会毁掉源，直接拒绝
+  const relTo = path.relative(src, dest);
+  const relFrom = path.relative(dest, src);
+  if (!relTo || !relFrom || (!relTo.startsWith('..') && !path.isAbsolute(relTo)) || (!relFrom.startsWith('..') && !path.isAbsolute(relFrom))) {
+    throw new Error(`源目录与安装位置相同或互相嵌套，不能安装：${src}`);
+  }
+  const tmpDest = `${dest}.tmp-${process.pid}`;
+  fs.rmSync(tmpDest, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  try {
+    fs.cpSync(src, tmpDest, { recursive: true });
+  } catch (err) {
+    fs.rmSync(tmpDest, { recursive: true, force: true });
+    throw err;
+  }
+  const replaced = fs.existsSync(dest);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.renameSync(tmpDest, dest);
+  return { name, dir: dest, replaced };
+}
+
+/** 卸载技能：只删数据目录里的；包内内置技能拒绝卸载（随包发布，删除无意义且会被升级还原）。 */
+export function uninstallSkill(name: string): void {
+  const trimmed = name.trim();
+  if (!SKILL_NAME_RE.test(trimmed)) throw new Error(`非法技能名「${trimmed}」`);
+  const dir = path.join(userSkillsDir(), trimmed);
+  if (!fs.existsSync(dir)) {
+    if (fs.existsSync(path.join(SKILLS_DIR, trimmed))) {
+      throw new Error(`「${trimmed}」是包内内置技能，不能卸载（可用同名目录放数据目录 skills/ 下覆盖它）`);
+    }
+    throw new Error(`未找到技能「${trimmed}」（数据目录 skills/ 下不存在）`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/**
+ * 启动迁移：历史上用户只能把技能放进包内 skills/（npm 安装目录），升级即被整目录替换。
+ * 这里把包内的非内置技能拷入数据目录持久保存（已存在同名则不动，以数据目录为准）。
+ * 返回本次迁移的技能名（供启动日志告知用户）；任何失败都不阻塞启动。
+ */
+export function migratePackageSkills(pkgSkillsDir: string = SKILLS_DIR): string[] {
+  const migrated: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(pkgSkillsDir, { withFileTypes: true });
+  } catch {
+    return migrated;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || BUILTIN_SKILLS.includes(e.name)) continue;
+    const src = path.join(pkgSkillsDir, e.name);
+    if (!fs.existsSync(path.join(src, 'SKILL.md'))) continue;
+    const dest = path.join(userSkillsDir(), e.name);
+    if (fs.existsSync(dest)) continue;
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.cpSync(src, dest, { recursive: true });
+      migrated.push(e.name);
+    } catch {
+      /* best-effort：权限等问题留给 /skills 报错，不影响启动 */
+    }
+  }
+  return migrated;
+}
 
 /** 定位技能目录：用户目录优先，包内兜底；不存在返回 null。 */
 export function resolveSkillDir(dirName: string): string | null {

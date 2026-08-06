@@ -8,6 +8,7 @@ import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INS
 import { fetchKanbanHealth } from './kanban/http';
 import { LOCAL_TOOL_SUMMARY } from './tools';
 import { loadSkillDigests } from './prompt';
+import { installSkill, uninstallSkill } from './skills';
 import { friendlyLlmError } from './llm-error';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -129,6 +130,43 @@ export function buildSkillsLines(
   }
   if (opts.footer) lines.push(opts.footer);
   return lines;
+}
+
+/** /skills 用法说明（子命令错误时提示；两端一致）。 */
+const SKILLS_USAGE = '用法：/skills 列表 · /skills install <技能目录路径> 安装 · /skills uninstall <技能名> 卸载';
+
+/**
+ * /skills 命令统一处理（CLI 与 bot 共用）：无参数=列表；install/uninstall 管理技能。
+ * text 为原始输入（保留大小写，路径区分大小写）。
+ */
+export function handleSkillsCommand(
+  text: string,
+  listOpts: { header: string; bullet: string; footer?: string; headerWhenEmpty?: boolean },
+  p: Paint,
+): string[] {
+  const arg = text.trim().replace(/^\/skills/i, '').trim();
+  if (!arg) return buildSkillsLines(listOpts, p);
+  const sp = arg.indexOf(' ');
+  const sub = (sp === -1 ? arg : arg.slice(0, sp)).toLowerCase();
+  const value = sp === -1 ? '' : arg.slice(sp + 1).trim();
+  try {
+    if (sub === 'install') {
+      if (!value) return [p.warn('缺少技能目录路径。'), p.gray(SKILLS_USAGE)];
+      const r = installSkill(value);
+      return [
+        p.ok(`✅ 已安装技能「${r.name}」${r.replaced ? '（覆盖了同名技能）' : ''}`),
+        p.gray(`位置：${r.dir}（数据目录，npm 升级不丢失）。/skills 即刻可见；对话上下文 /clear 或重启后生效。`),
+      ];
+    }
+    if (sub === 'uninstall') {
+      if (!value) return [p.warn('缺少技能名。'), p.gray(SKILLS_USAGE)];
+      uninstallSkill(value);
+      return [p.ok(`✅ 已卸载技能「${value}」。`), p.gray('对话上下文 /clear 或重启后生效。')];
+    }
+  } catch (err) {
+    return [p.warn(err instanceof Error ? err.message : String(err))];
+  }
+  return [p.warn(`未知子命令「${sub}」。`), p.gray(SKILLS_USAGE)];
 }
 
 /** /memory 内容行：[标题, 记忆正文]。 */

@@ -7,16 +7,17 @@ import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { connectMcp } from './kanban/mcp';
 import { checkHkDeps, checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT } from './deps';
 import { validateSkills } from './prompt';
+import { migratePackageSkills } from './skills';
 import { wizardAskSecret, wizardChoose } from './wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import {
   buildMemoryLines,
-  buildSkillsLines,
   buildStatusLines,
   buildToolsLines,
   CLEARED_TEXT,
   confirmRevokedText,
   confirmStateText,
+  handleSkillsCommand,
   llmFailureParts,
   TRY_EXAMPLES,
 } from './commands';
@@ -64,7 +65,7 @@ const HELP = `
   ${c.info('/help')}     显示帮助
   ${c.info('/config')}   重新配置模型 / kanban 地址
   ${c.info('/tools')}    列出当前可用的 kanban 工具
-  ${c.info('/skills')}   列出已安装技能（数据目录 skills/ 优先，包内置底）
+  ${c.info('/skills')}   列出技能；install <路径> 安装（升级不丢失）/ uninstall <名称> 卸载
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
@@ -151,6 +152,10 @@ export async function main(): Promise<void> {
   });
   // banner 状态行已含未授权/未找到说明；这里只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
   if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));
+  // 历史误放进 npm 包内 skills/ 的技能升级即丢失：启动时先迁到数据目录持久保存，再校验最终生效的技能集
+  for (const name of migratePackageSkills()) {
+    console.log(c.info(`已将技能「${name}」从包内目录迁移到数据目录（以后升级不再丢失）`));
+  }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   for (const problem of validateSkills()) console.log(c.warn(`技能契约: ${problem}`));
 
@@ -316,8 +321,10 @@ export async function main(): Promise<void> {
         )) {
           console.log(l);
         }
-      } else if (cmd === '/skills') {
-        for (const l of buildSkillsLines(
+      } else if (cmd === '/skills' || cmd.startsWith('/skills ')) {
+        // 子命令参数（install 路径等）区分大小写，用原始 line 而非小写化后的 cmd
+        for (const l of handleSkillsCommand(
+          line,
           {
             header: c.strong('已安装技能:'),
             bullet: '  ',

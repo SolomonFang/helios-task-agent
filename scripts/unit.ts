@@ -39,7 +39,7 @@ import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
 import { loadEnvFiles, writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
 import { parseFrontmatter, loadSkillDigests, renderSkillsBlock, userSkillsDir, validateSkills, buildSystemPrompt } from '../src/prompt';
-import { readSkillDoc } from '../src/skills';
+import { readSkillDoc, installSkill, uninstallSkill, migratePackageSkills } from '../src/skills';
 import { auditLog } from '../src/audit';
 import { SessionRouter } from '../src/session-router';
 import { AgentSession } from '../src/session';
@@ -83,6 +83,7 @@ import {
   buildStatusLines,
   buildToolsLines,
   buildSkillsLines,
+  handleSkillsCommand,
   plainPaint,
   confirmStateText,
   confirmRevokedText,
@@ -2596,6 +2597,134 @@ async function main(): Promise<void> {
       const overridden = loadSkillDigests().find((s) => s.name === 'helios-kanban-remote');
       assert.equal(overridden?.description, '用户覆盖版');
       assert.ok(readSkillDoc('helios-kanban-remote').includes('正文'), 'skill_doc 也应读到用户覆盖版');
+    } finally {
+      if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
+      else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 技能安装/卸载/包内迁移（升级不丢失） ----------
+  await checkAsync('技能管理：install 装入数据目录、同名覆盖、uninstall 卸载、内置技能拒绝卸载', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skillmgr-'));
+    const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
+    process.env.HELIOS_TASK_AGENT_HOME = tmp;
+    try {
+      // 源技能目录（数据目录之外）
+      const src = path.join(tmp, 'src-skill');
+      fs.mkdirSync(src, { recursive: true });
+      const writeSrc = (desc: string) =>
+        fs.writeFileSync(path.join(src, 'SKILL.md'), `---\nname: src-skill\ndescription: ${desc}\n---\n\n# src-skill\n`);
+
+      writeSrc('v1');
+      const r1 = installSkill(src);
+      assert.equal(r1.name, 'src-skill');
+      assert.equal(r1.replaced, false);
+      assert.equal(r1.dir, path.join(tmp, 'skills', 'src-skill'), '应装入数据目录 skills/（npm 升级不影响）');
+      assert.ok(loadSkillDigests().some((s) => s.name === 'src-skill' && s.description === 'v1'), '安装后应被扫描到');
+
+      // 同名覆盖 = 更新
+      writeSrc('v2');
+      const r2 = installSkill(src);
+      assert.equal(r2.replaced, true);
+      assert.ok(loadSkillDigests().some((s) => s.name === 'src-skill' && s.description === 'v2'), '覆盖后应生效新版本');
+
+      // 非法源
+      assert.throws(() => installSkill(path.join(tmp, 'not-exist')), /路径不存在/);
+      const noMd = path.join(tmp, 'no-skill-md');
+      fs.mkdirSync(noMd);
+      assert.throws(() => installSkill(noMd), /没有 SKILL\.md/);
+
+      // 源 == 安装位置（重装已安装技能）：必须拒绝且源完好（先删后拷会把源一起删掉）
+      const installedDir = path.join(tmp, 'skills', 'src-skill');
+      assert.throws(() => installSkill(installedDir), /相同或互相嵌套/);
+      assert.ok(fs.existsSync(path.join(installedDir, 'SKILL.md')), '拒绝后源目录不应受损');
+      // 目标在源内部（把数据目录 skills/ 本身当技能装）：同样拒绝
+      fs.writeFileSync(path.join(tmp, 'skills', 'SKILL.md'), '---\nname: skills\ndescription: d\n---\n');
+      assert.throws(() => installSkill(path.join(tmp, 'skills')), /相同或互相嵌套/);
+      fs.rmSync(path.join(tmp, 'skills', 'SKILL.md'));
+
+      // 卸载：数据目录里的可卸；内置技能拒绝
+      uninstallSkill('src-skill');
+      assert.ok(!fs.existsSync(path.join(tmp, 'skills', 'src-skill')), '卸载后目录应删除');
+      assert.throws(() => uninstallSkill('src-skill'), /未找到技能/);
+      assert.throws(() => uninstallSkill('helios-kanban-remote'), /内置技能/);
+
+      // ~/ 前缀展开（POSIX 下 os.homedir() 读 $HOME）
+      const fakeHome = path.join(tmp, 'fake-home');
+      fs.mkdirSync(path.join(fakeHome, 'tilde-skill'), { recursive: true });
+      fs.writeFileSync(
+        path.join(fakeHome, 'tilde-skill', 'SKILL.md'),
+        '---\nname: tilde-skill\ndescription: 波浪线\n---\n',
+      );
+      const prevEnvHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        const r = installSkill('~/tilde-skill');
+        assert.equal(r.name, 'tilde-skill');
+        assert.ok(fs.existsSync(path.join(tmp, 'skills', 'tilde-skill', 'SKILL.md')), '~/ 路径应能安装');
+      } finally {
+        if (prevEnvHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevEnvHome;
+      }
+    } finally {
+      if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
+      else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('技能管理：包内非内置技能启动迁移到数据目录（内置与同名跳过、幂等）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skillmig-'));
+    const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
+    process.env.HELIOS_TASK_AGENT_HOME = path.join(tmp, 'home');
+    try {
+      // 伪造一个「包内 skills/」：一个用户误放技能、一个内置技能、一个无 SKILL.md 目录
+      const pkg = path.join(tmp, 'pkg-skills');
+      const mk = (name: string) => {
+        fs.mkdirSync(path.join(pkg, name), { recursive: true });
+        fs.writeFileSync(path.join(pkg, name, 'SKILL.md'), `---\nname: ${name}\ndescription: d\n---\n\n# ${name}\n`);
+      };
+      mk('user-misplaced');
+      mk('helios-kanban-remote');
+      fs.mkdirSync(path.join(pkg, 'no-md-dir'), { recursive: true });
+
+      const migrated = migratePackageSkills(pkg);
+      assert.deepEqual(migrated, ['user-misplaced'], '只迁移非内置且含 SKILL.md 的技能');
+      assert.ok(fs.existsSync(path.join(tmp, 'home', 'skills', 'user-misplaced', 'SKILL.md')), '迁移副本应存在');
+      assert.ok(!fs.existsSync(path.join(tmp, 'home', 'skills', 'helios-kanban-remote')), '内置技能不应被复制');
+      assert.deepEqual(migratePackageSkills(pkg), [], '重复执行应幂等（已存在不再迁移）');
+    } finally {
+      if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
+      else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('技能管理：/skills 子命令分发（install/uninstall/未知子命令）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skillcmd-'));
+    const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
+    process.env.HELIOS_TASK_AGENT_HOME = tmp;
+    try {
+      const src = path.join(tmp, 'CmdSkill');
+      fs.mkdirSync(src, { recursive: true });
+      fs.writeFileSync(path.join(src, 'SKILL.md'), '---\nname: cmd-skill\ndescription: 命令安装\n---\n\n# cmd-skill\n');
+
+      const listOpts = { header: '已安装技能', bullet: '· ' };
+      // install 路径区分大小写（不能小写化参数）
+      const installed = handleSkillsCommand(`/skills install ${src}`, listOpts, plainPaint);
+      assert.ok(installed.some((l) => l.includes('已安装技能「CmdSkill」')), `install 输出不符合预期: ${installed}`);
+      assert.ok(fs.existsSync(path.join(tmp, 'skills', 'CmdSkill', 'SKILL.md')), '命令安装应落盘数据目录');
+
+      const removed = handleSkillsCommand('/skills uninstall CmdSkill', listOpts, plainPaint);
+      assert.ok(removed.some((l) => l.includes('已卸载技能「CmdSkill」')), `uninstall 输出不符合预期: ${removed}`);
+
+      const unknown = handleSkillsCommand('/skills frobnicate', listOpts, plainPaint);
+      assert.ok(unknown.some((l) => l.includes('未知子命令')), '未知子命令应提示用法');
+
+      // 无参数仍为列表
+      const list = handleSkillsCommand('/skills', listOpts, plainPaint);
+      assert.ok(list[0] === '已安装技能', '无参数应走列表');
     } finally {
       if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
       else process.env.HELIOS_TASK_AGENT_HOME = prevHome;

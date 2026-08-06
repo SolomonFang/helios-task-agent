@@ -8,6 +8,7 @@
 
 ### Added
 
+- 技能管理命令 `/skills install <路径>` / `/skills uninstall <名称>`（CLI 与飞书 bot 一致）：安装即复制到数据目录 `skills/`（`HELIOS_TASK_AGENT_HOME` 或 `~/.helios-task-agent`），`npm i -g` 升级不再丢失；同名覆盖即更新；包内内置技能不可卸载。启动时自动把历史误放进包内 `skills/`（npm 安装目录）的非内置技能迁移到数据目录并打印提示——此前没有安装入口，用户只能手动拷目录，且界面上唯一可见的 `skills/` 路径是包内那个，放进去一升级就没
 - 新增 `skill_exec` 工具：技能目录内脚本（node/shell/python 等）可直接运行——此前技能只有文档注入（`skill_doc`），带脚本的技能除硬编码的 `hk_cli` 外无任何执行通道。脚本路径限定在技能目录内（realpath 校验，拒绝 `..`/绝对路径/符号链接逃逸），按扩展名推断解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录；执行任意脚本不可预判读写，每次调用逐次弹用户确认（不参与「同类免问」，无确认通道 fail-closed），子进程沿用最小环境变量并写审计日志
 - `helios-task-agent bot --reconfig`：凭证已存在时重跑完整配置向导（换模型 / Base URL / API Key 不用再手编 `.env`）；`--rebind` 仍只重跑飞书凭证向导
 - 审计增加 read 类记录：`lark_cli` 读路径、`repo_fs` 读取及敏感文件 denylist 拒绝均写入 `audit.log`（此前只有写操作与拦截有审计）

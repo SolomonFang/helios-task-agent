@@ -13,12 +13,12 @@ import { checkLarkCliAsync, checkOcrCliAsync } from '../deps';
 import { wrapUntrusted } from '../guard';
 import {
   buildMemoryLines,
-  buildSkillsLines,
   buildStatusLines,
   buildToolsLines,
   CLEARED_TEXT,
   confirmRevokedText,
   confirmStateText,
+  handleSkillsCommand,
   llmFailureParts,
   parseCommand,
   plainPaint,
@@ -310,7 +310,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return;
     }
     if (cmd === '/skills') {
-      const lines = buildSkillsLines({ header: '已安装技能', bullet: '· ', headerWhenEmpty: true }, plainPaint);
+      // 子命令参数（install 路径等）区分大小写，传原始 text
+      const lines = handleSkillsCommand(text, { header: '已安装技能', bullet: '· ', headerWhenEmpty: true }, plainPaint);
       await channel.reply(msg, lines.join('\n'));
       return;
     }

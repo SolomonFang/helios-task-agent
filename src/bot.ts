@@ -28,6 +28,7 @@ import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisable
 import { connectMcp } from './kanban/mcp';
 import { TRY_EXAMPLES } from './commands';
 import { validateSkills } from './prompt';
+import { migratePackageSkills } from './skills';
 import { wizardAskSecret, wizardChoose } from './wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
@@ -42,7 +43,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /help     显示帮助
 /status   健康检查（kanban / MCP / lark-cli / 推送）
 /tools    列出当前可用工具
-/skills   列出已安装技能（数据目录 skills/ 优先，包内置底）
+/skills   列出技能；install <路径> 安装（升级不丢失）/ uninstall <名称> 卸载
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
 /stop     中断当前任务（排队消息与待确认写操作一并取消）
@@ -212,6 +213,10 @@ async function main(): Promise<void> {
   }
   if (!checkOcrCli()) {
     console.log(c.warn(`未检测到代码审查工具 open-code-review（AI 审查功能）。${OCR_INSTALL_HINT}`));
+  }
+  // 历史误放进 npm 包内 skills/ 的技能升级即丢失：启动时先迁到数据目录持久保存，再校验最终生效的技能集
+  for (const name of migratePackageSkills()) {
+    console.log(c.info(`已将技能「${name}」从包内目录迁移到数据目录（以后升级不再丢失）`));
   }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   for (const problem of validateSkills()) {
