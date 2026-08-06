@@ -132,7 +132,11 @@ export class ConfirmationManager {
           const p = this.pendings.get(openId);
           if (p && p.id === id && messageId) p.cardMessageId = messageId;
         })
-        .catch(() => {});
+        .catch((err) => {
+          // 卡片与文本降级都发送失败：用户完全无感知、工具干等超时——至少落日志可排查
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[confirm] 确认请求发送失败（用户无法裁决，将等超时自动拒绝）: ${message}`);
+        });
     });
   }
 

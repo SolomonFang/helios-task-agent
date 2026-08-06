@@ -8,6 +8,7 @@ import path from 'path';
 import { defaultDataHome } from './memory';
 import { writeFilePrivateSync } from './private-file';
 import { newReportToken } from './report-server';
+import { pruneOldReports, sanitizeName } from './report-utils';
 import type { WorkSummaryData, WorkSummaryTask } from './kanban/summary';
 
 export function escapeHtml(s: string): string {
@@ -283,10 +284,6 @@ export function reportsDir(): string {
   return path.join(defaultDataHome(), 'reports');
 }
 
-function sanitizeName(s: string): string {
-  return s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'report';
-}
-
 export function writeSummaryReports(
   data: WorkSummaryData,
   opts: WriteSummaryReportsOptions = {},
@@ -294,6 +291,8 @@ export function writeSummaryReports(
   const format = opts.format ?? 'both';
   const dir = opts.dir ?? reportsDir();
   fs.mkdirSync(dir, { recursive: true });
+  // 与 AI 审查报告同一清理策略：30 天前的历史报告自动删除，避免目录无界增长
+  pruneOldReports(dir);
   const stamp = data.iteration?.trim()
     ? data.iteration.trim()
     : (() => {
@@ -303,7 +302,7 @@ export function writeSummaryReports(
         const day = String(d.getDate()).padStart(2, '0');
         return `${y}-${m}-${day}`;
       })();
-  const base = path.join(dir, `work-summary-${sanitizeName(stamp)}`);
+  const base = path.join(dir, `work-summary-${sanitizeName(stamp, 'report')}`);
   const out: SummaryReportPaths = {};
   if (format === 'both' || format === 'html') {
     // HTML 走 report-server HTTP 访问：文件名带随机 token 作为访问凭证（含任务 diff 数据，0600 写入）

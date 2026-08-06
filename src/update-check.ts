@@ -1,8 +1,10 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
 import { defaultDataHome } from './memory';
 import { writeFilePrivateSync } from './private-file';
+import { minimalChildEnv } from './proc-env';
 
 /**
  * npm 版本更新检查：启动时探测 registry 上的更新版本，发现后请示用户是否更新。
@@ -98,7 +100,7 @@ export function compareVersions(a: string, b: string): number {
 let cachedRegistry: string | null = null;
 function npmConfigRegistry(): Promise<string> {
   return new Promise((resolve) => {
-    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000 }, (err, stdout) => {
+    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir() }, (err, stdout) => {
       const out = (stdout || '').trim();
       resolve(!err && /^https?:\/\//.test(out) ? out : '');
     });
@@ -200,7 +202,12 @@ export interface PromptUpdateDeps {
 
 function defaultRunUpdate(tag: 'latest' | 'next'): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn('npm', ['i', '-g', `${PKG_NAME}@${tag}`], { stdio: 'inherit' });
+    // cwd 取用户主目录避免读项目级 .npmrc；最小环境防止 LLM_API_KEY 等敏感变量泄给子进程
+    const child = spawn('npm', ['i', '-g', `${PKG_NAME}@${tag}`], {
+      stdio: 'inherit',
+      cwd: os.homedir(),
+      env: minimalChildEnv(),
+    });
     child.on('error', () => resolve(false));
     child.on('exit', (code) => resolve(code === 0));
   });

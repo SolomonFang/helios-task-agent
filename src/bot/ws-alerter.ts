@@ -4,7 +4,8 @@
  * 补投，用户无感），若每次都通知 owner 会刷屏。因此：
  * - 短暂抖动（宽限期内恢复）完全静默；
  * - 断线持续超过 graceMs（默认 3 分钟）才告警一次，恢复时补一条「已恢复」；
- * - 重连彻底失败（SDK 放弃重试，需人工重启）立即告警，但只报一次。
+ * - 重连彻底失败（SDK 放弃重试，需人工重启）立即告警，但只报一次；
+ *   若此后 SDK 又自行连上，补一条「已恢复」并解锁（新一轮失败可再告警）。
  *
  * 宽限期默认 3 分钟的理由：SDK 重连节奏为断开后 0~30s（随机 nonce）内首试，
  * 失败后每次间隔 120s——「首试失败、第二次成功」的普通抖动总时长约 2~2.5 分钟，
@@ -47,8 +48,14 @@ export class WsAlerter {
       this.pending.unref();
     } else if (state === 'reconnected') {
       this.cancelPending();
-      if (this.alerted) {
-        this.alerted = false;
+      const hadAlerted = this.alerted;
+      const hadFailed = this.failedNotified;
+      this.alerted = false;
+      this.failedNotified = false;
+      if (hadFailed) {
+        // 「重连失败」锁存后 SDK 又自行连上：补恢复通知并解锁，避免 owner 以为仍需重启
+        this.opts.notify('✅ 飞书长连接已恢复（此前重连失败，现已自行恢复，无需重启）');
+      } else if (hadAlerted) {
         this.opts.notify('✅ 飞书长连接已恢复');
       }
       // 未告警过的快速抖动：静默

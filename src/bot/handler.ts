@@ -31,6 +31,12 @@ import { MCP_FALLBACK_TEXT } from '../ui';
 /** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */
 type CardAction = FeishuCardAction;
 
+/** AI 审查全局并发上限：每个审查是最长 15 分钟的子进程，不同 attempt 叠加会拖垮机器。 */
+const AI_REVIEW_MAX_CONCURRENT = 2;
+
+/** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
+const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
+
 export interface BotHandlerDeps {
   channel: FeishuChannel;
   router: SessionRouter;
@@ -65,6 +71,13 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const handleAiReview = async (openId: string, attemptId: string, title: string): Promise<void> => {
     if (aiReviewRunning.has(attemptId)) {
       await channel.notifyOpenId(openId, `🤖 《${title}》的 AI 审查正在进行中，请稍候…`).catch(() => {});
+      return;
+    }
+    // 全局并发上限：超出时拒收并提示稍后再试（按 attempt 去重挡不住不同 attempt 的叠加）
+    if (aiReviewRunning.size >= AI_REVIEW_MAX_CONCURRENT) {
+      await channel
+        .notifyOpenId(openId, `🤖 同时进行的 AI 审查已达上限（${AI_REVIEW_MAX_CONCURRENT} 个），请等现有审查完成后再试：《${title}》`)
+        .catch(() => {});
       return;
     }
     aiReviewRunning.add(attemptId);
@@ -303,6 +316,11 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
 
     const openId = msg.senderId;
+    // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
+    if (router.queueFull(openId)) {
+      await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或先 /stop 清空队列）。');
+      return;
+    }
     // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
     if (confirmations.hasPending(openId)) {
       await channel.reply(
@@ -313,7 +331,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       await channel.reply(msg, '📥 已收到并排队：当前任务完成后依次处理。');
     }
     // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
-    // 排在队列里时表情先行，用户立刻知道消息已被收到。失败（如缺表情回复权限）降级为静默跳过。
+    // 排在队列里时表情先行，用户立刻知道消息已被收到。
+    // 失败分级：永久性错误（缺权限/不支持）降级为静默且不再重试；瞬时错误（限流/网络）下条消息再试。
     let typingReactionId: string | undefined;
     if (!reactionUnsupported) {
       try {
@@ -324,11 +343,31 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           pendingTyping.set(openId, list);
         }
       } catch (err) {
-        reactionUnsupported = true;
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[feishu] 敲键盘表情回执不可用，已降级为仅占位消息: ${message}`);
+        if (REACTION_PERMANENT_RE.test(message)) {
+          reactionUnsupported = true;
+          console.warn(`[feishu] 敲键盘表情回执不可用，已降级为仅占位消息: ${message}`);
+        } else {
+          console.warn(`[feishu] 敲键盘表情回执失败（瞬时错误，下条消息重试）: ${message}`);
+        }
       }
     }
+    // 该条消息处理完毕（含 /memory、/clear、未知命令、中断、报错）或被 /stop 代际丢弃时，
+    // 即移除敲键盘表情；onDropped 兜底了「丢弃回调不执行 finally」的漏洞。
+    const cleanupTyping = async (): Promise<void> => {
+      if (!typingReactionId) return;
+      const rid = typingReactionId;
+      typingReactionId = undefined;
+      const list = pendingTyping.get(openId);
+      const tracked = list?.some((r) => r.reactionId === rid) ?? false;
+      if (list) {
+        const rest = list.filter((r) => r.reactionId !== rid);
+        if (rest.length) pendingTyping.set(openId, rest);
+        else pendingTyping.delete(openId);
+      }
+      // 仍在追踪表内才发移除请求（/stop 的兜底清理已移除过时跳过，避免重复调用）
+      if (tracked) await channel.removeReaction(fmsg.messageId, rid).catch(() => {});
+    };
     const runQueued = async () => {
       const session = router.getOrCreate(openId);
 
@@ -393,22 +432,19 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         running.delete(openId);
       }
     };
-    await router.enqueue(openId, async () => {
-      try {
-        await runQueued();
-      } finally {
-        // 该条消息处理完毕（含 /memory、/clear、未知命令、中断、报错）即移除敲键盘表情
-        if (typingReactionId) {
-          await channel.removeReaction(fmsg.messageId, typingReactionId).catch(() => {});
-          const list = pendingTyping.get(openId);
-          if (list) {
-            const rest = list.filter((r) => r.reactionId !== typingReactionId);
-            if (rest.length) pendingTyping.set(openId, rest);
-            else pendingTyping.delete(openId);
-          }
+    await router.enqueue(
+      openId,
+      async () => {
+        try {
+          await runQueued();
+        } finally {
+          await cleanupTyping();
         }
-      }
-    });
+      },
+      // 被 /stop 代际丢弃的消息不会执行上面的回调，其敲键盘表情由这个钩子即时清理
+      // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
+      () => void cleanupTyping(),
+    );
   };
 
   return { handle, onCardAction };

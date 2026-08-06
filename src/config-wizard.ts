@@ -37,6 +37,26 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     return ans.trim();
   };
 
+  /**
+   * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
+   * 给出醒目警告并要求显式确认；不确认则重新输入，直到拿到 https 或用户确认。
+   */
+  const ensureSecureBaseUrl = async (url: string): Promise<string> => {
+    let u = url;
+    for (;;) {
+      if (/^https:\/\//i.test(u)) return u;
+      // loopback 放行：IPv6 本机地址在 URL 中带方括号（http://[::1]:8080），一并覆盖
+      if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(u)) return u;
+      console.log(
+        c.err(`⚠️ 警告：Base URL 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
+      );
+      const ok = (await need('确认继续使用该明文端点？[输入 YES 继续 / 回车 = 重新输入 Base URL]: ')).toUpperCase();
+      if (ok === 'YES' || ok === 'Y') return u;
+      u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+      if (!u) throw new Error('Base URL 不能为空');
+    }
+  };
+
   let idx: number;
   if (choose && process.stdin.isTTY) {
     idx = await choose(PRESETS);
@@ -55,6 +75,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   let baseUrl = preset.baseUrl;
   if (!baseUrl) {
     baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+    baseUrl = await ensureSecureBaseUrl(baseUrl);
   }
   const apiKeyInput = await needSecret('API Key（输入显示为 *）: ');
   if (!apiKeyInput) throw new Error('API Key 不能为空');
@@ -83,6 +104,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     if (which === 'b' || which === 'base' || which === 'url') {
       baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
       if (!baseUrl) throw new Error('Base URL 不能为空');
+      baseUrl = await ensureSecureBaseUrl(baseUrl);
     } else if (which === 'm' || which === 'model') {
       model = await need('模型名: ');
       if (!model) throw new Error('模型名不能为空');

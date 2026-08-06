@@ -8,22 +8,7 @@ import dotenv from 'dotenv';
 import { loadEnvFiles, writeEnvFile } from '../src/config';
 import { repoFsRead, repoFsGrep } from '../src/repo-fs';
 import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/deps';
-
-let failures = 0;
-const check = (name: string, ok: boolean, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-  if (!ok) failures++;
-};
-
-/** try/catch 包装：异常即 FAIL。 */
-async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    check(name, true);
-  } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
-  }
-}
+import { check, checkAsync, finish } from './testkit';
 
 async function main() {
   // ---------- loadEnvFiles：cwd .env 命令注入类高危键被忽略 ----------
@@ -164,8 +149,7 @@ async function main() {
     DEFAULT_KANBAN_PACKAGE,
   );
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

@@ -1,15 +1,14 @@
 import readline from 'readline';
 import { type ChildProcess } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import { c, printBanner, Spinner, renderReply, selectList, readSecret, MCP_FALLBACK_TEXT } from './ui';
+import { c, printBanner, Spinner, renderReply, MCP_FALLBACK_TEXT } from './ui';
 import { ensureConfig } from './config-wizard';
-import { currentConfig } from './config';
 import { AgentSession } from './session';
 import { ensureKanbanRunning } from './kanban/kanban-ensure';
-import { checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT } from './deps';
+import { connectMcp } from './kanban/mcp';
+import { checkHkDeps, checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT } from './deps';
 import { validateSkills } from './prompt';
-import { checkForUpdate, promptVersionUpdate, updateCheckDisabled } from './update-check';
+import { wizardAskSecret, wizardChoose } from './wizard-io';
+import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import {
   buildMemoryLines,
   buildSkillsLines,
@@ -18,17 +17,12 @@ import {
   CLEARED_TEXT,
   confirmRevokedText,
   confirmStateText,
-  connectMcp,
   llmFailureParts,
   TRY_EXAMPLES,
 } from './commands';
 import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './confirm';
 import type { ConfirmFn } from './guard';
-import type { AgentConfig, AskFn, LlmPreset } from './types';
-
-const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
-  version: string;
-};
+import type { AgentConfig, AskFn } from './types';
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void };
 
@@ -94,30 +88,13 @@ export async function main(): Promise<void> {
     process.stdout.write(promptText);
     return nextLine();
   };
-  const choose = async (presets: LlmPreset[]) => {
-    rl.pause();
-    try {
-      // 重配（/config）时在标题里给出当前模型，避免用户忘记自己之前选的是什么
-      const current = currentConfig().llmModel;
-      const title = `配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：`;
-      return await selectList({ title, options: presets });
-    } finally {
-      rl.resume();
-      nextLine.drain();
-    }
-  };
+  // 向导交互原语与 bot 共用（wizard-io）；行读模式需在交互后 drain 缓冲
+  const choose = wizardChoose(rl, () => nextLine.drain());
   /** 密钥掩码输入（仅 TTY；非 TTY 回退普通输入，向导内自动处理） */
-  const askSecret: AskFn | undefined = isTTY
-    ? async (promptText) => {
-        rl.pause();
-        try {
-          return await readSecret(promptText);
-        } finally {
-          rl.resume();
-          nextLine.drain();
-        }
-      }
-    : undefined;
+  const askSecret = wizardAskSecret(rl, isTTY, () => nextLine.drain());
+
+  // 版本号统一走 update-check 的读取（读取失败回退 0.0.0）
+  const version = readPkgVersion();
 
   let cfg: AgentConfig;
   try {
@@ -130,7 +107,7 @@ export async function main(): Promise<void> {
   }
 
   // npm 更新检查：与看板/MCP 启动并发进行，banner 打印后再请示（结果缓存 24h，离线静默）
-  const pendingUpdate = !updateCheckDisabled() && isTTY ? checkForUpdate({ current: pkg.version }) : null;
+  const pendingUpdate = !updateCheckDisabled() && isTTY ? checkForUpdate({ current: version }) : null;
 
   let kanbanChild: ChildProcess | null = null;
   const bootKanban = new Spinner('检查 helios-kanban…').start();
@@ -160,14 +137,17 @@ export async function main(): Promise<void> {
 
   const larkStatus = checkLarkCliStatus();
 
+  // 依赖探测（子进程）在这里完成，banner 只负责渲染传入的结果
   printBanner({
-    version: pkg.version,
+    version,
     model: cfg.llmModel,
     baseUrl: cfg.llmBaseUrl,
     kanbanUrl: cfg.kanbanUrl,
     mcp: mcpOk ? 'ok' : 'fail',
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
     larkOk: larkStatus !== 'missing',
+    larkAuthed: larkStatus === 'ok',
+    hkMissing: checkHkDeps(),
   });
   // banner 状态行已含未授权/未找到说明；这里只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
   if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));

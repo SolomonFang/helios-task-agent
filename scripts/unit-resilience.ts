@@ -13,22 +13,7 @@ import { AgentSession } from '../src/session';
 import { MemoryStore } from '../src/memory';
 import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from '../src/guard';
 import type { AgentConfig, ChatMessage, OpenAiClient } from '../src/types';
-
-let failures = 0;
-const check = (name: string, ok: boolean, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-  if (!ok) failures++;
-};
-
-/** try/catch 包装：异常即 FAIL。 */
-async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    check(name, true);
-  } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
-  }
-}
+import { check, checkAsync, finish } from './testkit';
 
 /** 标准 chat completion 响应体。 */
 function completionBody(content: string) {
@@ -344,8 +329,7 @@ async function main(): Promise<void> {
     }
   });
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

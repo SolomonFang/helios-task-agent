@@ -59,8 +59,18 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
         res.writeHead(404).end('not found');
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      fs.createReadStream(file).pipe(res);
+      // existsSync 与读流之间有竞态（报告可能恰好被 prune 删掉）：error 无监听者会以
+      // 未捕获异常打崩整个 bot 进程。headers 推迟到流成功打开再发，出错时未发则 404，
+      // 已发（打开后读失败）则直接断开。
+      const stream = fs.createReadStream(file);
+      stream.on('open', () => {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        stream.pipe(res);
+      });
+      stream.on('error', () => {
+        if (!res.headersSent) res.writeHead(404);
+        res.end();
+      });
     } catch {
       res.writeHead(400).end('bad request');
     }

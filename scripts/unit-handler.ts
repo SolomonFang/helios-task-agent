@@ -17,22 +17,8 @@ import { CLEARED_TEXT } from '../src/commands';
 import type { ConfirmRequest } from '../src/guard';
 import type { AgentConfig, InboundMessage } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-
-let failures = 0;
-const check = (name: string, ok: boolean, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-  if (!ok) failures++;
-};
-
-/** try/catch 包装：异常即 FAIL。 */
-async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    check(name, true);
-  } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
-  }
-}
+import { redactSnippet } from '../src/audit';
+import { check, checkAsync, finish } from './testkit';
 
 /** 轮询等待条件成立（队列与 LLM 请求均为异步），超时抛错。 */
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
@@ -45,7 +31,25 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Pro
 
 // --- fake channel：实现 handler 实际用到的 FeishuChannel 方法子集，记录全部出站消息 ---
 
-class FakeChannel {
+/**
+ * handler 实际依赖的 FeishuChannel 最小接口：FakeChannel 显式 implements，
+ * FeishuChannel 删掉其中任一方法时 tsc 会在此处报错（接口漂移受类型检查保护）。
+ */
+type ChannelUnderTest = Pick<
+  FeishuChannel,
+  | 'name'
+  | 'reply'
+  | 'sendText'
+  | 'updateText'
+  | 'addReaction'
+  | 'removeReaction'
+  | 'notifyOpenId'
+  | 'notifyCardOpenId'
+  | 'lastEventAt'
+  | 'connectionState'
+>;
+
+class FakeChannel implements ChannelUnderTest {
   readonly name = 'fake-feishu';
   replies: { sessionId: string; text: string }[] = [];
   sent: string[] = [];
@@ -54,8 +58,10 @@ class FakeChannel {
   addedReactions: string[] = [];
   removedReactions: string[] = [];
   addReactionCalls = 0;
-  /** 模拟表情回执权限缺失（addReaction 抛错，触发降级）。 */
+  /** 模拟表情回执失败（addReaction 抛错）。 */
   failReactions = false;
+  /** 失败时的错误文案：权限类（永久性）或网络类（瞬时）。 */
+  reactionError = 'no reaction permission';
   private reactionSeq = 0;
   private messageSeq = 0;
 
@@ -71,7 +77,7 @@ class FakeChannel {
   }
   async addReaction(messageId: string, _emojiType: string): Promise<string | undefined> {
     this.addReactionCalls++;
-    if (this.failReactions) throw new Error('no reaction permission');
+    if (this.failReactions) throw new Error(this.reactionError);
     this.addedReactions.push(messageId);
     return `r-${++this.reactionSeq}`;
   }
@@ -162,7 +168,7 @@ interface Fixture {
   confirmPrompts: { openId: string; req: ConfirmRequest; id: string }[];
 }
 
-function setup(llmBaseUrl: string): Fixture {
+function setup(llmBaseUrl: string, kanbanUrl = 'http://localhost:1'): Fixture {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-handler-'));
   const cfg: AgentConfig = {
     llmBaseUrl,
@@ -170,7 +176,7 @@ function setup(llmBaseUrl: string): Fixture {
     llmModel: 'm',
     mcpCommand: 'npx',
     mcpArgs: [],
-    kanbanUrl: 'http://localhost:1',
+    kanbanUrl,
     kanbanProjectId: '',
     kanbanRepoId: '',
     kanbanIteration: '',
@@ -186,7 +192,14 @@ function setup(llmBaseUrl: string): Fixture {
     { timeoutMs: 5000 },
   );
   const channel = new FakeChannel();
-  const fakeMcp = { tools: [] } as unknown as KanbanMcp;
+  // fake MCP：handler/supervisor 实际依赖的最小接口（tools 列表 + 健康探测），同样受类型检查保护；
+  // 两处强转各自只做一次收窄（私有字段导致无法直接赋值）。
+  const fakeMcpTyped: Pick<KanbanMcp, 'tools' | 'ping' | 'reconnect'> = {
+    tools: [],
+    async ping() {},
+    async reconnect() {},
+  };
+  const fakeMcp = fakeMcpTyped as unknown as KanbanMcp;
   const supervisor = new McpSupervisor({ mcp: fakeMcp, initiallyAlive: false });
   const handlers = createBotHandlers({
     channel: channel as unknown as FeishuChannel,
@@ -404,6 +417,82 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- typing 回执瞬时错误：不永久禁用，下条消息重试 ----------
+    await checkAsync('handler：敲键盘表情瞬时错误（限流/网络）下条消息重试', async () => {
+      const f = setup(llm.baseUrl);
+      f.channel.failReactions = true;
+      f.channel.reactionError = '飞书添加表情回复失败: code=99991400 msg=network timeout';
+      await f.handlers.handle(mkMsg('u1', '/clear'));
+      await f.handlers.handle(mkMsg('u1', '/clear'));
+      assert.equal(f.channel.addReactionCalls, 2, '瞬时错误后下条消息应重试加表情');
+      f.channel.reactionError = 'no reaction permission'; // 永久性错误：此后禁用
+      await f.handlers.handle(mkMsg('u1', '/clear'));
+      await f.handlers.handle(mkMsg('u1', '/clear'));
+      assert.equal(f.channel.addReactionCalls, 3, '永久性错误后不再重试');
+      cleanup(f);
+    });
+
+    // ---------- 排队上限：满员拒收并提示 ----------
+    await checkAsync('handler：排队满 20 条后拒收并提示「排队消息已满」', async () => {
+      const f = setup(llm.baseUrl);
+      llm.mode = 'hang';
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const pA = f.handlers.handle(mkMsg('u1', '长任务'));
+      await waitFor(() => llm.requestCount === base + 1, '长任务进入 LLM');
+      const queued: Promise<void>[] = [];
+      for (let i = 0; i < 20; i++) queued.push(f.handlers.handle(mkMsg('u1', `排队${i}`)));
+      await waitFor(() => f.router.queuedCount('u1') === 20, '20 条排队');
+      await f.handlers.handle(mkMsg('u1', '第 21 条'));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('排队消息已满')),
+        '满员后应提示排队消息已满',
+      );
+      assert.equal(f.router.queuedCount('u1'), 20, '满员后不再入队');
+      await f.handlers.handle(mkMsg('u1', '/stop')); // 清场：中断长任务并丢弃排队
+      llm.mode = 'ok';
+      llm.release();
+      await Promise.all([pA, ...queued]);
+      cleanup(f);
+    });
+
+    // ---------- AI 审查：全局并发上限（最多 2 个），超出提示稍后再试 ----------
+    await checkAsync('handler：AI 审查全局并发上限，第三个被拒并提示', async () => {
+      // 假看板：响应头给出后永不结束 body，让 resolveReviewTarget 的 apiGet 挂起（审查进行中）
+      const kanban = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"success":true,"data":');
+      });
+      await new Promise<void>((r) => kanban.listen(0, '127.0.0.1', r));
+      const kbUrl = `http://127.0.0.1:${(kanban.address() as AddressInfo).port}`;
+      const f = setup(llm.baseUrl, kbUrl);
+      const click = (attempt: string) =>
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: attempt, title: attempt } } });
+      click('a1');
+      click('a2');
+      await waitFor(
+        () => f.channel.notifies.filter((n) => n.text.includes('AI 审查已开始')).length === 2,
+        '两个审查进入进行中',
+      );
+      click('a3'); // 第三个（不同 attempt）：并发上限拒收
+      await waitFor(
+        () => f.channel.notifies.some((n) => n.text.includes('已达上限')),
+        '并发上限提示',
+      );
+      click('a1'); // 同 attempt 连点：仍走去重提示
+      await waitFor(
+        () => f.channel.notifies.some((n) => n.text.includes('正在进行中')),
+        'attempt 去重提示',
+      );
+      // 收尾：断开假看板连接，两个挂起的审查以失败结束（不拖累进程退出）
+      kanban.closeAllConnections?.();
+      await new Promise((r) => kanban.close(r));
+      await waitFor(
+        () => f.channel.notifies.filter((n) => n.text.includes('AI 审查失败')).length === 2,
+        '挂起审查收尾',
+      );
+      cleanup(f);
+    });
+
     // ---------- 卡片回调：白名单外静默忽略，未知 id 兜底，有效 id 裁决 ----------
     await checkAsync('handler：卡片回调白名单与确认裁决', async () => {
       const f = setup(llm.baseUrl);
@@ -426,13 +515,22 @@ async function main(): Promise<void> {
       assert.ok(f.channel.notifies.at(-1)!.text.includes('✅ 已批准，正在执行'));
       cleanup(f);
     });
+
+    // ---------- 审计脱敏：写操作 resultSnippet 中的密钥字段不落盘 ----------
+    await checkAsync('audit：redactSnippet 替换 token/密钥字段与 Bearer 头', async () => {
+      const json = redactSnippet('{"access_token":"abc123","password": "p@ss","title":"普通内容"}');
+      assert.ok(json.includes('"access_token":"***"') && json.includes('"password": "***"'), `JSON 密钥值应替换为 ***，实际：${json}`);
+      assert.ok(!json.includes('abc123') && !json.includes('p@ss'), '原密钥值不得残留');
+      assert.ok(json.includes('普通内容'), '非敏感内容应保持不变');
+      const bearer = redactSnippet('请求失败 Authorization: Bearer sk-live-abcdef 重试');
+      assert.ok(bearer.includes('Bearer ***') && !bearer.includes('sk-live-abcdef'), `Bearer 头应脱敏，实际：${bearer}`);
+    });
   } finally {
     await llm.stop();
     console.warn = origWarn;
   }
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

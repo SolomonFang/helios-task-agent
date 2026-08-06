@@ -170,9 +170,21 @@ expand_tags() {
     printf '%s' "$text"
     return
   fi
+  # split("@"+name)/join 是纯字面量替换；不能用 gsub 拼正则——服务端 tag_name
+  # 插进 jq 程序会引入正则/jq 代码注入面
   jq -n --arg text "$text" --argjson tags "$tags" '
-    reduce $tags[] as $t ($text; gsub("@\($t.tag_name)"; $t.content))
+    reduce $tags[] as $t ($text; split("@" + $t.tag_name) | join($t.content))
   ' -r
+}
+
+# 任务/工作区/审批 id 会拼进 API 路径与查询串（id 来自 LLM 参数）；
+# 只接受 UUID 形态（hex + 连字符），其余字符直接报错退出，防止路径/查询注入
+validate_id() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    echo "error: invalid $name '$value' (expect UUID)" >&2
+    exit 1
+  fi
 }
 
 # Build repos JSON array for start/create-and-start.
@@ -202,6 +214,7 @@ build_repos_json() {
       repo_id="$spec"
       branch=""
     fi
+    validate_id "repo_id" "$repo_id"
     if [[ -z "$branch" ]]; then
       if [[ -n "$global_branch" ]]; then
         branch="$global_branch"
@@ -338,6 +351,7 @@ cmd_projects_update() {
   require_jq
   local project_id="$1"
   shift
+  validate_id "project_id" "$project_id"
   local name="" description="" has_description=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -403,6 +417,7 @@ cmd_branches() {
   require_jq
   local repo_id="$1"
   shift
+  validate_id "repo_id" "$repo_id"
   local query=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -473,6 +488,7 @@ cmd_tasks_list() {
 
 cmd_tasks_get() {
   require_jq
+  validate_id "task_id" "$1"
   api GET "/tasks/$1"
 }
 
@@ -531,6 +547,7 @@ cmd_tasks_update() {
   require_jq
   local task_id="$1"
   shift
+  validate_id "task_id" "$task_id"
   local title="" status="" desc="" iteration="" has_iteration=0 priority=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -561,12 +578,14 @@ cmd_tasks_update() {
 
 cmd_tasks_delete() {
   require_jq
+  validate_id "task_id" "$1"
   api DELETE "/tasks/$1"
 }
 
 cmd_tasks_cancel() {
   require_jq
   local task_id="$1"
+  validate_id "task_id" "$task_id"
   # Stop running workspaces first (best-effort)
   local workspaces
   workspaces=$(api GET "/task-attempts?task_id=${task_id}" 2>/dev/null || echo "[]")
@@ -586,6 +605,7 @@ cmd_start() {
   require_jq
   local task_id="$1"
   shift
+  validate_id "task_id" "$task_id"
   local executor="" variant="" branch=""
   local repo_specs=()
   while [[ $# -gt 0 ]]; do
@@ -701,6 +721,7 @@ cmd_follow_up() {
   fi
   local id="$1"
   shift
+  validate_id "task_id|workspace_id" "$id"
   local prompt="$*"
   if [[ -z "$prompt" ]]; then
     echo "error: prompt required" >&2
@@ -764,6 +785,7 @@ cmd_follow_up() {
 cmd_status() {
   require_jq
   local task_id="$1"
+  validate_id "task_id" "$task_id"
   local task workspaces summaries
   task=$(api GET "/tasks/${task_id}")
   workspaces=$(api GET "/task-attempts?task_id=${task_id}")
@@ -817,6 +839,7 @@ cmd_workspaces() {
     esac
   done
   if [[ -n "$task_id" ]]; then
+    validate_id "task_id" "$task_id"
     api GET "/task-attempts?task_id=${task_id}"
   else
     api GET "/task-attempts"
@@ -825,6 +848,7 @@ cmd_workspaces() {
 
 cmd_stop() {
   require_jq
+  validate_id "workspace_id" "$1"
   api POST "/task-attempts/$1/stop" -d '{}'
 }
 
@@ -842,6 +866,7 @@ cmd_approve() {
   require_jq
   local approval_id="$1"
   shift
+  validate_id "approval_id" "$approval_id"
   local process_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -863,6 +888,7 @@ cmd_deny() {
   require_jq
   local approval_id="$1"
   shift
+  validate_id "approval_id" "$approval_id"
   local process_id="" reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in

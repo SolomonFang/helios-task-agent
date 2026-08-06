@@ -96,7 +96,7 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 - Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
 - With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
 - `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
-- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*`), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
+- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*` — note the ocr subprocess receives your LLM key as `OCR_LLM_TOKEN`), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
 
 > **Phone reachability**: the kanban links and AI-review report links in pushed cards point at the machine running the bot. With the default `HELIOS_KANBAN_URL=http://localhost:7964`, these links **only work on that machine — they are dead links on your phone** (the bot logs a warning about this at startup). To review from your phone, set `HELIOS_KANBAN_URL` to the machine's LAN IP or Tailscale address (the board and report server must be reachable at that address). Report URLs carry a random token, and the report server binds `127.0.0.1` by default — set `HELIOS_REPORT_HOST` explicitly only if you really need to expose it.
 
@@ -172,7 +172,7 @@ via the `skill_doc` tool (progressive disclosure).
 - Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
 - Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution never joins batch approvals), and the child process inherits only a minimal environment.
 
-**Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up.
+**Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up. Note: the kanban API has no authentication — when `HELIOS_KANBAN_URL` points off-box, traffic is plaintext and unauthenticated; use only on trusted networks (LAN / Tailscale).
 
 ## Environment variables
 
@@ -212,7 +212,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 
-Bot accepts text + post; other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes.
+Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes.
 
 Memory tools: `memory_set` / `get` / `delete` / `note`. Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
 

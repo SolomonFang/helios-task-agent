@@ -1,10 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from './memory';
+import { SKILLS_DIR } from './skills';
 import type { UserMemory } from './types';
-
-/** 包内内置技能目录（兜底；npm 全局安装目录，用户不应往里放自定义技能）。 */
-export const SKILLS_DIR = path.join(__dirname, '..', 'skills');
 
 /** 用户自定义技能目录：数据目录下 skills/（升级 npm 包不会抹掉，也无安装目录写权限问题）。 */
 export function userSkillsDir(): string {
@@ -66,7 +64,8 @@ function digestSkillBody(body: string, sections: string[]): string {
   return keep.join('\n\n').slice(0, DIGEST_MAX_LEN);
 }
 
-function loadSkill(absDir: string, dirName: string): { digest: SkillDigest; problems: string[] } | null {
+/** 加载单个技能目录（SKILL.md → 摘要 + 契约问题）；无 SKILL.md 返回 null。 */
+export function loadSkill(absDir: string, dirName: string): { digest: SkillDigest; problems: string[] } | null {
   const skillFile = path.join(absDir, 'SKILL.md');
   if (!fs.existsSync(skillFile)) return null;
   const rel = path.relative(process.cwd(), absDir) || absDir;
@@ -141,37 +140,6 @@ export function validateSkills(): string[] {
     if (loaded) problems.push(...loaded.problems);
   }
   return problems;
-}
-
-/** 定位技能目录：用户目录优先，包内兜底；不存在返回 null。 */
-export function resolveSkillDir(dirName: string): string | null {
-  for (const base of [userSkillsDir(), SKILLS_DIR]) {
-    const dir = path.join(base, dirName);
-    if (fs.existsSync(path.join(dir, 'SKILL.md'))) return dir;
-  }
-  return null;
-}
-
-/** 读取技能完整文档（skill_doc 工具用）；name 为空返回技能清单文本。 */
-export function readSkillDoc(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) {
-    const digests = loadSkillDigests();
-    if (!digests.length) return '（skills/ 下没有已安装技能）';
-    return digests.map((s) => `- ${s.name}：${s.description || '（无 description）'}`).join('\n');
-  }
-  if (!/^[\w][\w.-]*$/.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
-  const dir = resolveSkillDir(trimmed);
-  if (!dir) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
-  const loaded = loadSkill(dir, trimmed);
-  if (!loaded) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
-  try {
-    const raw = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
-    const { body } = parseFrontmatter(raw);
-    return `# 技能 ${loaded.digest.name} 完整文档\n\n${body.trim()}`;
-  } catch (err) {
-    return `读取技能「${trimmed}」失败：${err instanceof Error ? err.message : err}`;
-  }
 }
 
 /** 渲染系统提示词尾部的技能摘要区块（无技能时返回空串）。 */

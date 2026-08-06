@@ -232,7 +232,7 @@ hk tasks create "Fix" --desc "Follow @coding-standards"
 
 ## Executors (from default_profiles.json)
 
-`CLAUDE_CODE`, `AMP`, `GEMINI`, `CODEX`, `COPILOT`, `REASONIX`, `CURSOR_AGENT`, `QWEN_CODE`, `OPENCODE`, `ECHO`, and others.
+`CLAUDE_CODE`, `AMP`, `GEMINI`, `CODEX`, `COPILOT`, `REASONIX`, `CURSOR_AGENT`, `QWEN_CODE`, `OPENCODE`, `KIMI_CLI`, `DROID`, `ECHO`, and others.
 
 Common variants: `DEFAULT`, `PLAN`, `OPUS`, `APPROVALS`, `FLASH`, `PRO`, `HIGH`, `MAX`.
 

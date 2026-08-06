@@ -22,4 +22,8 @@ if (unknown.length) {
   console.error(`未知参数: ${unknown.join(' ')}\n\n${USAGE}`);
   process.exit(1);
 }
-require('../dist/bot').main();
+// main() 是 async：顶层 reject 必须显式捕获，否则 unhandledRejection 打崩溃栈
+require('../dist/bot').main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

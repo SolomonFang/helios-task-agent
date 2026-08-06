@@ -22,6 +22,8 @@ export interface McpSupervisorOptions {
   onLost?: () => void;
   /** 恢复时回调。 */
   onRecovered?: () => void;
+  /** ping 挂起防护（超时按失败处理），默认 30s。 */
+  pingTimeoutMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -57,17 +59,21 @@ export class McpSupervisor {
     this.timer.unref();
   }
 
-  stop(): void {
+  /** 停止周期探测；等待在途重连结束（调用方随后会 close MCP，避免 connect 中途完成残留无人持有的子进程）。 */
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    await this.reconnecting;
   }
 
   /**
    * 轮次开始：若有重连进行中，等它结束（拿到的是重连后的新连接）。
    * 与 exitTurn 配对使用（finally）。
+   * 无重连时检查-计数在同一同步路径完成（不让出事件循环）：
+   * 否则 await 的微任务间隙 tick 可能启动重连，与「重连前确认无轮次」形成竞态。
    */
   async enterTurn(): Promise<void> {
-    await this.reconnecting;
+    if (this.reconnecting) await this.reconnecting;
     this.activeTurns++;
   }
 
@@ -82,7 +88,7 @@ export class McpSupervisor {
     try {
       const threshold = this.opts.failThreshold ?? 2;
       try {
-        await this.opts.mcp.ping();
+        await this.pingWithTimeout();
         this.failures = 0;
         if (!this.alive) {
           this.alive = true;
@@ -101,6 +107,25 @@ export class McpSupervisor {
       }
     } finally {
       this.busy = false;
+    }
+  }
+
+  /**
+   * ping 挂起防护：mcp.ping 不接收 AbortSignal，用竞速超时兜底——
+   * ping 永不 settle 时按失败处理，否则 busy 永真、健康监督静默停摆。
+   */
+  private async pingWithTimeout(): Promise<void> {
+    const ms = this.opts.pingTimeoutMs ?? 30000;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      // 不 unref：ping 挂死时这个定时器必须保证触发（它是 tick 的唯一出路）；
+      // ping 正常 settle 时 finally 立刻 clear，不会拖延进程退出
+      timer = setTimeout(() => reject(new Error(`MCP ping 超时（${Math.round(ms / 1000)}s）`)), ms);
+    });
+    try {
+      await Promise.race([this.opts.mcp.ping(), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 

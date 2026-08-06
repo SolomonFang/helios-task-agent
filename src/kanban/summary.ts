@@ -4,7 +4,17 @@
  * Read-only; individual fetch failures never abort the whole collection.
  */
 
-import { apiGet, apiPost, taskPageUrl, attemptDiffUrl, sortTaskAttempts } from './http';
+import {
+  apiGet,
+  apiPost,
+  taskPageUrl,
+  attemptDiffUrl,
+  sortTaskAttempts,
+  validateKanbanProjectRows,
+  validateSummaryTaskRows,
+  type KanbanProjectRow,
+  type SummaryTaskRow,
+} from './http';
 
 export type WorkSummaryScope = 'iteration' | 'today' | 'all';
 
@@ -52,13 +62,7 @@ export interface CollectWorkSummaryOptions {
   scope: WorkSummaryScope;
 }
 
-interface TaskRow {
-  id?: string;
-  title?: string;
-  status?: string;
-  iteration?: string | number;
-  updated_at?: string;
-}
+type TaskRow = SummaryTaskRow;
 
 interface ProjectRef {
   id: string;
@@ -151,8 +155,13 @@ async function resolveProjects(kanbanUrl: string, projectId?: string): Promise<P
     }
     return [{ id: projectId, name }];
   }
-  const list = (await apiGet(kanbanUrl, '/projects')) as Array<Record<string, unknown>>;
-  if (!Array.isArray(list)) return [];
+  const raw = await apiGet(kanbanUrl, '/projects'); // 网络错误照常上抛
+  let list: KanbanProjectRow[];
+  try {
+    list = validateKanbanProjectRows('/projects', raw);
+  } catch {
+    return []; // 返回形状不符按原 Array.isArray 兜底：视为无项目
+  }
   return list
     .map((p) => ({ id: String(p.id || ''), name: String(p.name || p.id || '') }))
     .filter((p) => p.id);
@@ -190,11 +199,13 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
   for (const project of projects) {
     let list: TaskRow[];
     try {
-      list = (await apiGet(kanbanUrl, `/tasks?project_id=${project.id}`)) as TaskRow[];
+      list = validateSummaryTaskRows(
+        `/tasks?project_id=${project.id}`,
+        await apiGet(kanbanUrl, `/tasks?project_id=${project.id}`),
+      );
     } catch {
-      continue; // 单项目失败不阻断其它项目
+      continue; // 单项目失败（网络错误或返回形状不符）不阻断其它项目
     }
-    if (!Array.isArray(list)) continue;
     for (const row of list) rows.push({ row, project });
   }
 

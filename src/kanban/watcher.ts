@@ -1,7 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 import { writeFilePrivateSync } from '../private-file';
-import { apiGet, taskPageUrl, attemptDiffUrl, pickLatestAttempt } from './http';
+import {
+  apiGet,
+  taskPageUrl,
+  attemptDiffUrl,
+  pickLatestAttempt,
+  validateKanbanTaskRows,
+  validateKanbanProjectRows,
+  type KanbanTaskRow,
+  type KanbanProjectRow,
+} from './http';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -33,14 +42,6 @@ interface WatchState {
   approvals: WatchApproval[];
   /** 未全员送达的事件：eventId → 送达进度，随 state 文件持久化，下轮仅重投未送达组合。 */
   pending?: Record<string, PendingWatchEvent>;
-}
-
-interface KanbanTaskRow {
-  id?: string;
-  title?: string;
-  status?: string;
-  has_in_progress_attempt?: boolean;
-  last_attempt_failed?: boolean;
 }
 
 export type WatchEventKind = 'review' | 'done' | 'cancelled' | 'failed' | 'approvals';
@@ -269,7 +270,13 @@ export class KanbanWatcher {
       }
       if (Object.keys(pendingOut).length) next.pending = pendingOut;
       this.state = next;
-      this.persist();
+      // 仅在快照有变化或本轮碰过待重投队列（含刚清零需落盘出队的）时写盘，
+      // 无变化的空转 tick 不重复写 state 文件
+      const snapshotChanged =
+        JSON.stringify(current.tasks) !== JSON.stringify(prev.tasks) ||
+        JSON.stringify(current.approvals) !== JSON.stringify(prev.approvals);
+      const pendingTouched = Object.keys(pending).length > 0 || Boolean(prev.pending && Object.keys(prev.pending).length);
+      if (snapshotChanged || pendingTouched) this.persist();
       if (failed) {
         this.opts.log?.(`${failed} 个 (事件, owner) 组合推送失败，已记入待重投队列，下轮仅重试未送达组合`);
       }
@@ -284,8 +291,15 @@ export class KanbanWatcher {
     const projectIds = this.opts.projectId ? [this.opts.projectId] : await this.fetchProjectIds();
     const tasks: Record<string, WatchTaskState> = {};
     for (const pid of projectIds) {
-      const list = (await this.api(`/tasks?project_id=${pid}`)) as KanbanTaskRow[];
-      if (!Array.isArray(list)) continue;
+      const raw = await this.api(`/tasks?project_id=${pid}`); // 网络错误照常上抛（tick 统一记轮询失败）
+      let list: KanbanTaskRow[];
+      try {
+        list = validateKanbanTaskRows(`/tasks?project_id=${pid}`, raw);
+      } catch (err) {
+        // 返回形状不符按原 Array.isArray 兜底语义跳过该项目，但记日志留信号
+        this.opts.log?.(err instanceof Error ? err.message : String(err));
+        continue;
+      }
       for (const t of list) {
         if (!t.id) continue;
         tasks[t.id] = {
@@ -299,10 +313,12 @@ export class KanbanWatcher {
     }
     let approvals: WatchApproval[] = [];
     try {
-      const list = (await this.api('/approvals')) as Array<Record<string, unknown>>;
-      if (Array.isArray(list)) {
-        approvals = list
-          .filter((a) => /pending/i.test(JSON.stringify(a)))
+      const raw = await this.api('/approvals');
+      if (Array.isArray(raw)) {
+        approvals = raw
+          .filter((a): a is Record<string, unknown> => Boolean(a && typeof a === 'object' && !Array.isArray(a)))
+          // 只看审批条目的状态字段：整行 JSON 匹配会把标题等任意字段里含 pending 的误算成待审批
+          .filter((a) => /pending/i.test(String(a.status ?? a.state ?? '')))
           .map((a) => {
             const id = String(a.id || '');
             const label = String(a.title || a.task_title || a.name || a.summary || id);
@@ -329,8 +345,16 @@ export class KanbanWatcher {
   }
 
   private async fetchProjectIds(): Promise<string[]> {
-    const list = (await this.api('/projects')) as Array<{ id?: string }>;
-    return Array.isArray(list) ? list.map((p) => p.id || '').filter(Boolean) : [];
+    const raw = await this.api('/projects'); // 网络错误照常上抛
+    let list: KanbanProjectRow[];
+    try {
+      list = validateKanbanProjectRows('/projects', raw);
+    } catch (err) {
+      // 形状不符按原 Array.isArray 兜底：视为无项目（记日志留信号）
+      this.opts.log?.(err instanceof Error ? err.message : String(err));
+      return [];
+    }
+    return list.map((p) => p.id || '').filter(Boolean);
   }
 
   private taskUrl(projectId: string, taskId: string): string {

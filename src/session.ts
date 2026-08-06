@@ -14,6 +14,9 @@ import type {
   UserMemory,
 } from './types';
 
+/** 待注入后台事件的缓存上限：超出丢弃最旧，避免 watcher 风暴/积压撑爆上下文。 */
+const MAX_PENDING_NOTES = 20;
+
 export interface AgentSessionOptions {
   /** CLI 默认 local；飞书通道传 open_id。 */
   userId?: string;
@@ -156,7 +159,13 @@ export class AgentSession {
     // 不直接插入历史：后台事件可能在 tool 轮次中途（assistant(tool_calls) 与其 tool
     // 响应之间，例如等待写确认时）到达，直接 push 会破坏配对，导致后续请求被 API 拒绝。
     // 缓存到下一轮用户消息的轮边界再注入。
+    // 去重：watcher 推送失败会重投同一事件，相同 note 只保留一条，不随重投次数叠加。
+    if (this.pendingNotes.includes(note)) return;
     this.pendingNotes.push(note);
+    // 上限兜底：积压过多时丢弃最旧
+    if (this.pendingNotes.length > MAX_PENDING_NOTES) {
+      this.pendingNotes.splice(0, this.pendingNotes.length - MAX_PENDING_NOTES);
+    }
   }
 
   /**

@@ -42,6 +42,11 @@ export class KanbanMcp {
       this.tools = tools || [];
       this.client = client;
       return this.tools;
+    } catch (err) {
+      // 快速失败路径（connect 在超时前 reject）：超时定时器尚未触发，transport 未关闭，
+      // 不主动关会泄漏 stdio 子进程（超时已触发过的重复 close 无害）
+      await transport.close().catch(() => {});
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -59,7 +64,8 @@ export class KanbanMcp {
   /** Liveness probe used by the supervisor (listTools is known to be supported). */
   async ping(): Promise<void> {
     if (!this.client) throw new Error('MCP 未连接');
-    await this.client.listTools();
+    // 显式 30s 超时，不依赖 SDK 隐式默认值
+    await this.client.listTools(undefined, { timeout: 30000 });
   }
 
   /** Drop the current client and establish a fresh stdio connection. */
@@ -70,10 +76,11 @@ export class KanbanMcp {
 
   async callTool(name: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
     if (!this.client) throw new Error('MCP 未连接');
+    // 显式 60s 超时（与 SDK 默认值一致，但不依赖隐式默认）；调用方 signal 仍可提前中断
     const result = await this.client.callTool(
       { name, arguments: args || {} },
       undefined,
-      signal ? { signal } : undefined,
+      { timeout: 60000, ...(signal ? { signal } : {}) },
     );
     const content = Array.isArray(result.content) ? result.content : [];
     const parts = content.map((block: { type: string; text?: string }) => {
@@ -110,4 +117,26 @@ export function diagnoseMcpFailure(stderrTail: string): string | null {
     );
   }
   return null;
+}
+
+export interface McpBootResult {
+  mcp: KanbanMcp;
+  ok: boolean;
+  /** 连接失败的错误信息（ok=false 时有值）。 */
+  error?: string;
+  /** 已知失败模式的排查提示（未命中为 null）。 */
+  hint: string | null;
+}
+
+/** 连接 kanban MCP（45s 超时）；失败不抛出（调用方按通道风格提示降级），返回诊断 hint。 */
+export async function connectMcp(cfg: { mcpCommand: string; mcpArgs: string[] }): Promise<McpBootResult> {
+  const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
+  try {
+    await mcp.connect({ timeoutMs: 45000 });
+    return { mcp, ok: true, hint: null };
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    if (process.env.HTA_DEBUG) console.error(`\n[mcp] ${e.stack || e.message}`);
+    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail()) };
+  }
 }

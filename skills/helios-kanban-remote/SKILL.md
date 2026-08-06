@@ -130,6 +130,10 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 | Reasonix | `REASONIX` |
 | Cursor | `CURSOR_AGENT` |
 | Copilot | `COPILOT` |
+| Kimi / Kimi CLI | `KIMI_CLI` |
+| Qwen / Qwen Code | `QWEN_CODE` |
+| OpenCode | `OPENCODE` |
+| Droid | `DROID` |
 
 ## Task statuses
 
@@ -176,7 +180,7 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 {
   "helios_kanban": {
     "command": "npx",
-    "args": ["-y", "helios-kanban@latest", "--mcp"]
+    "args": ["-y", "helios-kanban@0.1.39", "--mcp"]
   }
 }
 ```

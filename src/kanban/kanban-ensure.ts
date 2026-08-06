@@ -134,7 +134,8 @@ export async function ensureKanbanRunning(
     spawnFailure.err = err;
   });
   child.stderr?.on('data', (chunk: Buffer) => {
-    stderrBuf += chunk.toString();
+    // 环形截断只留尾部（64KB）：等待窗口内子进程可能持续刷 stderr，无界累积会撑爆内存
+    stderrBuf = (stderrBuf + chunk.toString()).slice(-65536);
     if (process.env.HTA_DEBUG) process.stderr.write(`[kanban] ${chunk}`);
   });
   child.stdout?.on('data', (chunk: Buffer) => {

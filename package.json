@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
-    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts",
+    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts && tsx scripts/unit-coverage.ts",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",

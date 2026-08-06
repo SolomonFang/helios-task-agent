@@ -146,7 +146,19 @@ async function main(): Promise<void> {
   child.stdin.write('创建一个测试任务然后删掉\ny\ny\n/exit\n');
   child.stdin.end();
 
-  const code = await new Promise<number>((resolve) => child.on('close', (c) => resolve(c ?? 1)));
+  // 总超时保护：子进程挂起时 kill 并计失败，不能永久卡住 npm run verify
+  const E2E_TIMEOUT_MS = 180_000;
+  let timedOut = false;
+  const code = await new Promise<number>((resolve) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, E2E_TIMEOUT_MS);
+    child.on('close', (c) => {
+      clearTimeout(timer);
+      resolve(c ?? 1);
+    });
+  });
   server.close();
   try {
     fs.rmSync(tmpHome, { recursive: true, force: true });
@@ -155,6 +167,7 @@ async function main(): Promise<void> {
   }
 
   const failures: string[] = [];
+  if (timedOut) failures.push(`agent 超过 ${E2E_TIMEOUT_MS / 1000}s 未退出，已强制 kill`);
   if (code !== 0) failures.push(`agent 退出码 ${code}`);
   if (state.error) failures.push('mock 侧错误: ' + state.error);
   if (!state.projectId) failures.push('未能从 list_projects 获取 project_id');

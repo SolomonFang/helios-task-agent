@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { probeLarkCliAuth, checkHkDeps, HK_CLI_INSTALL_HINT } from './deps';
+import { HK_CLI_INSTALL_HINT } from './deps';
 
 const ESC = '\u001b';
 
@@ -93,7 +93,12 @@ export interface BannerStatus {
   baseUrl: string;
   mcp: 'pending' | 'ok' | 'fail';
   mcpToolCount?: number;
+  /** lark-cli 二进制是否存在（调用方探测，如 checkLarkCliStatus() !== 'missing'）。 */
   larkOk: boolean;
+  /** lark-cli 是否已授权（调用方探测；larkOk=false 时忽略）。 */
+  larkAuthed: boolean;
+  /** hk_cli 降级链缺失的依赖（调用方探测，如 checkHkDeps()；空数组 = 齐全）。 */
+  hkMissing: string[];
   kanbanUrl: string;
   version: string;
 }
@@ -103,8 +108,8 @@ export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口
 
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
-  // 探测 hk_cli 降级链依赖（jq/curl）：缺失时 MCP 掉线文案的「已自动切换为 hk_cli」不成立，必须警示
-  const hkMissing = checkHkDeps();
+  // 探测由调用方完成（hkMissing / larkAuthed）：ui 只做渲染，不反向依赖 deps 层
+  const hkMissing = status.hkMissing;
   const mcpSuffix =
     status.mcp === 'fail'
       ? hkMissing.length
@@ -117,8 +122,8 @@ export function printBanner(status: BannerStatus): void {
       : status.mcp === 'fail'
         ? c.warn('●') + ` helios-kanban MCP  连接失败${mcpSuffix}`
         : c.warn('●') + ' helios-kanban MCP  连接中…';
-  // larkOk 只代表二进制存在（调用方传 checkLarkCli()），在此补探测授权态，区分未安装/未授权/可用
-  const larkAuthed = status.larkOk ? probeLarkCliAuth() === 'ok' : false;
+  // larkOk 只代表二进制存在，授权态用调用方传入的 larkAuthed，区分未安装/未授权/可用
+  const larkAuthed = status.larkOk && status.larkAuthed;
   const larkLine = !status.larkOk
     ? c.warn('●') + ' lark-cli         未找到，飞书能力不可用（可选，见下方安装提示）'
     : larkAuthed

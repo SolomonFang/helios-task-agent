@@ -10,6 +10,14 @@ export type RepoStartInput = {
   base_branch?: string | null;
 };
 
+/** 运行时校验 RepoStartInput：对象、repo_id 为非空字符串、base_branch 存在则为 string/null。 */
+export function isRepoStartInput(v: unknown): v is RepoStartInput {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.repo_id !== 'string' || !o.repo_id) return false;
+  return o.base_branch === undefined || o.base_branch === null || typeof o.base_branch === 'string';
+}
+
 export type WorkspaceSetupState = 'ready' | 'pending' | 'failed';
 
 export interface WorkspaceSnapshot {
@@ -67,7 +75,11 @@ export async function fillHkStartBranches(
     });
     repos = repoArgs.map((i) => ({ repo_id: argv[i]! }));
   } else {
-    repos = target as RepoStartInput[];
+    // 数据可能直接来自 MCP 入参：逐元素运行时校验，坏输入直接报错而不是静默错位回填
+    const rows = target as unknown[];
+    const bad = rows.findIndex((r) => !isRepoStartInput(r));
+    if (bad >= 0) return `无法启动 workspace：repos[${bad}] 不是有效的 { repo_id: string } 输入`;
+    repos = rows as RepoStartInput[];
   }
   if (!repos.length) return noRepoError ?? null;
   const defaults = await fetchRepoDefaultBranches(
@@ -81,7 +93,7 @@ export async function fillHkStartBranches(
     const argv = target as string[];
     for (const i of repoArgs) argv[i] = `${argv[i]}:${defaults[argv[i]!]}`;
   } else {
-    const out = target as RepoStartInput[];
+    const out = target as unknown[];
     for (let i = 0; i < out.length; i++) out[i] = filled[i]!;
   }
   return null;
@@ -135,10 +147,11 @@ export async function fetchRepoDefaultBranches(
   await Promise.all(
     repoIds.map(async (id) => {
       try {
-        const json = (await apiGet(kanbanUrl, `/repos/${id}`, { timeoutMs: 8000, signal })) as {
-          default_target_branch?: string | null;
-        } | null;
-        const branch = json?.default_target_branch ?? null;
+        const json: unknown = await apiGet(kanbanUrl, `/repos/${id}`, { timeoutMs: 8000, signal });
+        const branch =
+          json && typeof json === 'object'
+            ? (json as { default_target_branch?: unknown }).default_target_branch
+            : null;
         out[id] = typeof branch === 'string' && branch.trim() ? branch.trim() : null;
       } catch {
         out[id] = null;
@@ -154,13 +167,13 @@ export async function fetchWorkspaceSnapshot(
   signal?: AbortSignal,
 ): Promise<WorkspaceSnapshot | null> {
   try {
-    const data = (await apiGet(kanbanUrl, `/task-attempts/${workspaceId}`, { timeoutMs: 8000, signal })) as
-      | WorkspaceSnapshot
-      | null;
-    if (!data || typeof data !== 'object') return null;
+    const data: unknown = await apiGet(kanbanUrl, `/task-attempts/${workspaceId}`, { timeoutMs: 8000, signal });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const o = data as Record<string, unknown>;
+    // 字段存在但类型不对（如 container_ref 非字符串）按缺失处理，不把脏数据当 ready
     return {
-      container_ref: data.container_ref ?? null,
-      setup_completed_at: data.setup_completed_at ?? null,
+      container_ref: typeof o.container_ref === 'string' ? o.container_ref : null,
+      setup_completed_at: typeof o.setup_completed_at === 'string' ? o.setup_completed_at : null,
     };
   } catch {
     return null;
@@ -173,10 +186,11 @@ export async function fetchWorkspaceTargetBranches(
   signal?: AbortSignal,
 ): Promise<string[]> {
   try {
-    const rows = (await apiGet(kanbanUrl, `/task-attempts/${workspaceId}/repos`, { timeoutMs: 8000, signal })) as Array<{
-      target_branch?: string;
-    }> | null;
-    return (rows || []).map((r) => r.target_branch).filter((b): b is string => Boolean(b));
+    const rows: unknown = await apiGet(kanbanUrl, `/task-attempts/${workspaceId}/repos`, { timeoutMs: 8000, signal });
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => (r && typeof r === 'object' ? (r as { target_branch?: unknown }).target_branch : undefined))
+      .filter((b): b is string => typeof b === 'string' && Boolean(b));
   } catch {
     return [];
   }

@@ -249,6 +249,8 @@ export class FeishuChannel implements AgentChannel {
             if (!persisted) {
               // fail-closed：绑定未写回 .env，撤销内存放行并阻断重试（重启前该用户按拒绝处理）
               this.access.unclaim(openId);
+              // Set 无清理会无界增长：超上限整体清空（代价只是老条目重新判定一次）
+              if (this.claimBlocked.size >= 1000) this.claimBlocked.clear();
               this.claimBlocked.add(openId);
               console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${openId}`);
               return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
@@ -258,6 +260,8 @@ export class FeishuChannel implements AgentChannel {
           if (access === 'deny') {
             console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
             if (!this.deniedNotified.has(openId)) {
+              // Set 无清理会无界增长：超上限整体清空（代价只是老用户再收一次提醒）
+              if (this.deniedNotified.size >= 1000) this.deniedNotified.clear();
               this.deniedNotified.add(openId);
               void this.notifyOpenId(
                 openId,

@@ -4,24 +4,7 @@ import assert from 'node:assert/strict';
 import { parseBotArgs } from '../src/bot';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/update-check';
 import { FeishuChannel } from '../src/channels/feishu';
-
-let failures = 0;
-function check(name: string, ok: boolean): void {
-  if (ok) console.log(`ok   ${name}`);
-  else {
-    failures++;
-    console.error(`FAIL ${name}`);
-  }
-}
-async function checkAsync(name: string, fn: () => Promise<void>): Promise<void> {
-  try {
-    await fn();
-    console.log(`ok   ${name}`);
-  } catch (err) {
-    failures++;
-    console.error(`FAIL ${name}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
+import { check, checkAsync, finish } from './testkit';
 
 async function main(): Promise<void> {
   // ---------- bot 参数解析（--rebind / --reconfig） ----------
@@ -90,8 +73,7 @@ async function main(): Promise<void> {
     await ch.stop();
   });
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

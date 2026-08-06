@@ -17,6 +17,7 @@ import { defaultDataHome } from './memory';
 import { escapeHtml } from './report';
 import { writeFilePrivateSync } from './private-file';
 import { newReportToken } from './report-server';
+import { pruneOldReports, sanitizeName } from './report-utils';
 
 export interface ReviewReportData {
   /** 任务标题。 */
@@ -622,37 +623,15 @@ export function renderReviewHtml(data: ReviewReportData): string {
 `;
 }
 
-function sanitizeName(s: string): string {
-  return s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'review';
-}
-
 export function reviewsDir(): string {
   return path.join(defaultDataHome(), 'reviews');
-}
-
-/** 清理 30 天前的历史报告，避免目录无界增长。 */
-function pruneOldReports(dir: string, keepDays = 30): void {
-  try {
-    const cutoff = Date.now() - keepDays * 24 * 3600 * 1000;
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.endsWith('.html')) continue;
-      const p = path.join(dir, name);
-      try {
-        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
-      } catch {
-        /* 单个文件失败不阻断 */
-      }
-    }
-  } catch {
-    /* 目录不可读时跳过清理 */
-  }
 }
 
 /** 渲染并写入 HTML 报告（0600），返回文件名（不含目录）；文件名带随机 token 作为访问凭证。 */
 export function writeReviewReport(data: ReviewReportData, dir = reviewsDir()): string {
   fs.mkdirSync(dir, { recursive: true });
   pruneOldReports(dir);
-  const name = `review-${sanitizeName(data.title).slice(0, 40)}-${newReportToken()}-${sanitizeName(data.attemptId).slice(0, 24)}-${Date.now()}.html`;
+  const name = `review-${sanitizeName(data.title, 'review').slice(0, 40)}-${newReportToken()}-${sanitizeName(data.attemptId, 'review').slice(0, 24)}-${Date.now()}.html`;
   writeFilePrivateSync(path.join(dir, name), renderReviewHtml(data));
   return name;
 }

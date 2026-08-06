@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import os from 'os';
@@ -52,12 +52,10 @@ export interface OcrCommand {
   via: 'path' | 'npx';
 }
 
-function isGitRepo(dir: string): boolean {
+/** 异步探测（bot 事件循环内路径）：同步 execFileSync 每个最多阻塞 5s，飞书回调/心跳全卡。 */
+async function isGitRepo(dir: string): Promise<boolean> {
   try {
-    execFileSync('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5000,
-    });
+    await execFileP('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'], { timeout: 5000 });
     return true;
   } catch {
     return false;
@@ -97,7 +95,7 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
     if (p) candidates.push(p);
   }
   for (const dir of candidates) {
-    if (fs.existsSync(dir) && isGitRepo(dir)) {
+    if (fs.existsSync(dir) && (await isGitRepo(dir))) {
       const fromRef = repos.map((r) => (r.target_branch || '').trim()).find(Boolean) || undefined;
       const toRef = (attempt.branch || '').trim() || undefined;
       return { repoDir: dir, fromRef, toRef };
@@ -151,10 +149,10 @@ export function buildOcrEnv(
   return out;
 }
 
-/** ocr 可执行命令：PATH 优先，缺失回退 npx 钉版本包（首次会下载，缓存后同速）。 */
-export function findOcrCommand(env: NodeJS.ProcessEnv = process.env): OcrCommand {
+/** ocr 可执行命令：PATH 优先，缺失回退 npx 钉版本包（首次会下载，缓存后同速）。异步探测（同 isGitRepo，避免阻塞 bot 事件循环）。 */
+export async function findOcrCommand(env: NodeJS.ProcessEnv = process.env): Promise<OcrCommand> {
   try {
-    execFileSync('ocr', ['version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env });
+    await execFileP('ocr', ['version'], { timeout: 5000, env });
     return { cmd: 'ocr', prefixArgs: [], via: 'path' };
   } catch {
     return { cmd: 'npx', prefixArgs: ['-y', ocrPackageSpec(env)], via: 'npx' };
@@ -184,7 +182,7 @@ const LANG_HINT = '输出要求：请全程使用简体中文撰写审查结论�
 /** 执行 AI 审查，返回完整文本结果（不截断，完整内容供 HTML 报告使用）；失败抛出带排查信息的中文错误。 */
 export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
   const target = await resolveReviewTarget(opts.kanbanUrl, opts.attemptId);
-  const ocr = findOcrCommand(opts.env);
+  const ocr = await findOcrCommand(opts.env);
   const args = [...ocr.prefixArgs, 'review', '--repo', target.repoDir];
   if (target.fromRef && target.toRef) {
     args.push('--from', target.fromRef, '--to', target.toRef);

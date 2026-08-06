@@ -25,14 +25,16 @@ import { startReportServer, type ReportServer } from './report-server';
 import { checkLarkCliStatus, checkOcrCli, kanbanManualStartHint, LARK_CLI_INSTALL_HINT, LARK_CLI_AUTH_HINT, OCR_INSTALL_HINT } from './deps';
 import { wrapUntrusted } from './guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
-import { connectMcp, TRY_EXAMPLES } from './commands';
+import { connectMcp } from './kanban/mcp';
+import { TRY_EXAMPLES } from './commands';
 import { validateSkills } from './prompt';
+import { wizardAskSecret, wizardChoose } from './wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
 import { createBotHandlers } from './bot/handler';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
-import { c, readSecret, selectList, MCP_FALLBACK_TEXT } from './ui';
+import { c, MCP_FALLBACK_TEXT } from './ui';
 
 const BOT_HELP = `Helios Task Agent（飞书私聊）
 
@@ -79,28 +81,9 @@ function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: 
       rl.once('close', () => resolve(null));
     });
   const isTTY = process.stdin.isTTY === true;
-  // 与终端一致的向导体验：箭头选择列表 + 密钥掩码输入（仅 TTY）
-  const askSecret: AskFn | undefined = isTTY
-    ? async (promptText) => {
-        rl.pause();
-        try {
-          return await readSecret(promptText);
-        } finally {
-          rl.resume();
-        }
-      }
-    : undefined;
-  const choose: ChooseFn = async (presets) => {
-    rl.pause();
-    try {
-      // 与 CLI 一致：重配时在标题里给出当前模型
-      const current = currentConfig().llmModel;
-      const title = `配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：`;
-      return await selectList({ title, options: presets });
-    } finally {
-      rl.resume();
-    }
-  };
+  // 与终端一致的向导体验：箭头选择列表 + 密钥掩码输入（仅 TTY），交互原语见 wizard-io
+  const askSecret = wizardAskSecret(rl, isTTY);
+  const choose: ChooseFn = wizardChoose(rl);
   return {
     ask,
     askSecret,
@@ -138,7 +121,8 @@ async function main(): Promise<void> {
     forceTimer.unref();
     console.log('\n' + c.gray('正在退出…'));
     try {
-      cleanup.supervisor?.stop();
+      // 先等在途重连结束再 close MCP：connect 中途完成会残留无人持有的子进程
+      await cleanup.supervisor?.stop();
       cleanup.wsAlerter?.stop();
       cleanup.watcher?.stop();
       cleanup.reportServer?.close();

@@ -97,7 +97,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
 
 > **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）；如需在手机上点按钮审查，请把 `HELIOS_KANBAN_URL` 配置为该机器的局域网 IP 或 Tailscale 地址（看板与报告服务需同步可从该地址访问）。报告 URL 带随机 token，且报告服务默认只绑 `127.0.0.1`——确需对外暴露时显式设置 `HELIOS_REPORT_HOST`。
 
@@ -174,7 +174,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 - 用户侧可用 `/skills`（CLI 与飞书 bot 一致）或直接问「你有什么技能」查看已安装技能。
 - 技能自带脚本（node/shell/python 等）可直接运行：在 SKILL.md 里写明用法，agent 会用 `skill_exec` 工具执行——脚本路径限定在技能目录内（拒绝 `..`/绝对路径/符号链接逃逸），按扩展名自动选解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录，**每次执行都向用户弹确认**（任意代码执行，不参与「同类免问」），子进程只继承最小环境变量。
 
-**看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。
+**看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。注意：看板 API 无鉴权，`HELIOS_KANBAN_URL` 指向非本机地址时流量为明文且无认证，请仅在可信网络（内网 / Tailscale）使用。
 
 ## 环境变量
 
@@ -224,7 +224,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 - 「用 Claude 跑这个任务」「start」（你指定何时、用谁）
 - 「有哪些项目」「创建一个任务：…」「跑得怎么样」「再跟它说一句…」
 
-bot 支持文字与 post（富文本：链接/@/图片/文件/代码块等转纯文本）；其它消息类型会提示不支持。长回复按约 3000 字拆分；进度约每 2 秒原地更新。同一 `message_id` 10 分钟内去重。每用户消息串行；忙或确认挂起时新消息会收到排队/提示回执。
+bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯文本）；其它消息类型会提示不支持。长回复按约 3000 字拆分；进度约每 2 秒原地更新。同一 `message_id` 10 分钟内去重。每用户消息串行；忙或确认挂起时新消息会收到排队/提示回执。
 
 记忆按飞书 `open_id`（bot）或 `local`（终端）分桶。工具：`memory_set` / `get` / `delete` / `note`（备注约保留最近 50 条）。常用键：`feishu_task_source`、`feishu_chat_id`、`preferred_project_id` / `repo_id` / `iteration`、`last_sync_at`。
 

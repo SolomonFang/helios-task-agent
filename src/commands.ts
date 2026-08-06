@@ -4,12 +4,11 @@
  * 与少量文案参数保留；文案、顺序与降级逻辑与两端原实现一致（纯重构）。
  */
 
-import { KanbanMcp, diagnoseMcpFailure } from './kanban/mcp';
 import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
+import { fetchKanbanHealth } from './kanban/http';
 import { LOCAL_TOOL_SUMMARY } from './tools';
 import { loadSkillDigests } from './prompt';
 import { friendlyLlmError } from './llm-error';
-import type { AgentConfig } from './types';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 /** 输出着色适配：CLI 传 ui.c，bot 传 plainPaint。 */
@@ -39,40 +38,6 @@ export function parseCommand(text: string): string | null {
   const t = text.trim();
   if (!t.startsWith('/')) return null;
   return t.split(/\s+/)[0]!.toLowerCase();
-}
-
-export interface McpBootResult {
-  mcp: KanbanMcp;
-  ok: boolean;
-  /** 连接失败的错误信息（ok=false 时有值）。 */
-  error?: string;
-  /** 已知失败模式的排查提示（未命中为 null）。 */
-  hint: string | null;
-}
-
-/** 连接 kanban MCP（45s 超时）；失败不抛出（调用方按通道风格提示降级），返回诊断 hint。 */
-export async function connectMcp(cfg: Pick<AgentConfig, 'mcpCommand' | 'mcpArgs'>): Promise<McpBootResult> {
-  const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
-  try {
-    await mcp.connect({ timeoutMs: 45000 });
-    return { mcp, ok: true, hint: null };
-  } catch (err) {
-    const e = err instanceof Error ? err : new Error(String(err));
-    if (process.env.HTA_DEBUG) console.error(`\n[mcp] ${e.stack || e.message}`);
-    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail()) };
-  }
-}
-
-/** /status 的 kanban 健康探测：'ok' / 'HTTP <code>' / '不可达'。 */
-export async function fetchKanbanHealth(kanbanUrl: string): Promise<string> {
-  try {
-    const res = await fetch(`${kanbanUrl.replace(/\/+$/, '')}/api/health`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    return res.ok ? 'ok' : `HTTP ${res.status}`;
-  } catch {
-    return '不可达';
-  }
 }
 
 /** /status 内容行（通道自己的标题/缩进由调用方加）；extra 为 bot 专属的 ocr / 推送行。 */

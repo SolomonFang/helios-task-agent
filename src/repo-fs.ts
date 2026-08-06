@@ -5,6 +5,7 @@ const MAX_OUTPUT = 8000;
 const MAX_GREP_HITS = 40;
 const MAX_LIST_ENTRIES = 200;
 const MAX_READ_BYTES = 200_000;
+const MAX_PATTERN_LEN = 200;
 
 export function truncateOutput(s: string, max = MAX_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
@@ -195,6 +196,8 @@ function matchesGlob(fileName: string, relFile: string, globHint?: string): bool
 
 export function repoFsGrep(root: string, pattern: string, relPath = '.', globHint?: string): string {
   if (!pattern) return '参数错误：grep 需要 pattern';
+  // pattern 来自模型生成：限制长度缓解 ReDoS，编译异常友好报错
+  if (pattern.length > MAX_PATTERN_LEN) return `参数错误：pattern 过长（>${MAX_PATTERN_LEN} 字符），请缩短后重试`;
   let re: RegExp;
   try {
     re = new RegExp(pattern, 'i');

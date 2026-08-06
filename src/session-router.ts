@@ -10,6 +10,8 @@ import { AgentSession } from './session';
  */
 export class SessionRouter {
   private static MAX_SESSIONS = 50;
+  /** 每用户排队消息上限：超出拒收（handler 层据此回复「排队已满」），防止队列无界堆积。 */
+  private static MAX_QUEUED = 20;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly queues = new Map<string, Promise<void>>();
   /** 每用户排队代际：/stop 时 +1，未开始的排队项据此自我丢弃。 */
@@ -53,6 +55,9 @@ export class SessionRouter {
       for (const key of this.sessions.keys()) {
         if (!this.busy(key)) {
           this.sessions.delete(key);
+          // 代际/排队计数随会话一并清理，否则两个 Map 不随 LRU 收敛
+          this.epochs.delete(key);
+          this.queuedCounts.delete(key);
           break;
         }
       }
@@ -84,6 +89,11 @@ export class SessionRouter {
     return this.queuedCounts.get(openId) || 0;
   }
 
+  /** 排队是否已达上限（handler 据此拒收并提示「排队已满」，不再入队）。 */
+  queueFull(openId: string): boolean {
+    return this.queuedCount(openId) >= SessionRouter.MAX_QUEUED;
+  }
+
   /**
    * 丢弃该用户所有未开始的排队消息（/stop）：递增代际，轮到它们时自行跳过。
    * 正在执行的那条不受影响（由调用方用 AbortController 中断）。返回丢弃条数。
@@ -95,7 +105,7 @@ export class SessionRouter {
   }
 
   /** Run work for a user strictly in order (prevents overlapping tool rounds). */
-  enqueue(openId: string, work: () => Promise<void>): Promise<void> {
+  enqueue(openId: string, work: () => Promise<void>, onDropped?: () => void): Promise<void> {
     const epoch = this.epochs.get(openId) || 0;
     const prev = this.queues.get(openId) || Promise.resolve();
     this.queuedCounts.set(openId, this.queuedCount(openId) + 1);
@@ -105,7 +115,11 @@ export class SessionRouter {
       })
       .then(() => {
         this.queuedCounts.set(openId, Math.max(0, this.queuedCount(openId) - 1));
-        if ((this.epochs.get(openId) || 0) !== epoch) return; // 已被 /stop 丢弃
+        if ((this.epochs.get(openId) || 0) !== epoch) {
+          // 已被 /stop 丢弃：回调给调用方兜底清理（如移除敲键盘表情，不等下一次 /stop）
+          onDropped?.();
+          return;
+        }
         return work();
       });
     // 注意：必须引用同一个 promise 做比较——之前把 finally 的新 promise 存入 map、

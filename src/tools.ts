@@ -3,7 +3,7 @@ import fs from 'fs';
 import { execFile } from 'child_process';
 import type { KanbanMcp } from './kanban/mcp';
 import type { MemoryStore } from './memory';
-import type { OpenAiTool, ToolHandlers } from './types';
+import type { OpenAiTool, ToolHandlers, UserMemory } from './types';
 import { runRepoFs } from './repo-fs';
 import {
   classifyHk,
@@ -30,7 +30,7 @@ import {
 } from './kanban/workspace-ready';
 import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
 import { summarizeForChat, writeSummaryReports } from './report';
-import { readSkillDoc, resolveSkillDir } from './prompt';
+import { readSkillDoc, resolveSkillDir } from './skills';
 import { minimalChildEnv } from './proc-env';
 
 const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
@@ -480,6 +480,63 @@ export function buildTools({
     for (const url of urls) reg.record(uid, url, entry);
   };
 
+  /**
+   * MCP 动态工具与 hk_cli 共用的写路径流水线：
+   * 去重 → 创建上限 → 前置补全（start 分支等）→ 确认闸门 → 执行 → 审计 → 记录来源。
+   * 差异点全部参数化：审计 kind、summary/detail（detail 传 getter，前置补全改写命令后取最新值）、
+   * 批量免问 batchKey、来源 URL 提取方式、执行体。
+   */
+  const runGatedWrite = async (p: {
+    kind: 'kanban' | 'hk';
+    summary: string;
+    detail: () => string;
+    isCreate: boolean;
+    isStart: boolean;
+    urls: string[];
+    title: string;
+    batchKey?: string;
+    /** start 前置补全（可能改写命令参数）；返回错误消息则审计 error 并拦截。 */
+    prepare?: () => Promise<string | null>;
+    execute: () => Promise<string>;
+    signal?: AbortSignal;
+  }): Promise<string> => {
+    if (p.urls.length) {
+      const dup = await checkDuplicates(p.urls);
+      if (dup) {
+        auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'blocked_dup' }, auditHome);
+        return dup;
+      }
+    }
+    if (p.isCreate && createCount >= MAX_CREATES_PER_SESSION) {
+      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'denied' }, auditHome);
+      return CREATE_CAP_MESSAGE;
+    }
+    if (p.prepare) {
+      const prepErr = await p.prepare();
+      if (prepErr) {
+        auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'error' }, auditHome);
+        return prepErr;
+      }
+    }
+    const gate = await passGate({ kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    let result = await p.execute();
+    if (p.isStart && !looksLikeStrongFailure(result)) {
+      result = await appendWorkspaceReadyCheck(result, kanbanUrl, p.signal);
+    }
+    const ok = !looksLikeStrongFailure(result) && !/⚠️ setup 未完成/.test(result);
+    auditLog(
+      { user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'approved', ok, resultSnippet: result },
+      auditHome,
+    );
+    if (ok && p.urls.length) recordSources(p.urls, result, p.title);
+    if (ok && p.isCreate) createCount++;
+    return wrapUntrusted(result);
+  };
+
   if (mcp && mcp.connected) {
     for (const tool of mcp.tools) {
       const name = `kanban_${tool.name}`;
@@ -504,53 +561,31 @@ export function buildTools({
             return `MCP 工具 ${tool.name} 调用失败: ${message}`;
           }
         }
-        // write path: dedupe → cap → gate → execute → audit (+record)
+        // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
         const summary = summarizeMcp(tool.name, args);
         const detail = formatMcpDetail(tool.name, args);
         const isCreate = /create/i.test(tool.name);
         const isStart = /start_workspace/i.test(tool.name);
-        const urls = isCreate ? extractSourceUrls(JSON.stringify(args)) : [];
-        if (urls.length) {
-          const dup = await checkDuplicates(urls);
-          if (dup) {
-            auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'blocked_dup' }, auditHome);
-            return dup;
-          }
-        }
-        if (isCreate && createCount >= MAX_CREATES_PER_SESSION) {
-          auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'denied' }, auditHome);
-          return CREATE_CAP_MESSAGE;
-        }
-        if (isStart) {
-          const prepErr = await prepareMcpStartArgs(args, kanbanUrl, ctx?.signal);
-          if (prepErr) {
-            auditLog({ user: uid, kind: 'kanban', summary, detail, decision: 'error' }, auditHome);
-            return prepErr;
-          }
-        }
-        const gate = await passGate({ kind: 'kanban', summary, detail, batchKey: batchKeyForMcp(tool.name) }, confirm);
-        if (!gate.allowed) {
-          auditLog({ user: uid, kind: 'kanban', summary, detail, decision: gate.reason }, auditHome);
-          return gate.message;
-        }
-        let result: string;
-        try {
-          result = await mcp.callTool(tool.name, args, ctx?.signal);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          result = `MCP 工具 ${tool.name} 调用失败: ${message}`;
-        }
-        if (isStart && !looksLikeStrongFailure(result)) {
-          result = await appendWorkspaceReadyCheck(result, kanbanUrl, ctx?.signal);
-        }
-        const ok = !looksLikeStrongFailure(result) && !/⚠️ setup 未完成/.test(result);
-        auditLog(
-          { user: uid, kind: 'kanban', summary, detail, decision: 'approved', ok, resultSnippet: result },
-          auditHome,
-        );
-        if (ok && urls.length) recordSources(urls, result, typeof args.title === 'string' ? args.title : '');
-        if (ok && isCreate) createCount++;
-        return wrapUntrusted(result);
+        return runGatedWrite({
+          kind: 'kanban',
+          summary,
+          detail: () => detail,
+          isCreate,
+          isStart,
+          urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
+          title: typeof args.title === 'string' ? args.title : '',
+          batchKey: batchKeyForMcp(tool.name),
+          prepare: isStart ? () => prepareMcpStartArgs(args, kanbanUrl, ctx?.signal) : undefined,
+          execute: async () => {
+            try {
+              return await mcp.callTool(tool.name, args, ctx?.signal);
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+            }
+          },
+          signal: ctx?.signal,
+        });
       });
     }
   }
@@ -611,68 +646,46 @@ export function buildTools({
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
     const summary = isCreate ? `创建看板任务「${title}」（hk_cli）` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
-    // start 分支补全会改写 argv，detail 在闸门调用前按最终命令重算（确认卡片须展示实际执行的命令）
-    let detail = `hk ${argv.join(' ')}`.slice(0, 800);
-    const urls = isCreate ? extractSourceUrls(argv.join(' ')) : [];
-    if (urls.length) {
-      const dup = await checkDuplicates(urls);
-      if (dup) {
-        auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'blocked_dup' }, auditHome);
-        return dup;
-      }
-    }
-    if (isCreate && createCount >= MAX_CREATES_PER_SESSION) {
-      auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'denied' }, auditHome);
-      return CREATE_CAP_MESSAGE;
-    }
-    if (isStart && !hkStartHasBranch(argv)) {
-      // Prefer env default repo's configured branch; otherwise require explicit --branch.
-      const repoId = kanbanRepoId || '';
-      if (repoId) {
-        const defaults = await fetchRepoDefaultBranches(kanbanUrl, [repoId], ctx?.signal);
-        const { unresolved } = applyRepoBaseBranches([{ repo_id: repoId }], defaults);
-        if (unresolved.length) {
-          auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
-          return formatMissingBaseBranchError(unresolved);
-        }
-        const branch = defaults[repoId];
-        if (branch) argv.push('--branch', branch);
-      } else {
-        // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk.sh 静默回退 main
-        const error = await fillHkStartBranches(argv, kanbanUrl, {
-          signal: ctx?.signal,
-          noRepoError:
-            '无法启动 workspace：未指定 --branch / --repo ID:branch，且未配置 HELIOS_KANBAN_REPO_ID。\n' +
-            '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。',
-        });
-        if (error) {
-          auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'error' }, auditHome);
-          return error;
-        }
-      }
-    } else if (isStart && !argv.includes('--branch')) {
-      // 混合形态：部分 --repo 已带 :branch，其余未带的也要补默认分支，不能静默回退 main
-      const error = await fillHkStartBranches(argv, kanbanUrl, { signal: ctx?.signal });
-      if (error) {
-        auditLog({ user: uid, kind: 'hk', summary, detail: `hk ${argv.join(' ')}`.slice(0, 800), decision: 'error' }, auditHome);
-        return error;
-      }
-    }
-    detail = `hk ${argv.join(' ')}`.slice(0, 800);
-    const gate = await passGate({ kind: 'hk', summary, detail, batchKey: batchKeyForHk(argv) }, confirm);
-    if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'hk', summary, detail, decision: gate.reason }, auditHome);
-      return gate.message;
-    }
-    let out = await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal });
-    if (isStart && !looksLikeStrongFailure(out)) {
-      out = await appendWorkspaceReadyCheck(out, kanbanUrl, ctx?.signal);
-    }
-    const ok = !looksLikeStrongFailure(out) && !/⚠️ setup 未完成/.test(out);
-    auditLog({ user: uid, kind: 'hk', summary, detail, decision: 'approved', ok, resultSnippet: out }, auditHome);
-    if (ok && urls.length) recordSources(urls, out, title);
-    if (ok && isCreate) createCount++;
-    return wrapUntrusted(out);
+    // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
+    return runGatedWrite({
+      kind: 'hk',
+      summary,
+      detail: () => `hk ${argv.join(' ')}`.slice(0, 800),
+      isCreate,
+      isStart,
+      urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
+      title,
+      batchKey: batchKeyForHk(argv),
+      prepare: isStart
+        ? async () => {
+            if (!hkStartHasBranch(argv)) {
+              // Prefer env default repo's configured branch; otherwise require explicit --branch.
+              const repoId = kanbanRepoId || '';
+              if (repoId) {
+                const defaults = await fetchRepoDefaultBranches(kanbanUrl, [repoId], ctx?.signal);
+                const { unresolved } = applyRepoBaseBranches([{ repo_id: repoId }], defaults);
+                if (unresolved.length) return formatMissingBaseBranchError(unresolved);
+                const branch = defaults[repoId];
+                if (branch) argv.push('--branch', branch);
+              } else {
+                // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk.sh 静默回退 main
+                return await fillHkStartBranches(argv, kanbanUrl, {
+                  signal: ctx?.signal,
+                  noRepoError:
+                    '无法启动 workspace：未指定 --branch / --repo ID:branch，且未配置 HELIOS_KANBAN_REPO_ID。\n' +
+                    '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。',
+                });
+              }
+            } else if (!argv.includes('--branch')) {
+              // 混合形态：部分 --repo 已带 :branch，其余未带的也要补默认分支，不能静默回退 main
+              return await fillHkStartBranches(argv, kanbanUrl, { signal: ctx?.signal });
+            }
+            return null;
+          }
+        : undefined,
+      execute: () => run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal }),
+      signal: ctx?.signal,
+    });
   });
 
   handlers.set('repo_fs', async (raw) => {
@@ -812,7 +825,12 @@ export function buildTools({
         return gate.message;
       }
       try {
-        const user = memory.setFact(uid, key, value);
+        // setFact 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
+        const user = memory.setFact(uid, key, value) as unknown as UserMemory & { ok?: boolean; error?: string };
+        if (user.ok === false) {
+          auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
+          return JSON.stringify({ ok: false, error: user.error || '记忆写入落盘失败，未持久化' });
+        }
         onMemoryChange?.();
         auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
         return JSON.stringify({ ok: true, key: key.trim(), value, facts: user.facts });
@@ -861,7 +879,12 @@ export function buildTools({
         return gate.message;
       }
       try {
-        const user = memory.addNote(uid, text);
+        // addNote 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
+        const user = memory.addNote(uid, text) as unknown as UserMemory & { ok?: boolean; error?: string };
+        if (user.ok === false) {
+          auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
+          return JSON.stringify({ ok: false, error: user.error || '记忆备注落盘失败，未持久化' });
+        }
         onMemoryChange?.();
         auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
         return JSON.stringify({ ok: true, notes: user.notes });

@@ -6,22 +6,7 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import { stopKanbanChild } from '../src/kanban/kanban-ensure';
 import { fillHkStartBranches, type RepoStartInput } from '../src/kanban/workspace-ready';
-
-let failures = 0;
-const check = (name: string, ok: boolean, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-  if (!ok) failures++;
-};
-
-/** try/catch 包装：异常即 FAIL。 */
-async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    check(name, true);
-  } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
-  }
-}
+import { check, checkAsync, finish } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
 function groupAlive(pid: number): boolean {
@@ -194,8 +179,7 @@ async function main(): Promise<void> {
     }
   });
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

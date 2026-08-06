@@ -5,6 +5,8 @@ import { writeFilePrivateSync } from './private-file';
 import type { MemoryFile, UserMemory } from './types';
 
 const MAX_NOTES = 50;
+/** facts 键数上限：记忆每轮全量回注系统提示词，无上限会被无限增长的键值撑爆上下文。 */
+const MAX_FACTS = 100;
 /** 单条 fact value / note 的长度上限：记忆每轮回注系统提示词，无上限会被超长文本撑爆上下文。 */
 const MAX_ENTRY_LEN = 1000;
 const FILE_VERSION = 1;
@@ -69,9 +71,10 @@ export class MemoryStore {
    * sessions, so a blind full-file overwrite would lose updates from other
    * instances; replaying only our own changes means a key another instance
    * wrote survives, and a key this instance deleted is applied as a delete
-   * (never resurrected by stale memory). Best-effort: never throws.
+   * (never resurrected by stale memory). Never throws: returns whether the
+   * write actually landed, so callers can refuse to report「已记住」on loss.
    */
-  private persist(): void {
+  private persist(): boolean {
     try {
       const merged = this.load();
       for (const [uid, journal] of this.changedFacts) {
@@ -99,8 +102,10 @@ export class MemoryStore {
       this.data = merged;
       this.changedFacts.clear();
       this.addedNotes.clear();
+      return true;
     } catch {
-      /* best-effort */
+      /* 写盘失败：返回 false，由调用方决定如何上报 */
+      return false;
     }
   }
 
@@ -134,9 +139,14 @@ export class MemoryStore {
     if (!k) throw new Error('key 不能为空');
     const v = clampEntry(String(value));
     const user = this.touch(userId);
+    // 键数上限：仅拦新增 key（更新已有 key 不受限）
+    if (!(k in user.facts) && Object.keys(user.facts).length >= MAX_FACTS) {
+      throw new Error(`记忆键数量已达上限（${MAX_FACTS}），请先删除不再需要的记忆`);
+    }
     user.facts[k] = v;
     this.journalFact(userId, k, v);
-    this.persist();
+    // 持久化失败必须显式报错：否则用户被告知「已记住」实际重启后丢失
+    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
     return this.getUser(userId);
   }
 
@@ -159,7 +169,8 @@ export class MemoryStore {
     const pending = this.addedNotes.get(userId);
     if (pending) pending.push(note);
     else this.addedNotes.set(userId, [note]);
-    this.persist();
+    // 与 setFact 一致：持久化失败显式报错，不假装「已记住」
+    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
     return this.getUser(userId);
   }
 

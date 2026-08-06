@@ -41,10 +41,16 @@ if (cmd === 'version' || cmd === '-v' || cmd === '--version') {
   process.exit(0);
 }
 
+// main() 是 async：顶层 reject 必须显式捕获，否则 unhandledRejection 打崩溃栈
+const onFatal = (err) => {
+  console.error(err);
+  process.exit(1);
+};
+
 if (cmd === 'bot') {
-  require('../dist/bot').main();
+  require('../dist/bot').main().catch(onFatal);
 } else if (cmd === 'cli' || cmd === 'start' || cmd === '') {
-  require('../dist/cli').main();
+  require('../dist/cli').main().catch(onFatal);
 } else {
   console.error(`未知命令: ${args[0]}`);
   printHelp();

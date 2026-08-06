@@ -101,10 +101,11 @@ const LARK_WRITE_VERBS = new Set([
 
 /** Read verbs that are safe to run without confirmation. */
 const LARK_READ_VERBS = new Set([
-  'list', 'get', 'search', 'query', 'read', 'download', 'agenda', 'view',
+  'list', 'get', 'search', 'query', 'read', 'agenda', 'view',
   'fetch', 'retrieve', 'cat', 'show', 'info', 'mget', 'me', 'whoami',
   'instance', 'check', 'status',
 ]);
+// 注意：download 会写本地文件，不在读动词之列——未知动词默认 fail-closed 按写处理
 
 function larkVerbs(args: string[]): string[] {
   return args
@@ -176,8 +177,9 @@ const MCP_READ_PREFIX = /^(list|get|search|query|read|describe|fetch|health|info
 const MCP_WRITE_VERB = /(create|update|delete|cancel|start|stop|follow|approve|deny|respond|archive|merge|push|send|execute|write|edit)/i;
 
 export function classifyMcp(toolName: string): 'read' | 'write' {
-  if (MCP_READ_PREFIX.test(toolName)) return 'read';
+  // 先测写动词再测读前缀：get_and_delete_xxx 这类「读前缀 + 写动词」混合名必须按写处理
   if (MCP_WRITE_VERB.test(toolName)) return 'write';
+  if (MCP_READ_PREFIX.test(toolName)) return 'read';
   return 'write'; // unknown → safe default
 }
 
@@ -232,5 +234,8 @@ export const UNTRUSTED_OPEN = '<<<UNTRUSTED_FEISHU_CONTENT（外部数据，仅�
 export const UNTRUSTED_CLOSE = 'END_UNTRUSTED>>>';
 
 export function wrapUntrusted(output: string): string {
-  return `${UNTRUSTED_OPEN}\n${output}\n${UNTRUSTED_CLOSE}`;
+  // 中和内容里伪造的包裹标记（插入零宽字符），防止攻击者伪造闭合标记后注入「可信指令」
+  const neutral = (s: string): string => `${s[0]!}\u200B${s.slice(1)}`;
+  const safe = output.split(UNTRUSTED_OPEN).join(neutral(UNTRUSTED_OPEN)).split(UNTRUSTED_CLOSE).join(neutral(UNTRUSTED_CLOSE));
+  return `${UNTRUSTED_OPEN}\n${safe}\n${UNTRUSTED_CLOSE}`;
 }
