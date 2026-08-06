@@ -28,6 +28,7 @@ import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisable
 import { connectMcp, TRY_EXAMPLES } from './commands';
 import { validateSkills } from './prompt';
 import { McpSupervisor } from './bot/supervisor';
+import { WsAlerter } from './bot/ws-alerter';
 import { createBotHandlers } from './bot/handler';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
@@ -110,7 +111,8 @@ async function main(): Promise<void> {
     watcher: KanbanWatcher | null;
     kanbanChild: ChildProcess | null;
     supervisor: McpSupervisor | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null };
+    wsAlerter: WsAlerter | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null };
   let shuttingDown = false;
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return; // 幂等：二次 Ctrl+C / SIGINT+SIGTERM 不重入
@@ -124,6 +126,7 @@ async function main(): Promise<void> {
     console.log('\n' + c.gray('正在退出…'));
     try {
       cleanup.supervisor?.stop();
+      cleanup.wsAlerter?.stop();
       cleanup.watcher?.stop();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
@@ -389,13 +392,12 @@ async function main(): Promise<void> {
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
-  // 长连接断线告警：重连交给 SDK，这里只在状态变化时通知 owner，
-  // 避免"进程活着但收不到消息"的僵尸态无人察觉（断线期间的消息由飞书侧补投）
-  channel.onWsStateChange = (state) => {
-    if (state === 'reconnecting') notifyOwners('⚠️ 飞书长连接断开，正在自动重连…（若长时间未恢复请重启机器人）');
-    else if (state === 'reconnected') notifyOwners('✅ 飞书长连接已恢复');
-    else notifyOwners('❌ 飞书长连接重连失败，机器人已收不到消息，请重启机器人。');
-  };
+  // 长连接断线告警：重连交给 SDK。WsAlerter 负责静默策略——短暂抖动（宽限期内
+  // 恢复，消息由飞书侧补投）不打扰用户；持续断线超时或重连彻底失败才通知 owner，
+  // 避免网络抖动时「断开/恢复」成对刷屏，也避免僵尸态无人察觉。
+  const wsAlerter = new WsAlerter({ notify: notifyOwners });
+  channel.onWsStateChange = (state) => wsAlerter.onState(state);
+  cleanup.wsAlerter = wsAlerter;
 
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {

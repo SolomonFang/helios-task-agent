@@ -47,6 +47,7 @@ import { diagnoseMcpFailure } from '../src/kanban/mcp';
 import { buildWatchEventCard, isLoopbackUrl, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
 import { apiGet, apiPost, taskPageUrl, attemptDiffUrl, pickLatestAttempt, sortTaskAttempts } from '../src/kanban/http';
 import { McpSupervisor } from '../src/bot/supervisor';
+import { WsAlerter } from '../src/bot/ws-alerter';
 import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
 import { minimalChildEnv } from '../src/proc-env';
 import {
@@ -1601,6 +1602,52 @@ async function main(): Promise<void> {
     assert.equal(sup.turnCount, 1);
     sup.exitTurn();
     assert.equal(sup.turnCount, 0);
+  });
+
+  // ---------- WsAlerter：宽限期内恢复静默，超时断线才告警 ----------
+  await checkAsync('WsAlerter：快速抖动不通知；持续断线超时告警一次，恢复时补「已恢复」', async () => {
+    const sent: string[] = [];
+    const alerter = new WsAlerter({ graceMs: 30, notify: (t) => sent.push(t) });
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    // 快速抖动：宽限期内恢复 → 完全静默（刷屏场景）
+    alerter.onState('reconnecting');
+    alerter.onState('reconnected');
+    await sleep(60);
+    assert.equal(sent.length, 0);
+
+    // 持续断线超过宽限期 → 告警一次
+    alerter.onState('reconnecting');
+    await sleep(60);
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].includes('断开超过'));
+    // 断线期间 SDK 反复触发 reconnecting：不重复告警
+    alerter.onState('reconnecting');
+    await sleep(60);
+    assert.equal(sent.length, 1);
+    // 恢复：因告警过，补一条「已恢复」
+    alerter.onState('reconnected');
+    assert.equal(sent.length, 2);
+    assert.ok(sent[1].includes('已恢复'));
+    alerter.stop();
+  });
+
+  // ---------- WsAlerter：重连失败立即告警且只报一次 ----------
+  await checkAsync('WsAlerter：failed 立即告警一次；failed 后的状态变化不再打扰', async () => {
+    const sent: string[] = [];
+    const alerter = new WsAlerter({ graceMs: 30, notify: (t) => sent.push(t) });
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    alerter.onState('reconnecting'); // 宽限期计时中
+    alerter.onState('failed'); // 取消宽限期，立即告警
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].includes('重连失败'));
+    alerter.onState('failed'); // 重复 failed 不再报
+    assert.equal(sent.length, 1);
+    alerter.onState('reconnecting'); // 已判失败：不再起宽限期告警
+    await sleep(60);
+    assert.equal(sent.length, 1);
+    alerter.stop();
   });
 
   // ---------- fetchHealth：2xx + kanban 信封才算健康 ----------

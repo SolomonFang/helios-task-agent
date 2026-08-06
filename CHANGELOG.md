@@ -29,6 +29,7 @@
 - 确认词表移除单字「都」（随口一个字即批准 10 分钟「同类免问」太危险）；「以后都」「都允许」仍覆盖该意图
 - `helios-task-agent-bot` 对 `--help` 与未知参数给出帮助/报错并非零退出（此前乱参数直接启动 bot）
 - 用户自建技能契约问题（缺 `name`/`description`、`digest_sections` 匹配不到章节）启动时即告警（CLI 与 bot 一致），不再只在测试期暴露
+- 飞书长连接断线告警刷屏：SDK 每次网络抖动都触发 reconnecting/reconnected，原实现对每次状态变化成对通知 owner；改为 `WsAlerter`（`src/bot/ws-alerter.ts`）宽限期静默——3 分钟内恢复不打扰（覆盖 SDK 一个完整重连周期：首试 0~30s，重试间隔 120s），持续断线超时告警一次、重连彻底失败（SDK 终态）只报一次
 - README.en 补齐 AI 审查整段说明（双语漂移）
 
 ### Changed
