@@ -6,7 +6,7 @@
 
 import readline from 'readline';
 import { currentConfig } from './config';
-import { readSecret, selectList } from '../ui';
+import { readSecret, selectList } from '../infra/ui';
 import type { AskFn, ChooseFn } from '../types';
 
 /** 模型预设选择：箭头列表；重配时标题给出当前模型，避免用户忘记自己之前选的是什么。 */

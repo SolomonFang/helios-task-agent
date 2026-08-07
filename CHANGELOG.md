@@ -59,6 +59,10 @@
 - `/stop` 可中断进行中的 AI 审查：`runAiReview` 支持 AbortSignal 并真正杀掉 ocr 子进程（此前要等 15 分钟自身超时）
 - supervisor `stop()` 对在途重连加竞速超时；用户单条消息增加 8000 字符上限，超限直接拒答
 - 测试修复：技能契约用例不再扫描用户数据目录（本机第三方技能曾致 `npm test` 环境性失败）；batchApproval TTL 过期路径、LLM 错误映射、无断言用例、SDK 私有字段脆性断言逐一补实
+- 目录重构复审收尾：断开 `agent/confirm.ts ↔ channels/feishu-cards.ts` 值级循环依赖（`kindLabel`/`ConfirmSettle` 下沉 `guard.ts`，删除兼容 re-export）；`ui.ts` 下沉 `infra/`（此前 `config/` 反向依赖顶层文件），`MCP_FALLBACK_TEXT`、`defaultDataHome`、`SKILLS_DIR` 的中转 re-export 全部收口为直引 `infra/`
+- smoke 的 `repo_fs list` 用例适配下沉后的目录布局（断言 `src/agent` 下的文件，此前仍假设扁平 `src/`、注册仓库场景下必 FAIL）
+- bot 长连接失败退出路径改走统一 `shutdown`（此前手写清理 mcp + 看板子进程，漏掉已登记的 supervisor / reportServer / channel）；`helios-task-agent-bot --help` 用法文案补独立入口命令名；统一入口 cli 分支与 bot 对称校验未知参数（此前静默进 REPL）
+- 文档对齐：`.env.example` 补 `OCR_LLM_MODEL`；README 环境变量表 `REPO_ID`/`ITERATION` 缩写更正为全名（照抄不生效）；`hk.sh` 默认地址表述与代码统一为 `http://localhost:7964`；skill `reference.md` 端点表补 `GET /tags`；README.en 补译两处中文新增说明
 
 ## [1.0.20] - 2026-08-07
 

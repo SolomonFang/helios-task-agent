@@ -7,8 +7,7 @@
  * 与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发。
  */
 
-import type { ConfirmRequest } from '../agent/guard';
-import { kindLabel, type ConfirmSettle } from '../agent/confirm';
+import { kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
 import type { WatchEvent, WatchEventKind } from '../kanban/watcher';
 import { isLoopbackUrl } from '../infra/url-utils';
 

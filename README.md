@@ -193,7 +193,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HELIOS_REPORT_HOST` | AI 审查报告静态服务的监听地址，默认 `127.0.0.1`（**不跟随** `HELIOS_KANBAN_HOST`；报告含代码 diff，确需对外暴露才改） |
 | `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |
 | `OCR_LLM_TOKEN` | AI 审查专用 LLM key；设置后优先于机器人主 key 派生（避免把主 key 交给第三方 ocr 子进程），URL/模型仍回退机器人配置 |
-| `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | 可选默认；设了 `PROJECT_ID` 时 bot 推送只盯该项目 |
+| `HELIOS_KANBAN_PROJECT_ID` / `HELIOS_KANBAN_REPO_ID` / `HELIOS_KANBAN_ITERATION` | 可选默认；设了 `HELIOS_KANBAN_PROJECT_ID` 时 bot 推送只盯该项目 |
 | `HELIOS_TASK_AGENT_HOME` | 数据目录，默认 `~/.helios-task-agent` |
 | `HELIOS_TASK_AGENT_ENV` | 强制 `.env` 路径（写入目标；加载优先级最高） |
 | `KANBAN_WATCH` | bot 看板推送，默认开；`0` 关闭 |

@@ -154,7 +154,7 @@ export function kanbanManualStartHint(): string {
 }
 
 /** ocr（open-code-review）npx 包规格，同理钉版本；OCR_PACKAGE 可覆盖。 */
-export const DEFAULT_OCR_PACKAGE = '@alibaba-group/open-code-review@1.8.0';
+const DEFAULT_OCR_PACKAGE = '@alibaba-group/open-code-review@1.8.0';
 
 export function ocrPackageSpec(env: NodeJS.ProcessEnv = process.env): string {
   return env.OCR_PACKAGE || DEFAULT_OCR_PACKAGE;

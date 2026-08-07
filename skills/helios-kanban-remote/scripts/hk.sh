@@ -2,7 +2,7 @@
 # Helios Kanban remote API CLI — used by helios-kanban-remote skill
 set -euo pipefail
 
-BASE_URL="${HELIOS_KANBAN_URL:-http://127.0.0.1:7964}"
+BASE_URL="${HELIOS_KANBAN_URL:-http://localhost:7964}"
 BASE_URL="${BASE_URL%/}"
 
 require_jq() {
@@ -264,7 +264,7 @@ usage() {
 Helios Kanban remote CLI
 
 Env:
-  HELIOS_KANBAN_URL          Base URL (default: http://127.0.0.1:7964)
+  HELIOS_KANBAN_URL          Base URL (default: http://localhost:7964)
   HELIOS_KANBAN_PROJECT_ID   Default project UUID (omit project_id args when set)
   HELIOS_KANBAN_REPO_ID      Default repo UUID (omit --repo when set)
   HELIOS_KANBAN_ITERATION    Default iteration code (e.g. 260717)

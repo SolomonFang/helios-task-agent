@@ -14,7 +14,8 @@ import readline from 'readline';
 import path from 'path';
 import { currentConfig, ensureEnvLoaded, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config/config';
 import { ensureBotConfig, ensureConfig, rebindFeishuBot } from './config/config-wizard';
-import { MemoryStore, defaultDataHome } from './agent/memory';
+import { MemoryStore } from './agent/memory';
+import { defaultDataHome } from './infra/paths';
 import { FeishuChannel } from './channels/feishu';
 import { SessionRouter } from './agent/session-router';
 import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
@@ -25,7 +26,7 @@ import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
 import { startReportServer, type ReportServer } from './report/report-server';
-import { checkLarkCliStatus } from './infra/deps';
+import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wrapUntrusted } from './agent/guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -38,7 +39,7 @@ import { createBotHandlers } from './bot/handler';
 import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
-import { c, MCP_FALLBACK_TEXT } from './ui';
+import { c } from './infra/ui';
 
 const BOT_HELP = `Helios Task Agent（飞书私聊）
 
@@ -61,8 +62,9 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 可以说
 ${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
 
-/** bot 子命令用法文案（--help 与未知参数报错共用，与独立入口 helios-task-agent-bot 风格一致）。 */
+/** bot 子命令用法文案（--help 与未知参数报错共用；两个入口同一份，第二行覆盖独立入口）。 */
 const BOT_CLI_USAGE = `用法: helios-task-agent bot [选项]
+      helios-task-agent-bot [选项]（独立入口，等同上一行）
 
 选项
   --rebind      换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
@@ -255,7 +257,7 @@ async function main(): Promise<void> {
   feishuCfg = feishuBotConfig();
 
   // npm 更新检查：发现新版本先请示（结果缓存 24h，离线静默；HTA_UPDATE_CHECK=0 关闭）
-  if (!updateCheckDisabled() && process.stdin.isTTY) {
+  if (!updateCheckDisabled() && process.stdin.isTTY === true) {
     const info = await checkForUpdate({ current: version });
     if (info) {
       const { ask: upAsk, close: upClose } = createAsk();
@@ -486,9 +488,9 @@ async function main(): Promise<void> {
     console.error(
       c.gray(`改凭证请直接编辑 ${userEnvPath()}；或清空其中 FEISHU_APP_ID / FEISHU_APP_SECRET 后重新运行（会重新进入配置向导）。`),
     );
-    await mcp.close();
-    await stopKanbanChild(cleanup.kanbanChild);
-    process.exit(1);
+    // 统一走 shutdown：此时 supervisor / reportServer / channel 等已登记进 cleanup，
+    // 手写清理 mcp + kanbanChild 会漏掉它们（shutdown 幂等且有 8s 强退兜底）
+    await shutdown(1);
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 

@@ -85,7 +85,7 @@ async function startMockKanban(state: { taskStatus: string }) {
 const tickOf = (w: KanbanWatcher) => (w as unknown as { tick: () => Promise<void> }).tick.bind(w);
 
 async function main(): Promise<void> {
-  // ---------- LLM：重试预算与错误传播（createClient 把 maxRetries 调为 3，见 src/llm.ts createClient） ----------
+  // ---------- LLM：重试预算与错误传播（createClient 把 maxRetries 调为 3，见 src/agent/llm.ts createClient） ----------
   await checkAsync('LLM 重试：瞬时 429 后自动退避重试成功，不整轮报废', async () => {
     const { server, base, seen } = await startMockLlm([429, 429, 200]);
     try {

@@ -27,6 +27,21 @@ export interface ConfirmRequest {
 export type ConfirmVerdict = 'once' | 'batch' | false;
 export type ConfirmFn = (req: ConfirmRequest) => Promise<ConfirmVerdict>;
 
+/**
+ * 确认请求的终态：once/batch = 批准；denied = 用户取消（含 /stop 一并取消）；
+ * timeout = 超时自动拒绝；superseded = 被新的写操作确认替代。
+ */
+export type ConfirmSettle = 'once' | 'batch' | 'denied' | 'timeout' | 'superseded';
+
+/** kind 枚举 → 用户可见中文名（未知值回退原值，不把内部枚举漏给用户）。 */
+export function kindLabel(kind: string): string {
+  if (kind === 'lark') return '飞书';
+  if (kind === 'kanban' || kind === 'hk') return '看板';
+  if (kind === 'memory') return '记忆';
+  if (kind === 'skill') return '技能脚本';
+  return kind;
+}
+
 /** ConfirmFn 附带「同类免问」查询/撤销能力（「恢复确认」/ `/confirm on` 用）。 */
 export interface BatchConfirmFn extends ConfirmFn {
   /** 撤销全部「同类免问」授权，返回撤销的类数。 */

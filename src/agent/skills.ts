@@ -12,9 +12,6 @@ import { defaultDataHome, SKILLS_DIR } from '../infra/paths';
 import { ensurePrivateDirSync } from '../infra/private-file';
 import { errMessage } from '../infra/err';
 
-// SKILLS_DIR 已移到 infra/paths.ts；re-export 兼容既有调用方（scripts/unit.ts 等）
-export { SKILLS_DIR };
-
 /** 用户自定义技能目录：数据目录下 skills/（升级 npm 包不会抹掉，也无安装目录写权限问题）。 */
 export function userSkillsDir(): string {
   return path.join(defaultDataHome(), 'skills');

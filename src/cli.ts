@@ -1,12 +1,12 @@
 import readline from 'readline';
 import { type ChildProcess } from 'child_process';
-import { c, printBanner, Spinner, renderReply, MCP_FALLBACK_TEXT } from './ui';
+import { c, printBanner, Spinner, renderReply } from './infra/ui';
 import { ensureEnvLoaded } from './config/config';
 import { ensureConfig } from './config/config-wizard';
 import { AgentSession } from './agent/session';
 import { connectMcp } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
-import { checkHkDeps, checkLarkCliStatus } from './infra/deps';
+import { checkHkDeps, checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -21,8 +21,8 @@ import {
   llmFailureParts,
   TRY_EXAMPLES,
 } from './commands';
-import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './agent/confirm';
-import type { ConfirmFn } from './agent/guard';
+import { CONFIRM_BATCH_RE, CONFIRM_YES_RE } from './agent/confirm';
+import { kindLabel, type ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
 

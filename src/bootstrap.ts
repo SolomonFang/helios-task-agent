@@ -14,7 +14,7 @@ import {
 } from './infra/deps';
 import { ensureKanbanRunning, type KanbanEnsureResult } from './kanban/kanban-ensure';
 import { migratePackageSkills, validateSkills } from './agent/skills';
-import { c } from './ui';
+import { c } from './infra/ui';
 import { errMessage } from './infra/err';
 
 export interface StartupDepsWarnOptions {

@@ -12,6 +12,7 @@ import {
   classifyLark,
   classifyMcp,
   isBatchable,
+  kindLabel,
   looksLikeStrongFailure,
   withBatchApproval,
   wrapUntrusted,
@@ -28,7 +29,6 @@ import {
   CONFIRM_BATCH_RE,
   CONFIRM_NO_RE,
   isConfirmWord,
-  kindLabel,
 } from '../src/agent/confirm';
 import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from '../src/channels/feishu-cards';
 import { isLoopbackUrl } from '../src/infra/url-utils';
@@ -50,8 +50,8 @@ import {
   renderSkillsBlock,
   userSkillsDir,
   validateSkills,
-  SKILLS_DIR,
 } from '../src/agent/skills';
+import { SKILLS_DIR } from '../src/infra/paths';
 import { auditLog } from '../src/infra/audit';
 import { SessionRouter } from '../src/agent/session-router';
 import { AgentSession } from '../src/agent/session';
@@ -86,6 +86,7 @@ import {
   kanbanPackageSpec,
   ocrPackageSpec,
   LARK_CLI_AUTH_HINT,
+  MCP_FALLBACK_TEXT,
 } from '../src/infra/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
 import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/report/review-report';
@@ -103,7 +104,7 @@ import {
   llmFailureParts,
   CLEARED_TEXT,
 } from '../src/commands';
-import { renderReply, printBanner, MCP_FALLBACK_TEXT } from '../src/ui';
+import { renderReply, printBanner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';

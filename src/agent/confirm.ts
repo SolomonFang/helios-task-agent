@@ -1,9 +1,6 @@
 import crypto from 'crypto';
-import type { ConfirmRequest, ConfirmVerdict } from './guard';
+import type { ConfirmRequest, ConfirmSettle, ConfirmVerdict } from './guard';
 import { errMessage } from '../infra/err';
-
-// 卡片构建已收口到 channels/feishu-cards.ts；此处 re-export 兼容既有调用方（scripts/smoke.ts 等）
-export { buildConfirmCard, buildResolvedCard } from '../channels/feishu-cards';
 
 /**
  * Bot-side write confirmation: one pending action per user.
@@ -20,12 +17,6 @@ export { buildConfirmCard, buildResolvedCard } from '../channels/feishu-cards';
 
 /** 'approved' = 仅此次；'approved_batch' = 同类免问；'denied'；'ignored' = 无 pending 或非应答。 */
 export type ConfirmAnswer = 'approved' | 'approved_batch' | 'denied' | 'ignored';
-
-/**
- * 确认请求的终态：once/batch = 批准；denied = 用户取消（含 /stop 一并取消）；
- * timeout = 超时自动拒绝；superseded = 被新的写操作确认替代。
- */
-export type ConfirmSettle = 'once' | 'batch' | 'denied' | 'timeout' | 'superseded';
 
 interface Pending {
   id: string;
@@ -56,15 +47,6 @@ export function isConfirmWord(text: string): boolean {
   const t = text.trim();
   if (t.length <= 1) return false;
   return CONFIRM_YES_RE.test(t) || CONFIRM_BATCH_RE.test(t) || CONFIRM_NO_RE.test(t);
-}
-
-/** kind 枚举 → 用户可见中文名（未知值回退原值，不把内部枚举漏给用户）。 */
-export function kindLabel(kind: string): string {
-  if (kind === 'lark') return '飞书';
-  if (kind === 'kanban' || kind === 'hk') return '看板';
-  if (kind === 'memory') return '记忆';
-  if (kind === 'skill') return '技能脚本';
-  return kind;
 }
 
 export class ConfirmationManager {

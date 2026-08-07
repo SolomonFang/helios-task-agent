@@ -15,7 +15,8 @@ import { buildSystemPrompt } from '../src/agent/prompt';
 import { MemoryStore } from '../src/agent/memory';
 import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/agent/guard';
 import { SourceRegistry, extractSourceUrls } from '../src/agent/source-registry';
-import { ConfirmationManager, buildResolvedCard } from '../src/agent/confirm';
+import { ConfirmationManager } from '../src/agent/confirm';
+import { buildResolvedCard } from '../src/channels/feishu-cards';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
 import { runAgentTurn } from '../src/agent/llm';
 import { checkLarkCli } from '../src/infra/deps';
@@ -128,7 +129,7 @@ async function main(): Promise<void> {
     if (requireE2e) check(name, false, `HTA_REQUIRE_E2E=1 禁止跳过：${detail}`);
     else console.log(`SKIP  ${name}  — ${detail}`);
   };
-  const listOut = await handlers.get('repo_fs')!({ action: 'list', root: repoRoot, path: 'src' });
+  const listOut = await handlers.get('repo_fs')!({ action: 'list', root: repoRoot, path: 'src/agent' });
   if (REPO_NOT_REGISTERED.test(listOut)) {
     skip('repo_fs list', '本机看板未注册该仓库，跳过');
     // 越界用例的断言 /越界|禁止/ 在白名单拒绝文案下同样不匹配，同一根因一并跳过（不再发起调用）

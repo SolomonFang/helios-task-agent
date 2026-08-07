@@ -4,9 +4,6 @@ import { defaultDataHome } from '../infra/paths';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import type { MemoryFile, UserMemory } from '../types';
 
-// 路径工具已抽到 paths.ts；此处 re-export 仅为兼容既有调用方（index.ts 公共 API 等）
-export { defaultDataHome };
-
 const MAX_NOTES = 50;
 /** facts 键数上限：记忆每轮全量回注系统提示词，无上限会被无限增长的键值撑爆上下文。 */
 const MAX_FACTS = 100;

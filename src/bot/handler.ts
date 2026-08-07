@@ -28,7 +28,7 @@ import {
 import type { AgentConfig, InboundMessage, ProgressInfo } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { McpSupervisor } from './supervisor';
-import { MCP_FALLBACK_TEXT } from '../ui';
+import { MCP_FALLBACK_TEXT } from '../infra/deps';
 import { errMessage } from '../infra/err';
 
 /** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */

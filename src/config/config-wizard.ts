@@ -1,4 +1,4 @@
-import { c } from '../ui';
+import { c } from '../infra/ui';
 import {
   PRESETS,
   currentConfig,

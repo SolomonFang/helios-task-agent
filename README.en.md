@@ -191,7 +191,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
 | `OCR_LLM_TOKEN` | Dedicated LLM key for AI review; when set it wins over the derived bot key (keeps your main key away from the third-party ocr subprocess), URL/model still fall back to the bot config |
-| `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
+| `HELIOS_KANBAN_PROJECT_ID` / `HELIOS_KANBAN_REPO_ID` / `HELIOS_KANBAN_ITERATION` | Optional defaults; `HELIOS_KANBAN_PROJECT_ID` scopes bot watch |
 | `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
@@ -215,9 +215,9 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 
-Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes.
+Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt.
 
-Memory tools: `memory_set` / `get` / `delete` / `note`. Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
+Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the latest 50 entries). Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
 
 ## Tools
 

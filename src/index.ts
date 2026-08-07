@@ -2,7 +2,8 @@
 export { AgentSession } from './agent/session';
 export { SessionRouter } from './agent/session-router';
 export { KanbanMcp } from './kanban/mcp';
-export { MemoryStore, defaultDataHome } from './agent/memory';
+export { MemoryStore } from './agent/memory';
+export { defaultDataHome } from './infra/paths';
 export { currentConfig, feishuBotConfig, isFeishuBotConfigured, userEnvPath, PRESETS } from './config/config';
 export { ensureConfig, ensureBotConfig } from './config/config-wizard';
 export { buildSystemPrompt } from './agent/prompt';

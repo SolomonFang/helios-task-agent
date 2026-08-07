@@ -50,6 +50,13 @@ const onFatal = (err) => {
 if (cmd === 'bot') {
   require('../dist/bot-main').main().catch(onFatal);
 } else if (cmd === 'cli' || cmd === 'start' || cmd === '') {
+  // 与 bot 分支（parseBotArgs）对称：cli 入口同样拒绝多余参数，而非静默进 REPL
+  const extra = cmd === '' ? [] : args.slice(1);
+  if (extra.length) {
+    console.error(`未知参数: ${extra.join(' ')}`);
+    printHelp();
+    process.exit(1);
+  }
   require('../dist/cli').main().catch(onFatal);
 } else {
   console.error(`未知命令: ${args[0]}`);

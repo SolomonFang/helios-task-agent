@@ -38,6 +38,7 @@ Read `.data` on success; read `.message` on failure.
 | POST | `/sessions/{session_id}/queue` | Queue follow-up while running |
 | GET | `/approvals` | List pending approvals |
 | POST | `/approvals/{id}/respond` | Approve / deny |
+| GET | `/tags` | List tags (used by `tags` / `expand_tags`) |
 
 ## Default executor profile
 

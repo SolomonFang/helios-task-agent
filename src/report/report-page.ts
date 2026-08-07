@@ -17,7 +17,7 @@ export function escapeHtml(s: string): string {
  * 代码片尺寸）留在各自渲染器的区块样式里。注意 .badge/.sev、.chips code/.md code
  * 是两套页面各自的类名，基底同时列出——未用到的选择器在对应页面里天然惰性。
  */
-export const BASE_CSS = `
+const BASE_CSS = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;

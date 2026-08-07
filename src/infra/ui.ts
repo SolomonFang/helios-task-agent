@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
+import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './deps';
 
 const ESC = '\u001b';
 
@@ -103,12 +103,9 @@ export interface BannerStatus {
   version: string;
 }
 
-/** MCP 降级口径单源在 src/deps.ts，此处 re-export 供既有 ui 引用方继续使用。 */
-export { MCP_FALLBACK_TEXT };
-
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
-  // 探测由调用方完成（hkMissing / larkAuthed）：ui 只做渲染，不反向依赖 deps 层
+  // 探测由调用方完成（hkMissing / larkAuthed）：ui 只做渲染，探测逻辑留在 deps 层
   const hkMissing = status.hkMissing;
   const mcpSuffix =
     status.mcp === 'fail'
