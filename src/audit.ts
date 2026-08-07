@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './memory';
+import { defaultDataHome } from './paths';
 import { appendFilePrivateSync } from './private-file';
 
 export type AuditDecision = 'approved' | 'denied' | 'blocked_dup' | 'no_gate' | 'error';
@@ -26,10 +26,11 @@ export interface AuditEntry {
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 /**
- * 写操作 resultSnippet 落盘前的轻量脱敏：工具输出若含 token/密钥字段，
- * 不应原样留在审计日志。启发式覆盖两类常见形态——
+ * 写操作 resultSnippet / detail 落盘前的轻量脱敏：工具输出若含 token/密钥字段，
+ * 不应原样留在审计日志。启发式覆盖三类常见形态——
  * 1. JSON 键值对：键名含 token/secret/key/password/authorization 的值替换为 ***；
- * 2. Bearer 认证头：Bearer xxx → Bearer ***。
+ * 2. Bearer 认证头：Bearer xxx → Bearer ***；
+ * 3. CLI 标志参数：--token xxx / --app-secret=xxx → --token ***（detail 含完整命令行，如 auth login --token xxx）。
  * 不保证完备（只是缓解），读路径本就不记读回内容（见上面的 kind 约定）。
  */
 export function redactSnippet(text: string): string {
@@ -38,7 +39,8 @@ export function redactSnippet(text: string): string {
       /("(?:[^"\\]|\\.)*(?:token|secret|key|password|authorization)(?:[^"\\]|\\.)*"\s*:\s*)"(?:[^"\\]|\\.)*"/gi,
       '$1"***"',
     )
-    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer ***');
+    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer ***')
+    .replace(/(--?[\w-]*(?:token|secret|key|password)[\w-]*)([ =])[^\s]+/gi, '$1$2***');
 }
 
 /** Append one JSONL record to <home>/audit.log（超 5MB 先轮转）。Never throws — audit must not break the gate. */
@@ -54,7 +56,8 @@ export function auditLog(entry: AuditEntry, homeDir?: string): void {
     const record = {
       ts: new Date().toISOString(),
       ...entry,
-      detail: entry.detail.slice(0, 1000),
+      // detail 含完整命令行 / memory value（如 auth login --token xxx）：与 resultSnippet 一样先脱敏再落盘
+      detail: redactSnippet(entry.detail).slice(0, 1000),
       resultSnippet:
         entry.resultSnippet === undefined ? undefined : redactSnippet(entry.resultSnippet).slice(0, 500),
     };

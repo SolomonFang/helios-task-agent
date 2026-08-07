@@ -1,0 +1,10 @@
+{
+  "//": "typecheck 专用：build（tsc）仍只用 tsconfig.json（rootDir=src，产物结构不变）。本配置额外覆盖 scripts/（tsx 运行，无需 emit）。",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

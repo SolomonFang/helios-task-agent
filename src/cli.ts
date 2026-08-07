@@ -3,11 +3,9 @@ import { type ChildProcess } from 'child_process';
 import { c, printBanner, Spinner, renderReply, MCP_FALLBACK_TEXT } from './ui';
 import { ensureConfig } from './config-wizard';
 import { AgentSession } from './session';
-import { ensureKanbanRunning } from './kanban/kanban-ensure';
 import { connectMcp } from './kanban/mcp';
-import { checkHkDeps, checkLarkCliStatus, kanbanManualStartHint, LARK_CLI_INSTALL_HINT } from './deps';
-import { validateSkills } from './prompt';
-import { migratePackageSkills } from './skills';
+import { checkHkDeps, checkLarkCliStatus } from './deps';
+import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
 import {
@@ -24,6 +22,7 @@ import {
 import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './confirm';
 import type { ConfirmFn } from './guard';
 import type { AgentConfig, AskFn } from './types';
+import { errMessage } from './err';
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void };
 
@@ -101,7 +100,7 @@ export async function main(): Promise<void> {
   try {
     cfg = await ensureConfig(ask, { choose, askSecret });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errMessage(err);
     console.error(c.err(`\n配置失败: ${message}`));
     rl.close();
     process.exit(1);
@@ -112,21 +111,18 @@ export async function main(): Promise<void> {
 
   let kanbanChild: ChildProcess | null = null;
   const bootKanban = new Spinner('检查 helios-kanban…').start();
-  try {
-    const ensured = await ensureKanbanRunning(cfg.kanbanUrl, {
-      onLog: (msg) => bootKanban.setText(msg),
-    });
-    kanbanChild = ensured.child;
-    bootKanban.stop();
-    if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
-  } catch (err) {
-    bootKanban.stop();
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(c.err(`看板不可用: ${message}`));
-    console.error(c.gray(kanbanManualStartHint()));
-    rl.close();
-    process.exit(1);
-  }
+  const ensured = await ensureKanbanOrExit({
+    kanbanUrl: cfg.kanbanUrl,
+    onLog: (msg) => bootKanban.setText(msg),
+    onFail: () => {
+      bootKanban.stop();
+      rl.close();
+    },
+    failLabel: '看板不可用',
+  });
+  kanbanChild = ensured.child;
+  bootKanban.stop();
+  if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
 
   const boot = new Spinner('正在连接 helios-kanban MCP…').start();
   const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg);
@@ -150,14 +146,9 @@ export async function main(): Promise<void> {
     larkAuthed: larkStatus === 'ok',
     hkMissing: checkHkDeps(),
   });
-  // banner 状态行已含未授权/未找到说明；这里只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
-  if (larkStatus === 'missing') console.log(c.warn(LARK_CLI_INSTALL_HINT));
-  // 历史误放进 npm 包内 skills/ 的技能升级即丢失：启动时先迁到数据目录持久保存，再校验最终生效的技能集
-  for (const name of migratePackageSkills()) {
-    console.log(c.info(`已将技能「${name}」从包内目录迁移到数据目录（以后升级不再丢失）`));
-  }
-  // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
-  for (const problem of validateSkills()) console.log(c.warn(`技能契约: ${problem}`));
+  // banner 状态行已含未授权/未找到说明；warnStartupDeps 只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
+  warnStartupDeps(larkStatus, { style: 'cli' });
+  migrateAndValidateSkills();
 
   const spinner = new Spinner('思考中…');
 
@@ -258,6 +249,16 @@ export async function main(): Promise<void> {
   // 任务运行中按 Ctrl+C 会关闭输入流而非中断当前任务；两级 handler 同一函数，天然幂等。
   process.on('SIGINT', onSigint);
   rl.on('SIGINT', onSigint);
+  // 长驻 REPL 兜底（与 bot 同策略）：漏网 rejection 记日志不退出；
+  // uncaughtException 复用 cleanup 优雅退出。handler 自身只做同步日志，不得再抛异常。
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+    console.error(c.err(`未处理的 Promise rejection（进程保持运行）: ${msg}`));
+  });
+  process.on('uncaughtException', (err) => {
+    console.error(c.err(`未捕获异常，执行优雅退出: ${err.stack || err.message}`));
+    void cleanup();
+  });
 
   // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效，复用 cleanup 的看板处置）
   if (pendingUpdate) {
@@ -373,7 +374,7 @@ export async function main(): Promise<void> {
             );
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = errMessage(err);
           console.error(c.err(`配置失败: ${message}`));
         }
       } else {
@@ -401,7 +402,7 @@ export async function main(): Promise<void> {
       if (ctl.signal.aborted) {
         console.log(c.gray('\n⏹ 已中断当前任务（进程未退出，可继续对话）。'));
       } else {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errMessage(err);
         const parts = llmFailureParts(message, line, 'cli');
         console.error(c.err(`\n${parts.head}`));
         if (parts.friendly) console.error(c.warn(parts.friendly));

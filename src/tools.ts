@@ -3,7 +3,7 @@ import fs from 'fs';
 import { execFile } from 'child_process';
 import type { KanbanMcp } from './kanban/mcp';
 import type { MemoryStore } from './memory';
-import type { OpenAiTool, ToolHandlers, UserMemory } from './types';
+import type { OpenAiTool, ToolHandler, ToolHandlers, UserMemory } from './types';
 import { runRepoFs } from './repo-fs';
 import {
   classifyHk,
@@ -32,8 +32,10 @@ import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
 import { summarizeForChat, writeSummaryReports } from './report';
 import { readSkillDoc, resolveSkillDir } from './skills';
 import { minimalChildEnv } from './proc-env';
+import { packageRoot } from './paths';
+import { errMessage } from './err';
 
-const HK_SCRIPT = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;
 const EXEC_TIMEOUT = 60000;
 
@@ -48,6 +50,16 @@ const SCRIPT_INTERPRETERS: Record<string, string> = {
 
 /** 显式指定的解释器白名单。 */
 const ALLOWED_INTERPRETERS = new Set(['bash', 'sh', 'node', 'python3', 'python']);
+
+/**
+ * 确认/审计展示的双向摘要：超长时展示首 600 + 中间省略长度警示 + 尾 200，
+ * 注入载荷无法藏在截断点之后（单向 slice 会把尾部内容彻底藏掉）。
+ */
+export function summarizeBothEnds(s: string, head = 600, tail = 200): string {
+  if (s.length <= head + tail) return s;
+  const omitted = s.length - head - tail;
+  return `${s.slice(0, head)}…(中间省略 ${omitted} 字符，共 ${s.length} 字符)…${s.slice(s.length - tail)}`;
+}
 
 function truncate(s: unknown): string {
   const str = String(s);
@@ -110,14 +122,22 @@ function hkCreateTitle(args: string[]): string {
   return '';
 }
 
-/** 批量免问判定收在 guard.isBatchable（唯一来源）：破坏性/高影响操作永不批量。 */
-function batchKeyForMcp(name: string): string | undefined {
-  return isBatchable(name) ? `kanban:${name}` : undefined;
+/**
+ * 批量免问判定收在 guard.isBatchable（唯一来源）：破坏性/高影响操作永不批量。
+ * 免问窗口绑定任务标识：窗口内只允许对同一任务的同类操作免问，防止借窗口改任意任务。
+ */
+function batchKeyForMcp(name: string, args: Record<string, unknown>): string | undefined {
+  if (!isBatchable(name)) return undefined;
+  const id = String(args.task_id ?? args.taskId ?? args.id ?? '');
+  return id ? `kanban:${name}:${id}` : `kanban:${name}`;
 }
 
 function batchKeyForHk(argv: string[]): string | undefined {
   const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
-  return isBatchable(sub) ? `hk:${sub}` : undefined;
+  if (!isBatchable(sub)) return undefined;
+  // 同上：任务/项目标识（UUID）纳入 key，免问仅对同一对象的同类操作生效
+  const id = argv.slice(2).map(extractUuid).find(Boolean);
+  return id ? `hk:${sub}:${id}` : `hk:${sub}`;
 }
 
 function parseMcpStartRepos(args: Record<string, unknown>): RepoStartInput[] | null {
@@ -175,17 +195,17 @@ const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 
 
 /** 闸门卡片 detail：create 类结构化展示（标题/项目/描述预览），其余保持命令行原文。 */
 function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
-  if (!/create/i.test(toolName)) return `kanban_${toolName}(${JSON.stringify(args).slice(0, 800)})`;
+  if (!/create/i.test(toolName)) return summarizeBothEnds(`kanban_${toolName}(${JSON.stringify(args)})`);
   const title = typeof args.title === 'string' ? args.title : '';
   const desc = typeof args.description === 'string' ? args.description : '';
   const project = String(args.project_id ?? args.projectId ?? '');
   const priority = typeof args.priority === 'string' ? args.priority : '';
-  const preview = desc.length > 300 ? `${desc.slice(0, 300)}…` : desc;
+  const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
     `标题：${title}`,
     project ? `项目：${project}` : '',
     priority ? `优先级：${priority}` : '',
-    preview ? `描述预览：\n${preview}` : '',
+    preview,
   ]
     .filter(Boolean)
     .join('\n');
@@ -414,48 +434,49 @@ const MEMORY_TOOLS: OpenAiTool[] = [
   },
 ];
 
-export function buildTools({
-  mcp,
-  kanbanUrl,
-  kanbanProjectId,
-  kanbanRepoId,
-  kanbanIteration,
-  memory,
-  userId,
-  onMemoryChange,
-  confirm,
+/** runGatedWrite 的单次写操作配置（见 makeGatedWriter）。 */
+interface GatedWriteParams {
+  kind: 'kanban' | 'hk';
+  summary: string;
+  detail: () => string;
+  isCreate: boolean;
+  isStart: boolean;
+  urls: string[];
+  title: string;
+  batchKey?: string;
+  /** start 前置补全（可能改写命令参数）；返回错误消息则审计 error 并拦截。 */
+  prepare?: () => Promise<string | null>;
+  execute: () => Promise<string>;
+  signal?: AbortSignal;
+}
+
+type GatedWrite = (p: GatedWriteParams) => Promise<string>;
+
+/**
+ * MCP 动态工具与 hk_cli 共用的写路径流水线：
+ * 去重 → 创建上限 → 前置补全（start 分支等）→ 确认闸门 → 执行 → 审计 → 记录来源。
+ * 差异点全部参数化：审计 kind、summary/detail（detail 传 getter，前置补全改写命令后取最新值）、
+ * 批量免问 batchKey、来源 URL 提取方式、执行体。
+ */
+function makeGatedWriter({
+  uid,
   registry,
+  kanbanUrl,
+  confirm,
   auditHome,
-  reportLinkBaseUrl,
 }: {
-  mcp: KanbanMcp | null;
+  uid: string;
+  registry: SourceRegistry;
   kanbanUrl: string;
-  kanbanProjectId?: string;
-  kanbanRepoId?: string;
-  kanbanIteration?: string;
-  memory?: MemoryStore | null;
-  userId?: string;
-  /** Called after any successful memory write so session can refresh system prompt. */
-  onMemoryChange?: () => void;
-  /** Write gate: every write op waits for explicit user approval. Omit → writes blocked. */
   confirm?: ConfirmFn;
-  /** Dedupe store for「飞书来源 → 看板任务」；defaults to <home>/synced-sources.json. */
-  registry?: SourceRegistry;
-  /** Override audit log home (tests). */
   auditHome?: string;
-  /** bot 场景传入报告静态服务基地址：work_summary 报告改推 HTTP 链接（CLI 不传，保留本机路径）。 */
-  reportLinkBaseUrl?: string;
-}): { openAiTools: OpenAiTool[]; handlers: ToolHandlers } {
-  const openAiTools: OpenAiTool[] = [];
-  const handlers: ToolHandlers = new Map();
-  const uid = userId || 'local';
-  const reg = registry || new SourceRegistry();
+}): GatedWrite {
   let createCount = 0;
 
   /** Returns a block message if any source URL was already synced; cleans stale mappings. */
   const checkDuplicates = async (urls: string[]): Promise<string | null> => {
     for (const url of urls) {
-      const hit = reg.lookup(uid, url);
+      const hit = registry.lookup(uid, url);
       if (!hit) continue;
       const exists = hit.taskId === 'unknown' ? true : await kanbanTaskExists(kanbanUrl, hit.taskId);
       if (exists) {
@@ -466,7 +487,7 @@ export function buildTools({
           '如用户是想把最新内容合并进原任务，改用 update 更新该任务，不要重建。'
         );
       }
-      reg.remove(uid, url); // 原任务已被删除 → 清理映射后放行
+      registry.remove(uid, url); // 原任务已被删除 → 清理映射后放行
     }
     return null;
   };
@@ -477,29 +498,10 @@ export function buildTools({
     const taskId = extractUuid(result);
     if (!taskId) return;
     const entry = { taskId, title, createdAt: new Date().toISOString() };
-    for (const url of urls) reg.record(uid, url, entry);
+    for (const url of urls) registry.record(uid, url, entry);
   };
 
-  /**
-   * MCP 动态工具与 hk_cli 共用的写路径流水线：
-   * 去重 → 创建上限 → 前置补全（start 分支等）→ 确认闸门 → 执行 → 审计 → 记录来源。
-   * 差异点全部参数化：审计 kind、summary/detail（detail 传 getter，前置补全改写命令后取最新值）、
-   * 批量免问 batchKey、来源 URL 提取方式、执行体。
-   */
-  const runGatedWrite = async (p: {
-    kind: 'kanban' | 'hk';
-    summary: string;
-    detail: () => string;
-    isCreate: boolean;
-    isStart: boolean;
-    urls: string[];
-    title: string;
-    batchKey?: string;
-    /** start 前置补全（可能改写命令参数）；返回错误消息则审计 error 并拦截。 */
-    prepare?: () => Promise<string | null>;
-    execute: () => Promise<string>;
-    signal?: AbortSignal;
-  }): Promise<string> => {
+  return async (p) => {
     if (p.urls.length) {
       const dup = await checkDuplicates(p.urls);
       if (dup) {
@@ -536,61 +538,69 @@ export function buildTools({
     if (ok && p.isCreate) createCount++;
     return wrapUntrusted(result);
   };
+}
 
-  if (mcp && mcp.connected) {
-    for (const tool of mcp.tools) {
-      const name = `kanban_${tool.name}`;
-      openAiTools.push({
-        type: 'function',
-        function: {
-          name,
-          description: `[helios-kanban MCP] ${tool.description || tool.name}`,
-          parameters: (tool.inputSchema as OpenAiTool['function']['parameters']) || {
-            type: 'object',
-            properties: {},
-          },
-        },
-      });
-      handlers.set(name, async (args, ctx) => {
-        if (classifyMcp(tool.name) === 'read') {
-          try {
-            // 看板内容（标题/描述等）可被任何能写看板的人控制：UNTRUSTED 包裹，其中「指令」无效
-            return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            return `MCP 工具 ${tool.name} 调用失败: ${message}`;
-          }
-        }
-        // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
-        const summary = summarizeMcp(tool.name, args);
-        const detail = formatMcpDetail(tool.name, args);
-        const isCreate = /create/i.test(tool.name);
-        const isStart = /start_workspace/i.test(tool.name);
-        return runGatedWrite({
-          kind: 'kanban',
-          summary,
-          detail: () => detail,
-          isCreate,
-          isStart,
-          urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
-          title: typeof args.title === 'string' ? args.title : '',
-          batchKey: batchKeyForMcp(tool.name),
-          prepare: isStart ? () => prepareMcpStartArgs(args, kanbanUrl, ctx?.signal) : undefined,
-          execute: async () => {
-            try {
-              return await mcp.callTool(tool.name, args, ctx?.signal);
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              return `MCP 工具 ${tool.name} 调用失败: ${message}`;
-            }
-          },
-          signal: ctx?.signal,
-        });
-      });
+/** kanban_<tool> 动态工具 handler：读直接调用，写与 hk_cli 共用 runGatedWrite 流水线。 */
+function makeKanbanMcpHandler({
+  mcp,
+  tool,
+  kanbanUrl,
+  runGatedWrite,
+}: {
+  mcp: KanbanMcp;
+  tool: KanbanMcp['tools'][number];
+  kanbanUrl: string;
+  runGatedWrite: GatedWrite;
+}): ToolHandler {
+  return async (args, ctx) => {
+    if (classifyMcp(tool.name) === 'read') {
+      try {
+        // 看板内容（标题/描述等）可被任何能写看板的人控制：UNTRUSTED 包裹，其中「指令」无效
+        return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
+      } catch (err) {
+        const message = errMessage(err);
+        return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+      }
     }
-  }
+    // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
+    const summary = summarizeMcp(tool.name, args);
+    const detail = formatMcpDetail(tool.name, args);
+    const isCreate = /create/i.test(tool.name);
+    const isStart = /start_workspace/i.test(tool.name);
+    return runGatedWrite({
+      kind: 'kanban',
+      summary,
+      detail: () => detail,
+      isCreate,
+      isStart,
+      urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
+      title: typeof args.title === 'string' ? args.title : '',
+      batchKey: batchKeyForMcp(tool.name, args),
+      prepare: isStart ? () => prepareMcpStartArgs(args, kanbanUrl, ctx?.signal) : undefined,
+      execute: async () => {
+        try {
+          return await mcp.callTool(tool.name, args, ctx?.signal);
+        } catch (err) {
+          const message = errMessage(err);
+          return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+        }
+      },
+      signal: ctx?.signal,
+    });
+  };
+}
 
-  handlers.set('lark_cli', async (raw, ctx) => {
+/** lark_cli handler：写操作过确认闸门，读操作留审计（不记读回内容）。 */
+function makeLarkCliHandler({
+  uid,
+  confirm,
+  auditHome,
+}: {
+  uid: string;
+  confirm?: ConfirmFn;
+  auditHome?: string;
+}): ToolHandler {
+  return async (raw, ctx) => {
     const args = raw.args;
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
@@ -598,7 +608,7 @@ export function buildTools({
     const argv = args as string[];
     if (classifyLark(argv) === 'write') {
       const summary = `飞书写操作：lark-cli ${argv.slice(0, 3).join(' ')}`;
-      const detail = `lark-cli ${argv.join(' ')}`.slice(0, 800);
+      const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
       const gate = await passGate({ kind: 'lark', summary, detail }, confirm);
       if (!gate.allowed) {
         auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason }, auditHome);
@@ -626,14 +636,29 @@ export function buildTools({
       auditHome,
     );
     return wrapUntrusted(out);
-  });
+  };
+}
 
+/** hk_cli handler：读直接执行，写走 runGatedWrite（start 前置补全分支后再过闸门）。 */
+function makeHkCliHandler({
+  kanbanUrl,
+  kanbanProjectId,
+  kanbanRepoId,
+  kanbanIteration,
+  runGatedWrite,
+}: {
+  kanbanUrl: string;
+  kanbanProjectId?: string;
+  kanbanRepoId?: string;
+  kanbanIteration?: string;
+  runGatedWrite: GatedWrite;
+}): ToolHandler {
   const hkEnv: NodeJS.ProcessEnv = { HELIOS_KANBAN_URL: kanbanUrl };
   if (kanbanProjectId) hkEnv.HELIOS_KANBAN_PROJECT_ID = kanbanProjectId;
   if (kanbanRepoId) hkEnv.HELIOS_KANBAN_REPO_ID = kanbanRepoId;
   if (kanbanIteration) hkEnv.HELIOS_KANBAN_ITERATION = kanbanIteration;
 
-  handlers.set('hk_cli', async (raw, ctx) => {
+  return async (raw, ctx) => {
     const args = raw.args;
     if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
       return '参数错误：args 必须是字符串数组';
@@ -650,7 +675,7 @@ export function buildTools({
     return runGatedWrite({
       kind: 'hk',
       summary,
-      detail: () => `hk ${argv.join(' ')}`.slice(0, 800),
+      detail: () => summarizeBothEnds(`hk ${argv.join(' ')}`),
       isCreate,
       isStart,
       urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
@@ -686,9 +711,20 @@ export function buildTools({
       execute: () => run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal }),
       signal: ctx?.signal,
     });
-  });
+  };
+}
 
-  handlers.set('repo_fs', async (raw) => {
+/** repo_fs handler：只读浏览仓库代码；读审计记 action/路径，不记读回内容。 */
+function makeRepoFsHandler({
+  uid,
+  kanbanUrl,
+  auditHome,
+}: {
+  uid: string;
+  kanbanUrl: string;
+  auditHome?: string;
+}): ToolHandler {
+  return async (raw) => {
     const action = typeof raw.action === 'string' ? raw.action : '';
     const relPath = typeof raw.path === 'string' ? raw.path : '.';
     // 仓库代码属外部内容（可能含注释型注入）：UNTRUSTED 包裹
@@ -723,15 +759,28 @@ export function buildTools({
       auditHome,
     );
     return wrapUntrusted(out);
-  });
+  };
+}
 
-  handlers.set('skill_doc', async (raw) => {
+/** skill_doc handler：技能文档是本仓库自带内容（非外部注入），无需 UNTRUSTED 包裹。 */
+function makeSkillDocHandler(): ToolHandler {
+  return async (raw) => {
     const name = typeof raw.name === 'string' ? raw.name : '';
-    // 技能文档是本仓库自带内容（非外部注入），无需 UNTRUSTED 包裹
     return truncate(readSkillDoc(name));
-  });
+  };
+}
 
-  handlers.set('skill_exec', async (raw, ctx) => {
+/** skill_exec handler：任意代码执行无法分类读写，一律逐次确认（不传 batchKey）。 */
+function makeSkillExecHandler({
+  uid,
+  confirm,
+  auditHome,
+}: {
+  uid: string;
+  confirm?: ConfirmFn;
+  auditHome?: string;
+}): ToolHandler {
+  return async (raw, ctx) => {
     const skill = typeof raw.skill === 'string' ? raw.skill.trim() : '';
     const script = typeof raw.script === 'string' ? raw.script.trim() : '';
     if (!skill || !script) return '参数错误：skill 与 script 均必填';
@@ -766,7 +815,7 @@ export function buildTools({
       }
     }
     const summary = `执行技能脚本：${skill}/${script}`;
-    const detail = `${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`.slice(0, 800);
+    const detail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
     // 执行任意脚本 = 任意代码执行，无法可靠分类读写：一律逐次确认（不传 batchKey）
     const gate = await passGate({ kind: 'skill', summary, detail }, confirm);
     if (!gate.allowed) {
@@ -779,9 +828,22 @@ export function buildTools({
       auditHome,
     );
     return wrapUntrusted(out);
-  });
+  };
+}
 
-  handlers.set('work_summary', async (raw) => {
+/** work_summary handler：生成工作总结报告；bot 场景传 reportLinkBaseUrl 改推 HTTP 链接。 */
+function makeWorkSummaryHandler({
+  kanbanUrl,
+  kanbanProjectId,
+  kanbanIteration,
+  reportLinkBaseUrl,
+}: {
+  kanbanUrl: string;
+  kanbanProjectId?: string;
+  kanbanIteration?: string;
+  reportLinkBaseUrl?: string;
+}): ToolHandler {
+  return async (raw) => {
     const iteration =
       (typeof raw.iteration === 'string' && raw.iteration.trim()) || kanbanIteration || '';
     const scopeArg = typeof raw.scope === 'string' ? raw.scope : '';
@@ -805,94 +867,189 @@ export function buildTools({
       return wrapUntrusted(empty + summarizeForChat(data, paths, { linkBaseUrl: reportLinkBaseUrl }));
     } catch (err) {
       return (
-        `生成工作总结失败: ${err instanceof Error ? err.message : String(err)}\n` +
+        `生成工作总结失败: ${errMessage(err)}\n` +
         `请确认 kanban 服务可访问（${kanbanUrl}）后重试。`
       );
     }
-  });
+  };
+}
+
+/** memory_* handler 组：写/删/备注回注系统提示词（持久化注入通道），一律过确认闸门。 */
+function makeMemoryHandlers({
+  uid,
+  memory,
+  confirm,
+  auditHome,
+  onMemoryChange,
+}: {
+  uid: string;
+  memory: MemoryStore;
+  confirm?: ConfirmFn;
+  auditHome?: string;
+  onMemoryChange?: () => void;
+}): Array<[string, ToolHandler]> {
+  const memorySet: ToolHandler = async (raw) => {
+    const key = typeof raw.key === 'string' ? raw.key : '';
+    const value = typeof raw.value === 'string' ? raw.value : '';
+    if (!key.trim()) return '参数错误：key 不能为空';
+    // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
+    const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
+    const detail = summarizeBothEnds(`memory_set(key=${key.trim()}, value=${value})`);
+    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    try {
+      // setFact 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
+      const user = memory.setFact(uid, key, value) as unknown as UserMemory & { ok?: boolean; error?: string };
+      if (user.ok === false) {
+        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
+        return JSON.stringify({ ok: false, error: user.error || '记忆写入落盘失败，未持久化' });
+      }
+      onMemoryChange?.();
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
+      return JSON.stringify({ ok: true, key: key.trim(), value, facts: user.facts });
+    } catch (err) {
+      return `memory_set 失败: ${errMessage(err)}`;
+    }
+  };
+
+  const memoryGet: ToolHandler = async (raw) => {
+    const key = typeof raw.key === 'string' ? raw.key.trim() : '';
+    if (key) {
+      const value = memory.getFact(uid, key);
+      return value === undefined
+        ? JSON.stringify({ key, value: null, found: false })
+        : JSON.stringify({ key, value, found: true });
+    }
+    const user = memory.getUser(uid);
+    return JSON.stringify({ facts: user.facts, notes: user.notes, updatedAt: user.updatedAt });
+  };
+
+  const memoryDelete: ToolHandler = async (raw) => {
+    const key = typeof raw.key === 'string' ? raw.key.trim() : '';
+    if (!key) return '参数错误：key 不能为空';
+    // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门
+    const summary = `删除记忆「${key}」`;
+    const detail = `memory_delete(key=${key})`;
+    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    const ok = memory.deleteFact(uid, key);
+    if (ok) onMemoryChange?.();
+    auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok }, auditHome);
+    return JSON.stringify({ ok, key });
+  };
+
+  const memoryNote: ToolHandler = async (raw) => {
+    const text = typeof raw.text === 'string' ? raw.text : '';
+    // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门
+    const summary = `追加记忆备注：${text.slice(0, 100)}`;
+    const detail = summarizeBothEnds(`memory_note(text=${text})`);
+    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    if (!gate.allowed) {
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      return gate.message;
+    }
+    try {
+      // addNote 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
+      const user = memory.addNote(uid, text) as unknown as UserMemory & { ok?: boolean; error?: string };
+      if (user.ok === false) {
+        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
+        return JSON.stringify({ ok: false, error: user.error || '记忆备注落盘失败，未持久化' });
+      }
+      onMemoryChange?.();
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
+      return JSON.stringify({ ok: true, notes: user.notes });
+    } catch (err) {
+      return `memory_note 失败: ${errMessage(err)}`;
+    }
+  };
+
+  return [
+    ['memory_set', memorySet],
+    ['memory_get', memoryGet],
+    ['memory_delete', memoryDelete],
+    ['memory_note', memoryNote],
+  ];
+}
+
+export function buildTools({
+  mcp,
+  kanbanUrl,
+  kanbanProjectId,
+  kanbanRepoId,
+  kanbanIteration,
+  memory,
+  userId,
+  onMemoryChange,
+  confirm,
+  registry,
+  auditHome,
+  reportLinkBaseUrl,
+}: {
+  mcp: KanbanMcp | null;
+  kanbanUrl: string;
+  kanbanProjectId?: string;
+  kanbanRepoId?: string;
+  kanbanIteration?: string;
+  memory?: MemoryStore | null;
+  userId?: string;
+  /** Called after any successful memory write so session can refresh system prompt. */
+  onMemoryChange?: () => void;
+  /** Write gate: every write op waits for explicit user approval. Omit → writes blocked. */
+  confirm?: ConfirmFn;
+  /** Dedupe store for「飞书来源 → 看板任务」；defaults to <home>/synced-sources.json. */
+  registry?: SourceRegistry;
+  /** Override audit log home (tests). */
+  auditHome?: string;
+  /** bot 场景传入报告静态服务基地址：work_summary 报告改推 HTTP 链接（CLI 不传，保留本机路径）。 */
+  reportLinkBaseUrl?: string;
+}): { openAiTools: OpenAiTool[]; handlers: ToolHandlers } {
+  const openAiTools: OpenAiTool[] = [];
+  const handlers: ToolHandlers = new Map();
+  const uid = userId || 'local';
+  const reg = registry || new SourceRegistry();
+  const runGatedWrite = makeGatedWriter({ uid, registry: reg, kanbanUrl, confirm, auditHome });
+
+  if (mcp && mcp.connected) {
+    for (const tool of mcp.tools) {
+      const name = `kanban_${tool.name}`;
+      openAiTools.push({
+        type: 'function',
+        function: {
+          name,
+          description: `[helios-kanban MCP] ${tool.description || tool.name}`,
+          parameters: (tool.inputSchema as OpenAiTool['function']['parameters']) || {
+            type: 'object',
+            properties: {},
+          },
+        },
+      });
+      handlers.set(name, makeKanbanMcpHandler({ mcp, tool, kanbanUrl, runGatedWrite }));
+    }
+  }
+
+  handlers.set('lark_cli', makeLarkCliHandler({ uid, confirm, auditHome }));
+  handlers.set(
+    'hk_cli',
+    makeHkCliHandler({ kanbanUrl, kanbanProjectId, kanbanRepoId, kanbanIteration, runGatedWrite }),
+  );
+  handlers.set('repo_fs', makeRepoFsHandler({ uid, kanbanUrl, auditHome }));
+  handlers.set('skill_doc', makeSkillDocHandler());
+  handlers.set('skill_exec', makeSkillExecHandler({ uid, confirm, auditHome }));
+  handlers.set(
+    'work_summary',
+    makeWorkSummaryHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
+  );
 
   if (memory) {
-    handlers.set('memory_set', async (raw) => {
-      const key = typeof raw.key === 'string' ? raw.key : '';
-      const value = typeof raw.value === 'string' ? raw.value : '';
-      if (!key.trim()) return '参数错误：key 不能为空';
-      // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
-      const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
-      const detail = `memory_set(key=${key.trim()}, value=${value})`.slice(0, 800);
-      const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
-      if (!gate.allowed) {
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
-        return gate.message;
-      }
-      try {
-        // setFact 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
-        const user = memory.setFact(uid, key, value) as unknown as UserMemory & { ok?: boolean; error?: string };
-        if (user.ok === false) {
-          auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-          return JSON.stringify({ ok: false, error: user.error || '记忆写入落盘失败，未持久化' });
-        }
-        onMemoryChange?.();
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
-        return JSON.stringify({ ok: true, key: key.trim(), value, facts: user.facts });
-      } catch (err) {
-        return `memory_set 失败: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    });
-
-    handlers.set('memory_get', async (raw) => {
-      const key = typeof raw.key === 'string' ? raw.key.trim() : '';
-      if (key) {
-        const value = memory.getFact(uid, key);
-        return value === undefined
-          ? JSON.stringify({ key, value: null, found: false })
-          : JSON.stringify({ key, value, found: true });
-      }
-      const user = memory.getUser(uid);
-      return JSON.stringify({ facts: user.facts, notes: user.notes, updatedAt: user.updatedAt });
-    });
-
-    handlers.set('memory_delete', async (raw) => {
-      const key = typeof raw.key === 'string' ? raw.key.trim() : '';
-      if (!key) return '参数错误：key 不能为空';
-      // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门
-      const summary = `删除记忆「${key}」`;
-      const detail = `memory_delete(key=${key})`;
-      const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
-      if (!gate.allowed) {
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
-        return gate.message;
-      }
-      const ok = memory.deleteFact(uid, key);
-      if (ok) onMemoryChange?.();
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok }, auditHome);
-      return JSON.stringify({ ok, key });
-    });
-
-    handlers.set('memory_note', async (raw) => {
-      const text = typeof raw.text === 'string' ? raw.text : '';
-      // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门
-      const summary = `追加记忆备注：${text.slice(0, 100)}`;
-      const detail = `memory_note(text=${text})`.slice(0, 800);
-      const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
-      if (!gate.allowed) {
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
-        return gate.message;
-      }
-      try {
-        // addNote 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
-        const user = memory.addNote(uid, text) as unknown as UserMemory & { ok?: boolean; error?: string };
-        if (user.ok === false) {
-          auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-          return JSON.stringify({ ok: false, error: user.error || '记忆备注落盘失败，未持久化' });
-        }
-        onMemoryChange?.();
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
-        return JSON.stringify({ ok: true, notes: user.notes });
-      } catch (err) {
-        return `memory_note 失败: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    });
-
+    for (const [name, handler] of makeMemoryHandlers({ uid, memory, confirm, auditHome, onMemoryChange })) {
+      handlers.set(name, handler);
+    }
     openAiTools.push(...MEMORY_TOOLS);
   }
 

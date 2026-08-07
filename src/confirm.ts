@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { ConfirmRequest, ConfirmVerdict } from './guard';
+import { errMessage } from './err';
 
 /**
  * Bot-side write confirmation: one pending action per user.
@@ -86,6 +87,8 @@ export class ConfirmationManager {
       onSuperseded?: (openId: string, req: ConfirmRequest) => void;
       /** 请求进入终态时回调；带卡片 message id 时可原地更新为终态卡片。 */
       onSettled?: (openId: string, req: ConfirmRequest, settle: ConfirmSettle, cardMessageId?: string) => void;
+      /** 确认卡片与文本降级都发送失败时回调（用户无法裁决）：bot 层借此走最后可达路径告知用户。 */
+      onSendFailed?: (openId: string, req: ConfirmRequest, error: string) => void;
     } = {},
   ) {}
 
@@ -133,9 +136,21 @@ export class ConfirmationManager {
           if (p && p.id === id && messageId) p.cardMessageId = messageId;
         })
         .catch((err) => {
-          // 卡片与文本降级都发送失败：用户完全无感知、工具干等超时——至少落日志可排查
-          const message = err instanceof Error ? err.message : String(err);
-          console.error(`[confirm] 确认请求发送失败（用户无法裁决，将等超时自动拒绝）: ${message}`);
+          // 卡片与文本降级都发送失败：用户无法裁决。 pending 仍属本条时才收尾——
+          // 尽快以「拒绝」返回（工具不再干等超时），并回调 bot 层走最后可达路径告知用户。
+          const message = errMessage(err);
+          console.error(`[confirm] 确认请求发送失败，按拒绝处理: ${message}`);
+          const p = this.pendings.get(openId);
+          if (p && p.id === id) {
+            clearTimeout(p.timer);
+            this.pendings.delete(openId);
+            resolve(false);
+            try {
+              this.opts.onSendFailed?.(openId, req, message);
+            } catch {
+              /* 通知回调失败不阻断收尾 */
+            }
+          }
         });
     });
   }

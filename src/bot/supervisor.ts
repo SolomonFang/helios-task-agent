@@ -24,6 +24,8 @@ export interface McpSupervisorOptions {
   onRecovered?: () => void;
   /** ping 挂起防护（超时按失败处理），默认 30s。 */
   pingTimeoutMs?: number;
+  /** stop() 等待在途重连的竞速超时（默认 5s）：超时后继续关闭流程，避免拖累整体退出。 */
+  stopTimeoutMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -63,7 +65,25 @@ export class McpSupervisor {
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.reconnecting;
+    if (!this.reconnecting) return;
+    // 在途重连最坏 45s 级别（mcp.reconnect 内部多次超时叠加），裸 await 会拖垮调用方的
+    // 退出超时兜底：竞速超时后照常返回继续关闭（重连 promise 不 reject，race 不会抛）
+    const ms = this.opts.stopTimeoutMs ?? 5000;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.reconnecting,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            this.opts.log?.(`stop 等待在途重连超时（${Math.round(ms / 1000)}s），继续关闭流程`);
+            resolve();
+          }, ms);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

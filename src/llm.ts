@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { UNTRUSTED_OPEN, wrapUntrusted } from './guard';
+import { errMessage } from './err';
 import type {
   ChatMessage,
   LlmClientConfig,
@@ -186,7 +187,7 @@ export async function runAgentTurn({
     try {
       resp = await createReq();
     } catch (err) {
-      const msgText = err instanceof Error ? err.message : String(err);
+      const msgText = errMessage(err);
       if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
       // 上下文超限自愈：逐级丢弃最旧轮次后重试（最多 3 次），仍失败则抛出原始错误
       let recovered = false;
@@ -196,7 +197,7 @@ export async function runAgentTurn({
           resp = await createReq();
           recovered = true;
         } catch (retryErr) {
-          const retryText = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          const retryText = errMessage(retryErr);
           if (!CONTEXT_OVERFLOW_RE.test(retryText)) throw retryErr;
         }
       }
@@ -238,14 +239,14 @@ export async function runAgentTurn({
         try {
           args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = errMessage(err);
           result = `错误：工具参数 JSON 解析失败: ${message}`;
         }
         if (result === undefined) {
           try {
             result = String(await handler(args, { signal }));
           } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
+            const message = errMessage(err);
             result = `工具 ${name} 执行异常: ${message}`;
           }
         }

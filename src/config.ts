@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
-import { defaultDataHome } from './memory';
+import { defaultDataHome, packageRoot } from './paths';
 import { writeFilePrivateSync } from './private-file';
 import { kanbanPackageSpec } from './deps';
 import type { AgentConfig, FeishuBotConfig, LlmPreset } from './types';
@@ -13,7 +13,7 @@ export function userEnvPath(): string {
 
 /** Package / repo .env (local development). */
 export function projectEnvPath(): string {
-  return path.join(__dirname, '..', '.env');
+  return path.join(packageRoot, '.env');
 }
 
 /**

@@ -10,6 +10,7 @@ import { LOCAL_TOOL_SUMMARY } from './tools';
 import { loadSkillDigests } from './prompt';
 import { installSkill, uninstallSkill } from './skills';
 import { friendlyLlmError } from './llm-error';
+import { errMessage } from './err';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 /** 输出着色适配：CLI 传 ui.c，bot 传 plainPaint。 */
@@ -164,7 +165,7 @@ export function handleSkillsCommand(
       return [p.ok(`✅ 已卸载技能「${value}」。`), p.gray('对话上下文 /clear 或重启后生效。')];
     }
   } catch (err) {
-    return [p.warn(err instanceof Error ? err.message : String(err))];
+    return [p.warn(errMessage(err))];
   }
   return [p.warn(`未知子命令「${sub}」。`), p.gray(SKILLS_USAGE)];
 }

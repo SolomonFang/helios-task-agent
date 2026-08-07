@@ -48,7 +48,7 @@ const onFatal = (err) => {
 };
 
 if (cmd === 'bot') {
-  require('../dist/bot').main().catch(onFatal);
+  require('../dist/bot-main').main().catch(onFatal);
 } else if (cmd === 'cli' || cmd === 'start' || cmd === '') {
   require('../dist/cli').main().catch(onFatal);
 } else {

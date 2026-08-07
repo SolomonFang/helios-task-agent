@@ -9,6 +9,41 @@
 ### Added
 
 - 技能管理命令 `/skills install <路径>` / `/skills uninstall <名称>`（CLI 与飞书 bot 一致）：安装即复制到数据目录 `skills/`（`HELIOS_TASK_AGENT_HOME` 或 `~/.helios-task-agent`），`npm i -g` 升级不再丢失；同名覆盖即更新；包内内置技能不可卸载。启动时自动把历史误放进包内 `skills/`（npm 安装目录）的非内置技能迁移到数据目录并打印提示——此前没有安装入口，用户只能手动拷目录，且界面上唯一可见的 `skills/` 路径是包内那个，放进去一升级就没
+- 新增 `scripts/unit-feishu-filter.ts`：WS 事件入口过滤的真实单测（p2p 过滤、bot 发送者忽略、message_id 去重与 TTL、卡片回调 open_id 白名单、owner 认领 fail-closed 与阻断集）——此前这些防线零覆盖，唯一的「白名单」用例实际绕过了 feishu 层
+
+### Changed
+
+- 大型函数拆分：`bot/handler.ts` 的 `handle`（约 260 行）按命令表驱动分发拆为十余个命名函数，`tools.ts` 的 `buildTools`（约 485 行）收敛为纯装配层 + 各工具工厂函数，`kanban/watcher.ts` 的 `tick`（约 140 行）拆为 diff / 投递 / 落盘三段——行为均保持不变
+- 公共启动序列抽为 `src/bootstrap.ts`（cli 与 bot 此前逐字重复且 OCR 检查只在 bot 侧，已漂移）；「发卡片失败降级纯文本」收敛为 `sendCardWithTextFallback`
+- 数据目录路径与包根路径收敛为 `src/paths.ts`（原 8 个模块为拿路径 import memory；4 处散落的 `__dirname` 假设统一为 `packageRoot` 并注明 CJS 前提）；`prompt.ts ↔ skills.ts` import 循环随之断开
+- 全仓 45 处手写 `err instanceof Error ? err.message : String(err)` 收敛为 `src/err.ts` 的 `errMessage`；`deps.ts` 同步/异步探测器共用 `parseLarkCliAuth`
+- `src/bot.ts` 改名 `src/bot-main.ts`，消除与 `src/bot/` 目录的同名歧义；删除零引用的 `channels/index.ts` barrel 与 `SUGGESTED_MEMORY_KEYS`
+- `npm run typecheck` 通过 `tsconfig.typecheck.json` 覆盖 scripts/ 测试脚本（此前 7 个测试文件无类型检查）
+
+### Security
+
+- 写操作确认展示改为「首尾双向摘要 + 省略长度警示」（`summarizeBothEnds`），注入载荷无法再藏在单向截断点之后——所见即所执行
+- 审计日志 `detail` 落盘前同样脱敏，`redactSnippet` 增加 `--token xxx` 等 CLI flag 形态（此前 detail 明文记录完整命令行与 memory value）
+- 「同类免问」batchKey 纳入任务标识（task_id / hk argv 中的 UUID），免问窗口不再对任意任务的写操作放行
+- `repo_fs` denylist 按路径整体拒绝 `.git/` 目录与 credentials 类文件（此前仅按 basename 匹配，`.git/config` 中带 token 的 remote URL 可被读回）；list/grep 同样前置拦截，grep 正则增加嵌套量词 ReDoS 启发式拒绝
+- memory 写入前中和伪造的 `<<<USER_MEMORY` / `END_USER_MEMORY>>>` 标记（持久化注入缺口）
+- `--help` 豁免不再优先于写动词检查：命中写动词的命令一律按写处理
+- `readSkillDoc` 拒绝读取符号链接；`hta_review` 的 git ref 增加 refname 校验；`update-check` 的 `npm config` 调用补齐最小环境变量
+
+### Fixed
+
+- 飞书 REST 调用配置 20s 超时（SDK 默认 axios 实例此前无超时，挂死连接会让用户队列与看板推送永久停摆）
+- bot / CLI 入口注册 `unhandledRejection` / `uncaughtException` 兜底：rejection 记日志，未捕获异常走优雅退出（此前漏网 rejection 直接 crash 且绕过 shutdown 清理）
+- watcher 未送达事件增加 24h TTL，过期丢弃并记日志（此前 pending 随 owner 不可达无限增长）；旧 state 文件兼容加载
+- 确认卡片与文本降级都发送失败时立即以「拒绝」收尾并经 `onSendFailed` 告知用户（此前工具干等 120/300s 超时）
+- `/stop` 可中断进行中的 AI 审查：`runAiReview` 支持 AbortSignal 并真正杀掉 ocr 子进程（此前要等 15 分钟自身超时）
+- supervisor `stop()` 对在途重连加竞速超时；用户单条消息增加 8000 字符上限，超限直接拒答
+- 测试修复：技能契约用例不再扫描用户数据目录（本机第三方技能曾致 `npm test` 环境性失败）；batchApproval TTL 过期路径、LLM 错误映射、无断言用例、SDK 私有字段脆性断言逐一补实
+
+## [1.0.19] - 2026-08-06
+
+### Added
+
 - 新增 `skill_exec` 工具：技能目录内脚本（node/shell/python 等）可直接运行——此前技能只有文档注入（`skill_doc`），带脚本的技能除硬编码的 `hk_cli` 外无任何执行通道。脚本路径限定在技能目录内（realpath 校验，拒绝 `..`/绝对路径/符号链接逃逸），按扩展名推断解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录；执行任意脚本不可预判读写，每次调用逐次弹用户确认（不参与「同类免问」，无确认通道 fail-closed），子进程沿用最小环境变量并写审计日志
 - `helios-task-agent bot --reconfig`：凭证已存在时重跑完整配置向导（换模型 / Base URL / API Key 不用再手编 `.env`）；`--rebind` 仍只重跑飞书凭证向导
 - 审计增加 read 类记录：`lark_cli` 读路径、`repo_fs` 读取及敏感文件 denylist 拒绝均写入 `audit.log`（此前只有写操作与拦截有审计）

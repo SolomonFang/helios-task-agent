@@ -1,8 +1,11 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import { defaultDataHome } from './paths';
 import { writeFilePrivateSync } from './private-file';
 import type { MemoryFile, UserMemory } from './types';
+
+// 路径工具已抽到 paths.ts；此处 re-export 仅为兼容既有调用方（index.ts 公共 API 等）
+export { defaultDataHome };
 
 const MAX_NOTES = 50;
 /** facts 键数上限：记忆每轮全量回注系统提示词，无上限会被无限增长的键值撑爆上下文。 */
@@ -15,8 +18,17 @@ function clampEntry(s: string): string {
   return s.length > MAX_ENTRY_LEN ? `${s.slice(0, MAX_ENTRY_LEN)}…（已截断）` : s;
 }
 
-export function defaultDataHome(): string {
-  return process.env.HELIOS_TASK_AGENT_HOME || path.join(os.homedir(), '.helios-task-agent');
+/**
+ * 记忆块包裹标记（与 prompt.ts 的 MEMORY_OPEN/CLOSE 对应）。记忆内容会原样回注系统
+ * 提示词：写入前中和伪造的开/闭标记（插零宽字符，同 guard.wrapUntrusted 的做法），
+ * 防止伪造闭合标记后在 prompt 里注入「可信指令」——只中和标记本身，不改其余内容。
+ */
+const MEMORY_MARKERS = ['<<<USER_MEMORY', 'END_USER_MEMORY>>>'];
+
+function neutralizeMemoryMarkers(s: string): string {
+  let out = s;
+  for (const m of MEMORY_MARKERS) out = out.split(m).join(`${m[0]!}\u200B${m.slice(1)}`);
+  return out;
 }
 
 function emptyUser(): UserMemory {
@@ -135,9 +147,9 @@ export class MemoryStore {
   }
 
   setFact(userId: string, key: string, value: string): UserMemory {
-    const k = key.trim();
+    const k = neutralizeMemoryMarkers(key.trim());
     if (!k) throw new Error('key 不能为空');
-    const v = clampEntry(String(value));
+    const v = neutralizeMemoryMarkers(clampEntry(String(value)));
     const user = this.touch(userId);
     // 键数上限：仅拦新增 key（更新已有 key 不受限）
     if (!(k in user.facts) && Object.keys(user.facts).length >= MAX_FACTS) {
@@ -161,7 +173,7 @@ export class MemoryStore {
   }
 
   addNote(userId: string, text: string): UserMemory {
-    const note = clampEntry(text.trim());
+    const note = neutralizeMemoryMarkers(clampEntry(text.trim()));
     if (!note) throw new Error('note 不能为空');
     const user = this.touch(userId);
     user.notes.push(note);
@@ -193,11 +205,3 @@ export class MemoryStore {
     return lines.join('\n');
   }
 }
-
-export const SUGGESTED_MEMORY_KEYS = [
-  'feishu_task_source',
-  'feishu_chat_id',
-  'preferred_project_id',
-  'preferred_repo_id',
-  'preferred_iteration',
-] as const;

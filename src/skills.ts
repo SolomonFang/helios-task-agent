@@ -1,16 +1,18 @@
 /**
  * 技能目录定位与完整文档读取（skill_doc 工具用）。
- * 技能扫描/摘要/校验逻辑在 prompt.ts；本模块依赖其中的加载器（单向调用期使用，
- * prompt.ts 仅反向引用 SKILLS_DIR 常量）。
+ * 技能扫描/摘要/校验逻辑在 prompt.ts；本模块单向依赖其中的加载器。
+ * 共享常量（SKILLS_DIR 等）放在 paths.ts，避免与 prompt.ts 形成 import 循环。
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { loadSkill, loadSkillDigests, parseFrontmatter, userSkillsDir } from './prompt';
+import { SKILLS_DIR } from './paths';
+import { errMessage } from './err';
 
-/** 包内内置技能目录（兜底；npm 全局安装目录，用户不应往里放自定义技能）。 */
-export const SKILLS_DIR = path.join(__dirname, '..', 'skills');
+// SKILLS_DIR 已移到 paths.ts；re-export 兼容既有调用方（scripts/unit.ts 等）
+export { SKILLS_DIR };
 
 /** 随包发布的内置技能目录名：启动迁移时跳过；发布新内置技能时需加入此列表。 */
 const BUILTIN_SKILLS = ['helios-kanban-remote'];
@@ -123,10 +125,15 @@ export function readSkillDoc(name: string): string {
   const loaded = loadSkill(dir, trimmed);
   if (!loaded) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
   try {
-    const raw = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
+    const skillFile = path.join(dir, 'SKILL.md');
+    // 符号链接可指向技能目录外的任意文件（含凭证），拒绝读取
+    if (fs.lstatSync(skillFile).isSymbolicLink()) {
+      return `已拒绝读取：技能「${trimmed}」的 SKILL.md 是符号链接，不予读取。`;
+    }
+    const raw = fs.readFileSync(skillFile, 'utf8');
     const { body } = parseFrontmatter(raw);
     return `# 技能 ${loaded.digest.name} 完整文档\n\n${body.trim()}`;
   } catch (err) {
-    return `读取技能「${trimmed}」失败：${err instanceof Error ? err.message : err}`;
+    return `读取技能「${trimmed}」失败：${errMessage(err)}`;
   }
 }

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
-import { defaultDataHome } from './memory';
+import { defaultDataHome, packageRoot } from './paths';
 import { writeFilePrivateSync } from './private-file';
 import { minimalChildEnv } from './proc-env';
 
@@ -37,7 +37,7 @@ export interface UpdateInfo {
 
 export function readPkgVersion(): string {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
+    const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')) as {
       version?: string;
     };
     return typeof pkg.version === 'string' && pkg.version ? pkg.version : '0.0.0';
@@ -50,7 +50,7 @@ export function readPkgVersion(): string {
 export function updateCheckDisabled(): boolean {
   if (process.env.HTA_UPDATE_CHECK === '0') return true;
   try {
-    if (fs.existsSync(path.join(__dirname, '..', '.git'))) return true;
+    if (fs.existsSync(path.join(packageRoot, '.git'))) return true;
   } catch {
     /* ignore */
   }
@@ -100,7 +100,8 @@ export function compareVersions(a: string, b: string): number {
 let cachedRegistry: string | null = null;
 function npmConfigRegistry(): Promise<string> {
   return new Promise((resolve) => {
-    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir() }, (err, stdout) => {
+    // 最小环境（同 defaultRunUpdate）：不向 npm 子进程泄露 LLM_API_KEY 等敏感变量
+    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir(), env: minimalChildEnv() }, (err, stdout) => {
       const out = (stdout || '').trim();
       resolve(!err && /^https?:\/\//.test(out) ? out : '');
     });

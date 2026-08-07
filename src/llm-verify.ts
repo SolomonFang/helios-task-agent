@@ -6,6 +6,8 @@
  * 这种情况标记 uncertain（无法预检），由用户选择仍保存，不误拦。
  */
 
+import { errMessage } from './err';
+
 export interface LlmVerifyResult {
   ok: boolean;
   /** true = 无法确定（端点不支持预检 / 网络不通），用户可选择仍保存。 */
@@ -40,7 +42,7 @@ export async function verifyLlmConfig(
     return {
       ok: false,
       uncertain: true,
-      message: `无法连接 ${baseUrl}（${err instanceof Error ? err.message : String(err)}）。检查网络 / 代理后重试，或选择仍然保存。`,
+      message: `无法连接 ${baseUrl}（${errMessage(err)}）。检查网络 / 代理后重试，或选择仍然保存。`,
     };
   }
 }

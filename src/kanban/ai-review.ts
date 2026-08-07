@@ -52,6 +52,14 @@ export interface OcrCommand {
   via: 'path' | 'npx';
 }
 
+/**
+ * git refname 合法性校验（fromRef/toRef 来自看板 API，作为 argv 传给 ocr 子进程）：
+ * 仅允许字母数字与 ._/-；拒绝以 - 开头（防被当作选项）、..、空白与控制字符。
+ */
+export function isValidGitRef(ref: string): boolean {
+  return Boolean(ref) && !ref.startsWith('-') && !ref.includes('..') && /^[A-Za-z0-9._/-]+$/.test(ref);
+}
+
 /** 异步探测（bot 事件循环内路径）：同步 execFileSync 每个最多阻塞 5s，飞书回调/心跳全卡。 */
 async function isGitRepo(dir: string): Promise<boolean> {
   try {
@@ -174,6 +182,8 @@ export interface RunAiReviewOptions {
   /** 整体超时（默认 15 分钟；ocr 内部单任务超时另计）。 */
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** 取消信号（/stop）：abort 时 execFile 立即 kill ocr 子进程，不必等整体超时。 */
+  signal?: AbortSignal;
 }
 
 /** ocr 无语言选项，通过 --background 注入输出语言要求。 */
@@ -185,6 +195,9 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
   const ocr = await findOcrCommand(opts.env);
   const args = [...ocr.prefixArgs, 'review', '--repo', target.repoDir];
   if (target.fromRef && target.toRef) {
+    if (!isValidGitRef(target.fromRef) || !isValidGitRef(target.toRef)) {
+      throw new Error(`非法的 git 分支名（from=${target.fromRef}, to=${target.toRef}），已拒绝执行 AI 审查。`);
+    }
     args.push('--from', target.fromRef, '--to', target.toRef);
   }
   args.push('--audience', 'agent', '--format', 'text');
@@ -201,6 +214,7 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
       encoding: 'utf8',
       timeout: timeoutMs,
       killSignal: 'SIGTERM',
+      signal: opts.signal,
       maxBuffer: 8 * 1024 * 1024,
     });
     stdout = out.stdout || '';

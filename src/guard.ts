@@ -134,6 +134,9 @@ export function classifyLark(args: string[]): 'read' | 'write' {
   // 帮助仅在「命令路径 + --help/-h 收尾」形态下判 read（如 ["task","list","--help"]）；
   // 携带其它实参时不得免确认——防止写命令夹带 --help 绕过闸门（如 ["im","send","ou_x","--help"]）
   const helpIdx = args.findIndex((a) => a === '--help' || a === '-h');
+  const verbs = larkVerbs(args);
+  // 命中写动词的一律不豁免（即使带了 --help）：启发式豁免不得放行写命令
+  if (verbs.some((v) => LARK_WRITE_VERBS.has(v))) return 'write';
   if (helpIdx === args.length - 1 && args.slice(0, helpIdx).filter((a) => !a.startsWith('-')).length <= 2) {
     return 'read';
   }
@@ -141,8 +144,6 @@ export function classifyLark(args: string[]): 'read' | 'write' {
     const method = (args[1] || '').toUpperCase();
     return method === 'GET' ? 'read' : 'write';
   }
-  const verbs = larkVerbs(args);
-  if (verbs.some((v) => LARK_WRITE_VERBS.has(v))) return 'write';
   if (verbs.some((v) => LARK_READ_VERBS.has(v))) return 'read';
   return 'write';
 }

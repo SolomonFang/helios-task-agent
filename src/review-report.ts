@@ -13,7 +13,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './memory';
+import { defaultDataHome } from './paths';
 import { escapeHtml } from './report';
 import { writeFilePrivateSync } from './private-file';
 import { newReportToken } from './report-server';

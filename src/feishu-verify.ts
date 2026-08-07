@@ -4,6 +4,8 @@
  * 目标：凭证/能力问题在向导里立刻暴露，而不是等到长连接失败才排查。
  */
 
+import { errMessage } from './err';
+
 export interface FeishuVerifyResult {
   ok: boolean;
   /** 机器人应用名（校验通过时用于回显确认）。 */
@@ -34,7 +36,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
   } catch (err) {
     return {
       ok: false,
-      message: `无法连接 open.feishu.cn（${err instanceof Error ? err.message : String(err)}）。检查网络后重试，或选择仍然保存。`,
+      message: `无法连接 open.feishu.cn（${errMessage(err)}）。检查网络后重试，或选择仍然保存。`,
     };
   }
 
@@ -54,7 +56,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
   } catch (err) {
     return {
       ok: false,
-      message: `机器人信息查询失败（${err instanceof Error ? err.message : String(err)}）。可重试，或选择仍然保存。`,
+      message: `机器人信息查询失败（${errMessage(err)}）。可重试，或选择仍然保存。`,
     };
   }
 }

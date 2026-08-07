@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './memory';
-import { SKILLS_DIR } from './skills';
+import { defaultDataHome, SKILLS_DIR } from './paths';
+import { errMessage } from './err';
 import type { UserMemory } from './types';
 
 /** 用户自定义技能目录：数据目录下 skills/（升级 npm 包不会抹掉，也无安装目录写权限问题）。 */
@@ -74,7 +74,7 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   try {
     raw = fs.readFileSync(skillFile, 'utf8');
   } catch (err) {
-    return { digest: { name: dirName, description: '', digest: '', dir: rel }, problems: [`${dirName}: SKILL.md 读取失败（${err instanceof Error ? err.message : err}）`] };
+    return { digest: { name: dirName, description: '', digest: '', dir: rel }, problems: [`${dirName}: SKILL.md 读取失败（${errMessage(err)}）`] };
   }
   const { data, body } = parseFrontmatter(raw);
   const name = typeof data.name === 'string' && data.name ? data.name : dirName;
@@ -92,11 +92,13 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   return { digest: { name, description, digest, dir: rel }, problems };
 }
 
-/** 扫描顺序：用户数据目录优先，包内内置目录兜底；同名技能以用户目录为准。 */
-function skillEntries(): Array<{ dirName: string; absDir: string }> {
+/** 默认扫描目录：用户数据目录优先，包内内置目录兜底；同名技能以用户目录为准。 */
+const defaultSkillBaseDirs = (): string[] => [userSkillsDir(), SKILLS_DIR];
+
+function skillEntries(baseDirs: string[] = defaultSkillBaseDirs()): Array<{ dirName: string; absDir: string }> {
   const seen = new Set<string>();
   const out: Array<{ dirName: string; absDir: string }> = [];
-  for (const base of [userSkillsDir(), SKILLS_DIR]) {
+  for (const base of baseDirs) {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(base, { withFileTypes: true });
@@ -132,10 +134,10 @@ export function loadSkillDigests(): SkillDigest[] {
   return digests;
 }
 
-/** 启动期/测试期校验：返回所有技能的契约问题（空数组 = 全部健康）。 */
-export function validateSkills(): string[] {
+/** 启动期/测试期校验：返回所有技能的契约问题（空数组 = 全部健康）。baseDirs 缺省扫描用户目录 + 包内目录，测试可只传包内目录隔离用户环境。 */
+export function validateSkills(baseDirs: string[] = defaultSkillBaseDirs()): string[] {
   const problems: string[] = [];
-  for (const { dirName, absDir } of skillEntries()) {
+  for (const { dirName, absDir } of skillEntries(baseDirs)) {
     const loaded = loadSkill(absDir, dirName);
     if (loaded) problems.push(...loaded.problems);
   }

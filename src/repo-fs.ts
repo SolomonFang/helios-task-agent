@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { errMessage } from './err';
 
 const MAX_OUTPUT = 8000;
 const MAX_GREP_HITS = 40;
@@ -41,9 +42,13 @@ export function resolveUnderRoot(
  * （与 proc-env.ts 不向子进程泄露敏感变量同一思路）。
  */
 const SENSITIVE_FILE_RE =
-  /^(?:\.env(?:\..+)?|\.npmrc|\.netrc|id_rsa.*|id_ed25519.*|.+\.(?:pem|key|p12|keystore))$/i;
+  /^(?:\.env(?:\..+)?|\.npmrc|\.netrc|\.?credentials|id_rsa.*|id_ed25519.*|.+\.(?:pem|key|p12|keystore))$/i;
+
+/** .git/ 内部一律拒绝（按路径整体判定，非仅 basename）：config 含带 token 的 remote URL，hooks 等也不外发。 */
+const GIT_INTERNAL_RE = /(^|[\\/])\.git([\\/]|$)/;
 
 function isSensitiveFile(fileAbs: string): boolean {
+  if (GIT_INTERNAL_RE.test(fileAbs)) return true;
   return SENSITIVE_FILE_RE.test(path.basename(fileAbs));
 }
 
@@ -74,7 +79,7 @@ export async function fetchRepoPath(  kanbanUrl: string,
     }
     return { ok: true, path: repoPath };
   } catch (err) {
-    return { ok: false, error: `请求 ${url} 失败: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, error: `请求 ${url} 失败: ${errMessage(err)}` };
   }
 }
 
@@ -137,7 +142,7 @@ export async function resolveRepoRoot(opts: {
     } catch (err) {
       return {
         ok: false,
-        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径: ${err instanceof Error ? err.message : String(err)}`,
+        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径: ${errMessage(err)}`,
       };
     }
     if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
@@ -153,6 +158,7 @@ export async function resolveRepoRoot(opts: {
 export function repoFsList(root: string, relPath = '.'): string {
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
+  if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
   if (!fs.existsSync(resolved.abs)) return `路径不存在: ${relPath || '.'}`;
   const st = fs.statSync(resolved.abs);
   if (!st.isDirectory()) return `不是目录: ${relPath || '.'}`;
@@ -198,15 +204,21 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
   if (!pattern) return '参数错误：grep 需要 pattern';
   // pattern 来自模型生成：限制长度缓解 ReDoS，编译异常友好报错
   if (pattern.length > MAX_PATTERN_LEN) return `参数错误：pattern 过长（>${MAX_PATTERN_LEN} 字符），请缩短后重试`;
+  // 简单启发式拒绝嵌套量词（如 (\w+)+ 一类灾难性回溯），不过度工程
+  if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
+    return '参数错误：pattern 含嵌套量词（如 (\\w+)+），有 ReDoS 风险，请改写后重试';
+  }
   let re: RegExp;
   try {
     re = new RegExp(pattern, 'i');
   } catch (err) {
-    return `无效正则: ${err instanceof Error ? err.message : String(err)}`;
+    return `无效正则: ${errMessage(err)}`;
   }
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
   if (!fs.existsSync(resolved.abs)) return `路径不存在: ${relPath || '.'}`;
+  // 目标本身命中敏感 denylist（含 .git/ 目录）时明确拒绝（树扫描场景则静默跳过）
+  if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
 
   const hits: string[] = [];
   const skipDir = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'target', 'vendor']);
@@ -254,8 +266,6 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
 
   const startSt = fs.statSync(resolved.abs);
   if (startSt.isFile()) {
-    // 直接对敏感文件 grep 时给出明确拒绝说明（树扫描场景则静默跳过）
-    if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
     scanFile(resolved.abs);
   } else walk(resolved.abs);
 

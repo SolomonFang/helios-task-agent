@@ -7,7 +7,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createBotHandlers, type BotHandlers } from '../src/bot/handler';
+import { createBotHandlers, MAX_USER_MESSAGE_CHARS, type BotHandlers } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import { SessionRouter } from '../src/session-router';
 import { ConfirmationManager } from '../src/confirm';
@@ -18,7 +18,7 @@ import type { ConfirmRequest } from '../src/guard';
 import type { AgentConfig, InboundMessage } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { redactSnippet } from '../src/audit';
-import { check, checkAsync, finish } from './testkit';
+import { checkAsync, finish } from './testkit';
 
 /** 轮询等待条件成立（队列与 LLM 请求均为异步），超时抛错。 */
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
@@ -50,7 +50,8 @@ type ChannelUnderTest = Pick<
 >;
 
 class FakeChannel implements ChannelUnderTest {
-  readonly name = 'fake-feishu';
+  // FeishuChannel.name 是字面量类型 'feishu'；fake 仅满足类型面，值不参与任何断言
+  readonly name = 'feishu';
   replies: { sessionId: string; text: string }[] = [];
   sent: string[] = [];
   updated: string[] = [];
@@ -248,6 +249,22 @@ async function main(): Promise<void> {
       assert.equal(f.channel.replies.length, 2);
       assert.ok(f.channel.replies[0]!.text.includes('暂只支持文字消息'));
       assert.ok(f.channel.replies[1]!.text.includes('请发送文字内容'));
+      cleanup(f);
+    });
+
+    // ---------- 消息长度上限：超限直接拒答，不排队不送 LLM ----------
+    await checkAsync('handler：超长消息直接拒答，不进入队列与 LLM', async () => {
+      const f = setup(llm.baseUrl);
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '长'.repeat(MAX_USER_MESSAGE_CHARS + 1)));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('太长了') && r.text.includes(String(MAX_USER_MESSAGE_CHARS))),
+        '超限应提示长度上限',
+      );
+      assert.equal(llm.requestCount, base, '超长消息不得发 LLM 请求');
+      // 边界：恰好上限的消息正常处理
+      await f.handlers.handle(mkMsg('u1', '长'.repeat(MAX_USER_MESSAGE_CHARS)));
+      await waitFor(() => llm.requestCount === base + 1, '上限内消息进入 LLM');
       cleanup(f);
     });
 
@@ -493,14 +510,52 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
-    // ---------- 卡片回调：白名单外静默忽略，未知 id 兜底，有效 id 裁决 ----------
-    await checkAsync('handler：卡片回调白名单与确认裁决', async () => {
+    // ---------- AI 审查：/stop 可中断（卡片回调触发的审查在串行队列外运行） ----------
+    await checkAsync('handler：/stop 中断进行中的 AI 审查', async () => {
+      // 假看板：响应头给出后永不结束 body，让 resolveReviewTarget 的 apiGet 挂起（审查进行中）
+      const kanban = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"success":true,"data":');
+      });
+      await new Promise<void>((r) => kanban.listen(0, '127.0.0.1', r));
+      const kbUrl = `http://127.0.0.1:${(kanban.address() as AddressInfo).port}`;
+      const f = setup(llm.baseUrl, kbUrl);
+      try {
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'a1', title: 'a1' } } });
+        await waitFor(
+          () => f.channel.notifies.some((n) => n.text.includes('AI 审查已开始')),
+          '审查进入进行中',
+        );
+        await f.handlers.handle(mkMsg('u1', '/stop'));
+        assert.ok(
+          f.channel.replies.some((r) => r.text.includes('已中断 1 个 AI 审查')),
+          `/stop 应报告中断 AI 审查，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+        );
+        await waitFor(
+          () => f.channel.notifies.some((n) => n.text.includes('AI 审查已中断')),
+          '审查中断回执',
+        );
+        assert.ok(
+          !f.channel.notifies.some((n) => n.text.includes('AI 审查失败')),
+          '被中断的审查不应再报「审查失败」',
+        );
+      } finally {
+        // 收尾：断开假看板连接，孤儿 runAiReview 以失败结束（race 已挂反应，不成未处理 rejection）
+        kanban.closeAllConnections?.();
+        await new Promise((r) => kanban.close(r));
+        cleanup(f);
+      }
+    });
+
+    // ---------- 卡片回调：非本机器人 payload / 无操作者静默忽略，未知 id 兜底，有效 id 裁决 ----------
+    // （open_id 白名单在 feishu.ts WS 层，由 unit-feishu-filter.ts 覆盖；本用例测 handler 层入口过滤）
+    await checkAsync('handler：卡片回调入口过滤（非本机器人/无操作者）与确认裁决', async () => {
       const f = setup(llm.baseUrl);
       // 无 hta_confirm / hta_review 的回调不属于本机器人，静默忽略
       f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: {} } });
       f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { decision: 'yes' } } });
       f.handlers.onCardAction({ action: { value: { hta_confirm: 'x', decision: 'yes' } } }); // 无 operator
-      assert.equal(f.channel.notifies.length, 0, '白名单外回调不得有任何出站消息');
+      assert.equal(f.channel.notifies.length, 0, '非本机器人/无操作者回调不得有任何出站消息');
       // 未知 / 已过期的确认 id
       f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_confirm: 'deadbeef', decision: 'yes' } } });
       assert.ok(f.channel.notifies.at(-1)!.text.includes('该确认已处理或已过期'));

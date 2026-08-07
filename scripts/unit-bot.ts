@@ -1,9 +1,10 @@
 // Unit tests（批次4：bot 与产品交互）: 纯逻辑 —— 无 LLM、无网络、无飞书连接。Run: npx tsx scripts/unit-bot.ts
 
 import assert from 'node:assert/strict';
-import { parseBotArgs } from '../src/bot';
+import * as Lark from '@larksuiteoapi/node-sdk';
+import { parseBotArgs } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/update-check';
-import { FeishuChannel } from '../src/channels/feishu';
+import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS } from '../src/channels/feishu';
 import { check, checkAsync, finish } from './testkit';
 
 async function main(): Promise<void> {
@@ -69,9 +70,19 @@ async function main(): Promise<void> {
   // ---------- FeishuChannel.stop()：未启动时可安全调用、可重复 ----------
   await checkAsync('FeishuChannel.stop：未 start 也幂等安全', async () => {
     const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    assert.equal(ch.connectionState(), null, '未启动时无连接状态');
     await ch.stop();
-    await ch.stop();
+    assert.equal(ch.connectionState(), null, 'stop 不应意外建立连接');
+    assert.equal(ch.lastEventAt(), 0, 'stop 不应伪造事件时间');
+    await ch.stop(); // 重复调用幂等
+    assert.equal(ch.connectionState(), null);
   });
+
+  // ---------- 飞书 REST 超时：构造 channel 即给 SDK 共享 axios 实例配默认超时 ----------
+  check('FeishuChannel：REST 调用有超时兜底（SDK axios 默认 timeout=0 会永久 pending）', (() => {
+    new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    return Lark.defaultHttpInstance.defaults.timeout === FEISHU_HTTP_TIMEOUT_MS && FEISHU_HTTP_TIMEOUT_MS > 0;
+  })());
 
   finish();
 }

@@ -20,6 +20,7 @@ import {
   DENIED_MESSAGE,
   NO_GATE_MESSAGE,
   type ConfirmRequest,
+  type ConfirmFn,
 } from '../src/guard';
 import {
   ConfirmationManager,
@@ -39,7 +40,7 @@ import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
 import { loadEnvFiles, writeEnvFile } from '../src/config';
 import { buildTools } from '../src/tools';
 import { parseFrontmatter, loadSkillDigests, renderSkillsBlock, userSkillsDir, validateSkills, buildSystemPrompt } from '../src/prompt';
-import { readSkillDoc, installSkill, uninstallSkill, migratePackageSkills } from '../src/skills';
+import { readSkillDoc, installSkill, uninstallSkill, migratePackageSkills, SKILLS_DIR } from '../src/skills';
 import { auditLog } from '../src/audit';
 import { SessionRouter } from '../src/session-router';
 import { AgentSession } from '../src/session';
@@ -47,6 +48,7 @@ import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { compareVersions, checkForUpdate, promptVersionUpdate, CHANGELOG_URL, type DistTags } from '../src/update-check';
 import { friendlyLlmError } from '../src/llm-error';
+import { errMessage } from '../src/err';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
 import { buildWatchEventCard, isLoopbackUrl, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
 import {
@@ -158,7 +160,7 @@ async function main(): Promise<void> {
     'classifyLark：update 与夹带 --help 的写命令不免确认',
     classifyLark(['update']) === 'write' &&
       classifyLark(['im', 'send', 'ou_x', '--help']) === 'write' &&
-      classifyLark(['im', 'send', '--help']) === 'read' &&
+      classifyLark(['im', 'send', '--help']) === 'write' && // 命中写动词的一律不豁免（即使带了 --help）
       classifyLark(['task', 'list', '--help']) === 'read' &&
       classifyLark(['--help']) === 'read',
   );
@@ -238,6 +240,24 @@ async function main(): Promise<void> {
     assert.equal(fn2.activeBatchApprovals(), 0);
   });
 
+  await checkAsync('withBatchApproval TTL 过期后重新询问', async () => {
+    let asks = 0;
+    const fn = withBatchApproval(
+      async () => {
+        asks++;
+        return 'batch' as const;
+      },
+      1, // 1ms TTL：免问授权即刻过期
+    );
+    const req = (): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k1' });
+    assert.equal(await fn(req()), 'batch');
+    assert.equal(asks, 1);
+    await new Promise((r) => setTimeout(r, 30)); // 越过 TTL
+    assert.equal(fn.activeBatchApprovals(), 0, '过期授权应被清理');
+    assert.equal(await fn(req()), 'batch');
+    assert.equal(asks, 2, 'TTL 过期后必须重新询问');
+  });
+
   // ---------- ConfirmationManager ----------
   await checkAsync('确认管理器：文本裁决 yes/no/batch/ignored', async () => {
     const settled: string[] = [];
@@ -293,6 +313,28 @@ async function main(): Promise<void> {
     assert.equal(mgr.cancel('u1'), true);
     assert.equal(await p2, false);
     assert.deepEqual(settled, ['timeout', 'denied']);
+  });
+
+  await checkAsync('确认管理器：卡片与文本降级都发送失败时按拒绝快速返回并回调 onSendFailed', async () => {
+    const failures: Array<{ openId: string; summary: string; error: string }> = [];
+    const mgr = new ConfirmationManager(
+      async () => {
+        throw new Error('feishu down');
+      },
+      {
+        timeoutMs: 60000, // 长超时：若仍在干等超时，本用例会明显变慢
+        destructiveTimeoutMs: 60000,
+        onSendFailed: (openId, req, error) => failures.push({ openId, summary: req.summary, error }),
+      },
+    );
+    const t0 = Date.now();
+    const verdict = await mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(verdict, false, '发送失败应按拒绝处理');
+    assert.ok(Date.now() - t0 < 5000, '发送失败应尽快返回，不干等确认超时');
+    assert.equal(mgr.hasPending('u1'), false, '失败后不得残留 pending（后续确认应答不应误裁决）');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!.openId, 'u1');
+    assert.ok(failures[0]!.error.includes('feishu down'));
   });
 
   check('确认卡片：可批量 3 按钮 / 破坏性 2 按钮 / 终态无按钮', (() => {
@@ -627,7 +669,7 @@ async function main(): Promise<void> {
     try {
       mem.setFact('u1', 'k100', 'v');
     } catch (err) {
-      rejected = err instanceof Error ? err.message : String(err);
+      rejected = errMessage(err);
     }
     mem.setFact('u1', 'k0', 'v2'); // 更新已有 key 不受上限限制
     check(
@@ -954,27 +996,33 @@ async function main(): Promise<void> {
   });
 
   // ---------- LLM 错误友好化 ----------
-  check('friendlyLlmError 常见错误映射', (() => {
-    return (
-      friendlyLlmError('401 Unauthorized: invalid api key') !== null &&
-      friendlyLlmError("This model's maximum context length is 128000 tokens") !== null &&
-      friendlyLlmError('429 rate limit reached') !== null &&
-      friendlyLlmError('The model `gpt-x` does not exist') !== null &&
-      friendlyLlmError('fetch failed: ECONNREFUSED 127.0.0.1') !== null &&
-      friendlyLlmError('some other weird error') === null
-    );
-  })());
+  await checkAsync('friendlyLlmError 常见错误映射', async () => {
+    const auth = friendlyLlmError('401 Unauthorized: invalid api key');
+    assert.ok(auth!.includes('API Key 无效或已过期'), '401 应映射到 Key 排查建议');
+    assert.ok(auth!.includes('/config'), 'CLI 渠道应指向 /config');
+    const authBot = friendlyLlmError('401 Unauthorized', { channel: 'bot' });
+    assert.ok(authBot!.includes('bot --reconfig') && !authBot!.includes('/config'), 'bot 渠道不应提 /config');
+    const ctx = friendlyLlmError("This model's maximum context length is 128000 tokens");
+    assert.ok(ctx!.includes('上下文超出模型上限'), '上下文超限应映射到 /clear 建议');
+    const rate = friendlyLlmError('429 rate limit reached');
+    assert.ok(rate!.includes('限流或额度不足'), '429 应映射到限流建议');
+    const model = friendlyLlmError('The model `gpt-x` does not exist');
+    assert.ok(model!.includes('模型名不存在'), '未知模型应映射到 LLM_MODEL 排查');
+    const net = friendlyLlmError('fetch failed: ECONNREFUSED 127.0.0.1');
+    assert.ok(net!.includes('无法连接模型服务') && net!.includes('LLM_BASE_URL'), '连接失败应映射到 BASE_URL 排查');
+    assert.equal(friendlyLlmError('some other weird error'), null, '未命中模式应返回 null');
+  });
 
   // ---------- MCP 失败诊断 ----------
-  check('diagnoseMcpFailure 端口文件缺失模式', (() => {
+  await checkAsync('diagnoseMcpFailure 端口文件缺失模式', async () => {
     const portFileStderr =
       '2026-07-29T02:22:26Z DEBUG utils::port_file: Reading port from "/var/folders/…/vibe-kanban/vibe-kanban.port"\nError: No such file or directory (os error 2)';
-    return (
-      diagnoseMcpFailure(portFileStderr) !== null &&
-      diagnoseMcpFailure('Error: spawn npx ENOENT') === null &&
-      diagnoseMcpFailure('') === null
-    );
-  })());
+    const hint = diagnoseMcpFailure(portFileStderr);
+    assert.ok(hint!.includes('vibe-kanban.port'), '诊断应点明端口文件');
+    assert.ok(hint!.includes('重启 helios-kanban'), '诊断应给出可操作的恢复动作');
+    assert.equal(diagnoseMcpFailure('Error: spawn npx ENOENT'), null, '其他启动错误不误诊');
+    assert.equal(diagnoseMcpFailure(''), null, '空 stderr 返回 null');
+  });
 
   // ---------- /stop 丢弃排队消息 ----------
   await checkAsync('SessionRouter.cancelQueued：丢弃未开始的排队项，进行中与后续新消息不受影响', async () => {
@@ -2172,9 +2220,11 @@ async function main(): Promise<void> {
         /等待 helios-kanban 就绪超时/,
       );
       assert.ok(spawned, 'onSpawn 必须在等待就绪前回调');
-      assert.ok(typeof spawned.pid === 'number' && groupAliveAtSpawn, 'child 应为独立进程组组长');
+      // spawned 只在闭包回调里赋值，CFA 仍视为 null——经 cast 恢复联合类型再收窄
+      const child = spawned as import('child_process').ChildProcess | null;
+      assert.ok(typeof child!.pid === 'number' && groupAliveAtSpawn, 'child 应为独立进程组组长');
       // 超时路径 ensure 内部调 stopKanbanChild：组杀后不留孤儿
-      assert.throws(() => process.kill(-spawned!.pid!, 0));
+      assert.throws(() => process.kill(-child!.pid!, 0));
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -2390,7 +2440,9 @@ async function main(): Promise<void> {
   });
 
   await checkAsync('validateSkills：包内技能契约全部健康', async () => {
-    assert.deepEqual(validateSkills(), []);
+    // 只校验包内技能：本机用户数据目录（~/.helios-task-agent/skills）里可能装有第三方技能，
+    // 其契约问题与本仓库无关，不能作为测试结果（环境依赖会换机器就翻转）。
+    assert.deepEqual(validateSkills([SKILLS_DIR]), []);
   });
 
   await checkAsync('skill_doc 工具：注册且只读（无确认闸门）', async () => {
@@ -2747,7 +2799,7 @@ async function main(): Promise<void> {
       // 技能目录外的文件：用于验证 ../ 逃逸被拒绝
       fs.writeFileSync(path.join(tmp, 'skills', 'escape.sh'), '#!/bin/sh\necho escaped\n');
 
-      const make = (confirm?: () => Promise<boolean>) =>
+      const make = (confirm?: ConfirmFn) =>
         buildTools({ mcp: null, kanbanUrl: 'http://127.0.0.1:1', confirm });
 
       // 注册
@@ -2767,7 +2819,7 @@ async function main(): Promise<void> {
       assert.ok(!fs.existsSync(path.join(skillDir, 'marker.txt')), '拒绝后脚本不应执行');
 
       // 确认后执行：.sh → bash，参数透传，cwd 为技能目录
-      const ok = await make(async () => true).handlers.get('skill_exec')!(
+      const ok = await make(async () => 'once').handlers.get('skill_exec')!(
         { skill: 'scripted-skill', script: 'scripts/run.sh', args: ['world'] },
         undefined,
       );
@@ -2776,14 +2828,14 @@ async function main(): Promise<void> {
       assert.ok(ok.includes('UNTRUSTED'), '输出应被 UNTRUSTED 包裹');
 
       // .js → node
-      const js = await make(async () => true).handlers.get('skill_exec')!(
+      const js = await make(async () => 'once').handlers.get('skill_exec')!(
         { skill: 'scripted-skill', script: 'scripts/run.js', args: ['n1'] },
         undefined,
       );
       assert.ok(js.includes('js:n1'), `.js 应走 node，实际：${js}`);
 
       // 路径逃逸 / 绝对路径 / 未知技能 / 未知扩展名 / 非法解释器
-      const h = make(async () => true).handlers.get('skill_exec')!;
+      const h = make(async () => 'once').handlers.get('skill_exec')!;
       assert.ok((await h({ skill: 'scripted-skill', script: '../escape.sh' }, undefined)).includes('越出技能目录'));
       assert.ok((await h({ skill: 'scripted-skill', script: '/etc/hosts' }, undefined)).includes('相对技能目录'));
       assert.ok((await h({ skill: 'no-such-skill', script: 'x.sh' }, undefined)).includes('未找到技能'));

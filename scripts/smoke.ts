@@ -22,6 +22,7 @@ import {
   formatWorkspaceSetupFailure,
 } from '../src/kanban/workspace-ready';
 import type { OpenAiClient } from '../src/types';
+import { errMessage } from '../src/err';
 
 async function main(): Promise<void> {
   const cfg = currentConfig();
@@ -36,7 +37,7 @@ async function main(): Promise<void> {
     const tools = await mcp.connect({ timeoutMs: 60000 });
     check('MCP 连接 helios-kanban', true, `${tools.length} 个工具`);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errMessage(err);
     check('MCP 连接 helios-kanban', false, message);
   }
 
@@ -48,7 +49,7 @@ async function main(): Promise<void> {
     memory,
     userId: 'local',
     // memory_set 已接入写闸门（fail-closed）：冒烟环境自动放行
-    confirm: async () => true,
+    confirm: async () => 'once',
   });
   check(
     '工具注册（含 lark_cli/hk_cli/repo_fs/memory_*）',

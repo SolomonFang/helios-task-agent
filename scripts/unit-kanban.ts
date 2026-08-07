@@ -6,7 +6,7 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import { stopKanbanChild } from '../src/kanban/kanban-ensure';
 import { fillHkStartBranches, type RepoStartInput } from '../src/kanban/workspace-ready';
-import { check, checkAsync, finish } from './testkit';
+import { checkAsync, finish } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
 function groupAlive(pid: number): boolean {
@@ -58,7 +58,11 @@ async function mockKanban(branches: Record<string, string | null>): Promise<{
 async function main(): Promise<void> {
   // ---------- stopKanbanChild ----------
   await checkAsync('stopKanbanChild(null) 直接返回', async () => {
-    await stopKanbanChild(null);
+    const started = Date.now();
+    const ret = await stopKanbanChild(null);
+    assert.equal(ret, undefined);
+    // 真实停止路径含 SIGTERM 后 500ms 等待窗；null 必须早返回，不进该窗口
+    assert.ok(Date.now() - started < 500, 'null 子进程应早返回，不进入 SIGTERM 等待窗口');
   });
 
   await checkAsync('stopKanbanChild：进程组整体已退出时不发信号也不抛错', async () => {

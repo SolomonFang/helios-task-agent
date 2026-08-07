@@ -4,6 +4,8 @@
  * 脚本末尾调用 finish() 汇总并以非零退出码报告失败。
  */
 
+import { errMessage } from '../src/err';
+
 let failures = 0;
 
 export const check = (name: string, ok: boolean, detail = '') => {
@@ -17,7 +19,7 @@ export async function checkAsync(name: string, fn: () => void | Promise<void>): 
     await fn();
     check(name, true);
   } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
+    check(name, false, errMessage(err));
   }
 }
 

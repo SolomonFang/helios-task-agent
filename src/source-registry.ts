@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './memory';
+import { defaultDataHome } from './paths';
 import { writeFilePrivateSync } from './private-file';
 
 /**

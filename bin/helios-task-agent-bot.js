@@ -23,7 +23,7 @@ if (unknown.length) {
   process.exit(1);
 }
 // main() 是 async：顶层 reject 必须显式捕获，否则 unhandledRejection 打崩溃栈
-require('../dist/bot').main().catch((err) => {
+require('../dist/bot-main').main().catch((err) => {
   console.error(err);
   process.exit(1);
 });

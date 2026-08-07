@@ -6,6 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import { spawn } from 'child_process';
 import path from 'path';
+import { errMessage } from '../src/err';
 
 const TEST_TITLE = '【测试】Helios Task Agent 冒烟任务（自动删除）';
 const FINAL_REPLY = '模拟回复：任务已创建并清理，链路正常。';
@@ -100,7 +101,7 @@ function startMockServer(): Promise<{ server: http.Server; state: MockState; por
           payload = finalReply();
         }
       } catch (err) {
-        state.error = err instanceof Error ? err.message : String(err);
+        state.error = errMessage(err);
         payload = finalReply();
       }
       res.writeHead(200, { 'content-type': 'application/json' });

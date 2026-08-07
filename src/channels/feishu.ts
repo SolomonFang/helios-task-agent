@@ -1,5 +1,6 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type { AgentChannel, FeishuBotConfig, InboundMessage } from '../types';
+import { errMessage } from '../err';
 
 export interface FeishuReceivePayload {
   sender?: {
@@ -28,6 +29,9 @@ export interface FeishuCardAction {
 }
 
 export type AccessDecision = 'allow' | 'claim' | 'deny';
+
+/** 飞书 REST 单请求超时：覆盖发消息/卡片/表情等全部 REST 调用（含 SDK 内部取 token）。 */
+export const FEISHU_HTTP_TIMEOUT_MS = 20000;
 
 /**
  * Owner-claim access control: with an empty allowlist, the FIRST user to DM
@@ -59,6 +63,131 @@ export function createAccessChecker(initialAllowed: string[]): {
       if (allowed.delete(openId)) claimable = allowed.size === 0;
     },
   };
+}
+
+/** WS 消息事件基础过滤的产出：必填字段齐全 + p2p 私聊 + 真人发送者。 */
+export interface FilteredIncomingMessage {
+  chatId: string;
+  messageId: string;
+  openId: string;
+  messageType: string;
+  content?: string;
+}
+
+/**
+ * 消息事件入口过滤（纯函数）：仅放行字段齐全的 p2p 私聊、真人（非 bot/系统）发送者。
+ * 返回 null = 丢弃该事件。
+ */
+export function filterIncomingMessage(data: FeishuReceivePayload): FilteredIncomingMessage | null {
+  const message = data.message;
+  const sender = data.sender;
+  if (!message?.chat_id || !message.message_id) return null;
+
+  // Only private chats
+  if (message.chat_type !== 'p2p') return null;
+
+  // Ignore bot / system senders
+  if (sender?.sender_type && sender.sender_type !== 'user') return null;
+
+  const openId = sender?.sender_id?.open_id || '';
+  if (!openId) return null;
+
+  return {
+    chatId: message.chat_id,
+    messageId: message.message_id,
+    openId,
+    messageType: message.message_type || 'unknown',
+    content: message.content,
+  };
+}
+
+/** message_id 去重表：TTL 过期清理（prune 由调用方在事件入口触发）。 */
+export interface MessageDedupe {
+  /** 清理超过 TTL 的条目。 */
+  prune: (now: number) => void;
+  /** 已见过返回 true；否则记录（时间戳 now）并返回 false。 */
+  isDuplicate: (id: string, now: number) => boolean;
+}
+
+export function createMessageDedupe(ttlMs: number): MessageDedupe {
+  const seen = new Map<string, number>();
+  return {
+    prune(now: number): void {
+      for (const [id, ts] of seen) {
+        if (now - ts > ttlMs) seen.delete(id);
+      }
+    },
+    isDuplicate(id: string, now: number): boolean {
+      if (seen.has(id)) return true;
+      seen.set(id, now);
+      return false;
+    },
+  };
+}
+
+/** resolveAccess 的判定结果。 */
+export interface AccessResolution {
+  /** 最终放行判定（claim 持久化成功按 allow）。 */
+  decision: 'allow' | 'deny';
+  /** 本次事件首次触发 owner 认领。 */
+  claimed: boolean;
+  /** 认领未持久化：已撤销内存放行并加入阻断集（fail-closed）。 */
+  claimRevoked: boolean;
+}
+
+export interface AccessHooks {
+  /** owner 认领持久化（写 .env）；返回 false 或抛错均按未持久化处理。 */
+  persistClaim: (openId: string) => boolean;
+  /** 认领 hook 抛错时的错误文案回调（日志用，参数为 errMessage 结果）。 */
+  onClaimError?: (message: string) => void;
+}
+
+/**
+ * 消息发送者的接入判定（fail-closed）：
+ * 白名单内放行；空白名单时首个用户触发认领，认领未持久化则撤销内存放行、
+ * 加入 claimBlocked 阻断集并按拒绝处理；阻断集中的用户一律拒绝。
+ */
+export function resolveAccess(
+  access: ReturnType<typeof createAccessChecker>,
+  claimBlocked: Set<string>,
+  openId: string,
+  hooks: AccessHooks,
+): AccessResolution {
+  const first = access.check(openId);
+  let claimed = false;
+  let claimRevoked = false;
+  let decision: 'allow' | 'deny';
+  if (first === 'claim') {
+    claimed = true;
+    let persisted = false;
+    try {
+      persisted = hooks.persistClaim(openId);
+    } catch (err) {
+      hooks.onClaimError?.(errMessage(err));
+    }
+    if (!persisted) {
+      // fail-closed：绑定未写回 .env，撤销内存放行并阻断重试（重启前该用户按拒绝处理）
+      claimRevoked = true;
+      access.unclaim(openId);
+      // Set 无清理会无界增长：超上限整体清空（代价只是老条目重新判定一次）
+      if (claimBlocked.size >= 1000) claimBlocked.clear();
+      claimBlocked.add(openId);
+    }
+    decision = persisted ? 'allow' : 'deny';
+  } else {
+    decision = first === 'allow' ? 'allow' : 'deny';
+  }
+  if (claimBlocked.has(openId)) decision = 'deny';
+  return { decision, claimed, claimRevoked };
+}
+
+/**
+ * 卡片回调操作者白名单判定（纯函数）：与消息同一套白名单。
+ * 卡片可能被转发，任何人都能点按钮；不过滤会让陌生人触发 AI 审查（耗 LLM 配额、读本机仓库 diff）。
+ */
+export function isCardActionAllowed(data: FeishuCardAction, allowedOpenIds: string[]): boolean {
+  const openId = data.operator?.open_id || '';
+  return !!openId && allowedOpenIds.includes(openId);
 }
 
 /** Split long text into ≤ limit chunks on paragraph/newline boundaries (hard cut as fallback). */
@@ -152,8 +281,7 @@ export class FeishuChannel implements AgentChannel {
   private wsClient: Lark.WSClient | null = null;
   /** 最近一次收到长连接事件（消息/卡片回传）的时间（ms；0 = 尚未收到），/status 探活用。 */
   private lastEventAtMs = 0;
-  private seenMessageIds = new Map<string, number>();
-  private readonly seenTtlMs = 10 * 60 * 1000;
+  private readonly dedupe = createMessageDedupe(10 * 60 * 1000);
   private deniedNotified = new Set<string>();
   /** owner 绑定写盘失败的用户（fail-closed）：重启前按拒绝处理，避免每条消息重试写盘。 */
   private claimBlocked = new Set<string>();
@@ -168,6 +296,11 @@ export class FeishuChannel implements AgentChannel {
   constructor(cfg: FeishuBotConfig) {
     this.cfg = cfg;
     this.access = createAccessChecker(cfg.allowedOpenIds);
+    // SDK 内部 axios 默认 timeout=0（永不超时）：一个挂死的 TCP 连接会让 reply/updateText
+    // 永久 pending，卡死用户队列与 watcher 推送。defaultHttpInstance 是 SDK 导出的共享实例
+    // （带响应解包拦截器，自建实例需复制拦截器否则 res.code 解析会坏），配默认超时即可；
+    // 超时抛 AxiosError（timeout of …ms exceeded），由上层既有错误处理消化。
+    Lark.defaultHttpInstance.defaults.timeout = FEISHU_HTTP_TIMEOUT_MS;
     this.client = new Lark.Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret,
@@ -188,12 +321,6 @@ export class FeishuChannel implements AgentChannel {
   /** SDK WSClient 连接状态快照（未启动返回 null）。 */
   connectionState(): Lark.WSConnectionState | null {
     return this.wsClient?.getConnectionStatus().state ?? null;
-  }
-
-  private pruneSeen(now: number): void {
-    for (const [id, ts] of this.seenMessageIds) {
-      if (now - ts > this.seenTtlMs) this.seenMessageIds.delete(id);
-    }
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
@@ -221,43 +348,23 @@ export class FeishuChannel implements AgentChannel {
         'im.message.receive_v1': async (data: FeishuReceivePayload) => {
           const now = Date.now();
           this.lastEventAtMs = now;
-          this.pruneSeen(now);
+          this.dedupe.prune(now);
 
-          const message = data.message;
-          const sender = data.sender;
-          if (!message?.chat_id || !message.message_id) return;
+          // 基础过滤：字段齐全 + p2p 私聊 + 真人发送者
+          const filtered = filterIncomingMessage(data);
+          if (!filtered) return;
+          const { openId } = filtered;
 
-          // Only private chats
-          if (message.chat_type !== 'p2p') return;
-
-          // Ignore bot / system senders
-          if (sender?.sender_type && sender.sender_type !== 'user') return;
-
-          const openId = sender?.sender_id?.open_id || '';
-          if (!openId) return;
-
-          let access = this.access.check(openId);
-          if (access === 'claim') {
-            console.log(`[feishu] owner claimed by ${openId}`);
-            let persisted = false;
-            try {
-              persisted = this.onOwnerClaim ? this.onOwnerClaim(openId) : true;
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error(`[feishu] owner claim hook error: ${msg}`);
-            }
-            if (!persisted) {
-              // fail-closed：绑定未写回 .env，撤销内存放行并阻断重试（重启前该用户按拒绝处理）
-              this.access.unclaim(openId);
-              // Set 无清理会无界增长：超上限整体清空（代价只是老条目重新判定一次）
-              if (this.claimBlocked.size >= 1000) this.claimBlocked.clear();
-              this.claimBlocked.add(openId);
-              console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${openId}`);
-              return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
-            }
+          const gate = resolveAccess(this.access, this.claimBlocked, openId, {
+            persistClaim: (id) => (this.onOwnerClaim ? this.onOwnerClaim(id) : true),
+            onClaimError: (msg) => console.error(`[feishu] owner claim hook error: ${msg}`),
+          });
+          if (gate.claimed) console.log(`[feishu] owner claimed by ${openId}`);
+          if (gate.claimRevoked) {
+            console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${openId}`);
+            return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
           }
-          if (this.claimBlocked.has(openId)) access = 'deny';
-          if (access === 'deny') {
+          if (gate.decision === 'deny') {
             console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
             if (!this.deniedNotified.has(openId)) {
               // Set 无清理会无界增长：超上限整体清空（代价只是老用户再收一次提醒）
@@ -272,46 +379,42 @@ export class FeishuChannel implements AgentChannel {
             return;
           }
 
-          if (this.seenMessageIds.has(message.message_id)) return;
-          this.seenMessageIds.set(message.message_id, now);
+          if (this.dedupe.isDuplicate(filtered.messageId, now)) return;
 
-          const messageType = message.message_type || 'unknown';
           const text =
-            messageType === 'text'
-              ? parseTextContent(message.content)
-              : messageType === 'post'
-                ? parsePostContent(message.content)
+            filtered.messageType === 'text'
+              ? parseTextContent(filtered.content)
+              : filtered.messageType === 'post'
+                ? parsePostContent(filtered.content)
                 : '';
 
           const inbound: FeishuInboundMessage = {
-            sessionId: message.chat_id,
+            sessionId: filtered.chatId,
             senderId: openId,
             text,
-            messageId: message.message_id,
-            messageType,
+            messageId: filtered.messageId,
+            messageType: filtered.messageType,
             raw: data,
           };
 
           // Return immediately; process in background to satisfy <3s ACK.
           void onMessage(inbound).catch((err) => {
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = errMessage(err);
             console.error(`[feishu] handler error: ${msg}`);
           });
         },
         // 卡片按钮回传（需在开放平台「回调订阅」配置长连接 + 卡片回传交互）
         'card.action.trigger': async (data: FeishuCardAction) => {
           try {
-            const openId = data.operator?.open_id || '';
-            // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮；
-            // 不过滤白名单会让陌生人触发 AI 审查（耗 LLM 配额、读本机仓库 diff）
-            if (!openId || !this.access.list().includes(openId)) {
-              console.warn(`[feishu] ignore card action from open_id not in allowlist: ${openId || '(unknown)'}`);
+            // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮
+            if (!isCardActionAllowed(data, this.access.list())) {
+              console.warn(`[feishu] ignore card action from open_id not in allowlist: ${data.operator?.open_id || '(unknown)'}`);
               return;
             }
             this.lastEventAtMs = Date.now();
             this.onCardAction?.(data);
           } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = errMessage(err);
             console.error(`[feishu] card action error: ${msg}`);
           }
         },

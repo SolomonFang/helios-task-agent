@@ -26,10 +26,11 @@ export async function checkLarkCliAsync(): Promise<boolean> {
   return (await probeAsync('lark-cli', ['--version'])) !== null;
 }
 
-/** probeLarkCliAuth 的异步版。 */
-export async function probeLarkCliAuthAsync(): Promise<'unauthorized' | 'ok'> {
-  const out = await probeAsync('lark-cli', ['auth', 'status'], 3000);
-  if (out === null) return 'unauthorized';
+/**
+ * 解析 `lark-cli auth status` 输出：任一身份 available=true 即视为已授权；
+ * 输出解析失败按未授权处理（保守不误报可用）。同步/异步探测共用此解析。
+ */
+function parseLarkCliAuth(out: string): 'unauthorized' | 'ok' {
   try {
     const parsed = JSON.parse(out) as { identities?: Record<string, { available?: boolean }> };
     const identities = Object.values(parsed?.identities ?? {});
@@ -37,6 +38,13 @@ export async function probeLarkCliAuthAsync(): Promise<'unauthorized' | 'ok'> {
   } catch {
     return 'unauthorized';
   }
+}
+
+/** probeLarkCliAuth 的异步版。 */
+export async function probeLarkCliAuthAsync(): Promise<'unauthorized' | 'ok'> {
+  const out = await probeAsync('lark-cli', ['auth', 'status'], 3000);
+  if (out === null) return 'unauthorized';
+  return parseLarkCliAuth(out);
 }
 
 /** checkOcrCli 的异步版。 */
@@ -66,6 +74,7 @@ export type LarkCliStatus = 'missing' | 'unauthorized' | 'ok';
 /**
  * 授权探测（假定二进制已存在）：`lark-cli auth status` 读本地配置（不走网络），
  * 任一身份 available=true 即视为已授权；命令失败或输出异常按未授权处理（保守不误报可用）。
+ * 启动早期同步上下文使用（无法 await）；事件循环内路径请用 probeLarkCliAuthAsync。
  */
 export function probeLarkCliAuth(): 'unauthorized' | 'ok' {
   try {
@@ -74,9 +83,7 @@ export function probeLarkCliAuth(): 'unauthorized' | 'ok' {
       timeout: 3000,
       encoding: 'utf8',
     });
-    const parsed = JSON.parse(out) as { identities?: Record<string, { available?: boolean }> };
-    const identities = Object.values(parsed?.identities ?? {});
-    return identities.some((i) => i?.available === true) ? 'ok' : 'unauthorized';
+    return parseLarkCliAuth(out);
   } catch {
     return 'unauthorized';
   }

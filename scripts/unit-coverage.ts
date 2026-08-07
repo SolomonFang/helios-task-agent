@@ -25,6 +25,7 @@ import { verifyLlmConfig } from '../src/llm-verify';
 import { verifyFeishuApp } from '../src/feishu-verify';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
+import { errMessage } from '../src/err';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -38,7 +39,7 @@ async function checkAsync(name: string, fn: () => void | Promise<void>): Promise
     await fn();
     check(name, true);
   } catch (err) {
-    check(name, false, err instanceof Error ? err.message : String(err));
+    check(name, false, errMessage(err));
   }
 }
 
