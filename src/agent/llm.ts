@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { UNTRUSTED_OPEN, wrapUntrusted } from './guard';
-import { errMessage } from './err';
+import { errMessage } from '../infra/err';
 import type {
   ChatMessage,
   LlmClientConfig,
@@ -9,7 +9,7 @@ import type {
   OpenAiTool,
   ProgressInfo,
   ToolHandlers,
-} from './types';
+} from '../types';
 
 /** Backstop on LLM rounds; real limit is on tool-call count below. */
 const MAX_TOOL_ROUNDS = 25;

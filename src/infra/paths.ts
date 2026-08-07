@@ -13,10 +13,10 @@ export function defaultDataHome(): string {
 
 /**
  * 包根目录（package.json 所在目录）。
- * CJS 假设：本文件编译后在 dist/ 下（tsx 直接跑时在 src/ 下），__dirname 上一级即包根；
+ * CJS 假设：本文件编译后在 dist/infra/ 下（tsx 直接跑时在 src/infra/ 下），__dirname 上两级即包根；
  * 若将来转 ESM，__dirname 不存在，此处是唯一需要改的点（import.meta.url 换算）。
  */
-export const packageRoot = path.join(__dirname, '..');
+export const packageRoot = path.join(__dirname, '..', '..');
 
 /** 包内内置技能目录（兜底；npm 全局安装目录，用户不应往里放自定义技能）。 */
 export const SKILLS_DIR = path.join(packageRoot, 'skills');

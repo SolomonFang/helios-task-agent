@@ -12,28 +12,30 @@
 
 import readline from 'readline';
 import path from 'path';
-import { currentConfig, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config';
-import { ensureBotConfig, ensureConfig, rebindFeishuBot } from './config-wizard';
-import { MemoryStore, defaultDataHome } from './memory';
+import { currentConfig, ensureEnvLoaded, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config/config';
+import { ensureBotConfig, ensureConfig, rebindFeishuBot } from './config/config-wizard';
+import { MemoryStore, defaultDataHome } from './agent/memory';
 import { FeishuChannel } from './channels/feishu';
-import { SessionRouter } from './session-router';
-import { stopKanbanChild } from './kanban/kanban-ensure';
-import { ConfirmationManager, buildConfirmCard, buildResolvedCard } from './confirm';
-import { KanbanWatcher, buildWatchEventCard, isLoopbackUrl, type WatchEvent } from './kanban/watcher';
-import { reviewsDir } from './review-report';
-import { reportsDir } from './report';
-import { startReportServer, type ReportServer } from './report-server';
-import { checkLarkCliStatus } from './deps';
+import { SessionRouter } from './agent/session-router';
+import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
+import { ConfirmationManager } from './agent/confirm';
+import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from './channels/feishu-cards';
+import { KanbanWatcher, type WatchEvent } from './kanban/watcher';
+import { isLoopbackUrl } from './infra/url-utils';
+import { reviewsDir } from './report/review-report';
+import { reportsDir } from './report/report';
+import { startReportServer, type ReportServer } from './report/report-server';
+import { checkLarkCliStatus } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
-import { wrapUntrusted } from './guard';
-import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
+import { wrapUntrusted } from './agent/guard';
+import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
 import { connectMcp } from './kanban/mcp';
 import { TRY_EXAMPLES } from './commands';
-import { wizardAskSecret, wizardChoose } from './wizard-io';
+import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
 import { createBotHandlers } from './bot/handler';
-import { errMessage } from './err';
+import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
 import { c, MCP_FALLBACK_TEXT } from './ui';
@@ -150,6 +152,10 @@ async function main(): Promise<void> {
   // 尽早解析：--help / --version / 未知参数在打印启动横幅前就退出
   const { rebind, reconfig } = parseBotArgs(process.argv.slice(2));
 
+  // env 显式初始化（import config 不再自动加载 .env，见 config.ts ensureEnvLoaded）；
+  // 放在 parseBotArgs 之后：--help / --version 不需要读盘
+  ensureEnvLoaded();
+
   const version = readPkgVersion();
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
@@ -167,10 +173,16 @@ async function main(): Promise<void> {
     reportServer: ReportServer | null;
   } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null };
   let shuttingDown = false;
-  const shutdown = async (): Promise<void> => {
+  /**
+   * 优雅退出：exitCode 由触发路径决定——正常信号（SIGINT/SIGTERM）传 0；
+   * uncaughtException 传 1：崩溃被 launchd/systemd 当成干净停止（退出码 0）时不会自动重启。
+   * 注意异常路径触发后若卡在清理里被 forceTimer 强退，退出码会是 1（与传入一致兜底见下）。
+   */
+  const shutdown = async (exitCode = 0): Promise<void> => {
     if (shuttingDown) return; // 幂等：二次 Ctrl+C / SIGINT+SIGTERM 不重入
     shuttingDown = true;
-    // 整体超时兜底：channel.stop / mcp.close 挂住时强制退出，避免进程永不退
+    // 整体超时兜底：channel.stop / mcp.close 挂住时强制退出，避免进程永不退。
+    // 强退用 1 而非透传 exitCode：挂住本身是异常状态，干净停止（0）不该出现在超时路径
     const forceTimer = setTimeout(() => {
       console.error(c.err('退出清理超时，强制结束进程'));
       process.exit(1);
@@ -190,12 +202,13 @@ async function main(): Promise<void> {
       /* 尽力清理，任何一步失败都继续退出 */
     }
     clearTimeout(forceTimer);
-    process.exit(0);
+    process.exit(exitCode);
   };
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
   // 长驻进程兜底：漏网 rejection 只记日志不退出（保持进程可用）；
-  // uncaughtException 说明状态已不可信，记日志后复用 shutdown 优雅退出（8s 强退兜底仍在）。
+  // uncaughtException 说明状态已不可信，记日志后复用 shutdown 优雅退出（8s 强退兜底仍在）——
+  // 退出码必须非 0：以 0 退出会被 launchd/systemd 当成干净停止而不触发自动重启。
   // handler 自身不得再抛异常（否则绕过清理直接 crash），故只做同步日志 + 幂等 shutdown。
   process.on('unhandledRejection', (reason) => {
     const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
@@ -203,8 +216,11 @@ async function main(): Promise<void> {
   });
   process.on('uncaughtException', (err) => {
     console.error(`[bot] 未捕获异常，执行优雅退出: ${err.stack || err.message}`);
-    void shutdown();
+    void shutdown(1);
   });
+  // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
+  // 验证崩溃退出码为 1（setImmediate 抛出才走 uncaughtException，同步 throw 只会 reject main）
+  if (process.env.HTA_TEST_CRASH) setImmediate(() => { throw new Error('HTA_TEST_CRASH'); });
 
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
@@ -304,8 +320,13 @@ async function main(): Promise<void> {
 
   const bootLabel = '正在连接 helios-kanban MCP…';
   process.stdout.write(c.gray(bootLabel));
-  const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg);
-  cleanup.mcp = mcp;
+  const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg, {
+    // 实例一创建即登记：45s 连接窗口内收到退出信号时，shutdown 能拿到 mcp 做 close
+    //（其 in-flight stdio 子进程由 closePending 兜底关闭），不等 connect resolve
+    onCreate: (instance) => {
+      cleanup.mcp = instance;
+    },
+  });
   if (mcpOk) {
     process.stdout.write(c.ok(`\rMCP 已连接（${mcp.tools.length} 个工具）          \n`));
   } else {
@@ -421,9 +442,14 @@ async function main(): Promise<void> {
 
   // MCP 健康监督：60s 探测；连续失败才降级 hk_cli，自动重连（退避至 ~5 分钟），恢复后切回。
   // 有用户轮次进行中时不重连（reconnect 的 close 会杀 in-flight 工具调用），竞态防护见 supervisor。
+  // kanbanHealth：mcp.ping 只证明 stdio 活着，看板假死时探活会误判健康——每 5 分钟
+  //（失败后逐 tick）补一次真实看板健康调用，连续失败走同一 onLost 降级/告警通道。
   const supervisor = new McpSupervisor({
     mcp,
     initiallyAlive: mcpOk,
+    kanbanHealth: async () => {
+      if (!(await fetchHealth(agentCfg.kanbanUrl))) throw new Error('看板健康检查未通过');
+    },
     onLost: () => {
       router.setMcpOk(false);
       console.log(c.warn(`MCP 连接丢失，${MCP_FALLBACK_TEXT}，将自动重连…`));

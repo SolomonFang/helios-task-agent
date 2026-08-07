@@ -1,11 +1,118 @@
 // Unit tests（批次4：bot 与产品交互）: 纯逻辑 —— 无 LLM、无网络、无飞书连接。Run: npx tsx scripts/unit-bot.ts
 
 import assert from 'node:assert/strict';
+import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import fs from 'fs';
+import http from 'http';
+import os from 'os';
+import path from 'path';
+import type { AddressInfo } from 'net';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseBotArgs } from '../src/bot-main';
-import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/update-check';
+import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
 import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS } from '../src/channels/feishu';
 import { check, checkAsync, finish } from './testkit';
+
+// ---------- 退出码子进程测试的共用装置 ----------
+// 以完整 env 配置启动真实入口（tsx 跑 src/*.ts），配合 HTA_TEST_CRASH 钩子 / SIGINT
+// 验证优雅退出的退出码：崩溃必须是 1（launchd/systemd 据此判断是否重启），正常信号是 0。
+
+const repoRoot = path.join(__dirname, '..');
+const tsxCli = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+/** 本地 mock 看板：/api/health 返回看板信封，让子进程顺利越过看板拉起进入 MCP 连接窗口。 */
+async function startMockKanbanHealth(): Promise<{ server: http.Server; url: string; healthSeen: Promise<void> }> {
+  let markSeen!: () => void;
+  const healthSeen = new Promise<void>((r) => (markSeen = r));
+  const server = http.createServer((req, res) => {
+    if ((req.url || '').startsWith('/api/health')) {
+      markSeen(); // CLI 子进程非 TTY 时 Spinner 静默：以此作为「看板拉起完成、即将连接 MCP」的同步点
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"success":true,"data":"OK","error_data":null,"message":null}');
+      return;
+    }
+    res.writeHead(404);
+    res.end('{}');
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return { server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, healthSeen };
+}
+
+function spawnAgent(entry: string, kanbanUrl: string, extraEnv: Record<string, string>) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-bot-exit-'));
+  const child = spawn(process.execPath, [tsxCli, path.join(repoRoot, 'src', entry)], {
+    cwd: tmp, // 避免 cwd .env 干扰子进程配置
+    env: {
+      ...process.env,
+      HELIOS_TASK_AGENT_HOME: tmp, // 数据目录隔离；同时让 home .env 不存在（不会覆盖下列 env）
+      HELIOS_TASK_AGENT_ENV: path.join(tmp, 'nonexistent.env'), // 中和父进程可能带来的强制 env
+      LLM_BASE_URL: 'http://127.0.0.1:9/v1',
+      LLM_API_KEY: 'sk-x',
+      LLM_MODEL: 'm',
+      HELIOS_KANBAN_URL: kanbanUrl,
+      // 慢命令：MCP 连接窗口（45s 超时）内信号/崩溃必然落在连接在途期间
+      HELIOS_KANBAN_MCP_COMMAND: process.execPath,
+      HELIOS_KANBAN_MCP_ARGS: '-e setTimeout(()=>{},30000)',
+      HTA_UPDATE_CHECK: '0',
+      KANBAN_WATCH: '0',
+      ...extraEnv,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let buf = '';
+  child.stdout.on('data', (d: Buffer) => (buf += d.toString()));
+  child.stderr.on('data', (d: Buffer) => (buf += d.toString()));
+  return { child, tmp, out: () => buf };
+}
+
+function waitExit(child: ChildProcess, timeoutMs = 30000): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('子进程退出超时'));
+    }, timeoutMs);
+    child.on('exit', (code) => {
+      clearTimeout(t);
+      resolve(code);
+    });
+  });
+}
+
+async function waitOutput(out: () => string, marker: string, timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!out().includes(marker)) {
+    if (Date.now() > deadline) throw new Error(`等待子进程输出超时: ${marker}；已有输出：${out()}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** 轮询进程表，直到 MCP 慢命令（`node -e setTimeout...`）出现在 pid 的后代进程中——即连接已在途。
+ *  注意必须沿祖先链判定而非直接父子：tsx 会再 fork 一层 node 跑入口，MCP 子进程是「孙子」。 */
+async function waitMcpConnecting(pid: number, timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const ps = execFileSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8' });
+    const ppidOf = new Map<number, number>();
+    const markers: number[] = [];
+    for (const line of ps.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      ppidOf.set(Number(m[1]), Number(m[2]));
+      if (m[3]!.includes('setTimeout(()=>{},30000)')) markers.push(Number(m[1]));
+    }
+    const isDescendant = (p: number): boolean => {
+      let cur = p;
+      while (ppidOf.has(cur)) {
+        cur = ppidOf.get(cur)!;
+        if (cur === pid) return true;
+      }
+      return false;
+    };
+    if (markers.some(isDescendant)) return;
+    if (Date.now() > deadline) throw new Error(`等待 MCP 慢命令后代进程超时（pid=${pid}）`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 async function main(): Promise<void> {
   // ---------- bot 参数解析（--rebind / --reconfig） ----------
@@ -83,6 +190,66 @@ async function main(): Promise<void> {
     new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
     return Lark.defaultHttpInstance.defaults.timeout === FEISHU_HTTP_TIMEOUT_MS && FEISHU_HTTP_TIMEOUT_MS > 0;
   })());
+
+  // ---------- 进程退出码：崩溃路径为 1，正常信号路径为 0 ----------
+  const feishuEnv = { FEISHU_APP_ID: 'cli_x', FEISHU_APP_SECRET: 's', FEISHU_ALLOWED_OPEN_IDS: 'ou_x' };
+  const kanban = await startMockKanbanHealth();
+  try {
+    await checkAsync('退出码：bot uncaughtException 优雅退出且退出码为 1（进程管理器据此重启）', async () => {
+      const { child, tmp, out } = spawnAgent('bot-main.ts', kanban.url, { ...feishuEnv, HTA_TEST_CRASH: '1' });
+      try {
+        const code = await waitExit(child);
+        assert.ok(out().includes('未捕获异常'), `应走 uncaughtException 优雅退出路径，输出：${out()}`);
+        assert.equal(code, 1, `崩溃路径退出码应为 1，实际 ${code}；输出：${out()}`);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('退出码：bot 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
+      const { child, tmp, out } = spawnAgent('bot-main.ts', kanban.url, feishuEnv);
+      try {
+        await waitOutput(out, '正在连接 helios-kanban MCP'); // 连接在途（慢命令）时发信号
+        child.kill('SIGINT');
+        const code = await waitExit(child);
+        assert.ok(out().includes('正在退出'), `应走优雅退出路径，输出：${out()}`);
+        assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('退出码：cli uncaughtException 优雅退出且退出码为 1', async () => {
+      const { child, tmp, out } = spawnAgent('cli.ts', kanban.url, { HTA_TEST_CRASH: '1' });
+      try {
+        const code = await waitExit(child);
+        assert.ok(out().includes('未捕获异常'), `应走 uncaughtException 优雅退出路径，输出：${out()}`);
+        assert.equal(code, 1, `崩溃路径退出码应为 1，实际 ${code}；输出：${out()}`);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('退出码：cli 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
+      const { child, tmp, out } = spawnAgent('cli.ts', kanban.url, {});
+      try {
+        // 非 TTY 时 Spinner 无输出，无法用 stdout 作同步点。改为等慢命令孙子进程出现：
+        // 孙子进程存在 = connectMcp 已发起，而信号处理在连接之前注册，此时 SIGINT 必走优雅退出。
+        // （此前用 healthSeen + 150ms 固定余量，高负载下信号偶尔落在处理注册之前 → 假失败）
+        await kanban.healthSeen;
+        await waitMcpConnecting(child.pid!);
+        child.kill('SIGINT');
+        const code = await waitExit(child);
+        assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
+        assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    kanban.server.closeAllConnections?.();
+    await new Promise((r) => kanban.server.close(r));
+  }
 
   finish();
 }

@@ -11,11 +11,11 @@
  * 解析为「概览 + 分级卡片 + diff 高亮」；识别不到该结构时回退为扁平 markdown 渲染。
  */
 
-import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './paths';
+import { defaultDataHome } from '../infra/paths';
 import { escapeHtml } from './report';
-import { writeFilePrivateSync } from './private-file';
+import { renderReportPage } from './report-page';
+import { ensurePrivateDirSync, writeFilePrivateSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
 import { pruneOldReports, sanitizeName } from './report-utils';
 
@@ -399,26 +399,17 @@ function renderPass(parsed: ParsedReview | null, text: string): string {
   return parts.join('\n  ');
 }
 
-const PAGE_CSS = `
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    background: #f1f5f9;
-    color: #1f2937;
-    line-height: 1.7;
-    padding: 32px 16px 64px;
-  }
-  .page { max-width: 920px; margin: 0 auto; }
+/** AI 审查页面专属区块样式（公共基底与页框见 report-page.ts）。 */
+const REVIEW_PAGE_CSS = `
+  body { background: #f1f5f9; line-height: 1.7; }
+  .page { max-width: 920px; }
   .hero {
     background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
-    color: #fff;
-    border-radius: 16px;
     padding: 28px 36px;
-    box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
   }
-  .hero h1 { font-size: 24px; letter-spacing: 1px; }
-  .hero .subtitle { font-size: 15px; margin-top: 6px; opacity: 0.95; word-break: break-all; }
-  .hero .gen { font-size: 12px; margin-top: 8px; opacity: 0.75; }
+  .hero h1 { font-size: 24px; }
+  .hero .subtitle { font-size: 15px; word-break: break-all; }
+  .hero .gen { margin-top: 8px; }
   .hero.pass {
     background: linear-gradient(135deg, #10b981 0%, #059669 100%);
     box-shadow: 0 8px 24px rgba(16, 185, 129, 0.25);
@@ -464,15 +455,10 @@ const PAGE_CSS = `
   }
   .chip b { color: #0f172a; font-weight: 600; }
 
-  /* 严重度徽章 */
+  /* 严重度徽章（药丸基底在 report-page.BASE_CSS，这里只补布局差量） */
   .sev {
     display: inline-block;
-    font-size: 12px;
-    font-weight: 600;
-    border-radius: 999px;
-    padding: 2px 10px;
     line-height: 1.5;
-    white-space: nowrap;
   }
   .sev-critical { background: #fee2e2; color: #b91c1c; }
   .sev-high { background: #ffedd5; color: #c2410c; }
@@ -551,14 +537,11 @@ const PAGE_CSS = `
   .md ul, .md ol { margin: 6px 0 10px 22px; }
   .md li { margin: 3px 0; }
   .md .empty { color: #94a3b8; }
+  /* 等宽基底在 report-page.BASE_CSS，这里只补尺寸差量 */
   .md code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12.5px;
-    background: #f3f4f6;
-    border: 1px solid #e5e7eb;
     border-radius: 4px;
     padding: 1px 5px;
-    color: #374151;
   }
   .md pre {
     background: #0f172a;
@@ -601,26 +584,16 @@ export function renderReviewHtml(data: ReviewReportData): string {
     : parsed
       ? renderStructured(parsed)
       : `<article class="report md">\n${renderReviewMarkdown(data.text)}\n  </article>`;
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI 审查 · ${escapeHtml(data.title || '(无标题)')}</title>
-<style>${PAGE_CSS}</style>
-</head>
-<body>
-<div class="page">
-  <header class="hero${pass ? ' pass' : ''}">
+  return renderReportPage({
+    title: `AI 审查 · ${escapeHtml(data.title || '(无标题)')}`,
+    css: REVIEW_PAGE_CSS,
+    body: `  <header class="hero${pass ? ' pass' : ''}">
     <h1>${pass ? '✅' : '🤖'} AI 代码审查${pass ? ' · 全部通过' : ''}</h1>
     <p class="subtitle">${escapeHtml(data.title || '(无标题)')}</p>
     <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间 ${escapeHtml(data.generatedAt)}</p>
   </header>
-  ${content}
-</div>
-</body>
-</html>
-`;
+  ${content}`,
+  });
 }
 
 export function reviewsDir(): string {
@@ -629,7 +602,7 @@ export function reviewsDir(): string {
 
 /** 渲染并写入 HTML 报告（0600），返回文件名（不含目录）；文件名带随机 token 作为访问凭证。 */
 export function writeReviewReport(data: ReviewReportData, dir = reviewsDir()): string {
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDirSync(dir);
   pruneOldReports(dir);
   const name = `review-${sanitizeName(data.title, 'review').slice(0, 40)}-${newReportToken()}-${sanitizeName(data.attemptId, 'review').slice(0, 24)}-${Date.now()}.html`;
   writeFilePrivateSync(path.join(dir, name), renderReviewHtml(data));

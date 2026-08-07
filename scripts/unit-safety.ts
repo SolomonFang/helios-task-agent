@@ -5,24 +5,24 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
-import { loadEnvFiles, writeEnvFile } from '../src/config';
-import { repoFsList, repoFsRead, repoFsGrep } from '../src/repo-fs';
-import { auditLog } from '../src/audit';
-import { MemoryStore } from '../src/memory';
-import { readSkillDoc } from '../src/skills';
+import { loadEnvFiles, writeEnvFile } from '../src/config/config';
+import { repoFsList, repoFsRead, repoFsGrep } from '../src/agent/repo-fs';
+import { auditLog } from '../src/infra/audit';
+import { MemoryStore } from '../src/agent/memory';
+import { readSkillDoc } from '../src/agent/skills';
 import { isValidGitRef } from '../src/kanban/ai-review';
-import { buildTools, summarizeBothEnds } from '../src/tools';
-import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/deps';
+import { buildTools, summarizeBothEnds } from '../src/agent/tools';
+import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/infra/deps';
 import { check, checkAsync, finish } from './testkit';
 
 async function main() {
   // ---------- loadEnvFiles：cwd .env 命令注入类高危键被忽略 ----------
-  await checkAsync('loadEnvFiles：cwd .env 受限键（MCP/包规格/看板地址/数据目录/registry/代理）被忽略', async () => {
+  await checkAsync('loadEnvFiles：cwd .env 受限键（MCP/包规格/看板地址/数据目录/registry/代理/PATH/动态库/绑定地址）被忽略', async () => {
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-home-'));
     const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-cwd-'));
     fs.writeFileSync(
       path.join(tmpHome, '.env'),
-      'HELIOS_KANBAN_URL=http://home-kanban\nHELIOS_KANBAN_PACKAGE=helios-kanban@home\n',
+      'HELIOS_KANBAN_URL=http://home-kanban\nHELIOS_KANBAN_PACKAGE=helios-kanban@home\nHELIOS_KANBAN_HOST=127.0.0.1\n',
     );
     fs.writeFileSync(
       path.join(tmpCwd, '.env'),
@@ -40,6 +40,21 @@ async function main() {
         'http_proxy=http://evil-proxy-lc',
         'https_proxy=http://evil-proxy-s-lc',
         'no_proxy=evil-noproxy-lc',
+        // 子进程可执行文件/动态库劫持类（PATH 大小写两形态都覆盖）
+        'PATH=/evil/bin',
+        'path=/evil/bin-lc',
+        'HOME=/evil-home',
+        'SHELL=/evil-shell',
+        'NODE_OPTIONS=--require /evil/pwn.js',
+        'NODE_PATH=/evil/node_modules',
+        'LD_PRELOAD=/evil/preload.so',
+        'LD_LIBRARY_PATH=/evil/lib',
+        'DYLD_INSERT_LIBRARIES=/evil/inject.dylib',
+        'DYLD_LIBRARY_PATH=/evil/dylib',
+        'DYLD_FALLBACK_LIBRARY_PATH=/evil/fallback',
+        // 无鉴权服务绑定地址劫持
+        'HELIOS_KANBAN_HOST=0.0.0.0',
+        'HELIOS_REPORT_HOST=0.0.0.0',
         'HTA_SAFETY_NONRESTRICTED=from-cwd',
         '',
       ].join('\n'),
@@ -59,6 +74,19 @@ async function main() {
       'http_proxy',
       'https_proxy',
       'no_proxy',
+      'PATH',
+      'path',
+      'HOME',
+      'SHELL',
+      'NODE_OPTIONS',
+      'NODE_PATH',
+      'LD_PRELOAD',
+      'LD_LIBRARY_PATH',
+      'DYLD_INSERT_LIBRARIES',
+      'DYLD_LIBRARY_PATH',
+      'DYLD_FALLBACK_LIBRARY_PATH',
+      'HELIOS_KANBAN_HOST',
+      'HELIOS_REPORT_HOST',
       'HTA_SAFETY_NONRESTRICTED',
     ];
     const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
@@ -67,9 +95,12 @@ async function main() {
       if (k !== 'HELIOS_TASK_AGENT_HOME') delete process.env[k];
     }
     const prevCwd = process.cwd();
-    // 静默丢弃提示（[config] cwd .env 中的高危键已被忽略…），不打断测试输出
+    // 记录而非丢弃 warn：断言 cwd .env 含 PATH 等高危键时有提示
+    const warns: string[] = [];
     const origWarn = console.warn;
-    console.warn = () => {};
+    console.warn = (msg?: unknown) => {
+      warns.push(String(msg));
+    };
     try {
       process.env.HELIOS_TASK_AGENT_HOME = tmpHome; // shell 提供，cwd .env 不得覆盖
       process.chdir(tmpCwd);
@@ -89,6 +120,26 @@ async function main() {
       assert.equal(process.env.http_proxy, undefined, 'http_proxy 应被忽略');
       assert.equal(process.env.https_proxy, undefined, 'https_proxy 应被忽略');
       assert.equal(process.env.no_proxy, undefined, 'no_proxy 应被忽略');
+      // 子进程劫持类：PATH/HOME/SHELL/NODE_*/LD_*/DYLD_* 一律不得被 cwd .env 注入
+      assert.equal(process.env.PATH, undefined, 'PATH 应被忽略');
+      assert.equal(process.env.path, undefined, 'path 应被忽略');
+      assert.equal(process.env.HOME, undefined, 'HOME 应被忽略');
+      assert.equal(process.env.SHELL, undefined, 'SHELL 应被忽略');
+      assert.equal(process.env.NODE_OPTIONS, undefined, 'NODE_OPTIONS 应被忽略');
+      assert.equal(process.env.NODE_PATH, undefined, 'NODE_PATH 应被忽略');
+      assert.equal(process.env.LD_PRELOAD, undefined, 'LD_PRELOAD 应被忽略');
+      assert.equal(process.env.LD_LIBRARY_PATH, undefined, 'LD_LIBRARY_PATH 应被忽略');
+      assert.equal(process.env.DYLD_INSERT_LIBRARIES, undefined, 'DYLD_INSERT_LIBRARIES 应被忽略');
+      assert.equal(process.env.DYLD_LIBRARY_PATH, undefined, 'DYLD_LIBRARY_PATH 应被忽略');
+      assert.equal(process.env.DYLD_FALLBACK_LIBRARY_PATH, undefined, 'DYLD_FALLBACK_LIBRARY_PATH 应被忽略');
+      // 绑定地址：cwd 的 0.0.0.0 不得生效，HELIOS_KANBAN_HOST 由 home 提供
+      assert.equal(process.env.HELIOS_KANBAN_HOST, '127.0.0.1', 'HELIOS_KANBAN_HOST 应取 home 值');
+      assert.equal(process.env.HELIOS_REPORT_HOST, undefined, 'HELIOS_REPORT_HOST 应被忽略');
+      // 忽略高危键必须有 warn 提示（知情权）
+      assert.ok(
+        warns.some((w) => w.includes('高危键') && w.includes('PATH') && w.includes('HELIOS_KANBAN_HOST')),
+        `应有高危键忽略提示，实际 warns=${JSON.stringify(warns)}`,
+      );
       // 非受限键仍生效
       assert.equal(process.env.HTA_SAFETY_NONRESTRICTED, 'from-cwd');
     } finally {
@@ -153,29 +204,69 @@ async function main() {
     fs.writeFileSync(path.join(root, '.npmrc'), '//registry/:_authToken=x');
     fs.writeFileSync(path.join(root, 'credentials'), 'aws_secret=aws-secret');
     fs.writeFileSync(path.join(root, '.git', 'config'), 'url = https://git-token@example.com/repo.git');
+    // JSON 形态凭证（GCP/AWS/kube 等常见落盘文件名）
+    fs.writeFileSync(path.join(root, 'credentials.json'), '{"secret":"json-cred"}');
+    fs.writeFileSync(path.join(root, 'aws-credentials.json'), '{"secret":"aws-json-cred"}');
+    fs.writeFileSync(path.join(root, 'token.json'), '{"access_token":"oauth-tok"}');
+    fs.writeFileSync(path.join(root, 'service-account-prod.json'), '{"private_key":"gcp-sa-key"}');
+    fs.writeFileSync(path.join(root, 'client_secret_web.json'), '{"client_secret":"oauth-client"}');
+    // .docker/.kube 的 config.json 含 registry/集群凭证；普通 config.json 不得误伤
+    fs.mkdirSync(path.join(root, '.docker'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.kube'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.docker', 'config.json'), '{"auths":{"docker-secret":{}}}');
+    fs.writeFileSync(path.join(root, '.kube', 'config.json'), '{"token":"kube-secret"}');
+    fs.writeFileSync(path.join(root, 'config.json'), '{"port":7964}');
     fs.writeFileSync(path.join(root, 'app.ts'), 'const token = 1;\n');
 
-    const denied = ['.env', '.env.local', 'id_rsa', 'cert.pem', '.npmrc', 'credentials', '.git/config'];
+    const denied = [
+      '.env',
+      '.env.local',
+      'id_rsa',
+      'cert.pem',
+      '.npmrc',
+      'credentials',
+      '.git/config',
+      'credentials.json',
+      'aws-credentials.json',
+      'token.json',
+      'service-account-prod.json',
+      'client_secret_web.json',
+      '.docker/config.json',
+      '.kube/config.json',
+    ];
     check(
       'repoFsRead 敏感文件命中 denylist（拒绝且不泄露内容）',
       denied.every((f) => {
         const out = repoFsRead(root, f);
-        return out.includes('已拒绝读取') && !out.includes('sk-secret') && !out.includes('PRIVATE KEY');
+        return (
+          out.includes('已拒绝读取') &&
+          !out.includes('sk-secret') &&
+          !out.includes('PRIVATE KEY') &&
+          !out.includes('json-cred') &&
+          !out.includes('docker-secret') &&
+          !out.includes('kube-secret')
+        );
       }),
     );
     const okOut = repoFsRead(root, 'app.ts');
     check('repoFsRead 普通文件放行', okOut.includes('const token = 1;'));
+    check(
+      'repoFsRead 普通 config.json 放行（不误伤非 .docker/.kube 路径）',
+      repoFsRead(root, 'config.json').includes('"port":7964'),
+    );
     check(
       'repoFsList 拒列 .git 目录（路径整体判定，非仅 basename）',
       repoFsList(root, '.git').includes('已拒绝读取') && repoFsList(root, '.').includes('app.ts'),
     );
     const grepTree = repoFsGrep(root, 'token');
     check(
-      'repoFsGrep 树扫描跳过敏感文件（不泄露 .npmrc/.env/.git 内容）',
+      'repoFsGrep 树扫描跳过敏感文件（不泄露 .npmrc/.env/.git/凭证 JSON 内容）',
       grepTree.includes('app.ts') &&
         !grepTree.includes('sk-secret') &&
         !grepTree.includes('_authToken') &&
-        !grepTree.includes('git-token'),
+        !grepTree.includes('git-token') &&
+        !grepTree.includes('oauth-tok') &&
+        !grepTree.includes('kube-secret'),
       grepTree.split('\n').slice(0, 4).join(' | '),
     );
     const grepDirect = repoFsGrep(root, 'token', '.env');
@@ -190,6 +281,17 @@ async function main() {
       repoFsGrep(root, '(\\w+)+$').includes('参数错误') &&
         repoFsGrep(root, 'a'.repeat(201)).includes('pattern 过长') &&
         repoFsGrep(root, 'token').includes('app.ts'),
+    );
+    check(
+      'repoFsGrep ReDoS 防护：无括号连续相邻量词段拒绝（.*.* / .+.* / .*\\w+）',
+      repoFsGrep(root, '.*.*.*.*.*b').includes('连续相邻的量词段') &&
+        repoFsGrep(root, '.+.*').includes('连续相邻的量词段') &&
+        repoFsGrep(root, '.*\\w+key').includes('连续相邻的量词段'),
+    );
+    check(
+      'repoFsGrep ReDoS 防护不误伤：字符类内 .* 字面量与非相邻量词段放行',
+      repoFsGrep(root, '[.*]').includes('pattern: [.*]') && // 未被拒即放行（输出头含原 pattern）
+        repoFsGrep(root, 'a.*b.*c').includes('pattern: a.*b.*c'),
     );
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -255,6 +357,39 @@ async function main() {
         !raw.includes('bearer-secret-456') &&
         raw.includes('--token ***') &&
         raw.includes('Bearer ***')
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  })());
+
+  // ---------- 审计脱敏：URL query 与裸环境赋值 ----------
+  check('auditLog：URL query 凭证与裸环境赋值脱敏，普通文本不过度脱敏', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-audit2-'));
+    try {
+      auditLog(
+        {
+          user: 'u',
+          kind: 'lark',
+          summary: 's',
+          detail:
+            'open https://evil.example/cb?access_token=query-secret-789&foo=1 后执行 FOO_API_KEY=env-secret-000 npm run；monkey=3 与 password 一词应保留',
+          decision: 'approved',
+          resultSnippet: '回调 &app_secret=result-secret-111 已触发',
+        },
+        tmp,
+      );
+      const raw = fs.readFileSync(path.join(tmp, 'audit.log'), 'utf8');
+      return (
+        !raw.includes('query-secret-789') &&
+        !raw.includes('env-secret-000') &&
+        !raw.includes('result-secret-111') &&
+        raw.includes('access_token=***') &&
+        raw.includes('app_secret=***') &&
+        raw.includes('FOO_API_KEY=***') &&
+        raw.includes('&foo=1') && // 非敏感 query 参数保留
+        raw.includes('monkey=3') && // 小写普通词不误伤
+        raw.includes('password 一词') // 叙述文本不误伤
       );
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

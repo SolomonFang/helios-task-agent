@@ -4,7 +4,7 @@
  * 脚本末尾调用 finish() 汇总并以非零退出码报告失败。
  */
 
-import { errMessage } from '../src/err';
+import { errMessage } from '../src/infra/err';
 
 let failures = 0;
 

@@ -1,7 +1,6 @@
 import fs from 'fs';
-import path from 'path';
-import { writeFilePrivateSync } from '../private-file';
-import { errMessage } from '../err';
+import { writeFileAtomicPrivateSync } from '../infra/private-file';
+import { errMessage } from '../infra/err';
 import {
   apiGet,
   taskPageUrl,
@@ -155,10 +154,7 @@ export class KanbanWatcher {
 
   private persist(): void {
     try {
-      fs.mkdirSync(path.dirname(this.opts.statePath), { recursive: true });
-      const tmp = `${this.opts.statePath}.${process.pid}.tmp`;
-      writeFilePrivateSync(tmp, JSON.stringify(this.state, null, 2) + '\n');
-      fs.renameSync(tmp, this.opts.statePath);
+      writeFileAtomicPrivateSync(this.opts.statePath, JSON.stringify(this.state, null, 2) + '\n');
     } catch {
       /* best-effort */
     }
@@ -168,8 +164,13 @@ export class KanbanWatcher {
     if (this.polling) return;
     this.polling = true;
     try {
-      const current = await this.collect();
+      const { state: current, approvalsUnknown } = await this.collect();
       const prev = this.state;
+      if (prev) {
+        // approvals 拉取失败 = 「未知」而非「空」：沿用上一轮快照，不把该字段推进为 []——
+        // 否则恢复后 diff 会把全部 pending 审批当成「新的待审批」再推一遍
+        if (approvalsUnknown) current.approvals = prev.approvals;
+      }
       if (!prev) {
         this.state = current;
         this.persist();
@@ -339,7 +340,8 @@ export class KanbanWatcher {
     if (snapshotChanged || touched) this.persist();
   }
 
-  private async collect(): Promise<WatchState> {
+  /** 拉取一轮快照；approvals 端点失败时 approvalsUnknown=true（调用方沿用旧快照，见 tick）。 */
+  private async collect(): Promise<{ state: WatchState; approvalsUnknown: boolean }> {
     const projectIds = this.opts.projectId ? [this.opts.projectId] : await this.fetchProjectIds();
     const tasks: Record<string, WatchTaskState> = {};
     for (const pid of projectIds) {
@@ -364,6 +366,7 @@ export class KanbanWatcher {
       }
     }
     let approvals: WatchApproval[] = [];
+    let approvalsUnknown = false;
     try {
       const raw = await this.api('/approvals');
       if (Array.isArray(raw)) {
@@ -378,10 +381,13 @@ export class KanbanWatcher {
           })
           .filter((a) => a.id);
       }
-    } catch {
-      /* approvals 端点可选，失败不阻断任务监控 */
+    } catch (err) {
+      // approvals 端点可选，失败不阻断任务监控；但要记日志并标记「未知」，
+      // 由 tick 沿用上一轮快照（按 [] 继续会把恢复后的全部 pending 误判为新审批）
+      approvalsUnknown = true;
+      this.opts.log?.(`approvals 拉取失败，本轮沿用上一轮审批快照: ${errMessage(err)}`);
     }
-    return { tasks, approvals };
+    return { state: { tasks, approvals }, approvalsUnknown };
   }
 
   /** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
@@ -428,85 +434,4 @@ export class KanbanWatcher {
   private async api(p: string): Promise<unknown> {
     return apiGet(this.opts.kanbanUrl, p);
   }
-}
-
-/** 判断 URL 主机是否为 loopback（localhost / 127.x / ::1）：推送链接在手机上不可达的场景识别用。 */
-export function isLoopbackUrl(raw: string): boolean {
-  try {
-    const h = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    return h === 'localhost' || h === '::1' || h.startsWith('127.');
-  } catch {
-    return false;
-  }
-}
-
-/** 看板事件通知的飞书卡片（legacy schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
-export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
-  const meta: Record<WatchEventKind, { template: string; title: string }> = {
-    review: { template: 'yellow', title: '🔍 看板任务待审阅' },
-    done: { template: 'green', title: '✅ 看板任务已完成' },
-    cancelled: { template: 'grey', title: '🚫 看板任务已取消' },
-    failed: { template: 'red', title: '❌ 看板任务执行失败' },
-    approvals: { template: 'blue', title: `⏳ 看板有 ${e.items?.length ?? 0} 个新的待审批项` },
-  };
-  const m = meta[e.kind];
-  const elements: Array<Record<string, unknown>> = [];
-
-  if (e.kind === 'approvals') {
-    // 审批标签来自看板数据，用 plain_text 避免 markdown 字符误解析
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: (e.items ?? []).map((l) => `· ${l}`).join('\n') } });
-    elements.push({ tag: 'hr' });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '回复「待审批」处理' }] });
-  } else {
-    // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
-    if (e.transition) {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${e.transition}\`` } });
-    }
-    if (e.kind === 'failed') {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: '请到看板查看日志定位问题。' } });
-    }
-    if (e.extra) {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: `结果摘要：${e.extra}` } });
-    }
-    if (e.url) {
-      const btn = e.kind === 'review' ? '🔍 人工审查' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
-      const actions: Array<Record<string, unknown>> = [
-        { tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url },
-      ];
-      // AI 审查：回传按钮（card.action.trigger），bot 侧调 open-code-review 跑该 attempt 的 diff
-      if (e.kind === 'review' && e.attemptId) {
-        actions.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: '🤖 AI 审查' },
-          value: { hta_review: e.attemptId, title: e.title.slice(0, 50) },
-        });
-      }
-      elements.push({ tag: 'action', actions });
-    }
-    const hints: Partial<Record<WatchEventKind, string>> = {
-      review: '「AI 审查」让 AI 先过一遍 diff；没问题回复「标记完成」，要继续改直接说',
-      done: '回复「帮我审一下」看结果，或「再跟它说一句…」继续迭代',
-      failed: '回复「为什么失败」让它分析原因',
-    };
-    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
-    // loopback（localhost/127.x/::1）连同一局域网都不可达，注脚需区分
-    const linkNote =
-      e.url && isLoopbackUrl(e.url)
-        ? '链接仅在运行本机器人的电脑上可达（本机地址，手机/局域网打不开），进程重启后失效。'
-        : '链接仅在运行本机器人的电脑所在网络可达，进程重启后失效。';
-    const notes = [hints[e.kind], e.url ? linkNote : null].filter(
-      (t): t is string => Boolean(t),
-    );
-    if (notes.length) {
-      elements.push({ tag: 'hr' });
-      elements.push({ tag: 'note', elements: notes.map((t) => ({ tag: 'plain_text', content: t })) });
-    }
-  }
-
-  return {
-    config: { wide_screen_mode: true, enable_forward: false },
-    header: { template: m.template, title: { tag: 'plain_text', content: m.title } },
-    elements,
-  };
 }

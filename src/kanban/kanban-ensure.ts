@@ -2,8 +2,8 @@ import { spawn, type ChildProcess } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
-import { kanbanPackageSpec } from '../deps';
-import { minimalChildEnv } from '../proc-env';
+import { kanbanPackageSpec } from '../infra/deps';
+import { minimalChildEnv } from '../infra/proc-env';
 
 export interface KanbanEnsureResult {
   /** True if we spawned a new process. */
@@ -15,6 +15,20 @@ export interface KanbanEnsureResult {
 
 function isLocalHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0';
+}
+
+/** 看板健康响应的字段级校验：必须是可以 JSON.parse 的看板 API 信封——
+ * success===true 且带 error_data/message 字段组合（vibe-kanban ApiResponse 的固定形状）。
+ * 仅匹配 "success":true 子串可被任何返回该字段的服务冒充（含把这几个字符写进 HTML 的页面）。 */
+function isKanbanHealthBody(body: string): boolean {
+  try {
+    const o: unknown = JSON.parse(body);
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+    const r = o as Record<string, unknown>;
+    return r.success === true && 'error_data' in r && 'message' in r;
+  } catch {
+    return false;
+  }
 }
 
 /** 导出以便单测直接验证健康判定（单测起本地 HTTP server 模拟各类占用者）。 */
@@ -33,7 +47,7 @@ export async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<bo
         const u = new URL(root + p);
         const lib = u.protocol === 'https:' ? https : http;
         const req = lib.get(u, { timeout: timeoutMs }, (res) => {
-          // 仅 2xx 且响应体是 kanban API 信封（"success":true）才算健康：
+          // 仅 2xx 且响应体是看板 API 信封（success+error_data+message 字段组合）才算健康：
           // 任意占用端口的 HTTP 服务（含对这些路径回 404/HTML 的）不得误判为「看板已在运行」
           if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
             res.resume();
@@ -45,7 +59,7 @@ export async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<bo
           res.on('data', (chunk: string) => {
             if (body.length < 8192) body += chunk;
           });
-          res.on('end', () => done(body.includes('"success":true')));
+          res.on('end', () => done(isKanbanHealthBody(body)));
           res.on('error', () => done(false));
         });
         req.on('error', () => done(false));

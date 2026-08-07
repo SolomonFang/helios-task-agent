@@ -1,13 +1,17 @@
 // E2E test with a local mock OpenAI server — verifies the full agent loop
 // against the REAL helios-kanban MCP. Run: npm run test:e2e
+//
+// 严格模式：HTA_REQUIRE_E2E=1 时，前置缺失（缺 lark-cli / 看板不可达）不再 SKIP 退出（退出码 0），
+// 而是 FAIL 退出（退出码 1 并说明缺什么前置），防止发布链路上「verify 通过」掩盖 e2e 未真跑。
+// scripts/smoke.ts 的 SKIP 用例共用同一开关。
 
 import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import { spawn } from 'child_process';
 import path from 'path';
-import { errMessage } from '../src/err';
-import { checkLarkCli } from '../src/deps';
+import { errMessage } from '../src/infra/err';
+import { checkLarkCli } from '../src/infra/deps';
 import { fetchKanbanHealth } from '../src/kanban/http';
 
 const TEST_TITLE = '【测试】Helios Task Agent 冒烟任务（自动删除）';
@@ -134,15 +138,24 @@ async function cleanupTestTask(kanbanUrl: string, state: MockState): Promise<voi
 }
 
 async function main(): Promise<void> {
-  // 前置检查：缺 lark-cli / 看板不可达属于环境问题，按 SKIP 退出（同 smoke.ts 的 SKIP 惯例），不报成链路失败
+  // 前置检查：缺 lark-cli / 看板不可达属于环境问题，默认按 SKIP 退出（退出码 0，同 smoke.ts 惯例）；
+  // HTA_REQUIRE_E2E=1 时改为 FAIL（退出码 1），防止发布链路上「verify 通过」掩盖 e2e 未真跑
+  const requireE2e = process.env.HTA_REQUIRE_E2E === '1';
+  const skipOrFail = (reason: string): void => {
+    if (requireE2e) {
+      console.error(`FAIL  e2e-mock  — HTA_REQUIRE_E2E=1 要求 e2e 必须执行，但前置缺失：${reason}`);
+      process.exit(1);
+    }
+    console.log(`SKIP  e2e-mock  — ${reason}`);
+  };
   if (!checkLarkCli()) {
-    console.log('SKIP  e2e-mock  — 未找到可执行命令「lark-cli」，请先安装并完成授权后再运行本用例');
+    skipOrFail('未找到可执行命令「lark-cli」，请先安装并完成授权后再运行本用例');
     return;
   }
   const kanbanUrl = (process.env.HELIOS_KANBAN_URL || 'http://localhost:7964').replace(/\/+$/, '');
   const health = await fetchKanbanHealth(kanbanUrl);
   if (health !== 'ok') {
-    console.log(`SKIP  e2e-mock  — 看板不可达（${kanbanUrl}: ${health}），请先启动 helios-kanban`);
+    skipOrFail(`看板不可达（${kanbanUrl}: ${health}），请先启动 helios-kanban`);
     return;
   }
 

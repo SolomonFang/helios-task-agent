@@ -1,20 +1,24 @@
 // Smoke test: MCP connectivity + tool registry + local tools. No LLM calls.
 // Run: npm run smoke
+//
+// 严格模式：HTA_REQUIRE_E2E=1 时，环境问题导致的 SKIP（如本机看板未注册当前仓库）按失败计入
+// （退出码非零），防止发布链路上用例被静默跳过。与 scripts/e2e-mock.ts 共用同一开关。
+// 审计日志（lark_read / repo_fs / memory_* 等）写入临时目录，不污染真实 ~/.helios-task-agent/audit.log。
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { KanbanMcp } from '../src/kanban/mcp';
-import { buildTools } from '../src/tools';
-import { currentConfig } from '../src/config';
-import { buildSystemPrompt } from '../src/prompt';
-import { MemoryStore } from '../src/memory';
-import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/guard';
-import { SourceRegistry, extractSourceUrls } from '../src/source-registry';
-import { ConfirmationManager, buildResolvedCard } from '../src/confirm';
+import { buildTools } from '../src/agent/tools';
+import { currentConfig } from '../src/config/config';
+import { buildSystemPrompt } from '../src/agent/prompt';
+import { MemoryStore } from '../src/agent/memory';
+import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/agent/guard';
+import { SourceRegistry, extractSourceUrls } from '../src/agent/source-registry';
+import { ConfirmationManager, buildResolvedCard } from '../src/agent/confirm';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
-import { runAgentTurn } from '../src/llm';
-import { checkLarkCli } from '../src/deps';
+import { runAgentTurn } from '../src/agent/llm';
+import { checkLarkCli } from '../src/infra/deps';
 import {
   applyRepoBaseBranches,
   classifyWorkspaceSetup,
@@ -22,7 +26,7 @@ import {
   formatWorkspaceSetupFailure,
 } from '../src/kanban/workspace-ready';
 import type { OpenAiClient } from '../src/types';
-import { errMessage } from '../src/err';
+import { errMessage } from '../src/infra/err';
 
 async function main(): Promise<void> {
   const cfg = currentConfig();
@@ -43,11 +47,15 @@ async function main(): Promise<void> {
 
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-memory-'));
   const memory = new MemoryStore(tmpHome);
+  // 审计日志统一写入独立临时目录：memory_set / lark_read / repo_fs 等的审计不得落到真实
+  // ~/.helios-task-agent/audit.log（tmpHome 用后即删，不复用；gated 工具另用 gateHome）
+  const auditHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-smoke-audit-'));
   const { openAiTools, handlers } = buildTools({
     mcp: mcp.connected ? mcp : null,
     kanbanUrl: cfg.kanbanUrl,
     memory,
     userId: 'local',
+    auditHome,
     // memory_set 已接入写闸门（fail-closed）：冒烟环境自动放行
     confirm: async () => 'once',
   });
@@ -106,14 +114,19 @@ async function main(): Promise<void> {
   );
 
   const hkOut = await handlers.get('hk_cli')!({ args: ['health'] });
-  check('hk_cli health', /success|OK/i.test(hkOut), hkOut.slice(0, 80).replace(/\n/g, ' '));
+  // 看板 ApiResponse 信封为 {"success":true,...}（见 src/kanban/http.ts envelopeData）：
+  // 严格匹配信封字段，避免错误页/引导文案中的 ok/success 子串误判 PASS
+  check('hk_cli health', /"success"\s*:\s*true/.test(hkOut), hkOut.slice(0, 80).replace(/\n/g, ' '));
 
   const repoRoot = path.join(__dirname, '..');
   // 本机看板未注册当前仓库时，repo_fs 两项用例必被白名单拒绝（环境问题，非产品缺陷）：
   // 打印 SKIP 且不计入 failures。SKIP 判定严格只匹配白名单拒绝文案，其余输出仍按原断言 PASS/FAIL。
   const REPO_NOT_REGISTERED = /路径不在看板注册仓库内/;
+  // 严格模式：HTA_REQUIRE_E2E=1 时 SKIP 按失败计入（复用 check，输出 FAIL 并累计 failures）
+  const requireE2e = process.env.HTA_REQUIRE_E2E === '1';
   const skip = (name: string, detail: string) => {
-    console.log(`SKIP  ${name}  — ${detail}`);
+    if (requireE2e) check(name, false, `HTA_REQUIRE_E2E=1 禁止跳过：${detail}`);
+    else console.log(`SKIP  ${name}  — ${detail}`);
   };
   const listOut = await handlers.get('repo_fs')!({ action: 'list', root: repoRoot, path: 'src' });
   if (REPO_NOT_REGISTERED.test(listOut)) {
@@ -454,6 +467,7 @@ async function main(): Promise<void> {
 
   try {
     fs.rmSync(gateHome, { recursive: true, force: true });
+    fs.rmSync(auditHome, { recursive: true, force: true });
   } catch {
     /* ignore */
   }

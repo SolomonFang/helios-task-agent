@@ -11,12 +11,11 @@ import {
   LARK_CLI_AUTH_HINT,
   OCR_INSTALL_HINT,
   type LarkCliStatus,
-} from './deps';
+} from './infra/deps';
 import { ensureKanbanRunning, type KanbanEnsureResult } from './kanban/kanban-ensure';
-import { migratePackageSkills } from './skills';
-import { validateSkills } from './prompt';
+import { migratePackageSkills, validateSkills } from './agent/skills';
 import { c } from './ui';
-import { errMessage } from './err';
+import { errMessage } from './infra/err';
 
 export interface StartupDepsWarnOptions {
   /**

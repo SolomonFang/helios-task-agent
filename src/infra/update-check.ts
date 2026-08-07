@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
 import { defaultDataHome, packageRoot } from './paths';
-import { writeFilePrivateSync } from './private-file';
+import { ensurePrivateDirSync, writeFilePrivateSync } from './private-file';
 import { minimalChildEnv } from './proc-env';
 
 /**
@@ -96,23 +96,28 @@ export function compareVersions(a: string, b: string): number {
   return comparePrerelease(pa.pre, pb.pre);
 }
 
+/** registry URL 归一化：仅接受 https://（http 会被中间人篡改版本元数据，继而诱导 npm i -g 恶意版本），不合格返回 ''。 */
+export function normalizeRegistry(r: string): string {
+  return /^https:\/\//.test(r.trim()) ? r.trim().replace(/\/+$/, '') : '';
+}
+
 /** 解析检查更新用的 registry：显式 env > npm 用户配置（镜像）> 官方。每进程解析一次（异步，不阻塞事件循环）。 */
 let cachedRegistry: string | null = null;
 function npmConfigRegistry(): Promise<string> {
   return new Promise((resolve) => {
     // 最小环境（同 defaultRunUpdate）：不向 npm 子进程泄露 LLM_API_KEY 等敏感变量
     execFile('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir(), env: minimalChildEnv() }, (err, stdout) => {
-      const out = (stdout || '').trim();
-      resolve(!err && /^https?:\/\//.test(out) ? out : '');
+      resolve(!err ? normalizeRegistry(stdout || '') : '');
     });
   });
 }
 
 async function npmRegistry(): Promise<string> {
   if (cachedRegistry) return cachedRegistry;
-  let r = process.env.HTA_UPDATE_REGISTRY || process.env.NPM_CONFIG_REGISTRY || '';
+  let r = normalizeRegistry(process.env.HTA_UPDATE_REGISTRY || '');
+  if (!r) r = normalizeRegistry(process.env.NPM_CONFIG_REGISTRY || '');
   if (!r) r = await npmConfigRegistry();
-  cachedRegistry = (r || 'https://registry.npmjs.org').replace(/\/+$/, '');
+  cachedRegistry = r || 'https://registry.npmjs.org';
   return cachedRegistry;
 }
 
@@ -140,7 +145,7 @@ function readCache(cachePath: string, now: number): DistTags | null {
 
 function writeCache(cachePath: string, tags: DistTags): void {
   try {
-    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    ensurePrivateDirSync(path.dirname(cachePath));
     writeFilePrivateSync(
       cachePath,
       JSON.stringify({ checkedAt: new Date().toISOString(), latest: tags.latest, next: tags.next }) + '\n',

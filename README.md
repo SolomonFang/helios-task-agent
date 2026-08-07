@@ -8,7 +8,7 @@
 
 核心亮点：
 
-- **写操作安全闸门（代码强制，不靠 prompt 自觉）**：建/改/删任务、start/stop、审批、发飞书消息等，执行前必须确认——终端 `y/b/N`，飞书端确认卡片；闸门缺失时全部写操作失败关闭
+- **写操作安全闸门（代码强制，不靠 prompt 自觉）**：建/改/删任务、start/stop、审批、发飞书消息等，执行前必须确认——终端 `y/batch/N`，飞书端确认卡片；闸门缺失时全部写操作失败关闭
 - **看板零预装**：本机 helios-kanban 不可达时自动拉起，马上就能建任务
 - **自然语言驱动**：「同步我的飞书任务」→「写进 helios-kanban」→「用 Claude 跑这个任务」，是否启动、用谁跑都听你的
 
@@ -22,12 +22,12 @@ npx helios-task-agent@latest
 
 ## 两种形态：CLI 与飞书 bot
 
-- **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/b/N`）、看板操作全部可用。
+- **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/batch/N`）、看板操作全部可用。
 - **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出三项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）。
 
 ## 安装
 
-要求：Node.js ≥ 18，macOS / Linux。
+要求：Node.js ≥ 20，macOS / Linux。
 
 ```bash
 npm i -g helios-task-agent
@@ -59,7 +59,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 飞书任务中心 / 文档 / 群聊
   → 列出或读取；标题/描述含飞书链接则展开一层详情（仅展示，不自动写看板；单次最多展开约 10 条）
   → 「写进 helios-kanban」：展示标题 + 需求摘要草稿
-       → 代码层写操作闸门确认（终端 y/b/N，或飞书确认卡片）→ create（不自动 start）
+       → 代码层写操作闸门确认（终端 y/batch/N，或飞书确认卡片）→ create（不自动 start）
   → 同一飞书来源已同步过 → 拦截并提示已有任务（任务被删后映射会自愈，可再同步）
   → 之后是否 start、用谁跑：听你的（Claude / Kimi / Codex / 看板默认 …）
 ```
@@ -76,7 +76,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 | 机制 | 说明 |
 |------|------|
-| 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`b`（同类免问）/`N`（应答词表与飞书端一致：确认/批准/同意/执行、同类免问/批量允许 等）；可批量操作 120 秒、破坏性操作 300 秒未操作自动拒绝，确认提示时 Ctrl+C = 拒绝。飞书：确认卡片（仅非破坏性操作带「同类免问（本会话）」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；超时策略与终端一致；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
+| 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`batch`（同类免问）/`N`（应答词表与飞书端一致：确认/批准/同意/执行、同类免问/批量允许 等）；可批量操作 120 秒、破坏性操作 300 秒未操作自动拒绝，确认提示时 Ctrl+C = 拒绝。飞书：确认卡片（仅非破坏性操作带「同类免问（本会话）」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；超时策略与终端一致；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
 | 批量确认 | 「同类免问」后本会话内同类型写操作自动放行（内存态授权，重启即失效）；「确认」默认**仅此次**。删除/取消/停止/审批/启动/归档/合并/推送/执行（delete/cancel/stop/approve/start/archive/merge/push/execute）等破坏性操作始终逐次确认。**飞书消息类写操作（lark 发送类）不支持同类免问**；看板类写操作的确认卡片上有「同类免问（本会话）」按钮。回复「恢复确认」或 `/confirm revoke` 立即撤销（`/confirm on` 为兼容别名） |
 | 会话创建上限 | 单会话最多创建 **10** 个看板任务；超限需 `/clear` 后再建 |
 | 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
@@ -97,9 +97,9 @@ npm i -g @larksuite/cli && lark-cli auth login
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`——可用独立的 `OCR_LLM_TOKEN` 环境变量覆盖以隔离主 key），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`——可用独立的 `OCR_LLM_TOKEN` 环境变量覆盖以隔离主 key），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口（绑定地址 `HELIOS_REPORT_HOST`，默认 `127.0.0.1`）；报告链接主机名取值规则：`HELIOS_KANBAN_URL` 为回环地址（localhost/127.x）时沿用其主机名（与看板链接可达性一致）；看板为非回环地址（如局域网 IP）时链接主机名取报告服务**绑定地址**——默认即 `127.0.0.1`（此时报告链接仅本机可开），绑定 `0.0.0.0` 则链接主机名会是不可拨号的 `0.0.0.0`，应显式绑定本机局域网 IP；进程存活期间有效，历史报告 30 天自动清理
 
-> **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）；如需在手机上点按钮审查，请把 `HELIOS_KANBAN_URL` 配置为该机器的局域网 IP 或 Tailscale 地址（看板与报告服务需同步可从该地址访问）。报告 URL 带随机 token，且报告服务默认只绑 `127.0.0.1`——确需对外暴露时显式设置 `HELIOS_REPORT_HOST`。
+> **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）。手机审查的正确配法：`HELIOS_KANBAN_URL` 配为该机器的局域网 IP 或 Tailscale 地址，**同时**把 `HELIOS_REPORT_HOST` 显式设为同一局域网 IP（不要设 `0.0.0.0`——链接主机名会原样变成不可拨号的 `0.0.0.0`）；只改 `HELIOS_KANBAN_URL` 时报告链接主机名会退回默认绑定地址 `127.0.0.1`，手机仍打不开。若看板保持回环地址，报告链接主机名也跟随回环，**目前没有让手机访问报告的办法**。报告 URL 带随机 token。
 
 ## MCP 健康监督（bot）
 
@@ -202,7 +202,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
-加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。
+加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。注意：**当前目录 `.env` 中的凭证/命令类高危键不参与覆盖**（`LLM_API_KEY`、`FEISHU_*`、`HELIOS_KANBAN_MCP_COMMAND/ARGS`、`HELIOS_KANBAN_PACKAGE`、`HELIOS_KANBAN_URL`、代理与 npm registry 等，防供应链/命令注入；被忽略时仅输出一行 `console.warn`）——这类键请写入 `~/.helios-task-agent/.env`（或 shell 环境 / 项目 `.env`）。
 
 ### 开放平台清单
 
@@ -216,7 +216,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 **终端命令**：`/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm`（查免问状态）`/confirm revoke`（撤销免问；`/confirm on` 为兼容别名）`/exit` 或 `/quit`（运行中 Ctrl+C 只中断当前轮；确认提示时 Ctrl+C = 拒绝该写操作）
 
-**飞书命令**：`/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/stop` `/confirm` `/status` `/tools` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
+**飞书命令**：`/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop`（中断当前任务、取消待确认写操作并丢弃排队消息）。`/help` `/stop` `/confirm` `/status` `/tools` `/skills` **即时响应**；`/memory` `/clear` 与普通对话一样排队。回复「恢复确认」等同撤销免问。
 
 **自然语言示例**：
 
@@ -239,6 +239,9 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 | kanban MCP | 优先的看板操作 |
 | `hk_cli` | 始终可用；跑内置 `hk.sh`（HTTP REST），MCP 掉线或缺能力时补充 |
 | `repo_fs` | 可选：对看板关联仓库本机 path 做 `list` / `read` / `grep`（不可越界） |
+| `work_summary` | 生成工作总结报告（HTML/MD） |
+| `skill_doc` | 按需读取已安装技能完整文档（SKILL.md） |
+| `skill_exec` | 运行技能目录内脚本（每次需用户确认） |
 | `memory_*` | 持久化偏好与备注 |
 
 包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.sh`）。

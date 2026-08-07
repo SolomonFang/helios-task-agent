@@ -7,21 +7,21 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createBotHandlers, MAX_USER_MESSAGE_CHARS, type BotHandlers } from '../src/bot/handler';
+import { createBotHandlers, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
-import { SessionRouter } from '../src/session-router';
-import { ConfirmationManager } from '../src/confirm';
-import { MemoryStore } from '../src/memory';
+import { SessionRouter } from '../src/agent/session-router';
+import { ConfirmationManager } from '../src/agent/confirm';
+import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
 import { CLEARED_TEXT } from '../src/commands';
-import type { ConfirmRequest } from '../src/guard';
+import { withBatchApproval, type ConfirmRequest } from '../src/agent/guard';
 import type { AgentConfig, InboundMessage } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import { redactSnippet } from '../src/audit';
+import { redactSnippet } from '../src/infra/audit';
 import { checkAsync, finish } from './testkit';
 
-/** 轮询等待条件成立（队列与 LLM 请求均为异步），超时抛错。 */
-async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+/** 轮询等待条件成立（队列与 LLM 请求均为异步），超时抛错。上限放宽到 10s，避免 CI 高负载下误判超时。 */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond()) {
     if (Date.now() > deadline) throw new Error(`等待超时: ${what}`);
@@ -56,6 +56,7 @@ class FakeChannel implements ChannelUnderTest {
   sent: string[] = [];
   updated: string[] = [];
   notifies: { openId: string; text: string }[] = [];
+  cards: { openId: string; card: Record<string, unknown> }[] = [];
   addedReactions: string[] = [];
   removedReactions: string[] = [];
   addReactionCalls = 0;
@@ -63,6 +64,11 @@ class FakeChannel implements ChannelUnderTest {
   failReactions = false;
   /** 失败时的错误文案：权限类（永久性）或网络类（瞬时）。 */
   reactionError = 'no reaction permission';
+  /** 模拟卡片推送失败（notifyCardOpenId 抛错）。 */
+  failCard = false;
+  /** 模拟 sendText / updateText 按内容选择性失败（命中子串即抛错，占位/进度文案不受影响）。 */
+  failSendIfIncludes: string | null = null;
+  failUpdateIfIncludes: string | null = null;
   private reactionSeq = 0;
   private messageSeq = 0;
 
@@ -70,10 +76,12 @@ class FakeChannel implements ChannelUnderTest {
     this.replies.push({ sessionId: msg.sessionId, text });
   }
   async sendText(_chatId: string, text: string): Promise<string | undefined> {
+    if (this.failSendIfIncludes && text.includes(this.failSendIfIncludes)) throw new Error('sendText mock failure');
     this.sent.push(text);
     return `ph-${++this.messageSeq}`;
   }
   async updateText(_messageId: string, text: string): Promise<void> {
+    if (this.failUpdateIfIncludes && text.includes(this.failUpdateIfIncludes)) throw new Error('updateText mock failure');
     this.updated.push(text);
   }
   async addReaction(messageId: string, _emojiType: string): Promise<string | undefined> {
@@ -88,8 +96,9 @@ class FakeChannel implements ChannelUnderTest {
   async notifyOpenId(openId: string, text: string): Promise<void> {
     this.notifies.push({ openId, text });
   }
-  async notifyCardOpenId(_openId: string, _card: Record<string, unknown>): Promise<void> {
-    /* 本批用例不触发 */
+  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
+    if (this.failCard) throw new Error('card mock failure');
+    this.cards.push({ openId, card });
   }
   lastEventAt(): number {
     return 0;
@@ -101,20 +110,13 @@ class FakeChannel implements ChannelUnderTest {
 
 // --- fake LLM 服务：ok 模式立即回固定补全；hang 模式挂起直到 release()（或被 /stop 中断） ---
 
-const COMPLETION = JSON.stringify({
-  id: 'cmpl-fake',
-  object: 'chat.completion',
-  created: 0,
-  model: 'm',
-  choices: [{ index: 0, message: { role: 'assistant', content: '好的，已收到' }, finish_reason: 'stop' }],
-  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-});
-
 class FakeLlmServer {
   readonly server: http.Server;
   requestCount = 0;
   mode: 'ok' | 'hang' = 'ok';
   baseUrl = '';
+  /** ok 模式返回的 assistant 文本（deliverReply 分段测试会换成超长回复）。 */
+  replyText = '好的，已收到';
   private hanging: http.ServerResponse[] = [];
 
   constructor() {
@@ -124,16 +126,25 @@ class FakeLlmServer {
       req.on('end', () => {
         this.requestCount++;
         if (this.mode === 'hang') this.hanging.push(res);
-        else FakeLlmServer.respondOk(res);
+        else this.respondOk(res);
       });
     });
   }
 
-  private static respondOk(res: http.ServerResponse): void {
+  private respondOk(res: http.ServerResponse): void {
     try {
       if (res.destroyed || res.writableEnded) return; // 客户端已中断（/stop）
       res.setHeader('content-type', 'application/json');
-      res.end(COMPLETION);
+      res.end(
+        JSON.stringify({
+          id: 'cmpl-fake',
+          object: 'chat.completion',
+          created: 0,
+          model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: this.replyText }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
     } catch {
       /* 连接已被 abort 销毁 */
     }
@@ -142,7 +153,7 @@ class FakeLlmServer {
   /** 放行所有挂起的请求。 */
   release(): void {
     const pending = this.hanging.splice(0);
-    for (const res of pending) FakeLlmServer.respondOk(res);
+    for (const res of pending) this.respondOk(res);
   }
 
   async start(): Promise<void> {
@@ -169,7 +180,11 @@ interface Fixture {
   confirmPrompts: { openId: string; req: ConfirmRequest; id: string }[];
 }
 
-function setup(llmBaseUrl: string, kanbanUrl = 'http://localhost:1'): Fixture {
+function setup(
+  llmBaseUrl: string,
+  kanbanUrl = 'http://localhost:1',
+  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner'>> = {},
+): Fixture {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-handler-'));
   const cfg: AgentConfig = {
     llmBaseUrl,
@@ -209,8 +224,9 @@ function setup(llmBaseUrl: string, kanbanUrl = 'http://localhost:1'): Fixture {
     cfg,
     mcp: fakeMcp,
     supervisor,
-    reportServer: null,
+    reportServer: extra.reportServer ?? null,
     helpText: 'HELP-TEXT',
+    ...(extra.aiReviewRunner ? { aiReviewRunner: extra.aiReviewRunner } : {}),
   });
   return { channel, router, confirmations, handlers, tmp, confirmPrompts };
 }
@@ -569,6 +585,125 @@ async function main(): Promise<void> {
       assert.equal(await verdict, 'once');
       assert.ok(f.channel.notifies.at(-1)!.text.includes('✅ 已批准，正在执行'));
       cleanup(f);
+    });
+
+    // ---------- /confirm revoke：完整文本判定（parseCommand 只取首分词，cmd 恒为 '/confirm'） ----------
+    await checkAsync('handler：/confirm revoke 真正撤销「同类免问」（而非只打印状态）', async () => {
+      const f = setup(llm.baseUrl);
+      // 用真实 withBatchApproval 装配一个生效中的 batch 授权（直接喂 verdict='batch'）
+      const session = f.router.getOrCreate('u1') as unknown as {
+        batchedConfirm?: ReturnType<typeof withBatchApproval>;
+        activeBatchApprovals(): number;
+      };
+      session.batchedConfirm = withBatchApproval(async () => 'batch');
+      await session.batchedConfirm({ kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' });
+      assert.equal(session.activeBatchApprovals(), 1);
+      await f.handlers.handle(mkMsg('u1', '/confirm revoke'));
+      const reply = f.channel.replies.at(-1)!.text;
+      assert.ok(reply.includes('已恢复逐次确认') && reply.includes('撤销 1 类'), `应撤销 1 类免问，实际：${reply}`);
+      assert.equal(session.activeBatchApprovals(), 0, '免问授权应已被撤销');
+      cleanup(f);
+    });
+
+    await checkAsync('handler：/confirm revoke 无免问时给撤销兜底文案，/confirm 仍打印状态', async () => {
+      const f = setup(llm.baseUrl);
+      await f.handlers.handle(mkMsg('u1', '/confirm revoke'));
+      assert.ok(
+        f.channel.replies.at(-1)!.text.includes('无需撤销'),
+        `撤销分支应给兜底文案，实际：${f.channel.replies.at(-1)!.text}`,
+      );
+      await f.handlers.handle(mkMsg('u1', '/confirm'));
+      assert.ok(
+        f.channel.replies.at(-1)!.text.includes('写操作逐次确认'),
+        `查询分支应打印状态，实际：${f.channel.replies.at(-1)!.text}`,
+      );
+      cleanup(f);
+    });
+
+    // ---------- deliverReply：超长回复分段续发，一段失败不丢后续段 ----------
+    await checkAsync('handler：回复分段续发时一段失败记日志继续，后续段不丢', async () => {
+      const f = setup(llm.baseUrl);
+      const origErr = console.error;
+      const errLogs: string[] = [];
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      try {
+        llm.replyText = `${'A'.repeat(2000)}\n\n${'B'.repeat(2000)}\n\n${'C'.repeat(2000)}`;
+        f.channel.failSendIfIncludes = 'BBB'; // 第二段续发失败
+        await f.handlers.handle(mkMsg('u1', '给我长回复'));
+        assert.ok(f.channel.updated.some((t) => t.includes('AAA')), '首段应替换占位消息');
+        assert.ok(!f.channel.sent.some((t) => t.includes('BBB')), '失败段不应出现');
+        assert.ok(f.channel.sent.some((t) => t.includes('CCC')), '失败段之后的分段仍应送达');
+        assert.ok(errLogs.some((m) => m.includes('续发分段失败')), '分段失败应记日志');
+        assert.ok(!f.channel.updated.some((t) => t.includes('回复投递失败')), '首段成功不应报投递失败');
+      } finally {
+        console.error = origErr;
+        llm.replyText = '好的，已收到';
+        cleanup(f);
+      }
+    });
+
+    await checkAsync('handler：首段更新与直发都失败时占位消息更新为「回复投递失败」', async () => {
+      const f = setup(llm.baseUrl);
+      const origErr = console.error;
+      console.error = () => {};
+      try {
+        llm.replyText = `${'A'.repeat(2000)}\n\n${'B'.repeat(2000)}`;
+        f.channel.failUpdateIfIncludes = 'AAA'; // 首段更新失败（进度更新文案不含 AAA，不受影响）
+        f.channel.failSendIfIncludes = 'AAA'; // 首段直发降级也失败
+        await f.handlers.handle(mkMsg('u1', '给我长回复'));
+        assert.ok(
+          f.channel.updated.some((t) => t.includes('回复投递失败')),
+          '首段彻底失败应把占位更新为投递失败提示',
+        );
+        assert.ok(f.channel.sent.some((t) => t.includes('BBB')), '续发段仍应送达');
+      } finally {
+        console.error = origErr;
+        llm.replyText = '好的，已收到';
+        cleanup(f);
+      }
+    });
+
+    // ---------- AI 审查：投递段（报告写盘/卡片推送）失败降级文本，不误报「AI 审查失败」 ----------
+    await checkAsync('handler：AI 审查卡片推送失败时降级文本推送审查结果', async () => {
+      // writeReviewReport 会真实落盘：数据目录指向临时目录，不污染真实用户目录
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-handler-home-'));
+      process.env.HELIOS_TASK_AGENT_HOME = home;
+      const origErr = console.error;
+      const errLogs: string[] = [];
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      try {
+        const f = setup(llm.baseUrl, 'http://localhost:1', {
+          reportServer: { baseUrl: 'http://report.local', close: () => {}, server: http.createServer() },
+          aiReviewRunner: async () => '审查结论：无问题',
+        });
+        f.channel.failCard = true; // 卡片推送失败
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'a9', title: '任务X' } } });
+        await waitFor(() => f.channel.notifies.some((n) => n.text.includes('改为文本推送')), '降级文本推送');
+        const degraded = f.channel.notifies.find((n) => n.text.includes('改为文本推送'))!;
+        assert.ok(degraded.text.includes('AI 审查结果'), '降级推送应带审查结果');
+        assert.ok(degraded.text.includes('审查结论：无问题'), '审查结果本身不得丢失');
+        assert.ok(degraded.text.includes('card mock failure'), '应注明卡片失败原因');
+        assert.ok(
+          !f.channel.notifies.some((n) => n.text.includes('AI 审查失败')),
+          '投递失败不得误报为「AI 审查失败」',
+        );
+        assert.ok(errLogs.some((m) => m.includes('报告写盘/卡片推送失败')), '投递失败应记日志');
+        cleanup(f);
+      } finally {
+        console.error = origErr;
+        delete process.env.HELIOS_TASK_AGENT_HOME;
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    // ---------- confirm：超时定时器 unref（不应成为保活理由） ----------
+    await checkAsync('confirm：确认超时定时器已 unref，不阻止进程退出', async () => {
+      const mgr = new ConfirmationManager(async () => undefined, { timeoutMs: 60000 });
+      const verdict = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+      const pendings = (mgr as unknown as { pendings: Map<string, { timer: NodeJS.Timeout }> }).pendings;
+      assert.equal(pendings.get('u1')!.timer.hasRef(), false, '超时定时器应 unref');
+      mgr.cancel('u1');
+      assert.equal(await verdict, false);
     });
 
     // ---------- 审计脱敏：写操作 resultSnippet 中的密钥字段不落盘 ----------

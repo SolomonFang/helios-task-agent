@@ -107,7 +107,7 @@ function larkVerbs(args: string[]): string[] {
 /**
  * lark-cli `<command> [subcommand] [method]`:
  * - help/version/schema/doctor → read
- * - `api GET …` → read; other methods → write
+ * - `api GET /open-apis/…` → read；非 GET 或路径形态不符（完整 URL / 相对路径前缀不符）→ write
  * - any write verb in command tokens → write
  * - known read verb → read
  * - unknown → write (safe default; confirmation card shows the full command)
@@ -130,7 +130,15 @@ export function classifyLark(args: string[]): 'read' | 'write' {
   }
   if (first === 'api') {
     const method = (args[1] || '').toUpperCase();
-    return method === 'GET' ? 'read' : 'write';
+    if (method !== 'GET') return 'write';
+    // GET 也不直接放行：若 api 子命令接受完整 URL，被注入的模型可把读到的内容
+    // 编进 URL 外发（数据外泄通道）。实现按 fail-closed 收敛：路径参数必须以
+    // /open-apis/ 开头，且全部实参都不得含 ://；缺参数或形态不符一律按写走确认闸门。
+    const rest = args.slice(2).filter((a) => !a.startsWith('-'));
+    const pathArg = rest[0];
+    return pathArg !== undefined && pathArg.startsWith('/open-apis/') && !rest.some((a) => a.includes('://'))
+      ? 'read'
+      : 'write';
   }
   if (verbs.some((v) => LARK_READ_VERBS.has(v))) return 'read';
   return 'write';

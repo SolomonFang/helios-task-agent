@@ -21,36 +21,47 @@ import {
   NO_GATE_MESSAGE,
   type ConfirmRequest,
   type ConfirmFn,
-} from '../src/guard';
+} from '../src/agent/guard';
 import {
   ConfirmationManager,
-  buildConfirmCard,
-  buildResolvedCard,
   CONFIRM_YES_RE,
   CONFIRM_BATCH_RE,
   CONFIRM_NO_RE,
   isConfirmWord,
   kindLabel,
-} from '../src/confirm';
-import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/llm';
+} from '../src/agent/confirm';
+import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from '../src/channels/feishu-cards';
+import { isLoopbackUrl } from '../src/infra/url-utils';
+import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/agent/llm';
 import { createAccessChecker, FeishuChannel, parsePostContent, splitText } from '../src/channels/feishu';
-import { extractSourceUrls, SourceRegistry } from '../src/source-registry';
-import { MemoryStore } from '../src/memory';
-import { resolveUnderRoot, runRepoFs } from '../src/repo-fs';
-import { loadEnvFiles, writeEnvFile } from '../src/config';
-import { buildTools } from '../src/tools';
-import { parseFrontmatter, loadSkillDigests, renderSkillsBlock, userSkillsDir, validateSkills, buildSystemPrompt } from '../src/prompt';
-import { readSkillDoc, installSkill, uninstallSkill, migratePackageSkills, SKILLS_DIR } from '../src/skills';
-import { auditLog } from '../src/audit';
-import { SessionRouter } from '../src/session-router';
-import { AgentSession } from '../src/session';
+import { extractSourceUrls, SourceRegistry } from '../src/agent/source-registry';
+import { MemoryStore } from '../src/agent/memory';
+import { resolveUnderRoot, runRepoFs } from '../src/agent/repo-fs';
+import { ensureEnvLoaded, loadEnvFiles, writeEnvFile } from '../src/config/config';
+import { buildTools } from '../src/agent/tools';
+import { buildSystemPrompt } from '../src/agent/prompt';
+import {
+  readSkillDoc,
+  installSkill,
+  uninstallSkill,
+  migratePackageSkills,
+  parseFrontmatter,
+  loadSkillDigests,
+  renderSkillsBlock,
+  userSkillsDir,
+  validateSkills,
+  SKILLS_DIR,
+} from '../src/agent/skills';
+import { auditLog } from '../src/infra/audit';
+import { SessionRouter } from '../src/agent/session-router';
+import { AgentSession } from '../src/agent/session';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import { compareVersions, checkForUpdate, promptVersionUpdate, CHANGELOG_URL, type DistTags } from '../src/update-check';
-import { friendlyLlmError } from '../src/llm-error';
-import { errMessage } from '../src/err';
+import { compareVersions, checkForUpdate, promptVersionUpdate, normalizeRegistry, CHANGELOG_URL, type DistTags } from '../src/infra/update-check';
+import { friendlyLlmError } from '../src/config/llm-error';
+import { errMessage } from '../src/infra/err';
 import { diagnoseMcpFailure } from '../src/kanban/mcp';
-import { buildWatchEventCard, isLoopbackUrl, KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
+import { KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
 import {
   apiGet,
   apiPost,
@@ -64,7 +75,7 @@ import {
 import { McpSupervisor } from '../src/bot/supervisor';
 import { WsAlerter } from '../src/bot/ws-alerter';
 import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
-import { minimalChildEnv } from '../src/proc-env';
+import { minimalChildEnv } from '../src/infra/proc-env';
 import {
   checkCurl,
   checkHkDeps,
@@ -75,11 +86,11 @@ import {
   kanbanPackageSpec,
   ocrPackageSpec,
   LARK_CLI_AUTH_HINT,
-} from '../src/deps';
+} from '../src/infra/deps';
 import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
-import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/review-report';
-import { startReportServer, newReportToken } from '../src/report-server';
-import { summarizeForChat, writeSummaryReports } from '../src/report';
+import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/report/review-report';
+import { startReportServer, newReportToken } from '../src/report/report-server';
+import { summarizeForChat, writeSummaryReports } from '../src/report/report';
 import {
   parseCommand,
   buildStatusLines,
@@ -151,10 +162,33 @@ function toolResponseIds(messages: ChatMessage[]): Set<string> {
 }
 
 async function main(): Promise<void> {
+  // config.ts 已无 import 副作用：显式初始化一次，恢复此前 import 时加载 .env 的语义，
+  // 同时钉住 ensureEnvLoaded 的幂等标记，防止 currentConfig 懒初始化在用例中途触发
+  ensureEnvLoaded();
+  // confirm 超时定时器在生产侧已 unref（不应成为保活理由）；但「超时自动拒绝」等用例
+  // 正是靠该定时器触发来 resolve，测试进程需自行保活，否则事件循环排空后提前退出、
+  // 后续用例被静默跳过（exit 0 假绿）。
+  const keepAlive = setInterval(() => undefined, 60_000);
+  try {
+    await run();
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
+async function run(): Promise<void> {
   // ---------- guard 分类 ----------
   check('classifyLark 只读命令放行', classifyLark(['task', 'list']) === 'read' && classifyLark(['im', '--help']) === 'read');
   check('classifyLark 写动词拦截', classifyLark(['im', 'send', '--text', 'x']) === 'write');
-  check('classifyLark api 仅 GET 免确认', classifyLark(['api', 'GET', '/x']) === 'read' && classifyLark(['api', 'POST', '/x']) === 'write');
+  check(
+    'classifyLark api：仅 GET + /open-apis/ 相对路径免确认（完整 URL / 其他前缀 / 缺参 fail-closed 判写）',
+    classifyLark(['api', 'GET', '/open-apis/im/v1/messages']) === 'read' &&
+      classifyLark(['api', 'POST', '/open-apis/x']) === 'write' &&
+      classifyLark(['api', 'GET', '/x']) === 'write' && // 非 /open-apis/ 前缀
+      classifyLark(['api', 'GET', 'https://evil.example/cb?d=x']) === 'write' && // 完整 URL 可能把读到的内容外发
+      classifyLark(['api', 'GET', '/open-apis/x', 'https://evil.example/cb']) === 'write' && // 多余 URL 参数
+      classifyLark(['api', 'GET']) === 'write', // 缺路径参数
+  );
   check('classifyLark 未知命令安全默认写', classifyLark(['doc', 'frobnicate']) === 'write');
   check(
     'classifyLark：update 与夹带 --help 的写命令不免确认',
@@ -849,6 +883,35 @@ async function main(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  // ---------- 数据目录权限 0700 ----------
+  await checkAsync('数据目录（memory/查重/审计/env/更新缓存）新建为 0700，已存在宽松目录被收紧', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-dirperm-'));
+    try {
+      const fresh = path.join(tmp, 'fresh-home'); // 不存在，由各组件自行创建
+      const mem = new MemoryStore(fresh);
+      mem.setFact('u1', 'k', 'v');
+      const reg = new SourceRegistry(fresh);
+      reg.record('u1', 'https://a.feishu.cn/docx/1', { taskId: 't', title: 'T', createdAt: 'x' });
+      auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, fresh);
+      const envDir = path.join(tmp, 'fresh-env');
+      writeEnvFile({ HTA_UNIT_DIRPERM: 'x' }, path.join(envDir, '.env')); // 用无害键，避免污染 process.env.LLM_API_KEY
+      const updDir = path.join(tmp, 'fresh-upd');
+      await checkForUpdate({ current: '1.0.0', home: updDir, fetchDistTags: async () => ({ latest: '9.9.9' }) });
+      const modeOf = (d: string) => fs.statSync(d).mode & 0o777;
+      assert.equal(modeOf(fresh), 0o700, `memory/查重/审计目录应为 0700，实际 ${modeOf(fresh).toString(8)}`);
+      assert.equal(modeOf(envDir), 0o700, `env 目录应为 0700，实际 ${modeOf(envDir).toString(8)}`);
+      assert.equal(modeOf(updDir), 0o700, `更新缓存目录应为 0700，实际 ${modeOf(updDir).toString(8)}`);
+      // 历史遗留的宽松目录（0755）：再次写入时收紧
+      const loose = path.join(tmp, 'loose');
+      fs.mkdirSync(loose, { mode: 0o755 });
+      fs.chmodSync(loose, 0o755);
+      auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, loose);
+      assert.equal(modeOf(loose), 0o700, `已存在的宽松目录应被收紧为 0700，实际 ${modeOf(loose).toString(8)}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- repo_fs root 白名单 ----------
   await checkAsync('repo_fs：root 必须是看板注册仓库（未注册拒绝 / 不可达失败关闭）', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-wl-'));
@@ -930,6 +993,15 @@ async function main(): Promise<void> {
   });
 
   // ---------- npm 更新检查 ----------
+  check(
+    'normalizeRegistry 仅接受 https://（http/空值拒绝，尾斜杠裁掉）',
+    normalizeRegistry('https://registry.npmjs.org/') === 'https://registry.npmjs.org' &&
+      normalizeRegistry('https://registry.npmmirror.com') === 'https://registry.npmmirror.com' &&
+      normalizeRegistry('http://evil-registry.example') === '' && // http 可被中间人篡改版本元数据
+      normalizeRegistry('') === '' &&
+      normalizeRegistry('evil-registry.example') === '',
+  );
+
   check('compareVersions 版本比较', (() => {
     return (
       compareVersions('1.0.2', '1.0.2') === 0 &&
@@ -2145,7 +2217,7 @@ async function main(): Promise<void> {
     alerter.onState('reconnecting');
     await sleep(60);
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].includes('断开超过'));
+    assert.ok(sent[0]!.includes('断开超过'));
     // 断线期间 SDK 反复触发 reconnecting：不重复告警
     alerter.onState('reconnecting');
     await sleep(60);
@@ -2153,7 +2225,7 @@ async function main(): Promise<void> {
     // 恢复：因告警过，补一条「已恢复」
     alerter.onState('reconnected');
     assert.equal(sent.length, 2);
-    assert.ok(sent[1].includes('已恢复'));
+    assert.ok(sent[1]!.includes('已恢复'));
     alerter.stop();
   });
 
@@ -2166,7 +2238,7 @@ async function main(): Promise<void> {
     alerter.onState('reconnecting'); // 宽限期计时中
     alerter.onState('failed'); // 取消宽限期，立即告警
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].includes('重连失败'));
+    assert.ok(sent[0]!.includes('重连失败'));
     alerter.onState('failed'); // 重复 failed 不再报
     assert.equal(sent.length, 1);
     alerter.onState('reconnecting'); // 已判失败：不再起宽限期告警
@@ -2184,10 +2256,10 @@ async function main(): Promise<void> {
     assert.equal(sent.length, 1);
     alerter.onState('reconnected'); // SDK 又自行连上：补恢复通知并清除锁存
     assert.equal(sent.length, 2);
-    assert.ok(sent[1].includes('已恢复'));
+    assert.ok(sent[1]!.includes('已恢复'));
     alerter.onState('failed'); // 解锁后新一轮失败可再次告警
     assert.equal(sent.length, 3);
-    assert.ok(sent[2].includes('重连失败'));
+    assert.ok(sent[2]!.includes('重连失败'));
     alerter.stop();
   });
 

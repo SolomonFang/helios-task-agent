@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './paths';
-import { writeFilePrivateSync } from './private-file';
+import { defaultDataHome } from '../infra/paths';
+import { writeFileAtomicPrivateSync } from '../infra/private-file';
 
 /**
  * Dedupe registry: remembers which Feishu/Lark source URLs already became
@@ -79,10 +79,7 @@ export class SourceRegistry {
 
   private persist(): void {
     try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
-      writeFilePrivateSync(tmp, JSON.stringify(this.data, null, 2) + '\n');
-      fs.renameSync(tmp, this.filePath);
+      writeFileAtomicPrivateSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n');
     } catch {
       /* best-effort */
     }

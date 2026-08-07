@@ -1,5 +1,5 @@
-import type { AgentConfig } from './types';
-import type { KanbanMcp } from './kanban/mcp';
+import type { AgentConfig } from '../types';
+import type { KanbanMcp } from '../kanban/mcp';
 import type { ConfirmFn } from './guard';
 import { MemoryStore } from './memory';
 import { AgentSession } from './session';

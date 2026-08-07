@@ -1,9 +1,9 @@
 import path from 'path';
 import fs from 'fs';
 import { execFile } from 'child_process';
-import type { KanbanMcp } from './kanban/mcp';
+import type { KanbanMcp } from '../kanban/mcp';
 import type { MemoryStore } from './memory';
-import type { OpenAiTool, ToolHandler, ToolHandlers } from './types';
+import type { OpenAiTool, ToolHandler, ToolHandlers } from '../types';
 import { runRepoFs } from './repo-fs';
 import {
   classifyHk,
@@ -16,8 +16,8 @@ import {
   wrapUntrusted,
   type ConfirmFn,
 } from './guard';
-import { LARK_CLI_INSTALL_HINT } from './deps';
-import { auditLog } from './audit';
+import { LARK_CLI_INSTALL_HINT } from '../infra/deps';
+import { auditLog } from '../infra/audit';
 import { SourceRegistry, extractSourceUrls, kanbanTaskExists } from './source-registry';
 import {
   applyRepoBaseBranches,
@@ -27,13 +27,13 @@ import {
   formatMissingBaseBranchError,
   waitForWorkspaceReady,
   type RepoStartInput,
-} from './kanban/workspace-ready';
-import { collectWorkSummary, type WorkSummaryScope } from './kanban/summary';
-import { summarizeForChat, writeSummaryReports } from './report';
+} from '../kanban/workspace-ready';
+import { collectWorkSummary, type WorkSummaryScope } from '../kanban/summary';
+import { summarizeForChat, writeSummaryReports } from '../report/report';
 import { readSkillDoc, resolveSkillDir } from './skills';
-import { minimalChildEnv } from './proc-env';
-import { packageRoot } from './paths';
-import { errMessage } from './err';
+import { minimalChildEnv } from '../infra/proc-env';
+import { packageRoot } from '../infra/paths';
+import { errMessage } from '../infra/err';
 
 const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 const MAX_OUTPUT = 8000;

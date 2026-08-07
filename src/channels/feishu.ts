@@ -1,6 +1,6 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type { AgentChannel, FeishuBotConfig, InboundMessage } from '../types';
-import { errMessage } from '../err';
+import { errMessage } from '../infra/err';
 
 export interface FeishuReceivePayload {
   sender?: {

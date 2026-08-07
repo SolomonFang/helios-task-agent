@@ -156,7 +156,7 @@ grep -q 'HELIOS_KANBAN_URL' "$PROFILE" 2>/dev/null || \
 Kanban server (separate host) must be running:
 
 ```bash
-HOST=0.0.0.0 PORT=7964 npx helios-kanban
+HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@0.1.39
 ```
 
 > ⚠️ The kanban Web UI / API has **no authentication**. `HOST=0.0.0.0` exposes it to the whole network — only bind `0.0.0.0` on a trusted network (LAN / Tailscale); otherwise keep the default `127.0.0.1`.

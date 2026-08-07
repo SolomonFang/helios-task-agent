@@ -19,6 +19,12 @@
 - 全仓 45 处手写 `err instanceof Error ? err.message : String(err)` 收敛为 `src/err.ts` 的 `errMessage`；`deps.ts` 同步/异步探测器共用 `parseLarkCliAuth`
 - `src/bot.ts` 改名 `src/bot-main.ts`，消除与 `src/bot/` 目录的同名歧义；删除零引用的 `channels/index.ts` barrel 与 `SUGGESTED_MEMORY_KEYS`
 - `npm run typecheck` 通过 `tsconfig.typecheck.json` 覆盖 scripts/ 测试脚本（此前 7 个测试文件无类型检查）
+- 最低 Node 版本升至 20（Node 18 已 EOL），`@types/node` 对齐到 `^20`；tsconfig 开启 `noUncheckedIndexedAccess`
+- `src/` 根目录按领域下沉为 `config/`（配置与向导）、`report/`（HTML 报告与服务）、`agent/`（LLM 会话/工具/闸门/记忆/技能）、`infra/`（路径/私密文件/审计/探测等基础件），入口与编排留根，发布产物路径不变
+- 技能子系统（frontmatter 解析/加载/校验）从 `prompt.ts` 并入 `skills.ts`；飞书卡片构建收口为 `channels/feishu-cards.ts`；两套报告渲染器共享 `report-page.ts` 公共 CSS；原子写收敛为 `writeFileAtomicPrivateSync`；`config.ts` 去除 import 时副作用（显式 `ensureEnvLoaded()`，删除死导出 `ENV_PATH`）；`helios-task-agent-bot` bin 改为纯分发（参数解析单一来源 `parseBotArgs`）；`deps.ts` 同步探针收敛为 `probeSync`
+- 看板 TS 客户端（`kanban/http.ts`）与 bash 客户端（`hk.sh`）增加契约测试（信封语义/任务 URL/健康端点一致性），防两侧静默漂移
+- CI/发布：新增 push/PR 级 `ci.yml`（Node 20/22 matrix + typecheck + 单测 + audit）；`npm publish` 启用 `--provenance`；`prepack` 先 `rm -rf dist` 再构建（防 stale 产物入包）；lockfile resolved 统一到 npmjs 官方 registry
+- e2e/smoke 支持 `HTA_REQUIRE_E2E=1` 严格模式（前置缺失时 SKIP 记为失败）；smoke 的审计写入改到临时目录（此前污染真实 `~/.helios-task-agent/audit.log`）
 
 ### Security
 
@@ -29,6 +35,12 @@
 - memory 写入前中和伪造的 `<<<USER_MEMORY` / `END_USER_MEMORY>>>` 标记（持久化注入缺口）
 - `--help` 豁免不再优先于写动词检查：命中写动词的命令一律按写处理
 - `readSkillDoc` 拒绝读取符号链接；`hta_review` 的 git ref 增加 refname 校验；`update-check` 的 `npm config` 调用补齐最小环境变量
+- 当前目录 `.env` 高危键清单扩充：新增 `PATH`/`HOME`/`SHELL`/`NODE_OPTIONS`/`NODE_PATH`/`LD_*`/`DYLD_*`（此前可经 cwd `.env` 注入 PATH 劫持子进程可执行文件解析）与 `HELIOS_KANBAN_HOST`/`HELIOS_REPORT_HOST`（此前可把无鉴权看板/报告服务绑到局域网）
+- `lark_cli api` 仅放行以 `/open-apis/` 开头且不含 `://` 的相对路径（此前 `api GET` 一律判只读，完整 URL 可构成数据外发通道）
+- `repo_fs` grep 的 ReDoS 启发式加宽：拒绝连续相邻量词段（`.*.*` 等无括号形态此前可绕过）；敏感文件 denylist 补 `*credentials*.json`/`token.json`/`service-account*.json` 及 `.docker`/`.kube` 的 config.json
+- 审计脱敏补 URL query（`?access_token=`）与裸 `KEY=value` 环境赋值两种形态；数据目录统一收紧为 0700（`ensurePrivateDirSync`，文件此前已是 0600）
+- `update-check` 的 registry 仅接受 `https://`；看板健康判定改为信封字段组合校验（本机进程占端口伪造 `"success":true"` 不再冒充看板）
+- 依赖漏洞清零：`@modelcontextprotocol/sdk` 最低版本升至 `^1.30.0`（传递引入的 fast-uri / ip-address / hono 等 5 个已知漏洞修复），`npm audit` 纳入 CI 与发布闸门
 
 ### Fixed
 
@@ -36,6 +48,14 @@
 - bot / CLI 入口注册 `unhandledRejection` / `uncaughtException` 兜底：rejection 记日志，未捕获异常走优雅退出（此前漏网 rejection 直接 crash 且绕过 shutdown 清理）
 - watcher 未送达事件增加 24h TTL，过期丢弃并记日志（此前 pending 随 owner 不可达无限增长）；旧 state 文件兼容加载
 - 确认卡片与文本降级都发送失败时立即以「拒绝」收尾并经 `onSendFailed` 告知用户（此前工具干等 120/300s 超时）
+- 飞书 bot 端 `/confirm revoke` 此前不生效（parseCommand 只取首个分词，`cmd === '/confirm revoke'` 永不可达），免问授权看似撤销实际仍在放行；现改为对完整文本判定
+- 进程崩溃语义：`uncaughtException` 路径以退出码 1 结束（此前 exit 0，launchd/systemd 视崩溃为干净停止、不触发重启）；CLI cleanup 补齐幂等标志与 8s 强退兜底（对齐 bot）
+- MCP 连接窗口期（最长 45s）收到 SIGINT 时 in-flight 的 MCP 子进程未登记清理；`connectMcp` 新增 `onCreate` 回调，实例创建即登记
+- watcher 的 `/approvals` 拉取失败时沿用上一轮快照（视为「未知」而非「空」），端点恢复后不再把全部待审批当新审批重推
+- AI 审查报告写盘/卡片推送失败不再误报「AI 审查失败」，降级为纯文本投递结果；`deliverReply` 多段续发逐段兜底，中段失败不再静默丢失后续段
+- supervisor 重连退避节奏对齐注释（前 3 次连续，之后每 5 个周期）；MCP 探活追加看板后端健康检查（节流），看板假死时经 onLost 通道告知 owner
+- report-server listen 成功后的 `error` 事件不再被静默吞掉；确认超时定时器补 `unref`（与全仓定时器纪律一致）
+- README 多处修正：终端确认按键 `y/b/N` → `y/batch/N`（`b` 此前会被当成取消）；AI 审查报告链接主机名规则按实际代码改写；即时命令与工具一览补全；说明当前目录 `.env` 高危键不参与覆盖
 - `/stop` 可中断进行中的 AI 审查：`runAiReview` 支持 AbortSignal 并真正杀掉 ocr 子进程（此前要等 15 分钟自身超时）
 - supervisor `stop()` 对在途重连加竞速超时；用户单条消息增加 8000 字符上限，超限直接拒答
 - 测试修复：技能契约用例不再扫描用户数据目录（本机第三方技能曾致 `npm test` 环境性失败）；batchApproval TTL 过期路径、LLM 错误映射、无断言用例、SDK 私有字段脆性断言逐一补实
@@ -86,7 +106,7 @@
 
 ### Changed
 
-- UED 全面审查与体验修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md)，五轮 30 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
+- UED 全面审查与体验修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md)，五轮 34 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
 
 ## [1.0.17] - 2026-08-03
 

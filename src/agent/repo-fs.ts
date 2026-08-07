@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { errMessage } from './err';
+import { errMessage } from '../infra/err';
 
 const MAX_OUTPUT = 8000;
 const MAX_GREP_HITS = 40;
@@ -42,13 +42,20 @@ export function resolveUnderRoot(
  * （与 proc-env.ts 不向子进程泄露敏感变量同一思路）。
  */
 const SENSITIVE_FILE_RE =
-  /^(?:\.env(?:\..+)?|\.npmrc|\.netrc|\.?credentials|id_rsa.*|id_ed25519.*|.+\.(?:pem|key|p12|keystore))$/i;
+  /^(?:\.env(?:\..+)?|\.npmrc|\.netrc|\.?credentials|id_rsa.*|id_ed25519.*|.*credentials.*\.json|token\.json|service-account.*\.json|client_secret.*\.json|.+\.(?:pem|key|p12|keystore))$/i;
 
 /** .git/ 内部一律拒绝（按路径整体判定，非仅 basename）：config 含带 token 的 remote URL，hooks 等也不外发。 */
 const GIT_INTERNAL_RE = /(^|[\\/])\.git([\\/]|$)/;
 
+/**
+ * .docker/.kube 的 config.json 常含 registry 凭证 / 集群证书与 token：按路径整体判定，
+ * 只拒这两个目录下的 config.json，不误伤项目里普通的 config.json。
+ */
+const CREDENTIAL_CONFIG_RE = /(^|[\\/])\.(?:docker|kube)[\\/]config\.json$/i;
+
 function isSensitiveFile(fileAbs: string): boolean {
   if (GIT_INTERNAL_RE.test(fileAbs)) return true;
+  if (CREDENTIAL_CONFIG_RE.test(fileAbs)) return true;
   return SENSITIVE_FILE_RE.test(path.basename(fileAbs));
 }
 
@@ -207,6 +214,13 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
   // 简单启发式拒绝嵌套量词（如 (\w+)+ 一类灾难性回溯），不过度工程
   if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
     return '参数错误：pattern 含嵌套量词（如 (\\w+)+），有 ReDoS 风险，请改写后重试';
+  }
+  // 无括号同样可 ReDoS：连续相邻的宽匹配量词段（.*.* / .+.* / \w*\w+ 等）在失配回退时
+  // 会指数级回溯，V8 同步正则会阻塞 bot 事件循环。先剥离字符类再判定：
+  // [.*] 里的 .* 是字面量，不算量词段，避免误伤。
+  const noClasses = pattern.replace(/\[(?:\\.|[^\]])*\]/g, '');
+  if (/(?:\.\*|\.\+|\.\{\d*,?\d*\}|\\[wWdDsS][*+]){2,}/.test(noClasses)) {
+    return '参数错误：pattern 含连续相邻的量词段（如 .*.*），有 ReDoS 风险，请改写后重试';
   }
   let re: RegExp;
   try {

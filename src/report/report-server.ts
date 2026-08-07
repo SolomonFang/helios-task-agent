@@ -22,6 +22,8 @@ export interface ReportServer {
   /** 报告基地址，如 http://localhost:51234（拼上 /文件名 即完整链接）。 */
   baseUrl: string;
   close: () => void;
+  /** 底层 http.Server（测试/诊断用，如断言 error 监听已换挂）。 */
+  server: http.Server;
 }
 
 /** kanbanUrl 的主机名作为链接主机（与既有看板链接的可达性一致），解析失败回退 localhost。 */
@@ -76,7 +78,8 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
     }
   });
   return new Promise((resolve, reject) => {
-    server.once('error', reject);
+    const onBootError = (err: Error) => reject(err);
+    server.once('error', onBootError);
     // 端口 0 = 随机空闲端口，避免与看板等本地服务冲突；
     // 绑定地址默认仅回环，且独立于看板的 HELIOS_KANBAN_HOST：
     // 报告含代码 diff，暴露到局域网必须显式设 HELIOS_REPORT_HOST
@@ -84,6 +87,12 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
     server.listen(0, bindHost, () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : 0;
+      // listen 成功后摘掉启动期的 reject 监听：promise 已 settle，留着会把 listen 之后的
+      // 运行时 error 静默吞掉。换挂记日志的监听（不抛出——error 事件无监听者会打崩进程）
+      server.removeListener('error', onBootError);
+      server.on('error', (err) => {
+        console.error(`[report] 报告服务运行时错误: ${err.message}`);
+      });
       // 链接主机：看板在本机时沿用其主机名（与既有看板链接同 reachability）；
       // 看板是远程地址而报告服务绑在本机，则退回绑定地址，不编造局域网可达性
       const kanbanHost = linkHost(kanbanUrl);
@@ -91,6 +100,7 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
       resolve({
         baseUrl: `http://${host}:${port}`,
         close: () => server.close(),
+        server,
       });
     });
   });

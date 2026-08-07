@@ -9,7 +9,7 @@
  */
 
 import type { KanbanMcp } from '../kanban/mcp';
-import { errMessage } from '../err';
+import { errMessage } from '../infra/err';
 
 export interface McpSupervisorOptions {
   mcp: KanbanMcp;
@@ -25,6 +25,13 @@ export interface McpSupervisorOptions {
   onRecovered?: () => void;
   /** ping 挂起防护（超时按失败处理），默认 30s。 */
   pingTimeoutMs?: number;
+  /**
+   * 可选：看板后端健康探测（抛错视为不健康）。mcp.ping 只证明 stdio 子进程活着，
+   * 看板假死（端口不响应）时纯 stdio 探活会误判健康、不告警；该探测补上后端维度。
+   */
+  kanbanHealth?: () => Promise<void>;
+  /** 看板健康探测的最小间隔（默认 5 分钟）：健康时不每 tick 打看板；上次失败时下轮立即复查。 */
+  kanbanHealthIntervalMs?: number;
   /** stop() 等待在途重连的竞速超时（默认 5s）：超时后继续关闭流程，避免拖累整体退出。 */
   stopTimeoutMs?: number;
   log?: (msg: string) => void;
@@ -41,6 +48,9 @@ export class McpSupervisor {
   /** 进行中的重连；enterTurn 等待它结束后再开始，杜绝 close() 杀 in-flight 调用。 */
   private reconnecting: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
+  /** 看板健康探测节流状态：上次探测时间与结果（失败后逐 tick 复查，见 probeKanban）。 */
+  private lastKanbanProbeAt = 0;
+  private lastKanbanProbeOk = true;
 
   constructor(opts: McpSupervisorOptions) {
     this.opts = opts;
@@ -110,6 +120,8 @@ export class McpSupervisor {
       const threshold = this.opts.failThreshold ?? 2;
       try {
         await this.pingWithTimeout();
+        // stdio 活着不代表看板后端健康：追加看板探测（内部按间隔节流，不每 tick 打看板）
+        await this.probeKanban();
         this.failures = 0;
         if (!this.alive) {
           this.alive = true;
@@ -122,7 +134,9 @@ export class McpSupervisor {
           this.notify('onLost');
         }
         // 重连退避：前 3 次连续试，之后每 5 个周期试一次（~5 分钟）
-        if (!this.alive && (this.failures <= 3 || this.failures % 5 === 0)) {
+        // （failures=4..7 不试，failures=8、13、18… 试；(failures-3)%5 才对齐注释意图，
+        //   此前 failures%5===0 会让 failures=5 时仅隔 2 个周期就重试）
+        if (!this.alive && (this.failures <= 3 || (this.failures - 3) % 5 === 0)) {
           await this.tryReconnect();
         }
       }
@@ -147,6 +161,27 @@ export class McpSupervisor {
       await Promise.race([this.opts.mcp.ping(), timeout]);
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 看板后端健康探测（可选）：上次成功时按 kanbanHealthIntervalMs 节流——
+   * 不每 tick 打看板（60s 周期全量打后端没必要）；上次失败时逐 tick 复查，
+   * 让连续失败尽快到达 failThreshold、走既有 onLost 降级/告警通道。
+   */
+  private async probeKanban(): Promise<void> {
+    const probe = this.opts.kanbanHealth;
+    if (!probe) return;
+    const interval = this.opts.kanbanHealthIntervalMs ?? 300000;
+    if (this.lastKanbanProbeOk && Date.now() - this.lastKanbanProbeAt < interval) return;
+    this.lastKanbanProbeAt = Date.now();
+    try {
+      await probe();
+      this.lastKanbanProbeOk = true;
+    } catch (err) {
+      this.lastKanbanProbeOk = false;
+      this.opts.log?.(`看板健康探测失败: ${errMessage(err)}`);
+      throw err;
     }
   }
 

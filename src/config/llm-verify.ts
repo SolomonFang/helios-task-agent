@@ -6,7 +6,7 @@
  * 这种情况标记 uncertain（无法预检），由用户选择仍保存，不误拦。
  */
 
-import { errMessage } from './err';
+import { errMessage } from '../infra/err';
 
 export interface LlmVerifyResult {
   ok: boolean;

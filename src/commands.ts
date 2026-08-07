@@ -4,13 +4,12 @@
  * 与少量文案参数保留；文案、顺序与降级逻辑与两端原实现一致（纯重构）。
  */
 
-import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './deps';
+import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './infra/deps';
 import { fetchKanbanHealth } from './kanban/http';
-import { LOCAL_TOOL_SUMMARY } from './tools';
-import { loadSkillDigests } from './prompt';
-import { installSkill, uninstallSkill } from './skills';
-import { friendlyLlmError } from './llm-error';
-import { errMessage } from './err';
+import { LOCAL_TOOL_SUMMARY } from './agent/tools';
+import { installSkill, loadSkillDigests, uninstallSkill } from './agent/skills';
+import { friendlyLlmError } from './config/llm-error';
+import { errMessage } from './infra/err';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 /** 输出着色适配：CLI 传 ui.c，bot 传 plainPaint。 */

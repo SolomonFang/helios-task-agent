@@ -4,14 +4,15 @@
  */
 
 import { FeishuChannel, splitText, type FeishuCardAction, type FeishuInboundMessage } from '../channels/feishu';
-import { SessionRouter } from '../session-router';
-import type { AgentSession } from '../session';
-import { ConfirmationManager, isConfirmWord } from '../confirm';
+import { SessionRouter } from '../agent/session-router';
+import type { AgentSession } from '../agent/session';
+import { ConfirmationManager, isConfirmWord } from '../agent/confirm';
 import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
-import { isAllPass, writeReviewReport } from '../review-report';
-import type { ReportServer } from '../report-server';
-import { checkLarkCliAsync, checkOcrCliAsync } from '../deps';
-import { wrapUntrusted } from '../guard';
+import { buildAiReviewCard } from '../channels/feishu-cards';
+import { isAllPass, writeReviewReport } from '../report/review-report';
+import type { ReportServer } from '../report/report-server';
+import { checkLarkCliAsync, checkOcrCliAsync } from '../infra/deps';
+import { wrapUntrusted } from '../agent/guard';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -28,7 +29,7 @@ import type { AgentConfig, InboundMessage, ProgressInfo } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { McpSupervisor } from './supervisor';
 import { MCP_FALLBACK_TEXT } from '../ui';
-import { errMessage } from '../err';
+import { errMessage } from '../infra/err';
 
 /** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */
 type CardAction = FeishuCardAction;
@@ -42,55 +43,6 @@ export const MAX_USER_MESSAGE_CHARS = 8000;
 /** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
 const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
 
-/**
- * AI 审查结果卡片：头部按是否全部通过换色，正文按钮直达本机静态报告页。
- * 纯函数（不含流程与 IO），便于单测与复用。
- */
-export function buildAiReviewCard(title: string, url: string, pass: boolean): Record<string, unknown> {
-  return {
-    header: {
-      template: pass ? 'green' : 'blue',
-      title: {
-        tag: 'plain_text',
-        content: pass ? `✅ AI 审查全部通过：《${title}》` : `🤖 AI 审查完成：《${title}》`,
-      },
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: pass ? '🎉 真棒！本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。',
-        },
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '📄 查看完整报告' },
-            type: 'primary',
-            url,
-            multi_url: { url, android_url: url, ios_url: url, pc_url: url },
-          },
-        ],
-      },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'plain_text',
-            content: pass
-              ? '已注入会话上下文，可直接继续追问。'
-              : '已注入会话上下文，可直接回复「按审查意见修一下」。',
-          },
-          { tag: 'plain_text', content: '报告链接仅在运行本机器人的电脑上可达，进程重启后失效。' },
-        ],
-      },
-    ],
-  };
-}
-
 export interface BotHandlerDeps {
   channel: FeishuChannel;
   router: SessionRouter;
@@ -100,6 +52,8 @@ export interface BotHandlerDeps {
   supervisor: McpSupervisor;
   reportServer: ReportServer | null;
   helpText: string;
+  /** 测试注入用：替换 AI 审查执行器（默认 runAiReview 会拉起 ocr 子进程，单测不可行）。 */
+  aiReviewRunner?: typeof runAiReview;
 }
 
 export interface BotHandlers {
@@ -111,6 +65,7 @@ export interface BotHandlers {
 
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const { channel, router, confirmations, cfg, mcp, supervisor, reportServer } = deps;
+  const runReview = deps.aiReviewRunner ?? runAiReview;
 
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
@@ -156,7 +111,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       // 底层 ocr 子进程随 abort 被 execFile 立即 kill，不必等自身 15 分钟超时。
       // （Promise.race 已给 runAiReview 挂上反应，其后续 settle 不会成未处理 rejection。）
       const result = await Promise.race([
-        runAiReview({
+        runReview({
           kanbanUrl: cfg.kanbanUrl,
           attemptId,
           title,
@@ -167,18 +122,35 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           ctl.signal.addEventListener('abort', () => reject(new Error('已中断')), { once: true });
         }),
       ]);
-      if (reportServer) {
-        // 完整结果写入 HTML 报告，飞书推卡片（按钮直达静态报告页，进程存活期间有效）
-        const name = writeReviewReport({
-          title,
-          attemptId,
-          generatedAt: new Date().toLocaleString('zh-CN'),
-          text: result,
-        });
-        const url = `${reportServer.baseUrl}/${name}`;
-        await channel.notifyCardOpenId(openId, buildAiReviewCard(title, url, isAllPass(result)));
-      } else {
-        await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
+      // 投递段（报告写盘 / 卡片推送）与审查执行分开兜底：投递失败不是「AI 审查失败」，
+      // 审查结果本身也不丢——降级为文本推送（截断 + 注明失败原因）
+      try {
+        if (reportServer) {
+          // 完整结果写入 HTML 报告，飞书推卡片（按钮直达静态报告页，进程存活期间有效）
+          const name = writeReviewReport({
+            title,
+            attemptId,
+            generatedAt: new Date().toLocaleString('zh-CN'),
+            text: result,
+          });
+          const url = `${reportServer.baseUrl}/${name}`;
+          await channel.notifyCardOpenId(openId, buildAiReviewCard(title, url, isAllPass(result)));
+        } else {
+          await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
+        }
+      } catch (deliverErr) {
+        const dmsg = errMessage(deliverErr);
+        console.error(`[review] 报告写盘/卡片推送失败，降级文本推送: ${dmsg}`);
+        const excerpt = result.length > 3000 ? `${result.slice(0, 3000)}\n…（结果过长已截断）` : result;
+        await channel
+          .notifyOpenId(
+            openId,
+            `🤖 AI 审查结果：《${title}》\n⚠️ 报告写盘/卡片推送失败（${dmsg}），改为文本推送：\n${excerpt}`,
+          )
+          .catch((e) => {
+            // 降级文本也失败：结果无法送达，只能落日志（不再往外抛，避免误报「AI 审查失败」）
+            console.error(`[review] 降级文本推送也失败: ${errMessage(e)}`);
+          });
       }
       // 注入会话：用户追问「按审查意见修一下」时 agent 有上下文
       // （审查结果含被审仓库代码，属外部内容，UNTRUSTED 包裹；注入发生在轮边界）
@@ -259,10 +231,13 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   };
 
   /** 「同类免问」查询/撤销。 */
-  const handleConfirmQuery = async (msg: InboundMessage, text: string, cmd: string | null): Promise<void> => {
+  const handleConfirmQuery = async (msg: InboundMessage, text: string): Promise<void> => {
     const session = router.getOrCreate(msg.senderId);
-    // /confirm on 是历史别名；语义化写法 /confirm revoke
-    if (text === '恢复确认' || cmd === '/confirm revoke' || text.toLowerCase() === '/confirm on') {
+    // /confirm on 是历史别名；语义化写法 /confirm revoke。
+    // 必须对完整 text 判定：parseCommand 只取第一个空白分词（恒为 '/confirm'），
+    // 用 cmd === '/confirm revoke' 判的话该分支永不可达，撤销会静默失效（安全语义 bug）
+    const lower = text.trim().toLowerCase();
+    if (text === '恢复确认' || lower === '/confirm revoke' || lower === '/confirm on') {
       const n = session.revokeBatchApprovals();
       await channel.reply(
         msg,
@@ -323,7 +298,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const instantCommands: Record<string, (msg: InboundMessage, text: string, cmd: string | null) => Promise<void>> = {
     '/help': async (msg) => channel.reply(msg, deps.helpText),
     '/stop': (msg) => handleStop(msg),
-    '/confirm': (msg, text, cmd) => handleConfirmQuery(msg, text, cmd),
+    '/confirm': (msg, text) => handleConfirmQuery(msg, text),
     '/status': (msg) => handleStatus(msg),
     '/tools': (msg) => handleTools(msg),
     '/skills': (msg, text) => handleSkills(msg, text),
@@ -438,12 +413,31 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const deliverReply = async (msg: InboundMessage, progressId: string | undefined, reply: string): Promise<void> => {
     const chunks = splitText(reply || '（无回复）');
     if (progressId) {
+      let firstDelivered = false;
       try {
         await channel.updateText(progressId, chunks[0]!);
-      } catch {
-        await channel.sendText(msg.sessionId, chunks[0]!);
+        firstDelivered = true;
+      } catch (err) {
+        console.error(`[feishu] 首段更新占位消息失败，尝试直接发送: ${errMessage(err)}`);
+        try {
+          await channel.sendText(msg.sessionId, chunks[0]!);
+          firstDelivered = true;
+        } catch (err2) {
+          console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
+        }
       }
-      for (const chunk of chunks.slice(1)) await channel.sendText(msg.sessionId, chunk);
+      // 续发逐段独立兜底：一段失败记日志继续发后续段，不再让剩余段静默丢失
+      for (const chunk of chunks.slice(1)) {
+        try {
+          await channel.sendText(msg.sessionId, chunk);
+        } catch (err) {
+          console.error(`[feishu] 回复续发分段失败（后续分段继续投递）: ${errMessage(err)}`);
+        }
+      }
+      if (!firstDelivered) {
+        // 首段彻底失败：占位消息还停在「处理中」，尽量更新为失败提示，别让用户干等
+        await channel.updateText(progressId, '⚠️ 回复投递失败，请重试或稍后再问。').catch(() => {});
+      }
     } else {
       await channel.reply(msg, reply || '（无回复）');
     }

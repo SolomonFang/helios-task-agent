@@ -4,7 +4,7 @@
  * 目标：凭证/能力问题在向导里立刻暴露，而不是等到长连接失败才排查。
  */
 
-import { errMessage } from './err';
+import { errMessage } from '../infra/err';
 
 export interface FeishuVerifyResult {
   ok: boolean;

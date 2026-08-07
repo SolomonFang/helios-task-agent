@@ -3,8 +3,8 @@ import { promisify } from 'util';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { ocrPackageSpec } from '../deps';
-import { minimalChildEnv } from '../proc-env';
+import { ocrPackageSpec } from '../infra/deps';
+import { minimalChildEnv } from '../infra/proc-env';
 import { apiGet } from './http';
 
 /**

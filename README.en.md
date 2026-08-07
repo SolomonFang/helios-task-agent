@@ -8,7 +8,7 @@ Terminal / Feishu DM agent that turns Lark/Feishu tasks & docs into [helios-kanb
 
 Highlights:
 
-- **Code-enforced write gate** (not prompt goodwill): create/update/delete tasks, start/stop, approvals, Feishu sends all require confirmation — `y/b/N` in the terminal, a confirm card in Feishu; if the gate is missing, every write fails closed
+- **Code-enforced write gate** (not prompt goodwill): create/update/delete tasks, start/stop, approvals, Feishu sends all require confirmation — `y/batch/N` in the terminal, a confirm card in Feishu; if the gate is missing, every write fails closed
 - **Zero-install kanban**: the board auto-spawns when unreachable locally, so you can create tasks right away
 - **Natural-language driven**: "sync my Feishu tasks" → "write to helios-kanban" → "run it with Claude" — when to start, and with whom, is your call
 
@@ -22,12 +22,12 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 
 ## Two forms: CLI vs Feishu bot
 
-- **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/b/N`), and all kanban operations included.
+- **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/batch/N`), and all kanban operations included.
 - **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds three bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), and **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link).
 
 ## Install
 
-Requires: Node.js ≥ 18, macOS / Linux.
+Requires: Node.js ≥ 20, macOS / Linux.
 
 ```bash
 npm i -g helios-task-agent
@@ -59,7 +59,7 @@ From source: `npm install && npm start`.
 Feishu Task Center / docs / group chats
   → List or read; expand Feishu URLs in title/description one hop (display only; ~10 expands per turn)
   → “Write to helios-kanban”: draft title + requirements summary
-       → code write-gate confirm (terminal y/b/N or Feishu card) → create (no auto start)
+       → code write-gate confirm (terminal y/batch/N or Feishu card) → create (no auto start)
   → Same Feishu source already synced → block and point to existing task
        (if that task was deleted, the mapping self-heals and sync can proceed)
   → Whether to start, and which executor: your call
@@ -75,7 +75,7 @@ Feishu Task Center / docs / group chats
 
 | Mechanism | Behavior |
 |-----------|----------|
-| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `b` (batch) / `N` (same answer vocabulary as Feishu: 确认/批准/同意/执行, 同类免问/批量允许, etc.); timeouts 120s for batchable ops, 300s for destructive ops; Ctrl+C at the prompt rejects. Feishu: confirm card (the “allow-similar (this session)” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); same timeout policy; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
+| Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `batch` (allow similar this session) / `N` (same answer vocabulary as Feishu: 确认/批准/同意/执行, 同类免问/批量允许, etc.); timeouts 120s for batchable ops, 300s for destructive ops; Ctrl+C at the prompt rejects. Feishu: confirm card (the “allow-similar (this session)” button shows only for non-destructive ops) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); same timeout policy; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
 | Batch approval | “Allow similar” for the rest of the session on the same write class (in-memory grant, lost on restart); plain confirm is **once**. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) always re-ask. **Feishu message writes (lark sends) never batch**; kanban writes do offer the “allow-similar (this session)” button on the confirm card. `/confirm revoke` or 恢复确认 revokes (`/confirm on` kept as a legacy alias) |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
@@ -96,9 +96,9 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 - Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
 - With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
 - `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
-- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*` — note the ocr subprocess receives your LLM key as `OCR_LLM_TOKEN`; set a dedicated `OCR_LLM_TOKEN` env var to override and keep the main key isolated), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
+- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*` — note the ocr subprocess receives your LLM key as `OCR_LLM_TOKEN`; set a dedicated `OCR_LLM_TOKEN` env var to override and keep the main key isolated), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port (bind address `HELIOS_REPORT_HOST`, default `127.0.0.1`); the report link hostname follows this rule: when `HELIOS_KANBAN_URL` is a loopback address (localhost/127.x), the link reuses its hostname (same reachability as kanban links); when the kanban address is non-loopback (e.g. a LAN IP), the link hostname is the report server's **bind address** — `127.0.0.1` by default (report links then only open on that machine), and binding `0.0.0.0` yields an undialable `0.0.0.0` in the link, so bind the machine's actual LAN IP instead; valid while the process lives; historical reports are cleaned up after 30 days
 
-> **Phone reachability**: the kanban links and AI-review report links in pushed cards point at the machine running the bot. With the default `HELIOS_KANBAN_URL=http://localhost:7964`, these links **only work on that machine — they are dead links on your phone** (the bot logs a warning about this at startup). To review from your phone, set `HELIOS_KANBAN_URL` to the machine's LAN IP or Tailscale address (the board and report server must be reachable at that address). Report URLs carry a random token, and the report server binds `127.0.0.1` by default — set `HELIOS_REPORT_HOST` explicitly only if you really need to expose it.
+> **Phone reachability**: the kanban links and AI-review report links in pushed cards point at the machine running the bot. With the default `HELIOS_KANBAN_URL=http://localhost:7964`, these links **only work on that machine — they are dead links on your phone** (the bot logs a warning about this at startup). The correct setup for reviewing from your phone: set `HELIOS_KANBAN_URL` to the machine's LAN IP or Tailscale address **and** set `HELIOS_REPORT_HOST` explicitly to that same LAN IP (do **not** use `0.0.0.0` — the link hostname would literally become the undialable `0.0.0.0`). Changing only `HELIOS_KANBAN_URL` leaves the report link hostname at the default bind address `127.0.0.1`, so the phone still can't open it. If the kanban stays on a loopback address, the report link hostname follows loopback too — **there is currently no way to reach reports from a phone in that setup**. Report URLs carry a random token.
 
 ## MCP health supervisor (bot)
 
@@ -197,7 +197,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
-Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example).
+Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example). Note: **credential/command-type high-risk keys in the cwd `.env` are ignored** (`LLM_API_KEY`, `FEISHU_*`, `HELIOS_KANBAN_MCP_COMMAND/ARGS`, `HELIOS_KANBAN_PACKAGE`, `HELIOS_KANBAN_URL`, proxy and npm registry keys, etc. — a supply-chain/command-injection guard; ignored keys only produce a one-line `console.warn`). Put such keys in `~/.helios-task-agent/.env` (or the shell environment / project `.env`).
 
 ### Open-platform checklist
 
@@ -211,7 +211,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Terminal**: `/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` (`/confirm on` legacy alias) `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
 
-**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/stop` `/confirm` `/status` `/tools`. Queued: `/memory` `/clear` and normal chat.
+**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/help` `/stop` `/confirm` `/status` `/tools` `/skills`. Queued: `/memory` `/clear` and normal chat.
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 
@@ -227,6 +227,9 @@ Memory tools: `memory_set` / `get` / `delete` / `note`. Keys: `feishu_task_sourc
 | kanban MCP | Preferred board API |
 | `hk_cli` | Always on; bundled `hk.sh` REST fallback/supplement |
 | `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
+| `work_summary` | Generate work-summary reports (HTML/MD) |
+| `skill_doc` | Read an installed skill's full doc (SKILL.md) on demand |
+| `skill_exec` | Run scripts inside a skill directory (user confirmation every time) |
 | `memory_*` | Persistent prefs & notes |
 
 Bundled skill: `skills/helios-kanban-remote/`.

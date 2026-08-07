@@ -2,7 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
-import { MCP_FALLBACK_TEXT } from '../deps';
+import { MCP_FALLBACK_TEXT } from '../infra/deps';
 
 export class KanbanMcp {
   readonly command: string;
@@ -141,9 +141,19 @@ export interface McpBootResult {
   hint: string | null;
 }
 
-/** 连接 kanban MCP（45s 超时）；失败不抛出（调用方按通道风格提示降级），返回诊断 hint。 */
-export async function connectMcp(cfg: { mcpCommand: string; mcpArgs: string[] }): Promise<McpBootResult> {
+/**
+ * 连接 kanban MCP（45s 超时）；失败不抛出（调用方按通道风格提示降级），返回诊断 hint。
+ *
+ * onCreate：实例一创建（connect 发起前）即同步回调。连接窗口最长 45s，期间收到退出
+ * 信号时调用方若等 resolve 才登记清理，in-flight 的 stdio 子进程会成孤儿——参照
+ * kanban 的 onSpawn 模式，创建即登记（配合 KanbanMcp 的 closePending 兜底关闭）。
+ */
+export async function connectMcp(
+  cfg: { mcpCommand: string; mcpArgs: string[] },
+  opts: { onCreate?: (mcp: KanbanMcp) => void } = {},
+): Promise<McpBootResult> {
   const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
+  opts.onCreate?.(mcp);
   try {
     await mcp.connect({ timeoutMs: 45000 });
     return { mcp, ok: true, hint: null };

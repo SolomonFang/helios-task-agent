@@ -1,0 +1,34 @@
+name: CI
+
+# PR / push 级检查：typecheck + 单元测试 + 生产依赖 audit
+# smoke / e2e 依赖本机 helios-kanban，不在 CI 跑
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # 纯逻辑单元测试：无 LLM / kanban 依赖，CI 可直接跑
+      - run: npm test
+
+      # 生产依赖高危漏洞拦截（npmmirror 无 audit 端点，须显式指定官方 registry）
+      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org

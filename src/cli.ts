@@ -1,13 +1,15 @@
 import readline from 'readline';
 import { type ChildProcess } from 'child_process';
 import { c, printBanner, Spinner, renderReply, MCP_FALLBACK_TEXT } from './ui';
-import { ensureConfig } from './config-wizard';
-import { AgentSession } from './session';
+import { ensureEnvLoaded } from './config/config';
+import { ensureConfig } from './config/config-wizard';
+import { AgentSession } from './agent/session';
 import { connectMcp } from './kanban/mcp';
-import { checkHkDeps, checkLarkCliStatus } from './deps';
+import type { KanbanMcp } from './kanban/mcp';
+import { checkHkDeps, checkLarkCliStatus } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
-import { wizardAskSecret, wizardChoose } from './wizard-io';
-import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './update-check';
+import { wizardAskSecret, wizardChoose } from './config/wizard-io';
+import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -19,10 +21,10 @@ import {
   llmFailureParts,
   TRY_EXAMPLES,
 } from './commands';
-import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './confirm';
-import type { ConfirmFn } from './guard';
+import { CONFIRM_BATCH_RE, CONFIRM_YES_RE, kindLabel } from './agent/confirm';
+import type { ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
-import { errMessage } from './err';
+import { errMessage } from './infra/err';
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void };
 
@@ -75,7 +77,47 @@ const HELP = `
 ${TRY_EXAMPLES.map((e) => `  · ${e}`).join('\n')}
 `;
 
+/** askWithAbort 的超时哨兵：与「用户留空 / Ctrl+C」区分，便于打印自动拒绝文案。 */
+export const ASK_TIMEOUT: unique symbol = Symbol('ask-timeout');
+
+/**
+ * ask 的 abort/超时感知版（纯逻辑抽出以便单测；main 内用 createAskWithAbort(ask, () => currentCtl) 构造）：
+ * 闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）；
+ * 超时未操作按拒绝处理（对齐飞书 bot：可批量 120s / 破坏性 300s）。
+ * getCtl 返回当前运行轮次的 AbortController（无轮次时为 null）。
+ */
+export function createAskWithAbort(
+  ask: AskFn,
+  getCtl: () => AbortController | null,
+): (promptText: string, timeoutMs?: number) => Promise<string | null | typeof ASK_TIMEOUT> {
+  return (promptText, timeoutMs) => {
+    const ctl = getCtl();
+    if (!ctl && !timeoutMs) return ask(promptText);
+    if (ctl?.signal.aborted) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const onAbort = () => finish(null);
+      const finish = (v: string | null | typeof ASK_TIMEOUT) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        ctl?.signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      };
+      ctl?.signal.addEventListener('abort', onAbort, { once: true });
+      if (timeoutMs) {
+        timer = setTimeout(() => finish(ASK_TIMEOUT), timeoutMs);
+        timer.unref();
+      }
+      void ask(promptText).then(finish);
+    });
+  };
+}
+
 export async function main(): Promise<void> {
+  // env 显式初始化（import config 不再自动加载 .env，见 config.ts ensureEnvLoaded）
+  ensureEnvLoaded();
   const isTTY = process.stdin.isTTY === true;
 
   const rl = readline.createInterface({
@@ -124,8 +166,80 @@ export async function main(): Promise<void> {
   bootKanban.stop();
   if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
 
+  /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
+  let currentCtl: AbortController | null = null;
+  const spinner = new Spinner('思考中…');
+  /** MCP 实例登记处：onCreate 在实例创建时（connect 发起前）即登记，45s 连接窗口内收到信号也能 close。 */
+  const cleanupRes: { mcp: KanbanMcp | null } = { mcp: null };
+
+  let cleaningUp = false;
+  /**
+   * 退出清理：幂等（Ctrl+C 连按 / process+rl 双通道 SIGINT 不重入）+ 8s 强退兜底（对齐 bot 模式）。
+   * exitCode 由触发路径决定：正常退出 0；uncaughtException 传 1——以 0 退出会被
+   * launchd/systemd 当成干净停止而不触发自动重启。
+   */
+  const cleanup = async (exitCode = 0): Promise<void> => {
+    if (cleaningUp) return;
+    cleaningUp = true;
+    // 强退兜底：mcp.close 挂住时进程不得永不退（unref：该定时器自身不得阻止正常退出）
+    const forceTimer = setTimeout(() => {
+      console.error(c.err('\n退出清理超时，强制结束进程'));
+      process.exit(1);
+    }, 8000);
+    forceTimer.unref();
+    spinner.stop();
+    try {
+      await cleanupRes.mcp?.close();
+    } catch {
+      /* 尽力清理，失败照常退出 */
+    }
+    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可
+    if (kanbanChild && kanbanChild.exitCode === null) {
+      kanbanChild.stdout?.destroy();
+      kanbanChild.stderr?.destroy();
+      kanbanChild.unref();
+      console.log(c.gray(`看板服务保留运行（PID ${kanbanChild.pid}），停止：kill ${kanbanChild.pid}`));
+    }
+    rl.close();
+    clearTimeout(forceTimer);
+    process.exit(exitCode);
+  };
+  const onSigint = () => {
+    if (currentCtl) {
+      currentCtl.abort();
+      return;
+    }
+    console.log('\n' + c.gray('再见 👋'));
+    void cleanup(0);
+  };
+  // 信号处理在 MCP 连接（最长 45s）之前注册：连接窗口内收到 SIGINT 时 cleanup 已可用，
+  // 配合 onCreate 登记能把 in-flight 的 MCP 子进程一并收掉，不留孤儿。
+  // terminal 模式下 readline 会拦截 ^C：rl 无 SIGINT listener 时默认 rl.close()，
+  // 任务运行中按 Ctrl+C 会关闭输入流而非中断当前任务；两级 handler 同一函数，天然幂等。
+  process.on('SIGINT', onSigint);
+  rl.on('SIGINT', onSigint);
+  // 长驻 REPL 兜底（与 bot 同策略）：漏网 rejection 记日志不退出；
+  // uncaughtException 复用 cleanup 优雅退出（退出码 1，见 cleanup 注释）。
+  // handler 自身只做同步日志，不得再抛异常。
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+    console.error(c.err(`未处理的 Promise rejection（进程保持运行）: ${msg}`));
+  });
+  process.on('uncaughtException', (err) => {
+    console.error(c.err(`未捕获异常，执行优雅退出: ${err.stack || err.message}`));
+    void cleanup(1);
+  });
+  // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
+  // 验证崩溃退出码为 1（setImmediate 抛出才走 uncaughtException，同步 throw 只会 reject main）
+  if (process.env.HTA_TEST_CRASH) setImmediate(() => { throw new Error('HTA_TEST_CRASH'); });
+
   const boot = new Spinner('正在连接 helios-kanban MCP…').start();
-  const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg);
+  const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg, {
+    // 实例一创建即登记清理（参照 kanban 的 onSpawn 模式），不等 connect resolve
+    onCreate: (instance) => {
+      cleanupRes.mcp = instance;
+    },
+  });
   boot.stop();
   if (!mcpOk) {
     console.log(c.warn(`MCP 连接失败，${MCP_FALLBACK_TEXT}，看板功能不受影响。`));
@@ -150,41 +264,8 @@ export async function main(): Promise<void> {
   warnStartupDeps(larkStatus, { style: 'cli' });
   migrateAndValidateSkills();
 
-  const spinner = new Spinner('思考中…');
-
-  /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
-  let currentCtl: AbortController | null = null;
-
-  /** 确认超时哨兵：与「用户留空 / Ctrl+C」区分，便于打印自动拒绝文案。 */
-  const ASK_TIMEOUT = Symbol('ask-timeout');
-
-  /**
-   * ask 的 abort/超时感知版：闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）；
-   * 超时未操作按拒绝处理（对齐飞书 bot：可批量 120s / 破坏性 300s）。
-   */
-  const askWithAbort = (promptText: string, timeoutMs?: number): Promise<string | null | typeof ASK_TIMEOUT> => {
-    const ctl = currentCtl;
-    if (!ctl && !timeoutMs) return ask(promptText);
-    if (ctl?.signal.aborted) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      const onAbort = () => finish(null);
-      const finish = (v: string | null | typeof ASK_TIMEOUT) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        ctl?.signal.removeEventListener('abort', onAbort);
-        resolve(v);
-      };
-      ctl?.signal.addEventListener('abort', onAbort, { once: true });
-      if (timeoutMs) {
-        timer = setTimeout(() => finish(ASK_TIMEOUT), timeoutMs);
-        timer.unref();
-      }
-      void ask(promptText).then(finish);
-    });
-  };
+  /** ask 的 abort/超时感知版：实现见模块级 createAskWithAbort（单测覆盖三路竞态）。 */
+  const askWithAbort = createAskWithAbort(ask, () => currentCtl);
 
   // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「batch」开启同类免问；Ctrl+C 视为拒绝；
   // 超时自动拒绝（与飞书 bot 同语义：可批量 120s、破坏性 300s）。
@@ -223,42 +304,6 @@ export async function main(): Promise<void> {
 
   /** MCP 实例绑定的看板地址：/config 改地址后 MCP 不会重连，/status 据此持续警示，直到重启。 */
   const mcpBoundKanbanUrl = cfg.kanbanUrl;
-
-  const cleanup = async () => {
-    spinner.stop();
-    await mcp.close();
-    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可
-    if (kanbanChild && kanbanChild.exitCode === null) {
-      kanbanChild.stdout?.destroy();
-      kanbanChild.stderr?.destroy();
-      kanbanChild.unref();
-      console.log(c.gray(`看板服务保留运行（PID ${kanbanChild.pid}），停止：kill ${kanbanChild.pid}`));
-    }
-    rl.close();
-    process.exit(0);
-  };
-  const onSigint = () => {
-    if (currentCtl) {
-      currentCtl.abort();
-      return;
-    }
-    console.log('\n' + c.gray('再见 👋'));
-    void cleanup();
-  };
-  // terminal 模式下 readline 会拦截 ^C：rl 无 SIGINT listener 时默认 rl.close()，
-  // 任务运行中按 Ctrl+C 会关闭输入流而非中断当前任务；两级 handler 同一函数，天然幂等。
-  process.on('SIGINT', onSigint);
-  rl.on('SIGINT', onSigint);
-  // 长驻 REPL 兜底（与 bot 同策略）：漏网 rejection 记日志不退出；
-  // uncaughtException 复用 cleanup 优雅退出。handler 自身只做同步日志，不得再抛异常。
-  process.on('unhandledRejection', (reason) => {
-    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
-    console.error(c.err(`未处理的 Promise rejection（进程保持运行）: ${msg}`));
-  });
-  process.on('uncaughtException', (err) => {
-    console.error(c.err(`未捕获异常，执行优雅退出: ${err.stack || err.message}`));
-    void cleanup();
-  });
 
   // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效，复用 cleanup 的看板处置）
   if (pendingUpdate) {

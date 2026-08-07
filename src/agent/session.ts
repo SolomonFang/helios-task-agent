@@ -1,4 +1,4 @@
-import type { KanbanMcp } from './kanban/mcp';
+import type { KanbanMcp } from '../kanban/mcp';
 import { MemoryStore } from './memory';
 import { createClient, runAgentTurn } from './llm';
 import { buildSystemPrompt } from './prompt';
@@ -12,7 +12,7 @@ import type {
   ProgressInfo,
   ToolHandlers,
   UserMemory,
-} from './types';
+} from '../types';
 
 /** 待注入后台事件的缓存上限：超出丢弃最旧，避免 watcher 风暴/积压撑爆上下文。 */
 const MAX_PENDING_NOTES = 20;

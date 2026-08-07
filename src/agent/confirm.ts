@@ -1,6 +1,9 @@
 import crypto from 'crypto';
 import type { ConfirmRequest, ConfirmVerdict } from './guard';
-import { errMessage } from './err';
+import { errMessage } from '../infra/err';
+
+// 卡片构建已收口到 channels/feishu-cards.ts；此处 re-export 兼容既有调用方（scripts/smoke.ts 等）
+export { buildConfirmCard, buildResolvedCard } from '../channels/feishu-cards';
 
 /**
  * Bot-side write confirmation: one pending action per user.
@@ -128,6 +131,9 @@ export class ConfirmationManager {
           resolve(false);
         }
       }, timeoutMs);
+      // unref：确认超时（最长 300s）不应成为保活理由——进程若只剩这一个定时器
+      //（如 shutdown 途中）应能直接退出，超时自动拒绝只是用户体验优化而非存活义务
+      timer.unref();
       this.pendings.set(openId, { id, req, resolve, timer });
       void this.sendPrompt(openId, this.chatIds.get(openId), req, id, timeoutMs)
         .then((messageId) => {
@@ -205,112 +211,4 @@ export class ConfirmationManager {
     p.resolve(verdict);
     this.opts.onSettled?.(openId, p.req, verdict === false ? 'denied' : verdict, p.cardMessageId);
   }
-}
-
-/** lark_md 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
-function detailCodeBlock(detail: string): string {
-  return '```\n' + detail.replace(/```/g, "'''") + '\n```';
-}
-
-/** 嵌入 lark_md 的用户数据（任务标题等）：星号全角化，避免 `**` 误触加粗切换破坏排版。 */
-function mdSafe(s: string): string {
-  return s.replace(/\*/g, '＊');
-}
-
-/** Interactive card shown for a pending write operation (legacy card schema). */
-export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 120000): Record<string, unknown> {
-  const isLark = req.kind === 'lark';
-  const kindText = kindLabel(req.kind);
-  const timeoutSec = Math.round(timeoutMs / 1000);
-  const actions: Record<string, unknown>[] = [
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '✅ 确认执行（仅此次）' },
-      type: 'primary',
-      value: { hta_confirm: id, decision: 'yes' },
-    },
-  ];
-  if (req.batchKey) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: '🔁 同类免问（本会话）' },
-      value: { hta_confirm: id, decision: 'batch' },
-    });
-  }
-  actions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: '✖️ 取消' },
-    // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
-    value: { hta_confirm: id, decision: 'no' },
-  });
-  const replyHint = req.batchKey
-    ? '或回复文本：「确认」仅此次 · 「同类免问」本会话 · 「取消」'
-    : '或回复文本：「确认」 · 「取消」';
-  return {
-    config: { wide_screen_mode: true, enable_forward: false },
-    header: {
-      template: isLark ? 'blue' : 'orange',
-      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认` },
-    },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      {
-        tag: 'div',
-        fields: [
-          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText} · 写操作` } },
-          { is_short: true, text: { tag: 'lark_md', content: `**确认有效期**\n${timeoutSec} 秒未操作自动拒绝` } },
-        ],
-      },
-      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
-      { tag: 'hr' },
-      { tag: 'action', actions },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: replyHint }] },
-    ],
-  };
-}
-
-/** 决策/超时/作废后的终态卡片（原地替换确认卡片；无按钮，避免误点与"没反应"）。 */
-export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): Record<string, unknown> {
-  const kindText = kindLabel(req.kind);
-  const meta: Record<ConfirmSettle, { template: string; title: string; note: string }> = {
-    once: {
-      template: 'green',
-      title: `✅ ${kindText} · 写操作已批准（仅此次）`,
-      note: '操作已放行，正在执行。',
-    },
-    batch: {
-      template: 'green',
-      title: `🔁 ${kindText} · 写操作已批准（同类免问 · 本会话）`,
-      note: '回复「恢复确认」可随时撤销免问；重启后自动失效。',
-    },
-    denied: {
-      template: 'red',
-      title: `🚫 ${kindText} · 写操作已取消`,
-      note: '操作未执行。',
-    },
-    timeout: {
-      template: 'grey',
-      title: `⏰ ${kindText} · 写操作确认超时`,
-      note: '超时未处理，已自动拒绝，操作未执行。',
-    },
-    superseded: {
-      template: 'grey',
-      title: `⚠️ ${kindText} · 写操作确认已作废`,
-      note: '该确认已被新的写操作确认替代，请以最新卡片为准。',
-    },
-  };
-  const m = meta[settle];
-  const time = new Date().toLocaleString('zh-CN', { hour12: false });
-  return {
-    config: { wide_screen_mode: true, enable_forward: false },
-    header: {
-      template: m.template,
-      title: { tag: 'plain_text', content: m.title },
-    },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: `${m.note} · ${time}` }] },
-    ],
-  };
 }

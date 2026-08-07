@@ -1,4 +1,4 @@
-import { c } from './ui';
+import { c } from '../ui';
 import {
   PRESETS,
   currentConfig,
@@ -8,10 +8,10 @@ import {
   writeEnv,
   resolveEnvWritePath,
 } from './config';
-import { checkLarkCli, LARK_CLI_INSTALL_HINT } from './deps';
+import { checkLarkCli, LARK_CLI_INSTALL_HINT } from '../infra/deps';
 import { verifyFeishuApp } from './feishu-verify';
 import { verifyLlmConfig } from './llm-verify';
-import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig } from './types';
+import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig } from '../types';
 
 export function printFeishuSetupChecklist(): void {
   console.log(c.strong('\n飞书开放平台（一次性，约 2 分钟）\n'));
@@ -23,7 +23,15 @@ export function printFeishuSetupChecklist(): void {
   console.log(c.gray('  凭证配好后，本机常驻进程即可接收私聊消息。\n'));
 }
 
-async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
+/**
+ * need/needSecret 闭包工厂：need 读取一行输入（EOF 抛错、去空白），needSecret 为密钥
+ * 掩码输入（未提供 askSecret 时回退普通输入）。runWizard / rebindFeishuBot /
+ * ensureBotConfig 共用——此前同一对闭包逐字复制了三份。
+ */
+export function makeNeed(
+  ask: AskFn,
+  askSecret?: AskFn | null,
+): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string> } {
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
     if (ans === null) throw new Error('输入已结束');
@@ -36,6 +44,20 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     if (ans === null) throw new Error('输入已结束');
     return ans.trim();
   };
+  return { need, needSecret };
+}
+
+/**
+ * 飞书白名单合并决策（纯函数，向导交互外可测）：
+ * 输入 `-`（仅换绑场景 allowClear）= 清除；输入新列表 = 覆盖；回车 = 保留现状。
+ */
+export function resolveAllowedOpenIds(raw: string, existing: string[], allowClear: boolean): string[] {
+  if (allowClear && raw === '-') return [];
+  return raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : existing;
+}
+
+async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
+  const { need, needSecret } = makeNeed(ask, askSecret);
 
   /**
    * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
@@ -183,12 +205,7 @@ async function promptFeishuConfig(
     ? `允许的 open_id（可选，逗号分隔；回车=保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
     : '允许的 open_id（可选，逗号分隔；回车=不限制）: ';
   const allowedRaw = await need(allowedPrompt);
-  const allowedOpenIds =
-    allowClear && allowedRaw === '-'
-      ? []
-      : allowedRaw
-        ? allowedRaw.split(',').map((s) => s.trim()).filter(Boolean)
-        : existing.allowedOpenIds;
+  const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };
 }
 
@@ -200,17 +217,7 @@ export async function rebindFeishuBot(
   ask: AskFn,
   { askSecret = null }: { askSecret?: AskFn | null } = {},
 ): Promise<{ feishu: FeishuBotConfig; envPath: string }> {
-  const need = async (promptText: string): Promise<string> => {
-    const ans = await ask(promptText);
-    if (ans === null) throw new Error('输入已结束');
-    return ans.trim();
-  };
-  const needSecret = async (promptText: string): Promise<string> => {
-    if (!askSecret) return need(promptText);
-    const ans = await askSecret(promptText);
-    if (ans === null) throw new Error('输入已结束');
-    return ans.trim();
-  };
+  const { need, needSecret } = makeNeed(ask, askSecret);
 
   const existing = feishuBotConfig();
   if (existing.appId) {
@@ -229,17 +236,7 @@ export async function ensureBotConfig(
   ask: AskFn,
   { force = false, choose = null, askSecret = null }: { force?: boolean; choose?: ChooseFn | null; askSecret?: AskFn | null } = {},
 ): Promise<{ agent: AgentConfig; feishu: FeishuBotConfig; envPath: string }> {
-  const need = async (promptText: string): Promise<string> => {
-    const ans = await ask(promptText);
-    if (ans === null) throw new Error('输入已结束');
-    return ans.trim();
-  };
-  const needSecret = async (promptText: string): Promise<string> => {
-    if (!askSecret) return need(promptText);
-    const ans = await askSecret(promptText);
-    if (ans === null) throw new Error('输入已结束');
-    return ans.trim();
-  };
+  const { need, needSecret } = makeNeed(ask, askSecret);
 
   let agent = currentConfig();
   if (force || !isConfigured()) {

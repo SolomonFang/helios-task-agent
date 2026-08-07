@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: npm-publish
@@ -29,8 +30,8 @@ jobs:
 
       - run: npm ci
 
-      # 纯逻辑单元测试：无 LLM / kanban 依赖，CI 可直接跑
-      - run: npm test
+      # 生产依赖高危漏洞拦截（npmmirror 无 audit 端点，须显式指定官方 registry）
+      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
 
       - name: Check tag matches package.json version
         run: |
@@ -39,13 +40,13 @@ jobs:
           echo "tag=$TAG package=$PKG"
           [ "$TAG" = "$PKG" ]
 
-      # npm publish 会执行 prepublishOnly（typecheck）和 prepack（build）
+      # npm publish 会执行 prepublishOnly（typecheck + npm test）和 prepack（clean build），此处不重复跑测试
       - name: Publish
         run: |
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            npm publish --tag next
+            npm publish --provenance --access public --tag next
           else
-            npm publish
+            npm publish --provenance --access public
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

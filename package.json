@@ -15,7 +15,7 @@
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",
     "typecheck": "tsc -p tsconfig.typecheck.json",
-    "prepack": "npm run build",
+    "prepack": "rm -rf dist && npm run build",
     "verify": "npm run typecheck && npm test && npm run smoke && npm run test:e2e",
     "prepublishOnly": "npm run typecheck && npm test",
     "bot": "tsx src/bot-main.ts"
@@ -53,17 +53,17 @@
     "linux"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
-    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dotenv": "^16.4.5",
     "openai": "^4.77.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "tsx": "^4.23.1",
-    "typescript": "^5.8.3"
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.10",
+    "typescript": "^5.9.3"
   }
 }

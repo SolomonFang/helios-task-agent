@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
-import { defaultDataHome, packageRoot } from './paths';
-import { writeFilePrivateSync } from './private-file';
-import { kanbanPackageSpec } from './deps';
-import type { AgentConfig, FeishuBotConfig, LlmPreset } from './types';
+import { defaultDataHome, packageRoot } from '../infra/paths';
+import { writeFileAtomicPrivateSync } from '../infra/private-file';
+import { kanbanPackageSpec } from '../infra/deps';
+import type { AgentConfig, FeishuBotConfig, LlmPreset } from '../types';
 
 /** User-level config. Wizards write here. */
 export function userEnvPath(): string {
@@ -34,6 +34,11 @@ export function projectEnvPath(): string {
  * 3) 供应链劫持：NPM_CONFIG_REGISTRY 会让自动拉起的 npx 钉版本包从恶意 registry
  *    下载，HTTP(S)_PROXY/NO_PROXY 会劫持 npx 与全部外发请求的流量（这些键会被
  *    proc-env 透传给看板/ocr 子进程），大小写变体一并限制。
+ * 4) 子进程可执行文件/动态库劫持：PATH/HOME/SHELL 改变 spawn 的命令解析与展开，
+ *    NODE_OPTIONS/NODE_PATH 向所有 node 子进程注入模块，LD_PRELOAD/DYLD_*
+ *    向所有原生子进程注入动态库——cwd .env 注入这些键等价于任意代码执行；
+ * 5) 无鉴权服务暴露：HELIOS_KANBAN_HOST/HELIOS_REPORT_HOST 决定看板与报告服务
+ *    的绑定地址，恶意 cwd .env 可将其绑到 0.0.0.0 把无鉴权接口暴露给局域网。
  * 这些键只接受 shell 环境、项目 .env、用户 home .env（及 HELIOS_TASK_AGENT_ENV
  * 强制路径）的值。
  */
@@ -57,6 +62,20 @@ const CWD_RESTRICTED_KEYS = new Set([
   'http_proxy',
   'https_proxy',
   'no_proxy',
+  // 大小写形态都收（同 http_proxy/HTTP_PROXY 双形态）：PATH 决定子进程命令解析
+  'PATH',
+  'path',
+  'HOME',
+  'SHELL',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+  'DYLD_FALLBACK_LIBRARY_PATH',
+  'HELIOS_KANBAN_HOST',
+  'HELIOS_REPORT_HOST',
 ]);
 
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
@@ -107,10 +126,20 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   return { primaryWritePath, loaded };
 }
 
-const { primaryWritePath: INITIAL_WRITE_PATH } = loadEnvFiles();
-
-/** @deprecated use userEnvPath / resolveEnvWritePath — kept for callers */
-export const ENV_PATH = INITIAL_WRITE_PATH;
+/**
+ * 显式初始化入口（幂等）：加载 .env 文件到 process.env。
+ * 本模块 import 时无任何副作用（不读盘、不改 process.env）——库调用方 import
+ * index.ts 不应触发 IO。CLI / bot 入口在 main() 开头显式调用本函数；
+ * 读取函数（currentConfig / feishuBotConfig）未初始化时被调用会懒初始化一次，
+ * 保证直接以库方式使用（如 scripts/smoke.ts）也能拿到 .env 配置。
+ * 测试需要重复加载或隔离时直接调用 loadEnvFiles（非幂等，每次真实读盘）。
+ */
+let envLoaded = false;
+export function ensureEnvLoaded(): void {
+  if (envLoaded) return;
+  envLoaded = true;
+  loadEnvFiles();
+}
 
 /** Wizards always persist to user home (override with HELIOS_TASK_AGENT_ENV). */
 export function resolveEnvWritePath(): string {
@@ -151,6 +180,7 @@ export const PRESETS: LlmPreset[] = [
 ];
 
 export function currentConfig(): AgentConfig {
+  ensureEnvLoaded(); // 懒初始化：未显式初始化时保证 .env 已加载（幂等，见上）
   return {
     llmBaseUrl: process.env.LLM_BASE_URL || '',
     llmApiKey: process.env.LLM_API_KEY || '',
@@ -170,6 +200,7 @@ export function isConfigured(): boolean {
 }
 
 export function feishuBotConfig(): FeishuBotConfig {
+  ensureEnvLoaded(); // 懒初始化：同 currentConfig
   const allowed = (process.env.FEISHU_ALLOWED_OPEN_IDS || '')
     .split(',')
     .map((s) => s.trim())
@@ -235,8 +266,6 @@ export function writeEnvFile(
   updates: Record<string, string | undefined>,
   filePath = resolveEnvWritePath(),
 ): string {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
   const map = parseEnvFile(filePath);
   for (const [k, v] of Object.entries(updates)) {
     if (v === undefined || v === '') delete map[k];
@@ -258,13 +287,11 @@ export function writeEnvFile(
     'HELIOS_TASK_AGENT_HOME',
   ];
   const keys = [...preferredOrder.filter((k) => k in map), ...Object.keys(map).filter((k) => !preferredOrder.includes(k))];
-  const body = keys.map((k) => `${k}=${serializeEnvValue(map[k])}`).join('\n') + '\n';
-  // 原子写：tmp + rename（与 memory.ts / source-registry.ts 同一模式），
+  const body = keys.map((k) => `${k}=${serializeEnvValue(map[k]!)}`).join('\n') + '\n';
+  // 原子写：tmp + rename（统一实现见 writeFileAtomicPrivateSync），
   // 避免写盘中途被杀导致 .env 截断、凭证丢失；rename 后目标一定是新建的
-  // 0600 文件（writeFilePrivateSync 内含 chmod），权限处理保持不变。
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  writeFilePrivateSync(tmp, body);
-  fs.renameSync(tmp, filePath);
+  // 0600 文件（内部含 chmod），所在目录确保 0700。
+  writeFileAtomicPrivateSync(filePath, body);
   applyProcessEnv(map);
   return filePath;
 }

@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './paths';
-import { writeFilePrivateSync } from './private-file';
-import type { MemoryFile, UserMemory } from './types';
+import { defaultDataHome } from '../infra/paths';
+import { writeFileAtomicPrivateSync } from '../infra/private-file';
+import type { MemoryFile, UserMemory } from '../types';
 
 // 路径工具已抽到 paths.ts；此处 re-export 仅为兼容既有调用方（index.ts 公共 API 等）
 export { defaultDataHome };
@@ -106,11 +106,7 @@ export class MemoryStore {
         if (user.notes.length > MAX_NOTES) user.notes = user.notes.slice(-MAX_NOTES);
         user.updatedAt = new Date().toISOString();
       }
-      const dir = path.dirname(this.filePath);
-      fs.mkdirSync(dir, { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
-      writeFilePrivateSync(tmp, JSON.stringify(merged, null, 2) + '\n');
-      fs.renameSync(tmp, this.filePath);
+      writeFileAtomicPrivateSync(this.filePath, JSON.stringify(merged, null, 2) + '\n');
       this.data = merged;
       this.changedFacts.clear();
       this.addedNotes.clear();

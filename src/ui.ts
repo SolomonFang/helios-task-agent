@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './deps';
+import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 
 const ESC = '\u001b';
 

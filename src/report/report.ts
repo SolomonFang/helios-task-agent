@@ -3,20 +3,16 @@
  * HTML is fully inline-styled: no external resources, no JS.
  */
 
-import fs from 'fs';
 import path from 'path';
-import { defaultDataHome } from './paths';
-import { writeFilePrivateSync } from './private-file';
+import { defaultDataHome } from '../infra/paths';
+import { escapeHtml, renderReportPage } from './report-page';
+import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
 import { pruneOldReports, sanitizeName } from './report-utils';
-import type { WorkSummaryData, WorkSummaryTask } from './kanban/summary';
+import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
 
-export function escapeHtml(s: string): string {
-  return s.replace(
-    /[&<>"']/g,
-    (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]!,
-  );
-}
+// escapeHtml 已移到 report-page.ts（两个报告渲染器共用）；re-export 兼容既有调用方
+export { escapeHtml } from './report-page';
 
 interface StatusMeta {
   emoji: string;
@@ -128,45 +124,17 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   return parts.join('\n');
 }
 
-export function renderHtml(data: WorkSummaryData): string {
-  const { totals } = data;
-  const sections: string[] = [];
-  for (const group of groupByStatus(data.tasks)) {
-    sections.push(
-      `<section class="group">\n<h2>${group.meta.emoji} ${escapeHtml(group.meta.label)}<span class="count">${group.tasks.length}</span></h2>\n` +
-        group.tasks.map(htmlTaskCard).join('\n') +
-        '\n</section>',
-    );
-  }
-  const body = sections.length
-    ? sections.join('\n')
-    : '<p class="empty">该范围内没有匹配的任务。</p>';
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>工作总结 · ${escapeHtml(data.sinceLabel)}</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    background: #f3f4f8;
-    color: #1f2937;
-    line-height: 1.6;
-    padding: 32px 16px 64px;
-  }
-  .page { max-width: 880px; margin: 0 auto; }
+/** work-summary 页面专属区块样式（公共基底与页框见 report-page.ts）。 */
+const SUMMARY_PAGE_CSS = `
+  body { background: #f3f4f8; line-height: 1.6; }
+  .page { max-width: 880px; }
   .hero {
     background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-    color: #fff;
-    border-radius: 16px;
     padding: 36px 40px;
-    box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
   }
-  .hero h1 { font-size: 28px; letter-spacing: 1px; }
-  .hero .subtitle { font-size: 17px; margin-top: 6px; opacity: 0.95; }
-  .hero .gen { font-size: 12px; margin-top: 10px; opacity: 0.75; }
+  .hero h1 { font-size: 28px; }
+  .hero .subtitle { font-size: 17px; }
+  .hero .gen { margin-top: 10px; }
   .stats {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -203,14 +171,7 @@ export function renderHtml(data: WorkSummaryData): string {
   }
   .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .card-head h3 { font-size: 16px; flex: 1; }
-  .badge {
-    flex-shrink: 0;
-    font-size: 12px;
-    font-weight: 600;
-    border-radius: 999px;
-    padding: 2px 10px;
-    white-space: nowrap;
-  }
+  .badge { flex-shrink: 0; }
   .badge.done { background: #dcfce7; color: #15803d; }
   .badge.inreview { background: #fef3c7; color: #b45309; }
   .badge.inprogress { background: #dbeafe; color: #1d4ed8; }
@@ -222,15 +183,7 @@ export function renderHtml(data: WorkSummaryData): string {
   .plus { color: #16a34a; font-weight: 600; }
   .minus { color: #dc2626; font-weight: 600; }
   .chips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-  .chips code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    background: #f3f4f6;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    padding: 2px 8px;
-    color: #374151;
-  }
+  .chips code { font-size: 12px; border-radius: 6px; padding: 2px 8px; }
   .diff-link {
     display: inline-block;
     margin-top: 12px;
@@ -245,11 +198,25 @@ export function renderHtml(data: WorkSummaryData): string {
   }
   .diff-link:hover { background: #eef2ff; }
   .empty { text-align: center; color: #9ca3af; margin-top: 40px; }
-</style>
-</head>
-<body>
-<div class="page">
-  <header class="hero">
+`;
+
+export function renderHtml(data: WorkSummaryData): string {
+  const { totals } = data;
+  const sections: string[] = [];
+  for (const group of groupByStatus(data.tasks)) {
+    sections.push(
+      `<section class="group">\n<h2>${group.meta.emoji} ${escapeHtml(group.meta.label)}<span class="count">${group.tasks.length}</span></h2>\n` +
+        group.tasks.map(htmlTaskCard).join('\n') +
+        '\n</section>',
+    );
+  }
+  const body = sections.length
+    ? sections.join('\n')
+    : '<p class="empty">该范围内没有匹配的任务。</p>';
+  return renderReportPage({
+    title: `工作总结 · ${escapeHtml(data.sinceLabel)}`,
+    css: SUMMARY_PAGE_CSS,
+    body: `  <header class="hero">
     <h1>工作总结</h1>
     <p class="subtitle">${escapeHtml(data.sinceLabel)}</p>
     <p class="gen">生成时间 ${escapeHtml(data.generatedAt)}</p>
@@ -262,11 +229,8 @@ export function renderHtml(data: WorkSummaryData): string {
     ${htmlStatCard(`+${totals.additions}`, '新增行', 'add')}
     ${htmlStatCard(`-${totals.deletions}`, '删除行', 'del')}
   </section>
-  ${body}
-</div>
-</body>
-</html>
-`;
+  ${body}`,
+  });
 }
 
 export interface WriteSummaryReportsOptions {
@@ -290,7 +254,7 @@ export function writeSummaryReports(
 ): SummaryReportPaths {
   const format = opts.format ?? 'both';
   const dir = opts.dir ?? reportsDir();
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDirSync(dir);
   // 与 AI 审查报告同一清理策略：30 天前的历史报告自动删除，避免目录无界增长
   pruneOldReports(dir);
   const stamp = data.iteration?.trim()

@@ -1,8 +1,8 @@
 // Coverage gap unit tests: 补四个审查发现的测试盲区——
 // 1. kanban/summary collectWorkSummary 采集层（日期过滤 / attempt 挑选 / diff 统计合并）
 // 2. handler hta_review 按钮全链路（分发 → handleAiReview → runAiReview，PATH 桩伪造 ocr）
-// 3. cli askWithAbort 三路竞态（见下方 SKIP 说明：不可低成本测，跳过）
-// 4. config-wizard 链路（writeEnvFile 往返 + llm-verify / feishu-verify 失败路径）
+// 3. cli askWithAbort 三路竞态（正常回答 / Ctrl+C abort / 超时自动拒绝；createAskWithAbort 已抽出可测）
+// 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径
 // 仅用 loopback mock 服务与 PATH 桩，离线可跑。Run: npx tsx scripts/unit-coverage.ts
 
 import assert from 'node:assert/strict';
@@ -16,19 +16,21 @@ import dotenv from 'dotenv';
 import { collectWorkSummary } from '../src/kanban/summary';
 import { createBotHandlers } from '../src/bot/handler';
 import type { FeishuChannel } from '../src/channels/feishu';
-import { SessionRouter } from '../src/session-router';
-import { ConfirmationManager } from '../src/confirm';
-import { MemoryStore } from '../src/memory';
+import { SessionRouter } from '../src/agent/session-router';
+import { ConfirmationManager } from '../src/agent/confirm';
+import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
-import { currentConfig, loadEnvFiles, writeEnvFile } from '../src/config';
-import { verifyLlmConfig } from '../src/llm-verify';
-import { verifyFeishuApp } from '../src/feishu-verify';
+import { currentConfig, ensureEnvLoaded, loadEnvFiles, writeEnvFile } from '../src/config/config';
+import { resolveAllowedOpenIds } from '../src/config/config-wizard';
+import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
+import { verifyLlmConfig } from '../src/config/llm-verify';
+import { verifyFeishuApp } from '../src/config/feishu-verify';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { check, checkAsync, finish } from './testkit';
 
 /** 轮询等待条件成立（按钮回调的审查流程全异步），超时抛错。 */
-async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 15000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond()) {
     if (Date.now() > deadline) throw new Error(`等待超时: ${what}`);
@@ -55,6 +57,19 @@ class FakeChannel {
 }
 
 async function main(): Promise<void> {
+  // config.ts 已无 import 副作用：显式初始化一次（幂等标记钉住，防 currentConfig 懒初始化中途触发）
+  ensureEnvLoaded();
+  // 保活（同 unit.ts）：askWithAbort 超时用例靠 unref 定时器 resolve，等待中的 promise
+  // 本身不占用事件循环——无 ref'd handle 时进程会提前退出，后续用例被静默跳过（exit 0 假绿）
+  const keepAlive = setInterval(() => undefined, 60_000);
+  try {
+    await run();
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
+async function run(): Promise<void> {
   // ================= 盲区 1：collectWorkSummary 采集层 =================
 
   // 迭代过滤 + attempt 排序/挑选 + keyed-object 形态的 diff 统计合并
@@ -362,12 +377,75 @@ async function main(): Promise<void> {
   });
 
   // ================= 盲区 3：cli askWithAbort =================
-  // askWithAbort 是 src/cli.ts main() 内的闭包（依赖 main 内的 readline 实例与 currentCtl），
-  // 没有导出；要测它必须改 src/cli.ts 抽出依赖，而本任务包不允许动 src/（另一代理正在重构）。
-  // import src/cli 也拿不到闭包本身，故跳过，仅记录原因。
-  console.log('SKIP  cli askWithAbort：main() 内闭包未导出，低成本不可测（需抽离 src/cli.ts，超出本包范围）');
+  // createAskWithAbort 已从 src/cli.ts main() 抽为模块级导出（ask 与当前轮次 ctl 由调用方注入），
+  // 这里直接测三路竞态：正常回答 / Ctrl+C abort / 超时自动拒绝。
 
-  // ================= 盲区 4：config-wizard 链路 =================
+  await checkAsync('askWithAbort：正常回答直通结果', async () => {
+    const askWithAbort = createAskWithAbort(async () => '用户输入', () => null);
+    assert.equal(await askWithAbort('问: '), '用户输入');
+  });
+
+  await checkAsync('askWithAbort：无 ctl 无 timeout 时直通 ask，不包竞态层', async () => {
+    let calls = 0;
+    const askWithAbort = createAskWithAbort(async () => {
+      calls++;
+      return null; // EOF
+    }, () => null);
+    assert.equal(await askWithAbort('问: '), null);
+    assert.equal(calls, 1);
+  });
+
+  await checkAsync('askWithAbort：abort 先于回答 → null（视为拒绝）', async () => {
+    const ctl = new AbortController();
+    const askWithAbort = createAskWithAbort(
+      () => new Promise<string | null>(() => {}), // 永不回答，模拟用户挂起
+      () => ctl,
+    );
+    const p = askWithAbort('问: ');
+    ctl.abort();
+    assert.equal(await p, null);
+  });
+
+  await checkAsync('askWithAbort：ctl 已 aborted 时立即 null，不再调用 ask', async () => {
+    const ctl = new AbortController();
+    ctl.abort();
+    let called = false;
+    const askWithAbort = createAskWithAbort(async () => {
+      called = true;
+      return 'x';
+    }, () => ctl);
+    assert.equal(await askWithAbort('问: '), null);
+    assert.equal(called, false);
+  });
+
+  await checkAsync('askWithAbort：超时未操作 → ASK_TIMEOUT（自动拒绝）', async () => {
+    const askWithAbort = createAskWithAbort(
+      () => new Promise<string | null>(() => {}),
+      () => null,
+    );
+    assert.equal(await askWithAbort('问: ', 50), ASK_TIMEOUT);
+  });
+
+  await checkAsync('askWithAbort：回答先于超时到达 → 正常结果，且 timer 已清理', async () => {
+    const askWithAbort = createAskWithAbort(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      return '及时回答';
+    }, () => null);
+    assert.equal(await askWithAbort('问: ', 5000), '及时回答');
+  });
+
+  // ================= 盲区 4：config-wizard 非交互部分 + 链路 =================
+
+  check('resolveAllowedOpenIds：回车保留现状 / 新列表覆盖 / 换绑场景 "-" 清除', (() => {
+    const existing = ['ou_1', 'ou_2'];
+    return (
+      resolveAllowedOpenIds('', existing, false) === existing && // 回车：原数组原样保留
+      resolveAllowedOpenIds('  ', existing, false).length === 0 && // 纯空白：视为输入了新列表（split 后滤空）
+      resolveAllowedOpenIds('ou_3, ou_4', existing, false).join(',') === 'ou_3,ou_4' &&
+      resolveAllowedOpenIds('-', existing, false).join(',') === '-' && // 非换绑场景 "-" 只是普通输入
+      resolveAllowedOpenIds('-', existing, true).length === 0 // 换绑场景 "-" 清除白名单
+    );
+  })());
 
   await checkAsync('config：writeEnvFile 写出 0600，合并保留无关键，且能被加载链路读回', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-env-'));

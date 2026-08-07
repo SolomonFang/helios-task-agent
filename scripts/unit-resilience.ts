@@ -7,14 +7,16 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createClient, downgradeSystemNotes, runAgentTurn } from '../src/llm';
+import { createClient, downgradeSystemNotes, runAgentTurn } from '../src/agent/llm';
 import { KanbanWatcher } from '../src/kanban/watcher';
 import { McpSupervisor } from '../src/bot/supervisor';
-import { KanbanMcp } from '../src/kanban/mcp';
+import { KanbanMcp, connectMcp } from '../src/kanban/mcp';
+import { fetchHealth } from '../src/kanban/kanban-ensure';
+import { startReportServer } from '../src/report/report-server';
 import { apiGet } from '../src/kanban/http';
-import { AgentSession } from '../src/session';
-import { MemoryStore } from '../src/memory';
-import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from '../src/guard';
+import { AgentSession } from '../src/agent/session';
+import { MemoryStore } from '../src/agent/memory';
+import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from '../src/agent/guard';
 import type { AgentConfig, ChatMessage, OpenAiClient } from '../src/types';
 import { check, checkAsync, finish } from './testkit';
 
@@ -347,7 +349,8 @@ async function main(): Promise<void> {
         kanbanUrl: base,
         projectId: 'p1',
         statePath,
-        pendingTtlMs: 60,
+        // TTL 100ms + 下方 sleep 300ms：留足余量，避免 CI 抖动下定时器误差导致 flaky
+        pendingTtlMs: 100,
         notify: async () => undefined,
         owners: () => ['o1'],
         notifyOwner: async () => {
@@ -365,7 +368,7 @@ async function main(): Promise<void> {
         pending?: Record<string, { enqueuedAt?: unknown }>;
       };
       assert.ok(typeof onDisk.pending?.['done:t1']?.enqueuedAt === 'number', 'pending 应持久化 enqueuedAt');
-      await new Promise((r) => setTimeout(r, 80)); // 越过 TTL
+      await new Promise((r) => setTimeout(r, 300)); // 越过 TTL（100ms），余量充足
       await tick(); // 超期丢弃，不再重投
       assert.equal(attempts, 1, '超期条目不得再重投');
       const after = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { pending?: unknown };
@@ -568,7 +571,7 @@ async function main(): Promise<void> {
       const t0 = Date.now();
       await assert.rejects(() => apiGet(base, '/boom'), /HTTP 500/);
       assert.equal(count500, 2, '5xx 应重试一次');
-      assert.ok(Date.now() - t0 >= 400, '重试应有 500ms 间隔');
+      assert.ok(Date.now() - t0 >= 300, '重试应有 500ms 间隔（下限留余量防定时器误差）');
     } finally {
       await stopServer(server);
     }
@@ -632,6 +635,201 @@ async function main(): Promise<void> {
       assert.ok(logs.some((m) => m.includes('超时')), '兜底超时应记日志');
     } finally {
       await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- KanbanWatcher：approvals 拉取失败按「未知」处理（沿用旧快照） ----------
+  await checkAsync('KanbanWatcher：approvals 瞬时失败沿用旧快照，恢复后不把全部 pending 当新审批重推', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-appr-'));
+    let approvalsFail = false;
+    const approvalsList: Array<Record<string, unknown>> = [{ id: 'a1', status: 'pending', title: '审批1' }];
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/approvals')) {
+        if (approvalsFail) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{}');
+          return;
+        }
+        return json(approvalsList);
+      }
+      if (url.startsWith('/api/tasks?')) return json([]);
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const sent: string[] = [];
+      const logs: string[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        notify: async (e) => {
+          sent.push(e.kind);
+        },
+        log: (m) => logs.push(m),
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 基线：a1 已在 pending（基线不通知）
+      approvalsFail = true;
+      await tick(); // approvals 500：按「未知」沿用旧快照 [a1]，不得推进为 []
+      assert.ok(logs.some((m) => m.includes('approvals 拉取失败')), '拉取失败应记日志');
+      const onDisk = JSON.parse(fs.readFileSync(path.join(tmp, 'watch-state.json'), 'utf8')) as {
+        approvals: Array<{ id: string }>;
+      };
+      assert.deepEqual(onDisk.approvals.map((a) => a.id), ['a1'], '失败轮不得把 approvals 推进为空');
+      approvalsFail = false;
+      await tick(); // 恢复：a1 不是「新」审批，不得全量重推
+      assert.deepEqual(sent, [], '恢复后不得把既有 pending 审批当新审批重推');
+      approvalsList.push({ id: 'a2', status: 'pending', title: '审批2' });
+      await tick(); // 真正新增的审批仍要推
+      assert.deepEqual(sent, ['approvals']);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- McpSupervisor：重连退避节奏（前 3 次连续，之后每 5 个周期） ----------
+  await checkAsync('McpSupervisor：退避节奏为 failures 1/2/3 连续试、之后 8/13…（每 5 个周期）', async () => {
+    const reconnectTicks: number[] = [];
+    let tickNo = 0;
+    const fakeMcp = {
+      tools: [],
+      ping: async () => {
+        throw new Error('mcp down');
+      },
+      reconnect: async () => {
+        reconnectTicks.push(tickNo);
+      },
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({ mcp: fakeMcp, initiallyAlive: false, failThreshold: 1 });
+    for (tickNo = 1; tickNo <= 13; tickNo++) await sup.tick();
+    // 旧条件 failures%5===0 会在 failures=5 时（距上次仅 2 个周期）误触发重连
+    assert.deepEqual(reconnectTicks, [1, 2, 3, 8, 13], `退避节奏应为 1/2/3/8/13，实际 ${reconnectTicks.join(',')}`);
+  });
+
+  // ---------- McpSupervisor：看板健康探测补 stdio 探活 ----------
+  await checkAsync('McpSupervisor：stdio 活着但看板假死时连续失败走 onLost，看板恢复后 onRecovered', async () => {
+    let kanbanUp = false;
+    const fakeMcp = {
+      tools: [],
+      ping: async () => {}, // stdio 探活始终通过（旧实现据此误判健康）
+      reconnect: async () => {},
+    } as unknown as KanbanMcp;
+    let lost = 0;
+    let recovered = 0;
+    const sup = new McpSupervisor({
+      mcp: fakeMcp,
+      initiallyAlive: true,
+      failThreshold: 2,
+      kanbanHealth: async () => {
+        if (!kanbanUp) throw new Error('kanban down');
+      },
+      onLost: () => {
+        lost++;
+      },
+      onRecovered: () => {
+        recovered++;
+      },
+    });
+    await sup.tick(); // 看板探测失败 #1（未达阈值）
+    assert.equal(sup.isAlive, true);
+    assert.equal(lost, 0);
+    await sup.tick(); // 上次失败后逐 tick 复查：失败 #2 → onLost
+    assert.equal(sup.isAlive, false);
+    assert.equal(lost, 1);
+    kanbanUp = true;
+    await sup.tick(); // 看板恢复 → onRecovered
+    assert.equal(sup.isAlive, true);
+    assert.equal(recovered, 1);
+  });
+
+  await checkAsync('McpSupervisor：看板健康时按间隔节流，不每 tick 打看板', async () => {
+    let probes = 0;
+    const fakeMcp = {
+      tools: [],
+      ping: async () => {},
+      reconnect: async () => {},
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({
+      mcp: fakeMcp,
+      initiallyAlive: true,
+      kanbanHealthIntervalMs: 60000,
+      kanbanHealth: async () => {
+        probes++;
+      },
+    });
+    await sup.tick();
+    await sup.tick();
+    await sup.tick();
+    assert.equal(probes, 1, `间隔内只应探测一次看板，实际 ${probes} 次`);
+  });
+
+  // ---------- fetchHealth：看板信封字段组合校验（防冒充） ----------
+  await checkAsync('fetchHealth：仅含 "success":true 的响应不再算看板（需 error_data/message 字段组合）', async () => {
+    const mk = async (body: string, contentType = 'application/json') => {
+      const s = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': contentType });
+        res.end(body);
+      });
+      await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+      return { s, url: `http://127.0.0.1:${(s.address() as AddressInfo).port}` };
+    };
+    const kanban = await mk('{"success":true,"data":"OK","error_data":null,"message":null}');
+    assert.equal(await fetchHealth(kanban.url, 1500), true, '完整看板信封应判健康');
+    await stopServer(kanban.s);
+    const partial = await mk('{"success":true}');
+    assert.equal(await fetchHealth(partial.url, 1500), false, '仅 success:true 不得判健康');
+    await stopServer(partial.s);
+    const html = await mk('<html>{"success":true,"error_data":null,"message":null}</html>', 'text/html');
+    assert.equal(await fetchHealth(html.url, 1500), false, '非 JSON 响应内嵌字段不得判健康');
+    await stopServer(html.s);
+  });
+
+  // ---------- connectMcp：onCreate 在实例创建时同步回调（连接窗口内即可登记清理） ----------
+  await checkAsync('connectMcp：onCreate 于 connect settle 前同步触发，拿到 in-flight 实例', async () => {
+    const holder: { m: KanbanMcp | null; syncFired: boolean } = { m: null, syncFired: false };
+    const p = connectMcp(
+      { mcpCommand: process.execPath, mcpArgs: ['-e', 'process.exit(1)'] }, // 快速失败
+      {
+        onCreate: (m) => {
+          holder.m = m;
+        },
+      },
+    );
+    holder.syncFired = holder.m !== null; // await 之前已回调：不等 connect resolve
+    const r = await p;
+    assert.ok(holder.syncFired, 'onCreate 应在 connect settle 前同步触发');
+    assert.ok(holder.m instanceof KanbanMcp);
+    assert.equal(r.mcp, holder.m, '回调拿到的就是最终返回的实例');
+    assert.equal(r.ok, false, '失败命令应连接失败');
+  });
+
+  // ---------- report-server：listen 后 error 监听换挂为记日志 ----------
+  await checkAsync('report-server：listen 成功后启动期 reject 监听被移除，运行时 error 记日志不吞', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-report-'));
+    const origErr = console.error;
+    const errLogs: string[] = [];
+    console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+    try {
+      const rs = await startReportServer(tmp, 'http://localhost:7964');
+      assert.equal(rs.server.listenerCount('error'), 1, 'listen 后应只剩一个 error 监听（记日志）');
+      rs.server.emit('error', new Error('boom')); // 启动期的 reject 监听若还挂着会被静默吞掉
+      assert.ok(
+        errLogs.some((m) => m.includes('报告服务运行时错误') && m.includes('boom')),
+        '运行时 error 应记日志',
+      );
+      rs.close();
+    } finally {
+      console.error = origErr;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

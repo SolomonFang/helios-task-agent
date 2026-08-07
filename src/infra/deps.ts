@@ -1,19 +1,28 @@
 import { execFile, execFileSync } from 'child_process';
 
-/** Shared dependency probe: is lark-cli installed and runnable? */
-export function checkLarkCli(): boolean {
+/**
+ * 同步探测助手：同一 try/catch execFileSync 模板的一处收口，公开探针均为一行包装。
+ *
+ * 为什么同步/异步双形态都要保留（唯二形态的唯一解释在此）：
+ * 启动早期路径（cli/bot main 开头、配置向导、横幅渲染）处于无法 await 的同步上下文，
+ * 只能用 execFileSync；而事件循环内路径（/status、bot 消息回调）若串行同步探测，
+ * 最坏阻塞事件循环十几秒，飞书回调/心跳全被卡住——故另有 probeAsync 一系。
+ * 两形态探测同一组命令、同一超时，语义必须保持一致。
+ */
+function probeSync(cmd: string, args: string[], timeoutMs = 5000): string | null {
   try {
-    execFileSync('lark-cli', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    return true;
+    return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, encoding: 'utf8' });
   } catch {
-    return false;
+    return null;
   }
 }
 
-/**
- * 异步探测（/status 等事件循环内路径用）：与同步版同一组命令，
- * 但不阻塞事件循环——同步探测串起来最坏阻塞十几秒，飞书回调/心跳全被卡住。
- */
+/** Shared dependency probe: is lark-cli installed and runnable? */
+export function checkLarkCli(): boolean {
+  return probeSync('lark-cli', ['--version']) !== null;
+}
+
+/** 异步探测助手（事件循环内路径用；为何需要同步/异步双形态见上方 probeSync 注释）。 */
 function probeAsync(cmd: string, args: string[], timeoutMs = 5000): Promise<string | null> {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 }, (err, stdout) => {
@@ -77,16 +86,9 @@ export type LarkCliStatus = 'missing' | 'unauthorized' | 'ok';
  * 启动早期同步上下文使用（无法 await）；事件循环内路径请用 probeLarkCliAuthAsync。
  */
 export function probeLarkCliAuth(): 'unauthorized' | 'ok' {
-  try {
-    const out = execFileSync('lark-cli', ['auth', 'status'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 3000,
-      encoding: 'utf8',
-    });
-    return parseLarkCliAuth(out);
-  } catch {
-    return 'unauthorized';
-  }
+  const out = probeSync('lark-cli', ['auth', 'status'], 3000);
+  if (out === null) return 'unauthorized';
+  return parseLarkCliAuth(out);
 }
 
 /** lark-cli 三态探测：先查二进制（checkLarkCli），存在再查授权。 */
@@ -97,12 +99,7 @@ export function checkLarkCliStatus(): LarkCliStatus {
 
 /** ocr（open-code-review）是否可用：PATH 上的 `ocr`；缺失时 AI 审查会自动走 npx 拉取。 */
 export function checkOcrCli(): boolean {
-  try {
-    execFileSync('ocr', ['version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return probeSync('ocr', ['version']) !== null;
 }
 
 /** ocr 缺失时的提示文案（AI 审查仍可走 npx 兜底，仅首次较慢）。 */
@@ -111,22 +108,12 @@ export const OCR_INSTALL_HINT =
 
 /** jq 是否可用：hk_cli 降级链（hk.sh）解析 API 响应所必需，缺失时 hk.sh 直接退出。 */
 export function checkJq(): boolean {
-  try {
-    execFileSync('jq', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return probeSync('jq', ['--version']) !== null;
 }
 
 /** curl 是否可用：hk_cli 降级链（hk.sh）发起 HTTP 请求所必需。 */
 export function checkCurl(): boolean {
-  try {
-    execFileSync('curl', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return probeSync('curl', ['--version']) !== null;
 }
 
 /** hk_cli 降级链依赖探测：返回缺失的工具名（空数组 = 降级链可用）。 */
