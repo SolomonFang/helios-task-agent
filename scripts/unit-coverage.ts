@@ -25,23 +25,7 @@ import { verifyLlmConfig } from '../src/llm-verify';
 import { verifyFeishuApp } from '../src/feishu-verify';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import { errMessage } from '../src/err';
-
-let failures = 0;
-const check = (name: string, ok: boolean, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-  if (!ok) failures++;
-};
-
-/** try/catch 包装：异常即 FAIL。 */
-async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    check(name, true);
-  } catch (err) {
-    check(name, false, errMessage(err));
-  }
-}
+import { check, checkAsync, finish } from './testkit';
 
 /** 轮询等待条件成立（按钮回调的审查流程全异步），超时抛错。 */
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
@@ -347,9 +331,11 @@ async function main(): Promise<void> {
         assert.ok(resultNotify.text.includes('审查任务标题'));
         assert.ok(resultNotify.text.includes('AI-REVIEW-STUB-RESULT'), '结果应含 ocr 输出原文');
         // 结果注入会话（pendingNotes 缓存到轮边界），供用户追问「按审查意见修一下」
-        const notes = (router.getOrCreate('u1') as unknown as { pendingNotes: string[] }).pendingNotes;
+        const notes = (router.getOrCreate('u1') as unknown as { pendingNotes: Array<{ text: string }> }).pendingNotes;
         assert.ok(
-          notes.some((n) => n.includes('AI 审查完成') && n.includes('审查任务标题') && n.includes('AI-REVIEW-STUB-RESULT')),
+          notes.some(
+            (n) => n.text.includes('AI 审查完成') && n.text.includes('审查任务标题') && n.text.includes('AI-REVIEW-STUB-RESULT'),
+          ),
           `审查结果应注入会话，实际：${JSON.stringify(notes)}`,
         );
 
@@ -499,8 +485,7 @@ async function main(): Promise<void> {
     check('feishu-verify 测试后全局 fetch 已恢复', globalThis.fetch === origFetch);
   });
 
-  console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
-  process.exit(failures ? 1 : 0);
+  finish();
 }
 
 void main();

@@ -2,9 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
-// MCP 降级口径文案：与 src/ui.ts 的 MCP_FALLBACK_TEXT 保持一致。
-// kanban 层不反向依赖 ui 层，故此处保留内联副本；改动文案时两处需同步。
-const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
+import { MCP_FALLBACK_TEXT } from '../deps';
 
 export class KanbanMcp {
   readonly command: string;
@@ -12,6 +10,12 @@ export class KanbanMcp {
   private client: Client | null = null;
   /** 子进程 stderr 尾部（连接失败时用于诊断已知模式，如端口文件缺失）。 */
   private stderrTail = '';
+  /**
+   * close 请求挂起标志：connect 在途时 close() 因 client===null 本会成为 no-op，
+   * connect 随后完成会留下无人持有的 stdio 子进程（supervisor.stop 竞速超时路径）。
+   * close() 置位后，connect 完成时立即自我关闭。
+   */
+  private closePending = false;
   tools: Tool[] = [];
 
   constructor({ command, args }: { command: string; args: string[] }) {
@@ -20,6 +24,7 @@ export class KanbanMcp {
   }
 
   async connect({ timeoutMs = 30000 }: { timeoutMs?: number } = {}): Promise<Tool[]> {
+    this.closePending = false;
     this.stderrTail = '';
     const transport = new StdioClientTransport({
       command: this.command,
@@ -41,6 +46,12 @@ export class KanbanMcp {
       const { tools } = await client.listTools();
       this.tools = tools || [];
       this.client = client;
+      if (this.closePending) {
+        // connect 在途期间收到 close()（如 supervisor.stop 竞速超时后进程退出）：
+        // 立即关闭刚建立的连接，不留孤儿 stdio 子进程
+        this.closePending = false;
+        await this.close();
+      }
       return this.tools;
     } catch (err) {
       // 快速失败路径（connect 在超时前 reject）：超时定时器尚未触发，transport 未关闭，
@@ -91,6 +102,8 @@ export class KanbanMcp {
   }
 
   async close(): Promise<void> {
+    // 置位挂起标志：connect 在途时本轮 close 拿不到 client，由 connect 完成后自我关闭兜底
+    this.closePending = true;
     if (this.client) {
       try {
         await this.client.close();

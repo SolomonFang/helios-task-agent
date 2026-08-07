@@ -18,7 +18,7 @@ function printHelp() {
   helios-task-agent               启动终端交互 agent
   helios-task-agent bot           启动飞书私聊机器人（长连接）
   helios-task-agent bot --rebind  换绑飞书机器人（只重跑飞书凭证向导）
-  helios-task-agent bot --reconfig  重跑完整配置向导（换模型/Base URL/Key）
+  helios-task-agent bot --reconfig  重跑模型/看板配置向导（飞书凭证保留）
   helios-task-agent-bot           等同 helios-task-agent bot
   helios-task-agent help          显示本帮助
   helios-task-agent --version     显示版本号

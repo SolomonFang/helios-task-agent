@@ -10,7 +10,7 @@
  */
 
 export interface KanbanApiOptions {
-  /** 默认 15000ms；传入 signal 时以调用方 signal 为准（不再套超时）。 */
+  /** 默认 15000ms；传入 signal 时与超时组合，任一触发即中断（signal 不再绕过超时兜底）。 */
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -32,6 +32,21 @@ function envelopeData(json: unknown): unknown {
   return json;
 }
 
+/**
+ * 组合调用方 signal 与超时兜底：任一触发即中断。
+ * AbortSignal.any 需 Node 20+（engines 要求 >=18），这里手写等价组合：
+ * 挂起的监听器随 timeout 信号到点释放，不会无限滞留。
+ */
+function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeout;
+  if (signal.aborted) return signal;
+  const ctl = new AbortController();
+  signal.addEventListener('abort', () => ctl.abort(), { once: true });
+  timeout.addEventListener('abort', () => ctl.abort(), { once: true });
+  return ctl.signal;
+}
+
 async function request(
   kanbanUrl: string,
   p: string,
@@ -41,17 +56,23 @@ async function request(
   const base = kanbanUrl.replace(/\/+$/, '');
   const res = await fetch(`${base}/api${p}`, {
     ...init,
-    signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? 15000),
+    signal: combinedSignal(opts.signal, opts.timeoutMs ?? 15000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return envelopeData(await res.json());
 }
 
-/** GET /api&lt;p&gt;，返回信封 data。瞬时失败间隔 500ms 轻量重试 1 次（GET 幂等）；写操作不重试。 */
+/** 中断错误（调用方 signal / 超时兜底触发）：重试无意义，直接抛。 */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
+}
+
+/** GET /api&lt;p&gt;，返回信封 data。瞬时失败间隔 500ms 轻量重试 1 次（GET 幂等）；中断与 HTTP 4xx 不重试；写操作不重试。 */
 export async function apiGet(kanbanUrl: string, p: string, opts: KanbanApiOptions = {}): Promise<unknown> {
   try {
     return await request(kanbanUrl, p, {}, opts);
-  } catch {
+  } catch (err) {
+    if (isAbortError(err) || (err instanceof Error && /^HTTP 4\d\d\b/.test(err.message))) throw err;
     await new Promise((r) => setTimeout(r, 500));
     return request(kanbanUrl, p, {}, opts);
   }

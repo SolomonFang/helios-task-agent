@@ -96,7 +96,7 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 - Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
 - With `HELIOS_KANBAN_PROJECT_ID`, watches that project only  
 - `KANBAN_WATCH=0` off; `KANBAN_WATCH_INTERVAL_SEC` (min 15)
-- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*` — note the ocr subprocess receives your LLM key as `OCR_LLM_TOKEN`), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
+- AI review: if `ocr` is not installed it is pulled via `npx` automatically (version pinned, override with `OCR_PACKAGE`; first run is slow); the LLM defaults to the bot's model config (derived `OCR_LLM_*` — note the ocr subprocess receives your LLM key as `OCR_LLM_TOKEN`; set a dedicated `OCR_LLM_TOKEN` env var to override and keep the main key isolated), and an explicit `OCR_LLM_URL` or an existing `~/.opencodereview/config.json` takes precedence; overall timeout 15 minutes; the report server listens on a random free port and link hostnames follow `HELIOS_KANBAN_URL` (same reachability as kanban links), valid while the process lives; historical reports are cleaned up after 30 days
 
 > **Phone reachability**: the kanban links and AI-review report links in pushed cards point at the machine running the bot. With the default `HELIOS_KANBAN_URL=http://localhost:7964`, these links **only work on that machine — they are dead links on your phone** (the bot logs a warning about this at startup). To review from your phone, set `HELIOS_KANBAN_URL` to the machine's LAN IP or Tailscale address (the board and report server must be reachable at that address). Report URLs carry a random token, and the report server binds `127.0.0.1` by default — set `HELIOS_REPORT_HOST` explicitly only if you really need to expose it.
 
@@ -134,7 +134,7 @@ helios-task-agent-bot
 2. Open Platform: long connection + `im.message.receive_v1`  
 3. DM only (p2p); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
 
-**Reconfigure**: to switch model / Base URL / API key, run `helios-task-agent bot --reconfig` to re-run the full config wizard — no hand-editing of `.env` needed; editing `~/.helios-task-agent/.env` directly also works. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
+**Reconfigure**: to switch model / Base URL / API key, run `helios-task-agent bot --reconfig` to re-run the model/kanban config wizard (Feishu credentials are kept) — no hand-editing of `.env` needed; editing `~/.helios-task-agent/.env` directly also works. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
 
 ## Commands
 
@@ -143,7 +143,7 @@ helios-task-agent-bot
 | `helios-task-agent` | Interactive terminal agent |
 | `helios-task-agent bot` | Feishu DM bot (wizard if unconfigured) |
 | `helios-task-agent bot --rebind` | Rebind / switch the Feishu bot (Feishu credential wizard only) |
-| `helios-task-agent bot --reconfig` | Re-run the full config wizard (model / Base URL / API key) |
+| `helios-task-agent bot --reconfig` | Re-run the model/kanban config wizard (Feishu credentials kept; model / Base URL / API key) |
 | `helios-task-agent-bot` | Same as `bot` (also supports `--rebind` / `--reconfig`) |
 | `helios-task-agent help` / `-h` / `--help` | Help |
 | `helios-task-agent --version` / `-v` | Show version |
@@ -152,7 +152,9 @@ Local: `npm start` / `npm run bot`.
 
 ## Adding skills
 
-Doc-style skills: drop a `SKILL.md` with frontmatter into `<data-dir>/skills/<skill-name>/` — scanned at startup, no code change needed. The data dir is `HELIOS_TASK_AGENT_HOME` or `~/.helios-task-agent` (alongside `.env` and memory); custom skills live here so `npm i -g` upgrades never wipe them. Scan order: **user data dir first, bundled `skills/` as built-in fallback** — a same-named user skill wins. The frontmatter is the skill contract:
+Doc-style skills: drop a `SKILL.md` with frontmatter into `<data-dir>/skills/<skill-name>/` — scanned at startup, no code change needed. The data dir is `HELIOS_TASK_AGENT_HOME` or `~/.helios-task-agent` (alongside `.env` and memory); custom skills live here so `npm i -g` upgrades never wipe them. Scan order: **user data dir first, bundled `skills/` as built-in fallback** — a same-named user skill wins.
+
+Install and uninstall have official entry points (same in CLI and Feishu bot): `/skills install <skill-dir-path>` copies a local skill directory into the data dir (installing over an existing name updates it), and `/skills uninstall <name>` removes a skill (bundled built-in skills cannot be uninstalled). Do **not** put custom skills into the bundled `skills/` (the npm install directory — upgrades replace the whole directory); skills previously misplaced there are auto-migrated to the data dir at startup, with a printed notice. The frontmatter is the skill contract:
 
 ```markdown
 ---
@@ -180,7 +182,7 @@ via the `skill_doc` tool (progressive disclosure).
 |----------|---------|
 | `LLM_*` | Required (wizard can write) |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | Required for bot |
-| `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner |
+| `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner (first-come-first-served — anyone who can find the bot could claim it, so configure it explicitly) |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
 | `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@0.1.39 --mcp` |
@@ -188,6 +190,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
+| `OCR_LLM_TOKEN` | Dedicated LLM key for AI review; when set it wins over the derived bot key (keeps your main key away from the third-party ocr subprocess), URL/model still fall back to the bot config |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | Optional defaults; `PROJECT_ID` scopes bot watch |
 | `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |

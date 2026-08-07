@@ -3,7 +3,7 @@ import fs from 'fs';
 import { execFile } from 'child_process';
 import type { KanbanMcp } from './kanban/mcp';
 import type { MemoryStore } from './memory';
-import type { OpenAiTool, ToolHandler, ToolHandlers, UserMemory } from './types';
+import type { OpenAiTool, ToolHandler, ToolHandlers } from './types';
 import { runRepoFs } from './repo-fs';
 import {
   classifyHk,
@@ -901,16 +901,13 @@ function makeMemoryHandlers({
       return gate.message;
     }
     try {
-      // setFact 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
-      const user = memory.setFact(uid, key, value) as unknown as UserMemory & { ok?: boolean; error?: string };
-      if (user.ok === false) {
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-        return JSON.stringify({ ok: false, error: user.error || '记忆写入落盘失败，未持久化' });
-      }
+      const user = memory.setFact(uid, key, value);
       onMemoryChange?.();
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
       return JSON.stringify({ ok: true, key: key.trim(), value, facts: user.facts });
     } catch (err) {
+      // setFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
       return `memory_set 失败: ${errMessage(err)}`;
     }
   };
@@ -938,10 +935,16 @@ function makeMemoryHandlers({
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
-    const ok = memory.deleteFact(uid, key);
-    if (ok) onMemoryChange?.();
-    auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok }, auditHome);
-    return JSON.stringify({ ok, key });
+    try {
+      const ok = memory.deleteFact(uid, key);
+      if (ok) onMemoryChange?.();
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok }, auditHome);
+      return JSON.stringify({ ok, key });
+    } catch (err) {
+      // deleteFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
+      return `memory_delete 失败: ${errMessage(err)}`;
+    }
   };
 
   const memoryNote: ToolHandler = async (raw) => {
@@ -955,16 +958,13 @@ function makeMemoryHandlers({
       return gate.message;
     }
     try {
-      // addNote 在 persist 失败时返回 { ok: false, ... }（不抛异常）：失败如实透传，不谎报 ok:true
-      const user = memory.addNote(uid, text) as unknown as UserMemory & { ok?: boolean; error?: string };
-      if (user.ok === false) {
-        auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-        return JSON.stringify({ ok: false, error: user.error || '记忆备注落盘失败，未持久化' });
-      }
+      const user = memory.addNote(uid, text);
       onMemoryChange?.();
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
       return JSON.stringify({ ok: true, notes: user.notes });
     } catch (err) {
+      // addNote 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
       return `memory_note 失败: ${errMessage(err)}`;
     }
   };

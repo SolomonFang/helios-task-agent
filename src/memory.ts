@@ -168,7 +168,8 @@ export class MemoryStore {
     delete user.facts[key];
     user.updatedAt = new Date().toISOString();
     this.journalFact(userId, key, null);
-    this.persist();
+    // 与 setFact/addNote 一致：持久化失败显式报错，不假装「已忘记」
+    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
     return true;
   }
 

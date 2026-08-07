@@ -41,10 +41,14 @@ async function main(): Promise<void> {
       data.sender!.sender_type = senderType;
       assert.equal(filterIncomingMessage(data), null, `sender_type=${senderType} 应被忽略`);
     }
-    // sender_type 缺失（旧事件格式）按真人处理，与重构前一致
+    // sender_type 缺失视为不可信，同样丢弃（不再按真人放行）
     const noType = mkP2pMessage();
     delete noType.sender!.sender_type;
-    assert.ok(filterIncomingMessage(noType), 'sender_type 缺失应放行');
+    assert.equal(filterIncomingMessage(noType), null, 'sender_type 缺失应丢弃');
+    // sender 整体缺失同样丢弃
+    const noSender = mkP2pMessage();
+    delete noSender.sender;
+    assert.equal(filterIncomingMessage(noSender), null, 'sender 缺失应丢弃');
   });
 
   await checkAsync('filter：缺 chat_id / message_id / open_id 的事件被丢弃', async () => {

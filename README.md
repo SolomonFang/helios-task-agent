@@ -97,7 +97,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`——可用独立的 `OCR_LLM_TOKEN` 环境变量覆盖以隔离主 key），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口，链接主机名取 `HELIOS_KANBAN_URL`（与看板链接可达性一致），进程存活期间有效，历史报告 30 天自动清理
 
 > **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）；如需在手机上点按钮审查，请把 `HELIOS_KANBAN_URL` 配置为该机器的局域网 IP 或 Tailscale 地址（看板与报告服务需同步可从该地址访问）。报告 URL 带随机 token，且报告服务默认只绑 `127.0.0.1`——确需对外暴露时显式设置 `HELIOS_REPORT_HOST`。
 
@@ -137,7 +137,7 @@ helios-task-agent-bot
 
 无需公网 Webhook。进程在线才能收消息；常驻运行可用 `pm2 start helios-task-agent -- bot`（或任何进程守护方式）。
 
-**改配置**：换模型 / Base URL / API Key 用 `helios-task-agent bot --reconfig` 重跑完整配置向导，不用手编 `.env`；也可直接编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——绑错机器人要换绑时用 `helios-task-agent bot --rebind`（只重跑飞书凭证向导，模型/看板配置保留；白名单可输入 `-` 清除）。终端可用 `/config` 改模型与看板地址。
+**改配置**：换模型 / Base URL / API Key 用 `helios-task-agent bot --reconfig` 重跑模型/看板配置向导（飞书凭证保留），不用手编 `.env`；也可直接编辑 `~/.helios-task-agent/.env`。bot **没有** `/config`；凭证已存在时重跑 bot **不会**再进向导——绑错机器人要换绑时用 `helios-task-agent bot --rebind`（只重跑飞书凭证向导，模型/看板配置保留；白名单可输入 `-` 清除）。终端可用 `/config` 改模型与看板地址。
 
 ## 命令
 
@@ -146,7 +146,7 @@ helios-task-agent-bot
 | `helios-task-agent` | 交互式终端 Agent |
 | `helios-task-agent bot` | 飞书私聊机器人（缺凭证则向导） |
 | `helios-task-agent bot --rebind` | 换绑飞书机器人（只重跑飞书凭证向导） |
-| `helios-task-agent bot --reconfig` | 重跑完整配置向导（换模型/Base URL/Key 不用手编 `.env`） |
+| `helios-task-agent bot --reconfig` | 重跑模型/看板配置向导，飞书凭证保留（换模型/Base URL/Key 不用手编 `.env`） |
 | `helios-task-agent-bot` | 同 `bot`（同样支持 `--rebind` / `--reconfig`） |
 | `helios-task-agent help` / `-h` / `--help` | 帮助 |
 | `helios-task-agent --version` / `-v` | 查看版本 |
@@ -184,7 +184,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 |------|------|
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 必填（向导可写） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | bot 必填（向导可写） |
-| `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；**留空则首个私聊用户成为 owner** |
+| `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；**留空则首个私聊用户成为 owner**（先聊先得，机器人可被他人搜到时存在被抢占风险，建议显式配置） |
 | `HELIOS_KANBAN_URL` | 看板地址，默认 `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | 默认开；本机看板未就绪时自动拉起；`0` 关闭 |
 | `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@0.1.39 --mcp` |
@@ -192,6 +192,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HELIOS_KANBAN_HOST` | 自动拉起看板的监听地址，默认 `127.0.0.1`（看板 Web/API 无鉴权，谨慎改为 `0.0.0.0`） |
 | `HELIOS_REPORT_HOST` | AI 审查报告静态服务的监听地址，默认 `127.0.0.1`（**不跟随** `HELIOS_KANBAN_HOST`；报告含代码 diff，确需对外暴露才改） |
 | `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |
+| `OCR_LLM_TOKEN` | AI 审查专用 LLM key；设置后优先于机器人主 key 派生（避免把主 key 交给第三方 ocr 子进程），URL/模型仍回退机器人配置 |
 | `HELIOS_KANBAN_PROJECT_ID` / `REPO_ID` / `ITERATION` | 可选默认；设了 `PROJECT_ID` 时 bot 推送只盯该项目 |
 | `HELIOS_TASK_AGENT_HOME` | 数据目录，默认 `~/.helios-task-agent` |
 | `HELIOS_TASK_AGENT_ENV` | 强制 `.env` 路径（写入目标；加载优先级最高） |
@@ -258,7 +259,7 @@ npm run test:e2e   # mock 链路，不需真实 LLM
 npm run build
 ```
 
-也可作为库嵌入（见 `src/index.ts` 导出）。
+也可作为库嵌入（导出见 GitHub 上的 [`src/index.ts`](https://github.com/SolomonFang/helios-task-agent/blob/main/src/index.ts)，发布包内对应 `dist/index.d.ts`）。
 
 ## 发布（维护者）
 

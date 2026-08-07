@@ -74,13 +74,15 @@ export interface KanbanWatcherOptions {
   projectId?: string;
   intervalMs?: number;
   statePath: string;
-  notify: (event: WatchEvent) => Promise<void>;
+  notify: (event: WatchEvent, eventId: string) => Promise<void>;
   /** 可选：推送目标 owner 列表。与 notifyOwner 同时提供时启用 (事件, owner) 粒度送达追踪。 */
   owners?: () => string[];
   /** 可选：单 owner 推送。缺省时回退 notify 整批推送（事件粒度追踪，占位 owner ''）。 */
-  notifyOwner?: (event: WatchEvent, owner: string) => Promise<void>;
+  notifyOwner?: (event: WatchEvent, owner: string, eventId: string) => Promise<void>;
   /** 待重投条目的存活时间（默认 24h）：超时未送达丢弃并记日志，防 pending 无界增长。 */
   pendingTtlMs?: number;
+  /** stop() 等待在途 tick 的兜底超时（默认 5s）：超时后照常返回，避免拖累整体退出。 */
+  stopTimeoutMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -102,9 +104,18 @@ export class KanbanWatcher {
     this.timer.unref();
   }
 
-  stop(): void {
+  /**
+   * 停止轮询并等待在途 tick 结束（带兜底超时）：否则 shutdown 后在途 tick
+   * 仍可能向已关闭的 channel 推送。
+   */
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    const deadline = Date.now() + (this.opts.stopTimeoutMs ?? 5000);
+    while (this.polling && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (this.polling) this.opts.log?.('stop 等待在途轮询超时，继续关闭流程');
   }
 
   private load(): WatchState | null {
@@ -293,12 +304,12 @@ export class KanbanWatcher {
     const perOwner = Boolean(this.opts.notifyOwner && this.opts.owners);
     const ownerList = perOwner ? this.opts.owners!() : [''];
     let failed = 0;
-    for (const p of Object.values(pending)) {
+    for (const [pid, p] of Object.entries(pending)) {
       for (const owner of ownerList) {
         if (p.delivered.includes(owner)) continue;
         try {
-          if (perOwner) await this.opts.notifyOwner!(p.event, owner);
-          else await this.opts.notify(p.event);
+          if (perOwner) await this.opts.notifyOwner!(p.event, owner, pid);
+          else await this.opts.notify(p.event, pid);
           p.delivered.push(owner);
         } catch (err) {
           failed++;

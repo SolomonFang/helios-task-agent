@@ -140,6 +140,9 @@ export function checkHkDeps(): string[] {
 /** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器）。 */
 export const HK_CLI_INSTALL_HINT = 'macOS: brew install jq curl；Linux: 用包管理器安装 jq curl';
 
+/** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
+export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
+
 /**
  * 运行时 npx 拉取的 helios-kanban 包规格，钉版本（同下方 OCR 包）：
  * 默认跟随 @latest 会让「自动启动看板」变成每次拉取并执行未审核的新版本，

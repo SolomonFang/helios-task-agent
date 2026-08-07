@@ -170,7 +170,8 @@ export async function checkForUpdate(deps: CheckForUpdateDeps): Promise<UpdateIn
     } catch {
       return null; // 离线 / registry 不可达：静默跳过
     }
-    writeCache(cachePath, tags);
+    // dist-tags 为空（res.ok 但响应无 dist-tags）不写缓存：否则空结果被缓存 24h，期间永不提示更新
+    if (tags.latest || tags.next) writeCache(cachePath, tags);
   }
   const candidates: Array<{ tag: 'latest' | 'next'; version: string }> = [];
   if (tags.latest) candidates.push({ tag: 'latest', version: tags.latest });

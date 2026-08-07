@@ -8,7 +8,6 @@
 
 ### Added
 
-- 技能管理命令 `/skills install <路径>` / `/skills uninstall <名称>`（CLI 与飞书 bot 一致）：安装即复制到数据目录 `skills/`（`HELIOS_TASK_AGENT_HOME` 或 `~/.helios-task-agent`），`npm i -g` 升级不再丢失；同名覆盖即更新；包内内置技能不可卸载。启动时自动把历史误放进包内 `skills/`（npm 安装目录）的非内置技能迁移到数据目录并打印提示——此前没有安装入口，用户只能手动拷目录，且界面上唯一可见的 `skills/` 路径是包内那个，放进去一升级就没
 - 新增 `scripts/unit-feishu-filter.ts`：WS 事件入口过滤的真实单测（p2p 过滤、bot 发送者忽略、message_id 去重与 TTL、卡片回调 open_id 白名单、owner 认领 fail-closed 与阻断集）——此前这些防线零覆盖，唯一的「白名单」用例实际绕过了 feishu 层
 
 ### Changed
@@ -41,12 +40,18 @@
 - supervisor `stop()` 对在途重连加竞速超时；用户单条消息增加 8000 字符上限，超限直接拒答
 - 测试修复：技能契约用例不再扫描用户数据目录（本机第三方技能曾致 `npm test` 环境性失败）；batchApproval TTL 过期路径、LLM 错误映射、无断言用例、SDK 私有字段脆性断言逐一补实
 
+## [1.0.20] - 2026-08-07
+
+### Added
+
+- 技能管理命令 `/skills install <路径>` / `/skills uninstall <名称>`（CLI 与飞书 bot 一致）：安装即复制到数据目录 `skills/`（`HELIOS_TASK_AGENT_HOME` 或 `~/.helios-task-agent`），`npm i -g` 升级不再丢失；同名覆盖即更新；包内内置技能不可卸载。启动时自动把历史误放进包内 `skills/`（npm 安装目录）的非内置技能迁移到数据目录并打印提示——此前没有安装入口，用户只能手动拷目录，且界面上唯一可见的 `skills/` 路径是包内那个，放进去一升级就没
+
 ## [1.0.19] - 2026-08-06
 
 ### Added
 
 - 新增 `skill_exec` 工具：技能目录内脚本（node/shell/python 等）可直接运行——此前技能只有文档注入（`skill_doc`），带脚本的技能除硬编码的 `hk_cli` 外无任何执行通道。脚本路径限定在技能目录内（realpath 校验，拒绝 `..`/绝对路径/符号链接逃逸），按扩展名推断解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录；执行任意脚本不可预判读写，每次调用逐次弹用户确认（不参与「同类免问」，无确认通道 fail-closed），子进程沿用最小环境变量并写审计日志
-- `helios-task-agent bot --reconfig`：凭证已存在时重跑完整配置向导（换模型 / Base URL / API Key 不用再手编 `.env`）；`--rebind` 仍只重跑飞书凭证向导
+- `helios-task-agent bot --reconfig`：凭证已存在时重跑模型/看板配置向导，飞书凭证保留（换模型 / Base URL / API Key 不用再手编 `.env`）；`--rebind` 仍只重跑飞书凭证向导
 - 审计增加 read 类记录：`lark_cli` 读路径、`repo_fs` 读取及敏感文件 denylist 拒绝均写入 `audit.log`（此前只有写操作与拦截有审计）
 - 新增单元测试 `scripts/unit-safety.ts` / `unit-kanban.ts` / `unit-resilience.ts` / `unit-bot.ts` / `unit-handler.ts`（覆盖安全闸门、看板进程回收、LLM 重试与事件推送、bot 产品交互、消息路由）
 
@@ -81,13 +86,15 @@
 
 ### Changed
 
-- UED 全面审查与体验修复（明细见 `docs/ued-issues.md`，五轮 30 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
+- UED 全面审查与体验修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md)，五轮 30 项）：配置向导校验失败两个分支默认动作统一为「回车=重试、`s`=保存」且可改模型名；确认卡片「取消」去掉 danger 红色、「裁决时效」改「确认有效期」、标题加分隔；新增 `/confirm revoke` 语义化命令（`/confirm on` 保留兼容）；owner 被拒文案附本人 open_id 自救指引；删除「Hermes」「post 消息」「ocr」等黑话；banner 长行顶破边框修复（`box()` 自适应加宽）；看板就绪超时改为秒并给出路；README / README.en / `.env.example` 与产品内文案同步
 
 ## [1.0.17] - 2026-08-03
 
 仅版本号发布，无代码变更。
 
 ## [1.0.16] - 2026-08-03
+
+> 注：1.0.16 未发布到 npm（npm 上 1.0.15 之后直接是 1.0.17），以下变更随 1.0.17 一并发布。
 
 ### Security
 

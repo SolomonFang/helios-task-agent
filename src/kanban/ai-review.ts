@@ -13,7 +13,8 @@ import { apiGet } from './http';
  *
  * - ocr 优先用 PATH 上的 `ocr`，未安装则 `npx -y <钉版本包规格>`（OCR_PACKAGE 可覆盖）。
  * - LLM 默认复用机器人的 OpenAI 兼容配置（派生为 OCR_LLM_* 环境变量）；用户已显式配置
- *   OCR_LLM_URL 或 ~/.opencodereview/config.json 里有 provider/llm 时尊重用户配置，不再注入。
+ *   OCR_LLM_URL / OCR_LLM_TOKEN（专用 key 优先于主 key 派生）或
+ *   ~/.opencodereview/config.json 里有 provider/llm 时尊重用户配置，不再注入对应项。
  */
 
 const execFileP = promisify(execFile);
@@ -133,6 +134,8 @@ export function ocrConfigHasProvider(home = os.homedir()): boolean {
  * 组装 ocr 子进程环境：最小环境（见 proc-env.ts，不继承 LLM_API_KEY 等敏感变量）
  * + 显式 OCR_* 变量；显式 OCR_LLM_URL / 已有 OCR 配置文件优先；
  * 否则把机器人的 OpenAI 兼容配置派生为 OCR_LLM_*（OCR 环境变量优先级高于其配置文件）。
+ * 安全：OCR_LLM_TOKEN 已显式设置（AI 审查专用 key）时不覆盖——避免把机器人主
+ * LLM key 交给第三方 ocr 子进程的用户可借此隔离；URL/MODEL 同理按项回退派生。
  */
 export function buildOcrEnv(
   llm: OcrLlmConfig,
@@ -150,11 +153,20 @@ export function buildOcrEnv(
     out.OCR_LLM_URL = /\/(chat\/completions|messages)\/?$/.test(llm.baseUrl)
       ? llm.baseUrl
       : `${llm.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-    out.OCR_LLM_TOKEN = llm.apiKey;
-    out.OCR_LLM_MODEL = llm.model;
-    out.OCR_USE_ANTHROPIC = 'false';
+    // 逐项回退：专用 OCR_LLM_TOKEN / OCR_LLM_MODEL 已显式提供时优先，不覆盖
+    out.OCR_LLM_TOKEN = out.OCR_LLM_TOKEN || llm.apiKey;
+    out.OCR_LLM_MODEL = out.OCR_LLM_MODEL || llm.model;
+    out.OCR_USE_ANTHROPIC = out.OCR_USE_ANTHROPIC || 'false';
   }
   return out;
+}
+
+/**
+ * AI 审查是否会把机器人主 LLM 配置派生给 ocr（未显式配置 OCR_LLM_URL 且
+ * 无 OCR 配置文件时）。用于首次触发审查时告知用户主 key 将交给第三方子进程。
+ */
+export function ocrWillDeriveBotLlm(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): boolean {
+  return !env.OCR_LLM_URL && !ocrConfigHasProvider(home);
 }
 
 /** ocr 可执行命令：PATH 优先，缺失回退 npx 钉版本包（首次会下载，缓存后同速）。异步探测（同 isGitRepo，避免阻塞 bot 事件循环）。 */

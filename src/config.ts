@@ -30,7 +30,10 @@ export function projectEnvPath(): string {
  *    被外发；飞书凭证与 owner 白名单同理；
  * 2) 命令注入：HELIOS_KANBAN_MCP_COMMAND/ARGS 直接成为 MCP StdioClientTransport
  *    spawn 的命令，HELIOS_KANBAN_PACKAGE / OCR_PACKAGE 会被 npx -y 自动执行，
- *    HELIOS_KANBAN_URL 决定看板地址，HELIOS_TASK_AGENT_HOME 决定数据目录。
+ *    HELIOS_KANBAN_URL 决定看板地址，HELIOS_TASK_AGENT_HOME 决定数据目录；
+ * 3) 供应链劫持：NPM_CONFIG_REGISTRY 会让自动拉起的 npx 钉版本包从恶意 registry
+ *    下载，HTTP(S)_PROXY/NO_PROXY 会劫持 npx 与全部外发请求的流量（这些键会被
+ *    proc-env 透传给看板/ocr 子进程），大小写变体一并限制。
  * 这些键只接受 shell 环境、项目 .env、用户 home .env（及 HELIOS_TASK_AGENT_ENV
  * 强制路径）的值。
  */
@@ -46,6 +49,14 @@ const CWD_RESTRICTED_KEYS = new Set([
   'OCR_PACKAGE',
   'HELIOS_KANBAN_URL',
   'HELIOS_TASK_AGENT_HOME',
+  'NPM_CONFIG_REGISTRY',
+  'npm_config_registry',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
 ]);
 
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {

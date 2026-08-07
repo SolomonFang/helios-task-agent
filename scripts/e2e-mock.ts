@@ -7,6 +7,8 @@ import os from 'os';
 import { spawn } from 'child_process';
 import path from 'path';
 import { errMessage } from '../src/err';
+import { checkLarkCli } from '../src/deps';
+import { fetchKanbanHealth } from '../src/kanban/http';
 
 const TEST_TITLE = '【测试】Helios Task Agent 冒烟任务（自动删除）';
 const FINAL_REPLY = '模拟回复：任务已创建并清理，链路正常。';
@@ -117,77 +119,110 @@ function startMockServer(): Promise<{ server: http.Server; state: MockState; por
   });
 }
 
+/** 兜底清理：按 id 直调看板 HTTP API 删除测试任务（同 src/kanban/http.ts 的 DELETE /api/tasks/<id>）。 */
+async function cleanupTestTask(kanbanUrl: string, state: MockState): Promise<void> {
+  if (!state.taskId) return;
+  try {
+    // 正常链路已删除时这里是重复 DELETE（404），无害；不校验响应，只保证请求发出
+    await fetch(`${kanbanUrl}/api/tasks/${state.taskId}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    console.error(`测试任务兜底清理失败，请手动删除（task_id=${state.taskId}）: ${errMessage(err)}`);
+  }
+}
+
 async function main(): Promise<void> {
+  // 前置检查：缺 lark-cli / 看板不可达属于环境问题，按 SKIP 退出（同 smoke.ts 的 SKIP 惯例），不报成链路失败
+  if (!checkLarkCli()) {
+    console.log('SKIP  e2e-mock  — 未找到可执行命令「lark-cli」，请先安装并完成授权后再运行本用例');
+    return;
+  }
+  const kanbanUrl = (process.env.HELIOS_KANBAN_URL || 'http://localhost:7964').replace(/\/+$/, '');
+  const health = await fetchKanbanHealth(kanbanUrl);
+  if (health !== 'ok') {
+    console.log(`SKIP  e2e-mock  — 看板不可达（${kanbanUrl}: ${health}），请先启动 helios-kanban`);
+    return;
+  }
+
   const { server, state, port } = await startMockServer();
   const bin = path.join(__dirname, '..', 'src', 'cli.ts');
   const tsx = path.join(__dirname, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
   // 隔离环境：临时 HOME + 强制 .env（最高优先级），避免用户/项目 .env 覆盖 mock 端点
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-e2e-'));
-  const forcedEnv = path.join(tmpHome, '.env');
-  fs.writeFileSync(
-    forcedEnv,
-    `LLM_BASE_URL=http://127.0.0.1:${port}/v1\nLLM_API_KEY=mock-key\nLLM_MODEL=mock-model\n`,
-    'utf8',
-  );
-  const child = spawn(process.execPath, [tsx, bin], {
-    env: {
-      ...process.env,
-      HELIOS_TASK_AGENT_HOME: tmpHome,
-      HELIOS_TASK_AGENT_ENV: forcedEnv,
-      LLM_BASE_URL: `http://127.0.0.1:${port}/v1`,
-      LLM_API_KEY: 'mock-key',
-      LLM_MODEL: 'mock-model',
-    },
-    stdio: ['pipe', 'pipe', 'inherit'],
-  });
-
-  let stdout = '';
-  child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-  // 流程固定产生两次写闸门确认（create_task + delete_task），依次回答 y
-  child.stdin.write('创建一个测试任务然后删掉\ny\ny\n/exit\n');
-  child.stdin.end();
-
-  // 总超时保护：子进程挂起时 kill 并计失败，不能永久卡住 npm run verify
-  const E2E_TIMEOUT_MS = 180_000;
-  let timedOut = false;
-  const code = await new Promise<number>((resolve) => {
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, E2E_TIMEOUT_MS);
-    child.on('close', (c) => {
-      clearTimeout(timer);
-      resolve(c ?? 1);
-    });
-  });
-  server.close();
+  let exitCode = 0;
   try {
-    fs.rmSync(tmpHome, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
+    const forcedEnv = path.join(tmpHome, '.env');
+    fs.writeFileSync(
+      forcedEnv,
+      `LLM_BASE_URL=http://127.0.0.1:${port}/v1\nLLM_API_KEY=mock-key\nLLM_MODEL=mock-model\n`,
+      'utf8',
+    );
+    const child = spawn(process.execPath, [tsx, bin], {
+      env: {
+        ...process.env,
+        HELIOS_TASK_AGENT_HOME: tmpHome,
+        HELIOS_TASK_AGENT_ENV: forcedEnv,
+        LLM_BASE_URL: `http://127.0.0.1:${port}/v1`,
+        LLM_API_KEY: 'mock-key',
+        LLM_MODEL: 'mock-model',
+      },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
 
-  const failures: string[] = [];
-  if (timedOut) failures.push(`agent 超过 ${E2E_TIMEOUT_MS / 1000}s 未退出，已强制 kill`);
-  if (code !== 0) failures.push(`agent 退出码 ${code}`);
-  if (state.error) failures.push('mock 侧错误: ' + state.error);
-  if (!state.projectId) failures.push('未能从 list_projects 获取 project_id');
-  if (!state.createdOk) failures.push('create_task 结果未包含测试标题');
-  if (!state.deletedOk) failures.push('delete_task 未确认删除');
-  if (!state.larkOk) failures.push('lark_cli 工具未成功执行');
-  if (!stdout.includes('写操作请求')) failures.push('未出现写操作确认提示（闸门未触发）');
-  if (!stdout.includes(FINAL_REPLY)) failures.push('agent 输出中未找到最终回复');
+    let stdout = '';
+    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    // 流程固定产生两次写闸门确认（create_task + delete_task），依次回答 y
+    child.stdin.write('创建一个测试任务然后删掉\ny\ny\n/exit\n');
+    child.stdin.end();
 
-  if (failures.length) {
-    console.error('E2E 失败:');
-    for (const f of failures) console.error('  - ' + f);
-    console.error('\n--- agent stdout ---\n' + stdout);
-    process.exit(1);
+    // 总超时保护：子进程挂起时 kill 并计失败，不能永久卡住 npm run verify
+    const E2E_TIMEOUT_MS = 180_000;
+    let timedOut = false;
+    const code = await new Promise<number>((resolve) => {
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, E2E_TIMEOUT_MS);
+      child.on('close', (c) => {
+        clearTimeout(timer);
+        resolve(c ?? 1);
+      });
+    });
+
+    const failures: string[] = [];
+    if (timedOut) failures.push(`agent 超过 ${E2E_TIMEOUT_MS / 1000}s 未退出，已强制 kill`);
+    if (code !== 0) failures.push(`agent 退出码 ${code}`);
+    if (state.error) failures.push('mock 侧错误: ' + state.error);
+    if (!state.projectId) failures.push('未能从 list_projects 获取 project_id');
+    if (!state.createdOk) failures.push('create_task 结果未包含测试标题');
+    if (!state.deletedOk) failures.push('delete_task 未确认删除');
+    if (!state.larkOk) failures.push('lark_cli 工具未成功执行');
+    if (!stdout.includes('写操作请求')) failures.push('未出现写操作确认提示（闸门未触发）');
+    if (!stdout.includes(FINAL_REPLY)) failures.push('agent 输出中未找到最终回复');
+
+    if (failures.length) {
+      console.error('E2E 失败:');
+      for (const f of failures) console.error('  - ' + f);
+      console.error('\n--- agent stdout ---\n' + stdout);
+      exitCode = 1;
+    } else {
+      console.log('E2E 通过 ✓');
+      console.log(`  project_id = ${state.projectId}`);
+      console.log(`  创建任务 → 删除任务 → lark_cli，全链路经真实 helios-kanban MCP 验证`);
+    }
+  } finally {
+    server.close();
+    try {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    // 兜底清理：只要 mock 侧拿到过 taskId，无论脚本成败（含超时 kill）都按 id 删除，不在看板留残留任务
+    await cleanupTestTask(kanbanUrl, state);
   }
-  console.log('E2E 通过 ✓');
-  console.log(`  project_id = ${state.projectId}`);
-  console.log(`  创建任务 → 删除任务 → lark_cli，全链路经真实 helios-kanban MCP 验证`);
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 main().catch((err) => {

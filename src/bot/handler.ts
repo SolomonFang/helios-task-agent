@@ -7,7 +7,7 @@ import { FeishuChannel, splitText, type FeishuCardAction, type FeishuInboundMess
 import { SessionRouter } from '../session-router';
 import type { AgentSession } from '../session';
 import { ConfirmationManager, isConfirmWord } from '../confirm';
-import { runAiReview } from '../kanban/ai-review';
+import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
 import { isAllPass, writeReviewReport } from '../review-report';
 import type { ReportServer } from '../report-server';
 import { checkLarkCliAsync, checkOcrCliAsync } from '../deps';
@@ -120,6 +120,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const pendingTyping = new Map<string, { messageId: string; reactionId: string }[]>();
   /** 进行中的 AI 审查（按 attempt 去重，防止连点按钮）；携带发起人与 AbortController，/stop 可中断。 */
   const aiReviewRunning = new Map<string, { openId: string; ctl: AbortController }>();
+  /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
+  let aiReviewLlmNoticed = false;
 
   /** 执行 AI 审查（open-code-review）并把结果推回飞书；同时注入会话上下文便于追问/修复。 */
   const handleAiReview = async (openId: string, attemptId: string, title: string): Promise<void> => {
@@ -137,9 +139,18 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const ctl = new AbortController();
     aiReviewRunning.set(attemptId, { openId, ctl });
     try {
+      // 首次触发时告知：AI 审查由第三方 open-code-review 执行，且将复用机器人主 LLM 配置
+      // （仅在实际会派生主 key 时提示；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
+      let llmNotice = '';
+      if (!aiReviewLlmNoticed && ocrWillDeriveBotLlm()) {
+        aiReviewLlmNoticed = true;
+        llmNotice =
+          '\n⚠️ 安全提示：AI 审查由第三方工具 open-code-review 执行，将把机器人 LLM 配置（含 API key）以 OCR_LLM_* 环境变量交给它；' +
+          '如需隔离，请配置 AI 审查专用 key（OCR_LLM_TOKEN）或用 ocr config provider 单独配置。';
+      }
       await channel.notifyOpenId(
         openId,
-        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用需自动下载代码审查工具，耗时稍长）。`,
+        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用需自动下载代码审查工具，耗时稍长）。${llmNotice}`,
       );
       // /stop 可中断：竞速胜出后立即向用户收尾返回；signal 同时透传给 runAiReview，
       // 底层 ocr 子进程随 abort 被 execFile 立即 kill，不必等自身 15 分钟超时。

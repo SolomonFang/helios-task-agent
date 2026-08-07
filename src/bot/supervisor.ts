@@ -9,6 +9,7 @@
  */
 
 import type { KanbanMcp } from '../kanban/mcp';
+import { errMessage } from '../err';
 
 export interface McpSupervisorOptions {
   mcp: KanbanMcp;
@@ -112,13 +113,13 @@ export class McpSupervisor {
         this.failures = 0;
         if (!this.alive) {
           this.alive = true;
-          this.opts.onRecovered?.();
+          this.notify('onRecovered');
         }
       } catch {
         this.failures++;
         if (this.alive && this.failures >= threshold) {
           this.alive = false;
-          this.opts.onLost?.();
+          this.notify('onLost');
         }
         // 重连退避：前 3 次连续试，之后每 5 个周期试一次（~5 分钟）
         if (!this.alive && (this.failures <= 3 || this.failures % 5 === 0)) {
@@ -146,6 +147,15 @@ export class McpSupervisor {
       await Promise.race([this.opts.mcp.ping(), timeout]);
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /** 掉线/恢复回调兜底：回调抛异常不得击穿 tick 成为 unhandledRejection。 */
+  private notify(kind: 'onLost' | 'onRecovered'): void {
+    try {
+      this.opts[kind]?.();
+    } catch (err) {
+      this.opts.log?.(`${kind} 回调异常: ${errMessage(err)}`);
     }
   }
 

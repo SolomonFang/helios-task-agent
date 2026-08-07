@@ -654,6 +654,8 @@ async function main(): Promise<void> {
     assert.throws(() => mem.setFact('u1', 'k', 'v'), /未持久化/); // 写盘失败必须报错
     assert.throws(() => mem.addNote('u1', 'n1'), /未持久化/);
     assert.equal(mem.getFact('u1', 'k'), 'v'); // 内存态仍可用
+    assert.throws(() => mem.deleteFact('u1', 'k'), /未持久化/); // 删除同样不得假装已忘记
+    assert.equal(mem.getFact('u1', 'k'), undefined); // 与写路径一致：删除失败也只影响内存态
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -969,8 +971,30 @@ async function main(): Promise<void> {
       },
     });
     assert.equal(fail, null);
+    // dist-tags 为空（res.ok 但无 dist-tags）不写缓存：24h 内应重新请求而非一直静默
+    const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-upd3-'));
+    let emptyFetches = 0;
+    const empty = await checkForUpdate({
+      current: '1.0.2',
+      home: tmp3,
+      fetchDistTags: async () => {
+        emptyFetches++;
+        return {};
+      },
+    });
+    assert.equal(empty, null);
+    await checkForUpdate({
+      current: '1.0.2',
+      home: tmp3,
+      fetchDistTags: async () => {
+        emptyFetches++;
+        return {};
+      },
+    });
+    assert.equal(emptyFetches, 2, '空 dist-tags 不应被缓存 24h');
     fs.rmSync(tmp, { recursive: true, force: true });
     fs.rmSync(tmp2, { recursive: true, force: true });
+    fs.rmSync(tmp3, { recursive: true, force: true });
   });
 
   await checkAsync('promptVersionUpdate：y 执行更新 / N 跳过 / 失败回报', async () => {
@@ -1202,13 +1226,19 @@ async function main(): Promise<void> {
     // 显式 env 优先，不覆盖
     const explicit = buildOcrEnv(llm, { OCR_LLM_URL: 'https://custom/v1/chat/completions' }, tmp);
     const explicitOk = explicit.OCR_LLM_URL === 'https://custom/v1/chat/completions' && !explicit.OCR_LLM_TOKEN;
+    // 专用 OCR_LLM_TOKEN 优先于主 key 派生（URL/MODEL 仍回退机器人配置）
+    const dedicated = buildOcrEnv(llm, { OCR_LLM_TOKEN: 'sk-ocr-dedicated' }, tmp);
+    const dedicatedOk =
+      dedicated.OCR_LLM_TOKEN === 'sk-ocr-dedicated' &&
+      dedicated.OCR_LLM_URL === 'https://api.example.com/v1/chat/completions' &&
+      dedicated.OCR_LLM_MODEL === 'm1';
     // 用户已有 OCR provider 配置 → 不注入
     fs.mkdirSync(path.join(tmp, '.opencodereview'), { recursive: true });
     fs.writeFileSync(path.join(tmp, '.opencodereview', 'config.json'), JSON.stringify({ provider: 'deepseek' }));
     const respect = buildOcrEnv(llm, {}, tmp);
     const respectOk = !respect.OCR_LLM_URL;
     fs.rmSync(tmp, { recursive: true, force: true });
-    return derivedOk && fullOk && explicitOk && respectOk;
+    return derivedOk && fullOk && explicitOk && dedicatedOk && respectOk;
   })());
 
   check('buildOcrEnv：LLM_API_KEY 等敏感变量不泄漏到 OCR 环境', (() => {
@@ -1613,7 +1643,8 @@ async function main(): Promise<void> {
       kanbanIteration: '',
     };
     const session = new AgentSession(cfg, null, false, { userId: 'u1', memory: new MemoryStore(tmp) });
-    const pending = () => (session as unknown as { pendingNotes: string[] }).pendingNotes;
+    const pending = () =>
+      (session as unknown as { pendingNotes: Array<{ text: string; key?: string }> }).pendingNotes.map((n) => n.text);
     // watcher 重投同一事件 N 次：只保留一条
     session.injectSystemNote('重复事件');
     session.injectSystemNote('重复事件');
@@ -1624,6 +1655,39 @@ async function main(): Promise<void> {
     const capOk = pending().length === 20 && pending()[0] === 'n5' && pending()[19] === 'n24';
     fs.rmSync(tmp, { recursive: true, force: true });
     return dedupOk && capOk;
+  })());
+
+  // ---------- injectSystemNote：dedupeKey 按事件 id 去重（note 时间戳不击穿） ----------
+  check('injectSystemNote：dedupeKey 相同的重投（时间戳不同）只留一条；不同 key 不去重', (() => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-notekey-'));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'http://localhost:1/v1',
+      llmApiKey: 'sk-x',
+      llmModel: 'm',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:1',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    const session = new AgentSession(cfg, null, false, { userId: 'u1', memory: new MemoryStore(tmp) });
+    const pending = () =>
+      (session as unknown as { pendingNotes: Array<{ text: string; key?: string }> }).pendingNotes;
+    // watcher 重投同一事件：note 带不同时间戳（全串不同），按 key 去重仍只留一条
+    session.injectSystemNote('[看板事件通知 10:00:00]\n事件A', 'watch:done:t1');
+    session.injectSystemNote('[看板事件通知 10:01:00]\n事件A', 'watch:done:t1');
+    session.injectSystemNote('[看板事件通知 10:02:00]\n事件A', 'watch:done:t1');
+    // 不同事件 id 不受影响
+    session.injectSystemNote('[看板事件通知 10:03:00]\n事件B', 'watch:done:t2');
+    const notes = pending();
+    const ok =
+      notes.filter((n) => n.key === 'watch:done:t1').length === 1 &&
+      notes[0]!.text === '[看板事件通知 10:00:00]\n事件A' && // 保留首条
+      notes.filter((n) => n.key === 'watch:done:t2').length === 1 &&
+      notes.length === 2;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return ok;
   })());
 
   // ---------- KanbanWatcher：推送失败快照仍推进，事件入 pending 重投 ----------
@@ -2230,35 +2294,39 @@ async function main(): Promise<void> {
   });
 
   // ---------- hk.sh：tasks list --limit 非纯数字直接拒绝（jq 注入防护） ----------
-  await checkAsync('hk.sh：tasks list --limit 注入串在 API 调用前报错退出', async () => {
-    let jqOk = true;
-    try {
-      execFileSync('jq', ['--version'], { stdio: 'ignore' });
-    } catch {
-      jqOk = false;
-    }
-    assert.ok(jqOk, '本测试需要 jq（hk.sh 依赖）');
-    const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
-    let code = 0;
-    let stderr = '';
-    try {
-      execFileSync('bash', [hk, 'tasks', 'list', '--limit', '1] + [env.X] | .[0:99'], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          HELIOS_KANBAN_PROJECT_ID: 'p-test', // 先过 project_id 检查；校验发生在 API 调用之前，无需真实看板
-          HELIOS_KANBAN_URL: 'http://127.0.0.1:1',
-        },
-      });
-    } catch (err) {
-      const e = err as { status?: number | null; stderr?: string };
-      code = e.status ?? -1;
-      stderr = String(e.stderr || '');
-    }
-    assert.notEqual(code, 0, '非法 --limit 应非零退出');
-    assert.match(stderr, /invalid --limit/);
-  });
+  // 本机未装 jq 属于环境问题（hk.sh 的运行时依赖），按 SKIP 处理（同 smoke.ts 的 SKIP 惯例）而不是 FAIL
+  let jqOk = true;
+  try {
+    execFileSync('jq', ['--version'], { stdio: 'ignore' });
+  } catch {
+    jqOk = false;
+  }
+  if (!jqOk) {
+    console.log('SKIP  hk.sh：tasks list --limit 注入串在 API 调用前报错退出  — 本机未安装 jq（hk.sh 依赖）');
+  } else {
+    await checkAsync('hk.sh：tasks list --limit 注入串在 API 调用前报错退出', async () => {
+      const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+      let code = 0;
+      let stderr = '';
+      try {
+        execFileSync('bash', [hk, 'tasks', 'list', '--limit', '1] + [env.X] | .[0:99'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            HELIOS_KANBAN_PROJECT_ID: 'p-test', // 先过 project_id 检查；校验发生在 API 调用之前，无需真实看板
+            HELIOS_KANBAN_URL: 'http://127.0.0.1:1',
+          },
+        });
+      } catch (err) {
+        const e = err as { status?: number | null; stderr?: string };
+        code = e.status ?? -1;
+        stderr = String(e.stderr || '');
+      }
+      assert.notEqual(code, 0, '非法 --limit 应非零退出');
+      assert.match(stderr, /invalid --limit/);
+    });
+  }
 
   // ---------- npx 包规格：kanban 与 ocr 均钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {

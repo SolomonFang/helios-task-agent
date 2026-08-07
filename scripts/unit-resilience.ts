@@ -10,7 +10,8 @@ import type { AddressInfo } from 'net';
 import { createClient, downgradeSystemNotes, runAgentTurn } from '../src/llm';
 import { KanbanWatcher } from '../src/kanban/watcher';
 import { McpSupervisor } from '../src/bot/supervisor';
-import type { KanbanMcp } from '../src/kanban/mcp';
+import { KanbanMcp } from '../src/kanban/mcp';
+import { apiGet } from '../src/kanban/http';
 import { AgentSession } from '../src/session';
 import { MemoryStore } from '../src/memory';
 import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from '../src/guard';
@@ -436,10 +437,203 @@ async function main(): Promise<void> {
     });
     void sup.tick(); // 触发挂死的重连（tick 永不结束，不 await；无定时器残留）
     await new Promise((r) => setTimeout(r, 20)); // 等重连占位生效
+    // stop 的竞速定时器是 unref 的（生产侧不拖累退出）：测试进程此时无其他 ref 句柄，
+    // 事件循环一旦清空进程会以 0 静默退出、后续用例整段丢失——持一个 ref 定时器保活
+    const keepAlive = setInterval(() => {}, 1000);
     const t0 = Date.now();
     await sup.stop();
+    clearInterval(keepAlive);
     assert.ok(Date.now() - t0 < 3000, `stop 应在竞速超时后返回，实际 ${Date.now() - t0}ms`);
     assert.ok(logs.some((m) => m.includes('超时')), '超时应记日志');
+  });
+
+  // ---------- McpSupervisor：onLost/onRecovered 回调异常兜底 ----------
+  await checkAsync('McpSupervisor：onLost/onRecovered 回调抛异常被吞并记日志，不击穿 tick', async () => {
+    const logs: string[] = [];
+    let pingOk = false;
+    const fakeMcp = {
+      tools: [],
+      ping: async () => {
+        if (!pingOk) throw new Error('mcp down');
+      },
+      reconnect: async () => {
+        pingOk = true;
+      },
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({
+      mcp: fakeMcp,
+      initiallyAlive: true,
+      failThreshold: 1,
+      onLost: () => {
+        throw new Error('onLost boom');
+      },
+      onRecovered: () => {
+        throw new Error('onRecovered boom');
+      },
+      log: (m) => logs.push(m),
+    });
+    await sup.tick(); // ping 失败 → onLost 抛：不得成 unhandledRejection
+    assert.equal(sup.isAlive, false);
+    await sup.tick(); // 重连成功 → ping 恢复 → onRecovered 抛：同样被吞
+    assert.equal(sup.isAlive, true);
+    assert.ok(logs.some((m) => m.includes('onLost 回调异常')), 'onLost 异常应记日志');
+    assert.ok(logs.some((m) => m.includes('onRecovered 回调异常')), 'onRecovered 异常应记日志');
+  });
+
+  // ---------- KanbanMcp：connect 在途时 close() 挂起，connect 完成后自我关闭 ----------
+  await checkAsync('KanbanMcp：connect 在途期间 close()，连接完成后立即关闭（不留孤儿子进程）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-mcp-'));
+    try {
+      // 真实 stdio MCP 服务（用项目依赖的 SDK 起最小 Server），验证与真实子进程的交互
+      const sdkRoot = path.join(__dirname, '..', 'node_modules', '@modelcontextprotocol/sdk', 'dist', 'cjs');
+      const serverScript = path.join(tmp, 'mock-mcp-server.cjs');
+      fs.writeFileSync(
+        serverScript,
+        [
+          `const { Server } = require(${JSON.stringify(path.join(sdkRoot, 'server', 'index.js'))});`,
+          `const { StdioServerTransport } = require(${JSON.stringify(path.join(sdkRoot, 'server', 'stdio.js'))});`,
+          `const { ListToolsRequestSchema } = require(${JSON.stringify(path.join(sdkRoot, 'types.js'))});`,
+          `const server = new Server({ name: 'mock', version: '1.0.0' }, { capabilities: { tools: {} } });`,
+          `server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));`,
+          `server.connect(new StdioServerTransport()).catch(() => process.exit(1));`,
+        ].join('\n'),
+      );
+      // 对照组：正常 connect 后 connected 为 true
+      const mcp1 = new KanbanMcp({ command: process.execPath, args: [serverScript] });
+      await mcp1.connect({ timeoutMs: 15000 });
+      assert.equal(mcp1.connected, true);
+      await mcp1.close();
+      assert.equal(mcp1.connected, false);
+      // close() 在 connect 完成前调用：client 尚为 null，靠 closePending 在 connect 完成后自我关闭
+      const mcp2 = new KanbanMcp({ command: process.execPath, args: [serverScript] });
+      const p = mcp2.connect({ timeoutMs: 15000 });
+      await mcp2.close();
+      await p; // connect 正常完成
+      assert.equal(mcp2.connected, false, 'closePending 应在 connect 完成后触发自我关闭');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- apiGet：signal 与超时组合 / 重试策略 ----------
+  await checkAsync('apiGet：传 signal 后 timeoutMs 仍兜底（signal 未触发时按超时中断）', async () => {
+    // 挂起服务：接受连接但永不响应
+    const server = http.createServer(() => {});
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const ctl = new AbortController();
+      const t0 = Date.now();
+      await assert.rejects(() => apiGet(base, '/hang', { signal: ctl.signal, timeoutMs: 200 }));
+      assert.ok(Date.now() - t0 < 3000, `超时兜底应生效，实际 ${Date.now() - t0}ms`);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  await checkAsync('apiGet：调用方 signal 中断仍然生效（AbortError 不重试、不等超时）', async () => {
+    const server = http.createServer(() => {});
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const ctl = new AbortController();
+      const t0 = Date.now();
+      setTimeout(() => ctl.abort(), 100);
+      await assert.rejects(() => apiGet(base, '/hang', { signal: ctl.signal, timeoutMs: 30000 }));
+      assert.ok(Date.now() - t0 < 5000, `中断应立刻生效，实际 ${Date.now() - t0}ms`);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  await checkAsync('apiGet 重试策略：4xx 不重试，5xx 间隔 500ms 重试一次', async () => {
+    let count404 = 0;
+    let count500 = 0;
+    const server = http.createServer((req, res) => {
+      if ((req.url || '').includes('/missing')) {
+        count404++;
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      count500++;
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      await assert.rejects(() => apiGet(base, '/missing'), /HTTP 404/);
+      assert.equal(count404, 1, '4xx 不应重试');
+      const t0 = Date.now();
+      await assert.rejects(() => apiGet(base, '/boom'), /HTTP 500/);
+      assert.equal(count500, 2, '5xx 应重试一次');
+      assert.ok(Date.now() - t0 >= 400, '重试应有 500ms 间隔');
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  // ---------- KanbanWatcher：stop 等待在途 tick ----------
+  await checkAsync('KanbanWatcher：stop 等待在途 tick 结束，兜底超时后照常返回', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-stop-'));
+    const kanbanState = { taskStatus: 'inprogress' };
+    const { server, base } = await startMockKanban(kanbanState);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let notifyEntered = false;
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        notify: async () => {
+          notifyEntered = true;
+          await gate; // 推送挂起，模拟在途 tick
+        },
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 基线
+      kanbanState.taskStatus = 'done'; // 下轮产生 done 事件 → notify 挂起
+      const inflight = tick();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(notifyEntered, 'tick 应已进入挂起的推送');
+      let stopped = false;
+      const sp = watcher.stop().then(() => {
+        stopped = true;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(stopped, false, '在途 tick 未结束时 stop 不应返回');
+      release();
+      await inflight;
+      await sp;
+      assert.equal(stopped, true, '在途 tick 结束后 stop 应返回');
+
+      // 兜底超时：tick 挂死不释放时 stop 按 stopTimeoutMs 照常返回并记日志
+      const logs: string[] = [];
+      const hanging = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state2.json'),
+        stopTimeoutMs: 100,
+        notify: () => new Promise<void>(() => {}), // 永不返回
+        log: (m) => logs.push(m),
+      });
+      const tick2 = tickOf(hanging);
+      await tick2(); // 基线（状态文件独立，首轮只建基线）
+      kanbanState.taskStatus = 'inprogress';
+      await tick2(); // 快照推进到 inprogress
+      kanbanState.taskStatus = 'done';
+      void tick2(); // 事件推送挂死，不 await
+      await new Promise((r) => setTimeout(r, 100));
+      const t0 = Date.now();
+      await hanging.stop();
+      assert.ok(Date.now() - t0 < 3000, `兜底超时后 stop 应返回，实际 ${Date.now() - t0}ms`);
+      assert.ok(logs.some((m) => m.includes('超时')), '兜底超时应记日志');
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   finish();

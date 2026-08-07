@@ -17,7 +17,7 @@ import { check, checkAsync, finish } from './testkit';
 
 async function main() {
   // ---------- loadEnvFiles：cwd .env 命令注入类高危键被忽略 ----------
-  await checkAsync('loadEnvFiles：cwd .env 受限键（MCP/包规格/看板地址/数据目录）被忽略', async () => {
+  await checkAsync('loadEnvFiles：cwd .env 受限键（MCP/包规格/看板地址/数据目录/registry/代理）被忽略', async () => {
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-home-'));
     const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-cwd-'));
     fs.writeFileSync(
@@ -32,6 +32,14 @@ async function main() {
         'HELIOS_KANBAN_PACKAGE=evil-pkg',
         'OCR_PACKAGE=evil-ocr',
         'HELIOS_KANBAN_URL=http://evil-kanban',
+        'NPM_CONFIG_REGISTRY=http://evil-registry',
+        'npm_config_registry=http://evil-registry-lc',
+        'HTTP_PROXY=http://evil-proxy',
+        'HTTPS_PROXY=http://evil-proxy-s',
+        'NO_PROXY=evil-noproxy',
+        'http_proxy=http://evil-proxy-lc',
+        'https_proxy=http://evil-proxy-s-lc',
+        'no_proxy=evil-noproxy-lc',
         'HTA_SAFETY_NONRESTRICTED=from-cwd',
         '',
       ].join('\n'),
@@ -43,9 +51,21 @@ async function main() {
       'HELIOS_KANBAN_PACKAGE',
       'OCR_PACKAGE',
       'HELIOS_KANBAN_URL',
+      'NPM_CONFIG_REGISTRY',
+      'npm_config_registry',
+      'HTTP_PROXY',
+      'HTTPS_PROXY',
+      'NO_PROXY',
+      'http_proxy',
+      'https_proxy',
+      'no_proxy',
       'HTA_SAFETY_NONRESTRICTED',
     ];
     const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
+    // 删除 shell 可能已带入的 registry/代理键：受限键须保持"未设置"而非仅不等于 evil 值
+    for (const k of ENV_KEYS) {
+      if (k !== 'HELIOS_TASK_AGENT_HOME') delete process.env[k];
+    }
     const prevCwd = process.cwd();
     // 静默丢弃提示（[config] cwd .env 中的高危键已被忽略…），不打断测试输出
     const origWarn = console.warn;
@@ -60,6 +80,15 @@ async function main() {
       assert.notEqual(process.env.HELIOS_KANBAN_MCP_COMMAND, 'evil-cmd');
       assert.notEqual(process.env.HELIOS_KANBAN_MCP_ARGS, '--evil');
       assert.notEqual(process.env.OCR_PACKAGE, 'evil-ocr');
+      // registry / 代理类受限键（含小写变体）：cwd .env 一律不得生效
+      assert.equal(process.env.NPM_CONFIG_REGISTRY, undefined, 'NPM_CONFIG_REGISTRY 应被忽略');
+      assert.equal(process.env.npm_config_registry, undefined, 'npm_config_registry 应被忽略');
+      assert.equal(process.env.HTTP_PROXY, undefined, 'HTTP_PROXY 应被忽略');
+      assert.equal(process.env.HTTPS_PROXY, undefined, 'HTTPS_PROXY 应被忽略');
+      assert.equal(process.env.NO_PROXY, undefined, 'NO_PROXY 应被忽略');
+      assert.equal(process.env.http_proxy, undefined, 'http_proxy 应被忽略');
+      assert.equal(process.env.https_proxy, undefined, 'https_proxy 应被忽略');
+      assert.equal(process.env.no_proxy, undefined, 'no_proxy 应被忽略');
       // 非受限键仍生效
       assert.equal(process.env.HTA_SAFETY_NONRESTRICTED, 'from-cwd');
     } finally {

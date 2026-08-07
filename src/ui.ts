@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { HK_CLI_INSTALL_HINT } from './deps';
+import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './deps';
 
 const ESC = '\u001b';
 
@@ -103,8 +103,8 @@ export interface BannerStatus {
   version: string;
 }
 
-/** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用）。 */
-export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
+/** MCP 降级口径单源在 src/deps.ts，此处 re-export 供既有 ui 引用方继续使用。 */
+export { MCP_FALLBACK_TEXT };
 
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内

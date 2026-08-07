@@ -59,15 +59,41 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 可以说
 ${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
 
+/** bot 子命令用法文案（--help 与未知参数报错共用，与独立入口 helios-task-agent-bot 风格一致）。 */
+const BOT_CLI_USAGE = `用法: helios-task-agent bot [选项]
+
+选项
+  --rebind      换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
+  --reconfig    重跑模型/看板配置向导（飞书凭证保留，换模型/Base URL/Key 不用手编 .env）
+  --version     打印版本号
+  --help        显示本帮助`;
+
 /**
  * bot 子命令参数解析：
  * --rebind   换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
- * --reconfig 重跑模型配置向导（换模型 / Base URL / API Key，保留飞书凭证）
+ * --reconfig 重跑模型/看板配置向导（换模型 / Base URL / API Key，保留飞书凭证）
+ * 与独立入口 helios-task-agent-bot 行为一致：--help / --version 打印后退出（退出码 0），
+ * 未知参数报错并以非零退出（此前静默忽略、直接启动 bot）。
  */
 export function parseBotArgs(argv: string[]): { rebind: boolean; reconfig: boolean } {
+  // 经统一入口 helios-task-agent bot … 进入时 argv 首位是子命令名本身，先剥掉
+  const args = (argv[0] === 'bot' ? argv.slice(1) : argv).map((a) => a.toLowerCase());
+  if (args.includes('help') || args.includes('-h') || args.includes('--help')) {
+    console.log(BOT_CLI_USAGE);
+    process.exit(0);
+  }
+  if (args.includes('version') || args.includes('-v') || args.includes('--version')) {
+    console.log(readPkgVersion());
+    process.exit(0);
+  }
+  const unknown = args.filter((a) => a !== 'rebind' && a !== '--rebind' && a !== 'reconfig' && a !== '--reconfig');
+  if (unknown.length) {
+    console.error(`未知参数: ${unknown.join(' ')}\n\n${BOT_CLI_USAGE}`);
+    process.exit(1);
+  }
   return {
-    rebind: argv.some((a) => a === 'rebind' || a === '--rebind'),
-    reconfig: argv.some((a) => a === 'reconfig' || a === '--reconfig'),
+    rebind: args.some((a) => a === 'rebind' || a === '--rebind'),
+    reconfig: args.some((a) => a === 'reconfig' || a === '--reconfig'),
   };
 }
 
@@ -120,6 +146,10 @@ function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: 
 }
 
 async function main(): Promise<void> {
+  // helios-task-agent bot --rebind / --reconfig / --help / --version：见 parseBotArgs 注释
+  // 尽早解析：--help / --version / 未知参数在打印启动横幅前就退出
+  const { rebind, reconfig } = parseBotArgs(process.argv.slice(2));
+
   const version = readPkgVersion();
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
   console.log(c.gray(`配置目录: ${userEnvPath()}`));
@@ -151,7 +181,7 @@ async function main(): Promise<void> {
       // 先等在途重连结束再 close MCP：connect 中途完成会残留无人持有的子进程
       await cleanup.supervisor?.stop();
       cleanup.wsAlerter?.stop();
-      cleanup.watcher?.stop();
+      await cleanup.watcher?.stop();
       cleanup.reportServer?.close();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
@@ -175,9 +205,6 @@ async function main(): Promise<void> {
     console.error(`[bot] 未捕获异常，执行优雅退出: ${err.stack || err.message}`);
     void shutdown();
   });
-
-  // helios-task-agent bot --rebind / --reconfig：见 parseBotArgs 注释
-  const { rebind, reconfig } = parseBotArgs(process.argv.slice(2));
 
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
@@ -240,7 +267,12 @@ async function main(): Promise<void> {
   if (feishuCfg.allowedOpenIds.length) {
     console.log(c.gray(`允许 open_id: ${feishuCfg.allowedOpenIds.join(', ')}`));
   } else {
-    console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：首个私聊用户将自动成为 owner 并写入白名单'));
+    console.log(
+      c.warn(
+        '⚠️ 安全警告：未设置 FEISHU_ALLOWED_OPEN_IDS，首个私聊本机器人的用户将自动成为唯一 owner 并写入白名单' +
+          '（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定 owner，请先在 .env 中配置该白名单。',
+      ),
+    );
   }
   const larkStatus = checkLarkCliStatus();
   // bot 无 banner，lark-cli 需完整告警文案；OCR 检查为 bot 特有（AI 审查功能依赖）
@@ -445,8 +477,8 @@ async function main(): Promise<void> {
   if (process.env.KANBAN_WATCH !== '0') {
     const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
     // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
-    // （重投时 injectSystemNote 自身去重，不会因重试而重复注入）
-    const notifyWatchOwner = async (event: WatchEvent, oid: string): Promise<void> => {
+    // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
+    const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
       const r = await sendCardWithTextFallback({
         sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event)),
         sendText: () => channel.notifyOpenId(oid, event.text),
@@ -459,7 +491,10 @@ async function main(): Promise<void> {
       try {
         router
           .getOrCreate(oid)
-          .injectSystemNote(`[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`);
+          .injectSystemNote(
+            `[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`,
+            `watch:${eventId}`,
+          );
       } catch {
         /* ignore */
       }
@@ -475,11 +510,11 @@ async function main(): Promise<void> {
       notifyOwner: notifyWatchOwner,
       // owners/notifyOwner 均已提供 → 启用 (事件, owner) 粒度送达追踪；
       // notify 仅作缺任一时的旧整批回退路径
-      notify: async (event) => {
+      notify: async (event, eventId) => {
         let firstErr: unknown = null;
         for (const oid of channel.allowedOpenIds()) {
           try {
-            await notifyWatchOwner(event, oid);
+            await notifyWatchOwner(event, oid, eventId);
           } catch (err) {
             firstErr = err;
           }

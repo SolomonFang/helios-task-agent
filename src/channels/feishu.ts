@@ -86,8 +86,8 @@ export function filterIncomingMessage(data: FeishuReceivePayload): FilteredIncom
   // Only private chats
   if (message.chat_type !== 'p2p') return null;
 
-  // Ignore bot / system senders
-  if (sender?.sender_type && sender.sender_type !== 'user') return null;
+  // Ignore bot / system senders（sender_type 缺失视为不可信，同样丢弃）
+  if (sender?.sender_type !== 'user') return null;
 
   const openId = sender?.sender_id?.open_id || '';
   if (!openId) return null;

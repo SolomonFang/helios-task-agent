@@ -45,6 +45,9 @@ export interface WorkSummaryTotals {
   deletions: number;
 }
 
+/** 任务状态键（totals 还含 filesChanged 等数值键，计数时必须用显式集合判定，不能用 in）。 */
+const SUMMARY_STATUS_KEYS = ['done', 'inreview', 'inprogress', 'todo', 'cancelled'] as const;
+
 export interface WorkSummaryData {
   scope: WorkSummaryScope;
   iteration?: string;
@@ -280,7 +283,8 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     deletions: 0,
   };
   for (const t of tasks) {
-    if (t.status in totals) totals[t.status as 'done' | 'inreview' | 'inprogress' | 'todo' | 'cancelled']++;
+    const statusKey = SUMMARY_STATUS_KEYS.find((s) => s === t.status);
+    if (statusKey) totals[statusKey]++;
     if (t.filesChanged !== undefined) totals.filesChanged += t.filesChanged;
     if (t.additions !== undefined) totals.additions += t.additions;
     if (t.deletions !== undefined) totals.deletions += t.deletions;

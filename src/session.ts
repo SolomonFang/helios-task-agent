@@ -45,7 +45,7 @@ export class AgentSession {
   private handlers: ToolHandlers;
   private messages: ChatMessage[];
   /** 后台事件缓存（injectSystemNote）：下一个轮边界注入，避免打断 tool_calls 配对。 */
-  private pendingNotes: string[] = [];
+  private pendingNotes: Array<{ text: string; key?: string }> = [];
 
   constructor(cfg: AgentConfig, mcp: KanbanMcp | null, mcpOk: boolean, opts: AgentSessionOptions = {}) {
     this.cfg = cfg;
@@ -155,13 +155,18 @@ export class AgentSession {
   }
 
   /** Inject a background event (e.g. kanban watcher notification) into the conversation context. */
-  injectSystemNote(note: string): void {
+  injectSystemNote(note: string, dedupeKey?: string): void {
     // 不直接插入历史：后台事件可能在 tool 轮次中途（assistant(tool_calls) 与其 tool
     // 响应之间，例如等待写确认时）到达，直接 push 会破坏配对，导致后续请求被 API 拒绝。
     // 缓存到下一轮用户消息的轮边界再注入。
-    // 去重：watcher 推送失败会重投同一事件，相同 note 只保留一条，不随重投次数叠加。
-    if (this.pendingNotes.includes(note)) return;
-    this.pendingNotes.push(note);
+    // 去重：watcher 推送失败会重投同一事件。note 带注入时间戳，全串比较会被重投击穿，
+    // 故 watcher 侧传事件 id 作 dedupeKey 按 key 去重；无 key 时回退全串比较。
+    const dup =
+      dedupeKey !== undefined
+        ? this.pendingNotes.some((n) => n.key === dedupeKey)
+        : this.pendingNotes.some((n) => n.key === undefined && n.text === note);
+    if (dup) return;
+    this.pendingNotes.push({ text: note, key: dedupeKey });
     // 上限兜底：积压过多时丢弃最旧
     if (this.pendingNotes.length > MAX_PENDING_NOTES) {
       this.pendingNotes.splice(0, this.pendingNotes.length - MAX_PENDING_NOTES);
@@ -176,7 +181,7 @@ export class AgentSession {
    */
   private flushPendingNotes(): void {
     if (!this.pendingNotes.length) return;
-    for (const note of this.pendingNotes) this.messages.push({ role: 'system', content: note });
+    for (const note of this.pendingNotes) this.messages.push({ role: 'system', content: note.text });
     this.pendingNotes = [];
   }
 

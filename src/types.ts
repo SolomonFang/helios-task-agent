@@ -65,8 +65,8 @@ export interface MemoryFile {
 }
 
 /**
- * Future transport for Feishu IM / webhook / long-poll.
- * CLI is one channel; a Feishu bot channel can implement the same surface.
+ * 消息通道抽象：当前唯一实现是飞书 bot 通道（src/channels/feishu.ts），
+ * 接口形状（sessionId / open_id 风格 senderId）按飞书 IM 设计；CLI 终端不走此接口。
  */
 export interface AgentChannel {
   readonly name: string;

@@ -5,7 +5,7 @@ const USAGE = `用法: helios-task-agent-bot [选项]
 
 选项
   --rebind      换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
-  --reconfig    重跑完整配置向导（换模型/Base URL/Key 不用手编 .env）
+  --reconfig    重跑模型/看板配置向导（飞书凭证保留，换模型/Base URL/Key 不用手编 .env）
   --version     打印版本号
   --help        显示本帮助`;
 
