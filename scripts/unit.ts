@@ -217,14 +217,14 @@ async function main(): Promise<void> {
       !looksLikeStrongFailure('{"success":true,"data":{"id":"…"}}'),
   );
 
-  // ---------- 批量免问 ----------
-  await checkAsync('withBatchApproval TTL 内免问 / 撤销 / once 不记忆', async () => {
+  // ---------- 批量免问（会话级，无 TTL） ----------
+  await checkAsync('withBatchApproval 会话内免问 / 撤销 / once 不记忆', async () => {
     let asks = 0;
     const base = async () => {
       asks++;
       return 'batch' as const;
     };
-    const fn = withBatchApproval(base, 60_000);
+    const fn = withBatchApproval(base);
     const req = (batchKey?: string): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey });
     assert.equal(await fn(req('k1')), 'batch');
     assert.equal(await fn(req('k1')), 'batch');
@@ -234,28 +234,25 @@ async function main(): Promise<void> {
     assert.equal(await fn(req('k1')), 'batch');
     assert.equal(asks, 2); // 撤销后重新询问
     const onceBase = async () => 'once' as const;
-    const fn2 = withBatchApproval(onceBase, 60_000);
+    const fn2 = withBatchApproval(onceBase);
     await fn2(req('k2'));
     await fn2(req('k2')); // once 不记忆，但 base 固定返回 once
     assert.equal(fn2.activeBatchApprovals(), 0);
   });
 
-  await checkAsync('withBatchApproval TTL 过期后重新询问', async () => {
+  await checkAsync('withBatchApproval 无 TTL：授权持续生效直到撤销或重启', async () => {
     let asks = 0;
-    const fn = withBatchApproval(
-      async () => {
-        asks++;
-        return 'batch' as const;
-      },
-      1, // 1ms TTL：免问授权即刻过期
-    );
+    const fn = withBatchApproval(async () => {
+      asks++;
+      return 'batch' as const;
+    });
     const req = (): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k1' });
     assert.equal(await fn(req()), 'batch');
     assert.equal(asks, 1);
-    await new Promise((r) => setTimeout(r, 30)); // 越过 TTL
-    assert.equal(fn.activeBatchApprovals(), 0, '过期授权应被清理');
+    await new Promise((r) => setTimeout(r, 30)); // 会话级授权不随时间过期
+    assert.equal(fn.activeBatchApprovals(), 1, '会话级授权不应过期');
     assert.equal(await fn(req()), 'batch');
-    assert.equal(asks, 2, 'TTL 过期后必须重新询问');
+    assert.equal(asks, 1, '无 TTL：仍免问');
   });
 
   // ---------- ConfirmationManager ----------
@@ -2509,9 +2506,12 @@ async function main(): Promise<void> {
       CONFIRM_BATCH_RE.test('批量允许') &&
       CONFIRM_BATCH_RE.test('都允许') &&
       CONFIRM_BATCH_RE.test('以后都') &&
-      !CONFIRM_BATCH_RE.test('都') && // 单字「都」随口误批准 10 分钟免问，已移除
+      CONFIRM_BATCH_RE.test('一直允许') &&
+      CONFIRM_BATCH_RE.test('始终允许') &&
+      CONFIRM_BATCH_RE.test('always') &&
+      !CONFIRM_BATCH_RE.test('都') && // 单字「都」随口误批准长期免问，已移除
       CONFIRM_BATCH_RE.test('免问') &&
-      !CONFIRM_BATCH_RE.test('b') && // 单字母「b」随口误批准 10 分钟免问，已移除
+      !CONFIRM_BATCH_RE.test('b') && // 单字母「b」随口误批准长期免问，已移除
       CONFIRM_NO_RE.test('取消') &&
       CONFIRM_NO_RE.test('拒绝') &&
       !CONFIRM_YES_RE.test('好') &&

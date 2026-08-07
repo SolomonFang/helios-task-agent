@@ -9,7 +9,7 @@ import { errMessage } from './err';
  * (card.action.trigger), resolving the promise — both bypass the per-user
  * message queue, so there is no deadlock.
  *
- * 裁决三态：'once' = 批准仅此次；'batch' = 批准且同类免问 10 分钟；false = 拒绝。
+ * 裁决三态：'once' = 批准仅此次；'batch' = 批准且本会话内同类免问；false = 拒绝。
  * 超时分级：可批量操作 120s；破坏性操作（无 batchKey）决策成本高，放宽到 300s。
  * 终态回调（onSettled）：携带确认卡片 message id，bot 层据此把卡片原地更新为
  * 终态（按钮消失），避免"点了没反应"与过期卡片误点。
@@ -34,10 +34,10 @@ interface Pending {
 }
 
 // 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作。
-// 单字「都」/「b」不在词表：随口一个字就批准 10 分钟免问太危险；「以后都」「都允许」「batch」仍覆盖该意图。
+// 单字「都」/「b」不在词表：随口一个字就批准长期免问太危险；「以后都」「都允许」「batch」仍覆盖该意图。
 // 词表为 CLI（readline 逐行）与飞书 bot（文本消息）共用：两端匹配方式可不同，词表必须一致。
 export const CONFIRM_YES_WORDS = ['确认', '确认执行', '同意', '批准', '执行', 'y', 'yes'];
-export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '批量允许', '以后都', '免问', 'batch'];
+export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '批量允许', '以后都', '免问', 'batch', '一直允许', '始终允许', 'always'];
 export const CONFIRM_NO_WORDS = ['取消', '算了', '不用', '否', '拒绝', 'n', 'no'];
 
 const wordsToRe = (words: string[]): RegExp => new RegExp(`^(?:${words.join('|')})$`, 'i');
@@ -233,7 +233,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   if (req.batchKey) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '🔁 同类免问 10 分钟' },
+      text: { tag: 'plain_text', content: '🔁 同类免问（本会话）' },
       value: { hta_confirm: id, decision: 'batch' },
     });
   }
@@ -244,7 +244,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     value: { hta_confirm: id, decision: 'no' },
   });
   const replyHint = req.batchKey
-    ? '或回复文本：「确认」仅此次 · 「同类免问」10 分钟 · 「取消」'
+    ? '或回复文本：「确认」仅此次 · 「同类免问」本会话 · 「取消」'
     : '或回复文本：「确认」 · 「取消」';
   return {
     config: { wide_screen_mode: true, enable_forward: false },
@@ -280,8 +280,8 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     },
     batch: {
       template: 'green',
-      title: `🔁 ${kindText} · 写操作已批准（同类免问 10 分钟）`,
-      note: '回复「恢复确认」可随时撤销免问。',
+      title: `🔁 ${kindText} · 写操作已批准（同类免问 · 本会话）`,
+      note: '回复「恢复确认」可随时撤销免问；重启后自动失效。',
     },
     denied: {
       template: 'red',

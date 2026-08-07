@@ -305,7 +305,7 @@ async function main(): Promise<void> {
   const batchConfirm = withBatchApproval(async () => {
     asks++;
     return 'batch' as const;
-  }, 60000);
+  });
   const mkReq = (batchKey?: string): ConfirmRequest => ({ kind: 'kanban', summary: 's', detail: 'd', batchKey });
   const b1 = await batchConfirm(mkReq('kanban:create_task'));
   const b2 = await batchConfirm(mkReq('kanban:create_task'));
@@ -316,7 +316,7 @@ async function main(): Promise<void> {
   const onceConfirm = withBatchApproval(async () => {
     onceAsks++;
     return 'once' as const;
-  }, 60000);
+  });
   await onceConfirm(mkReq('k'));
   await onceConfirm(mkReq('k'));
   check('批量确认：「仅此次」不缓存', onceAsks === 2);
@@ -324,7 +324,7 @@ async function main(): Promise<void> {
   const denyConfirm = withBatchApproval(async () => {
     denyAsks++;
     return false as const;
-  }, 60000);
+  });
   await denyConfirm(mkReq('k'));
   await denyConfirm(mkReq('k'));
   check('批量确认：拒绝不缓存', denyAsks === 2);
@@ -334,7 +334,7 @@ async function main(): Promise<void> {
   const revokeConfirm = withBatchApproval(async () => {
     revokeAsks++;
     return 'batch' as const;
-  }, 60000);
+  });
   await revokeConfirm(mkReq('kanban:create_task'));
   await revokeConfirm(mkReq('kanban:create_task'));
   const revoked = revokeConfirm.revokeBatchApprovals();

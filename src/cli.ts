@@ -194,7 +194,7 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.batchKey ? 120000 : 300000;
-    const batchHint = req.batchKey ? '，batch=同类免问 10 分钟' : '';
+    const batchHint = req.batchKey ? '，batch=同类免问（本会话）' : '';
     const ans = await askWithAbort(
       c.warn(`允许执行？[y=仅此次${batchHint} / N=取消]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
       timeoutMs,
@@ -208,7 +208,7 @@ export async function main(): Promise<void> {
     const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
     const once = !batch && CONFIRM_YES_RE.test(t);
     if (batch) {
-      console.log(c.ok('已批准；同类写操作 10 分钟内免问（/confirm revoke 撤销）。'));
+      console.log(c.ok('已批准；同类写操作本会话内免问（/confirm revoke 撤销）。'));
       return 'batch';
     }
     if (once) {

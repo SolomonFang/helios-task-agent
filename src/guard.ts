@@ -13,58 +13,46 @@ export interface ConfirmRequest {
   /** Full command / arguments for transparency. */
   detail: string;
   /**
-   * Batch approval key: when set, an approval is remembered for a short TTL
-   * and subsequent requests with the same key skip re-asking (批量创建场景).
-   * Omitted for destructive ops (delete/cancel/stop) and lark writes.
+   * Batch approval key: when set, an approval is remembered for the rest of
+   * the session and subsequent requests with the same key skip re-asking
+   * (批量创建场景). Omitted for destructive ops (delete/cancel/stop) and lark writes.
    */
   batchKey?: string;
 }
 
 /**
- * 确认裁决：'once' = 批准（仅此次）；'batch' = 批准且 TTL 内同类免问；false = 拒绝。
+ * 确认裁决：'once' = 批准（仅此次）；'batch' = 批准且本会话内同类免问；false = 拒绝。
  * 默认批准不再隐式开启批量免问——用户必须显式选择「同类免问」（知情权 + 发现性）。
  */
 export type ConfirmVerdict = 'once' | 'batch' | false;
 export type ConfirmFn = (req: ConfirmRequest) => Promise<ConfirmVerdict>;
 
-export const BATCH_APPROVAL_TTL_MS = 10 * 60 * 1000;
-
 /** ConfirmFn 附带「同类免问」查询/撤销能力（「恢复确认」/ `/confirm on` 用）。 */
 export interface BatchConfirmFn extends ConfirmFn {
-  /** 撤销全部「同类免问」授权，返回撤销的类数（先清理已过期授权）。 */
+  /** 撤销全部「同类免问」授权，返回撤销的类数。 */
   revokeBatchApprovals: () => number;
   /** 当前生效中的「同类免问」授权类数。 */
   activeBatchApprovals: () => number;
 }
 
-/** Remember 'batch' approvals per batchKey for ttlMs; destructive ops (no batchKey) always re-ask. */
-export function withBatchApproval(confirm: ConfirmFn, ttlMs = BATCH_APPROVAL_TTL_MS): BatchConfirmFn {
-  const approved = new Map<string, number>();
-  const prune = (): void => {
-    const now = Date.now();
-    for (const [key, exp] of approved) {
-      if (exp <= now) approved.delete(key);
-    }
-  };
+/**
+ * Remember 'batch' approvals per batchKey for the rest of the session（内存态，
+ * 进程退出即失效）；destructive ops (no batchKey) always re-ask.
+ */
+export function withBatchApproval(confirm: ConfirmFn): BatchConfirmFn {
+  const approved = new Set<string>();
   const fn = (async (req) => {
-    if (req.batchKey) {
-      const exp = approved.get(req.batchKey);
-      if (exp && exp > Date.now()) return 'batch';
-    }
+    if (req.batchKey && approved.has(req.batchKey)) return 'batch';
     const verdict = await confirm(req);
-    if (verdict === 'batch' && req.batchKey) approved.set(req.batchKey, Date.now() + ttlMs);
+    if (verdict === 'batch' && req.batchKey) approved.add(req.batchKey);
     return verdict;
   }) as BatchConfirmFn;
   fn.revokeBatchApprovals = () => {
-    prune();
     const n = approved.size;
     approved.clear();
     return n;
   };
-  fn.activeBatchApprovals = () => {
-    prune();
-    return approved.size;
-  };
+  fn.activeBatchApprovals = () => approved.size;
   return fn;
 }
 

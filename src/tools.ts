@@ -124,7 +124,7 @@ function hkCreateTitle(args: string[]): string {
 
 /**
  * 批量免问判定收在 guard.isBatchable（唯一来源）：破坏性/高影响操作永不批量。
- * 免问窗口绑定任务标识：窗口内只允许对同一任务的同类操作免问，防止借窗口改任意任务。
+ * 免问授权绑定任务标识：授权后只允许对同一任务的同类操作免问，防止借授权改任意任务。
  */
 function batchKeyForMcp(name: string, args: Record<string, unknown>): string | undefined {
   if (!isBatchable(name)) return undefined;

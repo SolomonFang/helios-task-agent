@@ -300,7 +300,7 @@ async function main(): Promise<void> {
       const v2 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '同类免问'));
       assert.equal(await v2, 'batch');
-      assert.ok(f.channel.replies.at(-1)!.text.includes('同类写操作 10 分钟内免问'));
+      assert.ok(f.channel.replies.at(-1)!.text.includes('同类写操作本会话内免问'));
 
       const v3 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '取消'));

@@ -13,6 +13,7 @@
 
 ### Changed
 
+- 「同类免问」从 10 分钟 TTL 改为**会话级**：批准后同类写操作在本会话内持续免问（内存态授权，重启即失效），批量建任务不再被中途过期打断；授权仍可随时经「恢复确认」/ `/confirm revoke` 撤销，破坏性操作依然逐次确认、授权仍绑定任务标识。确认词表新增「一直允许 / 始终允许 / always」
 - 大型函数拆分：`bot/handler.ts` 的 `handle`（约 260 行）按命令表驱动分发拆为十余个命名函数，`tools.ts` 的 `buildTools`（约 485 行）收敛为纯装配层 + 各工具工厂函数，`kanban/watcher.ts` 的 `tick`（约 140 行）拆为 diff / 投递 / 落盘三段——行为均保持不变
 - 公共启动序列抽为 `src/bootstrap.ts`（cli 与 bot 此前逐字重复且 OCR 检查只在 bot 侧，已漂移）；「发卡片失败降级纯文本」收敛为 `sendCardWithTextFallback`
 - 数据目录路径与包根路径收敛为 `src/paths.ts`（原 8 个模块为拿路径 import memory；4 处散落的 `__dirname` 假设统一为 `packageRoot` 并注明 CJS 前提）；`prompt.ts ↔ skills.ts` import 循环随之断开

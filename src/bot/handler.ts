@@ -206,7 +206,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
     else if (result === 'approved_batch')
       void channel
-        .notifyOpenId(openId, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…（回复「恢复确认」可随时撤销）')
+        .notifyOpenId(openId, '✅ 已批准；同类写操作本会话内免问，正在执行…（回复「恢复确认」可随时撤销）')
         .catch(() => {});
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
     else void channel.notifyOpenId(openId, '该确认已处理或已过期，无需重复操作。').catch(() => {});
@@ -340,7 +340,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return true;
     }
     if (answer === 'approved_batch') {
-      await channel.reply(msg, '✅ 已批准；同类写操作 10 分钟内免问，正在执行…（回复「恢复确认」可随时撤销）');
+      await channel.reply(msg, '✅ 已批准；同类写操作本会话内免问，正在执行…（回复「恢复确认」可随时撤销）');
       return true;
     }
     if (answer === 'denied') {
