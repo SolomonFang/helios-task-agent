@@ -4,6 +4,7 @@ import { UNTRUSTED_OPEN, wrapUntrusted } from './guard';
 import { errMessage } from '../infra/err';
 import type {
   ChatMessage,
+  InlineImage,
   LlmClientConfig,
   OpenAiClient,
   OpenAiTool,
@@ -156,6 +157,7 @@ export async function runAgentTurn({
   handlers,
   onProgress,
   signal,
+  image,
 }: {
   client: OpenAiClient;
   model: string;
@@ -165,6 +167,8 @@ export async function runAgentTurn({
   onProgress?: (info: ProgressInfo) => void;
   /** Aborted by /stop: checked before each round/tool call, passed to the LLM request. */
   signal?: AbortSignal;
+  /** 当次透传的图片：仅注入首轮请求（含上下文超限重试），历史与后续工具轮次均为文本占位。 */
+  image?: InlineImage;
 }): Promise<string> {
   sanitizeToolPairs(messages);
   trimHistory(messages);
@@ -172,17 +176,33 @@ export async function runAgentTurn({
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     if (signal?.aborted) return '（已被用户中断）';
     if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
-    const createReq = () =>
-      client.chat.completions.create(
+    const createReq = () => {
+      const payload = downgradeSystemNotes(messages);
+      // 图片只进当次首个请求：会话历史存的是文本占位（[图片] …），这里仅在请求载荷副本上
+      // 把末尾 user 消息替换为多模态 content 数组，避免 base64 随历史回放反复进上下文。
+      if (image && round === 0) {
+        const last = payload[payload.length - 1];
+        if (last && last.role === 'user') {
+          payload[payload.length - 1] = {
+            role: 'user',
+            content: [
+              { type: 'image_url', image_url: { url: image.dataUrl } },
+              { type: 'text', text: image.prompt },
+            ],
+          };
+        }
+      }
+      return client.chat.completions.create(
         {
           model,
-          messages: downgradeSystemNotes(messages),
+          messages: payload,
           tools: tools.length ? tools : undefined,
           tool_choice: tools.length ? 'auto' : undefined,
           temperature: 0.3,
         },
         signal ? { signal } : {},
       );
+    };
     let resp: Awaited<ReturnType<typeof createReq>> | undefined;
     try {
       resp = await createReq();

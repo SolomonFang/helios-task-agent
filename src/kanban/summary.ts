@@ -25,6 +25,8 @@ export interface WorkSummaryTask {
   iteration: string;
   projectName: string;
   updatedAt: string;
+  /** 最近一次 attempt 失败标记（晨报「失败」分组用）。 */
+  failed?: boolean;
   attemptSummary?: string;
   filesChanged?: number;
   additions?: number;
@@ -238,6 +240,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
       updatedAt: String(row.updated_at || ''),
       diffUrl: pageUrl,
     };
+    if (row.last_attempt_failed) task.failed = true;
     try {
       const summary = pickAttemptSummary(await apiGet(kanbanUrl, `/tasks/${taskId}`));
       if (summary) task.attemptSummary = summary;

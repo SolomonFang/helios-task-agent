@@ -23,7 +23,7 @@ npx helios-task-agent@latest
 ## 两种形态：CLI 与飞书 bot
 
 - **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/batch/N`）、看板操作全部可用。
-- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出三项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）。
+- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出几项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）、**定时晨报**（`HTA_DAILY_BRIEF=HH:MM`，每天定时向 owner 推送当前迭代看板概览）、**图片消息**（`LLM_VISION=1`，需模型支持图片输入）。
 
 ## 安装
 
@@ -113,6 +113,8 @@ npm i -g @larksuite/cli && lark-cli auth login
 ~/.helios-task-agent/synced-sources.json   # 飞书来源 → 看板任务（查重）
 ~/.helios-task-agent/audit.log             # 写操作审计（JSONL）
 ~/.helios-task-agent/watch-state.json      # 看板推送快照
+~/.helios-task-agent/daily-brief-state.json # 定时晨报推送日期（当天不重复推）
+~/.helios-task-agent/sessions/             # 会话历史（每用户一个文件，重启后恢复上下文；/clear 同步清除）
 ```
 
 ### 终端
@@ -200,6 +202,8 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `KANBAN_WATCH_INTERVAL_SEC` | 推送间隔秒（默认 60，最小 15） |
 | `HTA_UPDATE_CHECK` | 启动时检查 npm 新版本，默认开；`0` 关闭 |
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
+| `LLM_VISION` | `1` 时 bot 支持图片消息：下载图片随当次请求发给模型（**需模型支持图片输入**；图片不进会话历史、不落盘，单张上限 10MB）。默认关，关闭时图片消息仍提示仅支持文字 |
+| `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向 owner 推送当前迭代看板概览（进行中/待审阅/已完成/失败）。未设置或非法值 = 关闭 |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
 加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。注意：**当前目录 `.env` 中的凭证/命令类高危键不参与覆盖**（`LLM_API_KEY`、`FEISHU_*`、`HELIOS_KANBAN_MCP_COMMAND/ARGS`、`HELIOS_KANBAN_PACKAGE`、`HELIOS_KANBAN_URL`、代理与 npm registry 等，防供应链/命令注入；被忽略时仅输出一行 `console.warn`）——这类键请写入 `~/.helios-task-agent/.env`（或 shell 环境 / 项目 `.env`）。
@@ -227,7 +231,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 - 「用 Claude 跑这个任务」「start」（你指定何时、用谁）
 - 「有哪些项目」「创建一个任务：…」「跑得怎么样」「再跟它说一句…」
 
-bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯文本）；其它消息类型会提示不支持。长回复按约 3000 字拆分；进度约每 2 秒原地更新。同一 `message_id` 10 分钟内去重。每用户消息串行；忙或确认挂起时新消息会收到排队/提示回执。
+bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯文本）；`LLM_VISION=1` 时可直接发图片消息（随当次请求发给模型分析，不落盘、不进会话历史，单张上限 10MB）；其它消息类型会提示不支持。长回复按约 3000 字拆分；进度占位随工具调用更新（约 2 秒节流），LLM 静默思考期间每 10 秒心跳刷新一次（附已等待秒数）。同一 `message_id` 10 分钟内去重。每用户消息串行；忙或确认挂起时新消息会收到排队/提示回执。群消息不处理，但在群里 @机器人 会回一句私聊指引（每群 24 小时最多一次），避免误以为机器人掉线。会话历史按用户落盘（`sessions/`），重启后自动恢复上下文，`/clear` 同步清除磁盘历史。
 
 记忆按飞书 `open_id`（bot）或 `local`（终端）分桶。工具：`memory_set` / `get` / `delete` / `note`（备注约保留最近 50 条）。常用键：`feishu_task_source`、`feishu_chat_id`、`preferred_project_id` / `repo_id` / `iteration`、`last_sync_at`。
 

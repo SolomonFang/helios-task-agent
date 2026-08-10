@@ -4,6 +4,7 @@ import { c, printBanner, Spinner, renderReply } from './infra/ui';
 import { ensureEnvLoaded } from './config/config';
 import { ensureConfig } from './config/config-wizard';
 import { AgentSession } from './agent/session';
+import { SessionHistoryStore } from './agent/session-store';
 import { connectMcp } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
 import { checkHkDeps, checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
@@ -300,7 +301,11 @@ export async function main(): Promise<void> {
     return false;
   };
 
-  const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, { userId: 'local', confirm: confirmWrite });
+  const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, {
+    userId: 'local',
+    confirm: confirmWrite,
+    historyStore: new SessionHistoryStore(),
+  });
 
   /** MCP 实例绑定的看板地址：/config 改地址后 MCP 不会重连，/status 据此持续警示，直到重启。 */
   const mcpBoundKanbanUrl = cfg.kanbanUrl;

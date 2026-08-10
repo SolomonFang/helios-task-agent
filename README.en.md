@@ -23,7 +23,7 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 ## Two forms: CLI vs Feishu bot
 
 - **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/batch/N`), and all kanban operations included.
-- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds three bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), and **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link).
+- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link), **daily brief** (`HTA_DAILY_BRIEF=HH:MM`, pushes a current-iteration kanban overview to the owner every day), and **image messages** (`LLM_VISION=1`, requires a vision-capable model).
 
 ## Install
 
@@ -112,6 +112,8 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 ~/.helios-task-agent/synced-sources.json
 ~/.helios-task-agent/audit.log
 ~/.helios-task-agent/watch-state.json
+~/.helios-task-agent/daily-brief-state.json # daily-brief last-push date (no duplicate push same day)
+~/.helios-task-agent/sessions/             # per-user conversation history (restored on restart; /clear wipes it)
 ```
 
 ### Terminal
@@ -132,7 +134,7 @@ helios-task-agent-bot
 
 1. Wizard when credentials are missing (online validation by default; you may force-save and fix later)  
 2. Open Platform: long connection + `im.message.receive_v1`  
-3. DM only (p2p); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
+3. DM only (p2p; group messages are ignored — @-mentioning the bot in a group gets a one-line DM hint, at most once per group per 24h); no public webhook; process must stay up (e.g. `pm2 start helios-task-agent -- bot`)  
 
 **Reconfigure**: to switch model / Base URL / API key, run `helios-task-agent bot --reconfig` to re-run the model/kanban config wizard (Feishu credentials are kept) — no hand-editing of `.env` needed; editing `~/.helios-task-agent/.env` directly also works. Bot has **no** `/config`; re-running bot with existing `FEISHU_*` does **not** reopen the wizard — to switch a wrongly bound bot use `helios-task-agent bot --rebind` (re-runs only the Feishu credential wizard; LLM/kanban config is kept; type `-` to clear the open_id allowlist). Terminal has `/config`.
 
@@ -195,6 +197,8 @@ via the `skill_doc` tool (progressive disclosure).
 | `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
+| `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
+| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed) to the owner every day. Unset or invalid = off |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
 Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example). Note: **credential/command-type high-risk keys in the cwd `.env` are ignored** (`LLM_API_KEY`, `FEISHU_*`, `HELIOS_KANBAN_MCP_COMMAND/ARGS`, `HELIOS_KANBAN_PACKAGE`, `HELIOS_KANBAN_URL`, proxy and npm registry keys, etc. — a supply-chain/command-injection guard; ignored keys only produce a one-line `console.warn`). Put such keys in `~/.helios-task-agent/.env` (or the shell environment / project `.env`).
@@ -215,7 +219,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
 
-Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); other types rejected. Replies split ~3000 chars; progress ~every 2s. Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt.
+Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); with `LLM_VISION=1` you can also send image messages (analyzed by the model with that single request — never written to disk or history, 10MB cap); other types rejected. Replies split ~3000 chars; the progress placeholder updates on tool calls (throttled ~2s) and heartbeats every 10s during silent LLM thinking (with elapsed seconds). Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt. Conversation history is persisted per user (`sessions/`) and restored after restart; `/clear` wipes it from disk too.
 
 Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the latest 50 entries). Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
 

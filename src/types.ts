@@ -12,6 +12,16 @@ export interface AgentConfig {
   kanbanProjectId: string;
   kanbanRepoId: string;
   kanbanIteration: string;
+  /** 图片消息（vision）开关：LLM_VISION=1 才启用，缺省关闭（需模型支持图片输入）。 */
+  visionEnabled?: boolean;
+}
+
+/** 当次请求透传的图片：只进首轮 LLM 请求的多模态 content，不进会话历史。 */
+export interface InlineImage {
+  /** base64 data URL（data:image/...;base64,...）。 */
+  dataUrl: string;
+  /** 与图片同条发送的文本：用户随图配文或默认提示。 */
+  prompt: string;
 }
 
 /** Feishu bot long-connection credentials. */

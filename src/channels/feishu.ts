@@ -13,6 +13,7 @@ export interface FeishuReceivePayload {
     chat_type?: string;
     message_type?: string;
     content?: string;
+    mentions?: Array<{ key?: string; id?: { open_id?: string }; name?: string }>;
   };
 }
 
@@ -20,6 +21,8 @@ export interface FeishuReceivePayload {
 export interface FeishuInboundMessage extends InboundMessage {
   messageId: string;
   messageType: string;
+  /** image 消息的 image_key（下载图片资源用）；其余消息类型无此字段。 */
+  imageKey?: string;
 }
 
 /** Subset of the card.action.trigger callback payload we care about. */
@@ -83,7 +86,7 @@ export function filterIncomingMessage(data: FeishuReceivePayload): FilteredIncom
   const sender = data.sender;
   if (!message?.chat_id || !message.message_id) return null;
 
-  // Only private chats
+  // Only private chats（群消息见 groupMentionChatId：@机器人 时回一句指引，其余静默）
   if (message.chat_type !== 'p2p') return null;
 
   // Ignore bot / system senders（sender_type 缺失视为不可信，同样丢弃）
@@ -99,6 +102,20 @@ export function filterIncomingMessage(data: FeishuReceivePayload): FilteredIncom
     messageType: message.message_type || 'unknown',
     content: message.content,
   };
+}
+
+/**
+ * 群消息中「@了机器人」的判定（纯函数）：返回应回执的 chat_id，否则 null。
+ * 群消息一律不进处理流程，但被 @ 却完全无响应时用户会以为 bot 挂了——回一句私聊指引。
+ */
+export function groupMentionChatId(data: FeishuReceivePayload, botOpenId: string): string | null {
+  const message = data.message;
+  if (!message?.chat_id || !message.chat_type || message.chat_type === 'p2p') return null;
+  // 只回应真人发送者，避免 bot 互 @ 死循环
+  if (data.sender?.sender_type !== 'user') return null;
+  if (!botOpenId) return null;
+  const mentioned = (message.mentions || []).some((m) => m.id?.open_id === botOpenId);
+  return mentioned ? message.chat_id : null;
 }
 
 /** message_id 去重表：TTL 过期清理（prune 由调用方在事件入口触发）。 */
@@ -216,6 +233,17 @@ function parseTextContent(content: string | undefined): string {
   }
 }
 
+/** 解析 image 消息 content（JSON {"image_key":"img_xxx"}）取 image_key；解析失败返回空串。 */
+export function parseImageKey(content: string | undefined): string {
+  if (!content) return '';
+  try {
+    const parsed = JSON.parse(content) as { image_key?: string };
+    return typeof parsed.image_key === 'string' ? parsed.image_key.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
 /** Flatten a Feishu post (rich text) message into plain text. */
 export function parsePostContent(content: string | undefined): string {
   if (!content) return '';
@@ -283,6 +311,10 @@ export class FeishuChannel implements AgentChannel {
   private lastEventAtMs = 0;
   private readonly dedupe = createMessageDedupe(10 * 60 * 1000);
   private deniedNotified = new Set<string>();
+  /** 机器人自身 open_id（懒加载）：用于识别群里是否 @ 了机器人；null = 已尝试但获取失败。 */
+  private botOpenId: string | null | undefined;
+  /** 群 @ 回执冷却：同一群 24h 内最多回一句，防刷屏。 */
+  private groupMentionReplied = new Map<string, number>();
   /** owner 绑定写盘失败的用户（fail-closed）：重启前按拒绝处理，避免每条消息重试写盘。 */
   private claimBlocked = new Set<string>();
   /** Card button callback (card.action.trigger); set by the bot layer. */
@@ -352,7 +384,11 @@ export class FeishuChannel implements AgentChannel {
 
           // 基础过滤：字段齐全 + p2p 私聊 + 真人发送者
           const filtered = filterIncomingMessage(data);
-          if (!filtered) return;
+          if (!filtered) {
+            // 群里 @ 机器人却完全无响应，用户会以为 bot 挂了：回一句私聊指引（每群 24h 一次）
+            void this.maybeReplyGroupMention(data);
+            return;
+          }
           const { openId } = filtered;
 
           const gate = resolveAccess(this.access, this.claimBlocked, openId, {
@@ -396,6 +432,10 @@ export class FeishuChannel implements AgentChannel {
             messageType: filtered.messageType,
             raw: data,
           };
+          if (filtered.messageType === 'image') {
+            const imageKey = parseImageKey(filtered.content);
+            if (imageKey) inbound.imageKey = imageKey;
+          }
 
           // Return immediately; process in background to satisfy <3s ACK.
           void onMessage(inbound).catch((err) => {
@@ -478,6 +518,26 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
+  /**
+   * 下载消息内的图片资源（私聊 image 消息），内存聚合为 Buffer 返回（不落盘）。
+   * SDK 该接口返回二进制流 + 响应头；MIME 取 content-type，缺失/非 image/* 时回退 jpeg。
+   */
+  async downloadImage(messageId: string, imageKey: string): Promise<{ data: Buffer; mimeType: string }> {
+    const res = await this.client.im.v1.messageResource.get({
+      path: { message_id: messageId, file_key: imageKey },
+      params: { type: 'image' },
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of res.getReadableStream()) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+    }
+    const headers = (res.headers ?? {}) as Record<string, unknown>;
+    const rawType = headers['content-type'] ?? headers['Content-Type'];
+    const mimeType =
+      typeof rawType === 'string' && rawType.startsWith('image/') ? rawType.split(';')[0]!.trim() : 'image/jpeg';
+    return { data: Buffer.concat(chunks), mimeType };
+  }
+
   async reply(msg: InboundMessage, text: string): Promise<void> {
     const chatId = msg.sessionId;
     if (!chatId) throw new Error('reply 缺少 chat_id (sessionId)');
@@ -544,5 +604,39 @@ export class FeishuChannel implements AgentChannel {
     // 不再只靠进程退出回收 socket（bot 的 8s 强退兜底仍保留）。
     this.wsClient?.close();
     this.wsClient = null;
+  }
+
+  /** 懒加载机器人自身 open_id（识别群 @）；失败记 null 不再每条消息重试。 */
+  private async ensureBotOpenId(): Promise<string | null> {
+    if (this.botOpenId !== undefined) return this.botOpenId;
+    try {
+      const res = (await this.client.request({ method: 'GET', url: '/open-apis/bot/v3/info' })) as {
+        bot?: { open_id?: string };
+      };
+      this.botOpenId = res?.bot?.open_id || null;
+    } catch (err) {
+      this.botOpenId = null;
+      console.warn(`[feishu] 获取机器人 open_id 失败，群 @ 回执不可用: ${errMessage(err)}`);
+    }
+    return this.botOpenId;
+  }
+
+  /** 群里被 @ 时回一句私聊指引（fire-and-forget；同一群 24h 冷却，防刷屏）。 */
+  private async maybeReplyGroupMention(data: FeishuReceivePayload): Promise<void> {
+    try {
+      const botOpenId = await this.ensureBotOpenId();
+      if (!botOpenId) return;
+      const chatId = groupMentionChatId(data, botOpenId);
+      if (!chatId) return;
+      const now = Date.now();
+      const last = this.groupMentionReplied.get(chatId) || 0;
+      if (now - last < 24 * 60 * 60 * 1000) return;
+      // Map 无清理会无界增长：超上限整体清空（代价只是老群可能再收一次指引）
+      if (this.groupMentionReplied.size >= 1000) this.groupMentionReplied.clear();
+      this.groupMentionReplied.set(chatId, now);
+      await this.sendText(chatId, '我只处理私聊消息：请点我头像发起私聊，把需求直接发给我。');
+    } catch (err) {
+      console.warn(`[feishu] 群 @ 回执发送失败: ${errMessage(err)}`);
+    }
   }
 }

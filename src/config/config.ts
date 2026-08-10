@@ -191,6 +191,7 @@ export function currentConfig(): AgentConfig {
     kanbanProjectId: process.env.HELIOS_KANBAN_PROJECT_ID || '',
     kanbanRepoId: process.env.HELIOS_KANBAN_REPO_ID || '',
     kanbanIteration: process.env.HELIOS_KANBAN_ITERATION || '',
+    visionEnabled: process.env.LLM_VISION === '1',
   };
 }
 

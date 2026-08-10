@@ -1,6 +1,7 @@
 /** Public API for embedding (e.g. Feishu channel process). */
 export { AgentSession } from './agent/session';
 export { SessionRouter } from './agent/session-router';
+export { SessionHistoryStore } from './agent/session-store';
 export { KanbanMcp } from './kanban/mcp';
 export { MemoryStore } from './agent/memory';
 export { defaultDataHome } from './infra/paths';

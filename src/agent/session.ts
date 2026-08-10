@@ -1,12 +1,15 @@
 import type { KanbanMcp } from '../kanban/mcp';
 import { MemoryStore } from './memory';
-import { createClient, runAgentTurn } from './llm';
+import { createClient, runAgentTurn, trimHistory } from './llm';
+import { SessionHistoryStore } from './session-store';
+import { errMessage } from '../infra/err';
 import { buildSystemPrompt } from './prompt';
 import { buildTools } from './tools';
 import { withBatchApproval, type BatchConfirmFn, type ConfirmFn } from './guard';
 import type {
   AgentConfig,
   ChatMessage,
+  InlineImage,
   OpenAiClient,
   OpenAiTool,
   ProgressInfo,
@@ -25,6 +28,8 @@ export interface AgentSessionOptions {
   confirm?: ConfirmFn;
   /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
   reportLinkBaseUrl?: string;
+  /** 会话历史持久化（重启/LRU 淘汰后恢复上下文）；缺省则仅内存。 */
+  historyStore?: SessionHistoryStore;
 }
 
 /**
@@ -39,6 +44,7 @@ export class AgentSession {
   private readonly memory: MemoryStore;
   private readonly confirm?: ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
+  private readonly historyStore?: SessionHistoryStore;
   private batchedConfirm?: BatchConfirmFn;
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
@@ -55,11 +61,24 @@ export class AgentSession {
     this.memory = opts.memory || new MemoryStore();
     this.confirm = opts.confirm;
     this.reportLinkBaseUrl = opts.reportLinkBaseUrl;
+    this.historyStore = opts.historyStore;
     const runtime = this.buildRuntime(cfg);
     this.client = runtime.client;
     this.openAiTools = runtime.openAiTools;
     this.handlers = runtime.handlers;
     this.messages = [{ role: 'system', content: runtime.systemPrompt }];
+    // 重启/会话重建时从磁盘恢复历史；坏文件由 store 兜底为空。恢复后仍受既有裁剪约束。
+    if (this.historyStore) {
+      try {
+        const restored = this.historyStore.load(this.userId);
+        if (restored.length) {
+          this.messages.push(...restored);
+          trimHistory(this.messages);
+        }
+      } catch (err) {
+        console.error(`[session] 会话历史恢复失败，按空历史继续: ${errMessage(err)}`);
+      }
+    }
   }
 
   get config(): AgentConfig {
@@ -189,12 +208,35 @@ export class AgentSession {
   clearHistory(): void {
     this.applyConfig(this.cfg);
     this.messages = this.messages.slice(0, 1);
+    // 同步清掉磁盘历史；清盘失败不阻断（内存已清，下次落盘会覆盖）
+    if (this.historyStore) {
+      try {
+        this.historyStore.clear(this.userId);
+      } catch (err) {
+        console.error(`[session] 磁盘会话历史清理失败: ${errMessage(err)}`);
+      }
+    }
   }
 
+  /** 每轮结束后把历史落盘（失败仅记日志：持久化是增强，不打断对话）。 */
+  private persistHistory(): void {
+    if (!this.historyStore) return;
+    try {
+      this.historyStore.save(this.userId, this.messages);
+    } catch (err) {
+      console.error(`[session] 会话历史落盘失败（不影响本次对话）: ${errMessage(err)}`);
+    }
+  }
+
+  /**
+   * 处理一条用户消息。image 为当次透传的图片（vision）：只进本轮首个 LLM 请求，
+   * 写入会话历史的仍是 text 本体（调用方传文本占位，如「[图片] 配文」）。
+   */
   async handleUserMessage(
     text: string,
     onProgress?: (info: ProgressInfo) => void,
     signal?: AbortSignal,
+    image?: InlineImage,
   ): Promise<string> {
     this.flushPendingNotes();
     this.messages.push({ role: 'user', content: text });
@@ -207,11 +249,16 @@ export class AgentSession {
         handlers: this.handlers,
         onProgress,
         signal,
+        image,
       });
     } catch (err) {
       const last = this.messages[this.messages.length - 1];
       if (last && last.role === 'user') this.messages.pop();
       throw err;
+    } finally {
+      // 成功/失败/中断都落一次盘：中断残留的 assistant+tool 占位也属于可恢复上下文；
+      // 失败弹回的 user 消息不落盘（与内存状态一致）
+      this.persistHistory();
     }
   }
 }

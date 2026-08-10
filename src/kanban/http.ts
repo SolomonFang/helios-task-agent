@@ -200,6 +200,7 @@ export interface SummaryTaskRow {
   status?: string;
   iteration?: string | number;
   updated_at?: string;
+  last_attempt_failed?: boolean;
 }
 
 export function validateSummaryTaskRows(endpoint: string, data: unknown): SummaryTaskRow[] {
@@ -209,6 +210,7 @@ export function validateSummaryTaskRows(endpoint: string, data: unknown): Summar
     status: 'string',
     iteration: 'string|number',
     updated_at: 'string',
+    last_attempt_failed: 'boolean',
   });
 }
 

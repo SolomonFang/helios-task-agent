@@ -25,7 +25,7 @@ import {
   parseCommand,
   plainPaint,
 } from '../commands';
-import type { AgentConfig, InboundMessage, ProgressInfo } from '../types';
+import type { AgentConfig, InboundMessage, InlineImage, ProgressInfo } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { McpSupervisor } from './supervisor';
 import { MCP_FALLBACK_TEXT } from '../infra/deps';
@@ -39,6 +39,15 @@ const AI_REVIEW_MAX_CONCURRENT = 2;
 
 /** 单条用户消息长度上限：超长消息直接拒答，不送入 LLM（上下文爆炸 / 网关 400）。 */
 export const MAX_USER_MESSAGE_CHARS = 8000;
+
+/** 进度占位消息静默期心跳间隔：超过该时长没有任何工具事件则刷新一次占位（LLM 长思考时用户分不清「在想」还是「死了」）。 */
+export const PROGRESS_HEARTBEAT_MS = 10_000;
+
+/** 图片消息大小上限（字节）：超限直接拒答，不送 LLM（base64 后约膨胀 1/3，撑爆上下文/网关）。 */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/** 图片下载器：默认走飞书 SDK（FeishuChannel.downloadImage），单测注入 mock（不触网络）。 */
+export type ImageFetcher = (messageId: string, imageKey: string) => Promise<{ data: Buffer; mimeType: string }>;
 
 /** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
 const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
@@ -54,6 +63,10 @@ export interface BotHandlerDeps {
   helpText: string;
   /** 测试注入用：替换 AI 审查执行器（默认 runAiReview 会拉起 ocr 子进程，单测不可行）。 */
   aiReviewRunner?: typeof runAiReview;
+  /** 测试注入用：静默期心跳间隔（默认 PROGRESS_HEARTBEAT_MS）。 */
+  progressHeartbeatMs?: number;
+  /** 测试注入用：图片下载器（默认 channel.downloadImage 走飞书 SDK）。 */
+  imageFetcher?: ImageFetcher;
 }
 
 export interface BotHandlers {
@@ -66,6 +79,8 @@ export interface BotHandlers {
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const { channel, router, confirmations, cfg, mcp, supervisor, reportServer } = deps;
   const runReview = deps.aiReviewRunner ?? runAiReview;
+  const progressHeartbeatMs = deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS;
+  const fetchImage: ImageFetcher = deps.imageFetcher ?? ((mid, key) => channel.downloadImage(mid, key));
 
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
@@ -396,17 +411,37 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
   };
 
-  /** 进度反馈：占位消息随工具调用节流更新（飞书消息更新限流，2 秒内合并）。 */
-  const createProgressReporter = (progressId: string | undefined): ((info: ProgressInfo) => void) => {
+  /** 进度反馈：占位消息随工具调用节流更新（飞书消息更新限流，2 秒内合并）；activity 供静默期心跳判断。 */
+  const createProgressReporter = (
+    progressId: string | undefined,
+    activity: { lastEventAt: number },
+  ): ((info: ProgressInfo) => void) => {
     let lastPush = 0;
     return (info: ProgressInfo) => {
+      activity.lastEventAt = Date.now();
       if (!progressId) return;
-      const now = Date.now();
+      const now = activity.lastEventAt;
       if (now - lastPush < 2000) return; // 飞书消息更新限流
       lastPush = now;
       const text = info.type === 'tool' ? `⏳ 处理中…（调用工具 ${info.name}）` : '⏳ 思考中…';
       void channel.updateText(progressId, text).catch(() => {});
     };
+  };
+
+  /**
+   * 静默期心跳：LLM 长思考期间没有任何工具事件，占位消息原地不动，用户分不清「在想」还是「死了」。
+   * 每 intervalMs 检查一次，静默超阈值则刷新占位并附已等待秒数；回复就绪即停（clearHeartbeat 在投递前调用）。
+   */
+  const startProgressHeartbeat = (progressId: string | undefined, activity: { lastEventAt: number }): (() => void) => {
+    if (!progressId) return () => {};
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (Date.now() - activity.lastEventAt < progressHeartbeatMs) return;
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      void channel.updateText(progressId, `⏳ 仍在处理…（已等待 ${secs} 秒；/stop 可中断）`).catch(() => {});
+    }, progressHeartbeatMs);
+    timer.unref();
+    return () => clearInterval(timer);
   };
 
   /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。 */
@@ -444,19 +479,28 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   };
 
   /** 单个 agent 轮次：占位/进度/中断登记/回复投递/异常分级（中断与 LLM 失败文案不同）。 */
-  const runAgentRound = async (msg: InboundMessage, session: AgentSession, text: string): Promise<void> => {
+  const runAgentRound = async (
+    msg: InboundMessage,
+    session: AgentSession,
+    text: string,
+    image?: InlineImage,
+  ): Promise<void> => {
     const openId = msg.senderId;
     // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
     const progressId = await sendPlaceholder(msg);
-    const onProgress = createProgressReporter(progressId);
+    const activity = { lastEventAt: Date.now() };
+    const onProgress = createProgressReporter(progressId, activity);
+    const clearHeartbeat = startProgressHeartbeat(progressId, activity);
     const ctl = new AbortController();
     running.set(openId, ctl);
     // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）
     await supervisor.enterTurn();
     try {
-      const reply = await session.handleUserMessage(text, onProgress, ctl.signal);
+      const reply = await session.handleUserMessage(text, onProgress, ctl.signal, image);
+      clearHeartbeat(); // 投递前停心跳：避免回复已就绪却被心跳刷回「仍在处理」
       await deliverReply(msg, progressId, reply);
     } catch (err) {
+      clearHeartbeat();
       if (ctl.signal.aborted) {
         await channel.reply(msg, '⏹ 已中断。');
       } else {
@@ -476,6 +520,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     text: string,
     cmd: string | null,
     openId: string,
+    image?: InlineImage,
   ): Promise<void> => {
     const session = router.getOrCreate(openId);
 
@@ -493,7 +538,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return;
     }
 
-    await runAgentRound(msg, session, text);
+    await runAgentRound(msg, session, text, image);
   };
 
   /** 排队入口：排队上限拒收、排队/闸门回执、敲键盘表情、串行入队。 */
@@ -502,6 +547,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     fmsg: FeishuInboundMessage,
     text: string,
     cmd: string | null,
+    image?: InlineImage,
   ): Promise<void> => {
     const openId = msg.senderId;
     // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
@@ -525,7 +571,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       openId,
       async () => {
         try {
-          await runQueuedMessage(msg, text, cmd, openId);
+          await runQueuedMessage(msg, text, cmd, openId, image);
         } finally {
           await cleanupTyping();
         }
@@ -536,11 +582,52 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     );
   };
 
+  /**
+   * 图片消息（LLM_VISION=1 才进入本路径）：下载字节 → 10MB 上限 → base64 data URL →
+   * 作为普通对话排入既有串行队列（占位/进度/心跳不变，不占确认闸门）。
+   * 会话历史只存文本占位「[图片] 配文」，图片仅透传给当次 LLM 请求（不落盘、不进审计）。
+   */
+  const handleImageMessage = async (msg: InboundMessage, fmsg: FeishuInboundMessage): Promise<void> => {
+    let img: { data: Buffer; mimeType: string };
+    try {
+      img = await fetchImage(fmsg.messageId, fmsg.imageKey!);
+    } catch (err) {
+      // 失败原因只进日志（可能含请求细节），给用户的是通用友好提示
+      console.error(`[feishu] 图片下载失败: ${errMessage(err)}`);
+      await channel.reply(msg, '⚠️ 图片下载失败了，请稍后重发；也可以把图片里的关键信息打字发给我。');
+      return;
+    }
+    if (img.data.length > MAX_IMAGE_BYTES) {
+      const mb = (img.data.length / 1024 / 1024).toFixed(1);
+      await channel.reply(msg, `⚠️ 图片太大了（${mb}MB，上限 10MB）：请压缩后再发，或把关键信息打字发给我。`);
+      return;
+    }
+    const caption = (msg.text || '').trim();
+    // 随图文字同样受单条长度上限约束（理论上 image 消息无配文，防御异常客户端）
+    if (caption.length > MAX_USER_MESSAGE_CHARS) {
+      await channel.reply(
+        msg,
+        `⚠️ 这条消息太长了（${caption.length} 字符，上限 ${MAX_USER_MESSAGE_CHARS}）：请精简或拆成几条发送。`,
+      );
+      return;
+    }
+    const image: InlineImage = {
+      dataUrl: `data:${img.mimeType};base64,${img.data.toString('base64')}`,
+      prompt: caption || '请分析这张图片并回应。',
+    };
+    await enqueueMessage(msg, fmsg, caption ? `[图片] ${caption}` : '[图片]', null, image);
+  };
+
   /** 消息入口：类型/长度门禁 → 确认应答 → 即时命令分发 → 串行排队。 */
   const handle = async (msg: InboundMessage): Promise<void> => {
     const fmsg = msg as FeishuInboundMessage;
 
     if (fmsg.messageType && fmsg.messageType !== 'text' && fmsg.messageType !== 'post') {
+      // 图片消息：仅 vision 开关打开且解析到 image_key 时放行，其余维持既有拒答文案
+      if (fmsg.messageType === 'image' && cfg.visionEnabled && fmsg.imageKey) {
+        await handleImageMessage(msg, fmsg);
+        return;
+      }
       await channel.reply(msg, '暂只支持文字消息：图片/文件等内容，请把关键信息打字或粘贴成文字发给我。');
       return;
     }

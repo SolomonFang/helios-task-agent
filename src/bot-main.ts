@@ -18,6 +18,7 @@ import { MemoryStore } from './agent/memory';
 import { defaultDataHome } from './infra/paths';
 import { FeishuChannel } from './channels/feishu';
 import { SessionRouter } from './agent/session-router';
+import { SessionHistoryStore } from './agent/session-store';
 import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
 import { ConfirmationManager } from './agent/confirm';
 import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from './channels/feishu-cards';
@@ -35,6 +36,7 @@ import { TRY_EXAMPLES } from './commands';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
+import { DailyBrief, parseDailyBriefTime, type DailyBriefTime } from './bot/daily-brief';
 import { createBotHandlers } from './bot/handler';
 import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
@@ -173,7 +175,8 @@ async function main(): Promise<void> {
     supervisor: McpSupervisor | null;
     wsAlerter: WsAlerter | null;
     reportServer: ReportServer | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null };
+    dailyBrief: DailyBrief | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null };
   let shuttingDown = false;
   /**
    * 优雅退出：exitCode 由触发路径决定——正常信号（SIGINT/SIGTERM）传 0；
@@ -196,6 +199,7 @@ async function main(): Promise<void> {
       await cleanup.supervisor?.stop();
       cleanup.wsAlerter?.stop();
       await cleanup.watcher?.stop();
+      await cleanup.dailyBrief?.stop();
       cleanup.reportServer?.close();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
@@ -434,6 +438,7 @@ async function main(): Promise<void> {
     memory,
     (openId) => (req) => confirmations.request(openId, req),
     reportServer?.baseUrl,
+    new SessionHistoryStore(),
   );
 
   const notifyOwners = (text: string): void => {
@@ -554,6 +559,31 @@ async function main(): Promise<void> {
     cleanup.watcher = watcher;
     watcher.start();
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
+  }
+
+  // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭
+  let dailyBriefTime: DailyBriefTime | null = null;
+  try {
+    dailyBriefTime = parseDailyBriefTime(process.env.HTA_DAILY_BRIEF);
+  } catch (err) {
+    console.warn(c.warn(`${errMessage(err)}，定时晨报已关闭`));
+  }
+  if (dailyBriefTime) {
+    const brief = new DailyBrief({
+      time: dailyBriefTime,
+      statePath: path.join(defaultDataHome(), 'daily-brief-state.json'),
+      kanbanUrl: agentCfg.kanbanUrl,
+      projectId: agentCfg.kanbanProjectId || undefined,
+      iteration: agentCfg.kanbanIteration || undefined,
+      owners: () => channel.allowedOpenIds(),
+      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
+      log: (msg) => console.log(c.gray(`[daily-brief] ${msg}`)),
+    });
+    cleanup.dailyBrief = brief;
+    brief.start();
+    const hh = String(dailyBriefTime.hour).padStart(2, '0');
+    const mm = String(dailyBriefTime.minute).padStart(2, '0');
+    console.log(c.gray(`定时晨报已开启（每天 ${hh}:${mm} 推送）`));
   }
 
   console.log(c.gray('Ctrl+C 退出'));

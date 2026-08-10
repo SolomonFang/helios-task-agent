@@ -3,6 +3,7 @@ import type { KanbanMcp } from '../kanban/mcp';
 import type { ConfirmFn } from './guard';
 import { MemoryStore } from './memory';
 import { AgentSession } from './session';
+import { SessionHistoryStore } from './session-store';
 
 /**
  * One AgentSession per Feishu open_id; serializes messages per user.
@@ -24,6 +25,7 @@ export class SessionRouter {
   private readonly memory: MemoryStore;
   private readonly confirmFactory?: (openId: string) => ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
+  private readonly historyStore?: SessionHistoryStore;
 
   constructor(
     cfg: AgentConfig,
@@ -33,6 +35,8 @@ export class SessionRouter {
     confirmFactory?: (openId: string) => ConfirmFn,
     /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
     reportLinkBaseUrl?: string,
+    /** 会话历史持久化：新建会话时恢复磁盘历史，LRU 淘汰后文件保留（下次说话可恢复）。 */
+    historyStore?: SessionHistoryStore,
   ) {
     this.cfg = cfg;
     this.mcp = mcp;
@@ -40,6 +44,7 @@ export class SessionRouter {
     this.memory = memory || new MemoryStore();
     this.confirmFactory = confirmFactory;
     this.reportLinkBaseUrl = reportLinkBaseUrl;
+    this.historyStore = historyStore;
   }
 
   getOrCreate(openId: string): AgentSession {
@@ -67,6 +72,7 @@ export class SessionRouter {
       memory: this.memory,
       confirm: this.confirmFactory?.(openId),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
+      historyStore: this.historyStore,
     });
     this.sessions.set(openId, session);
     return session;

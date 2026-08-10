@@ -6,6 +6,7 @@ import {
   createAccessChecker,
   createMessageDedupe,
   filterIncomingMessage,
+  groupMentionChatId,
   isCardActionAllowed,
   resolveAccess,
   type FeishuReceivePayload,
@@ -33,6 +34,34 @@ async function main(): Promise<void> {
     const group = mkP2pMessage();
     group.message!.chat_type = 'group';
     assert.equal(filterIncomingMessage(group), null, '群聊消息应被丢弃');
+  });
+
+  // ---------- 群 @ 回执判定（groupMentionChatId） ----------
+  await checkAsync('群 @ 回执：群里 @ 机器人返回 chat_id，其余情况不回', async () => {
+    const bot = 'ou_bot';
+    const mentionBot = mkP2pMessage();
+    mentionBot.message!.chat_type = 'group';
+    mentionBot.message!.mentions = [{ key: '@_user_1', id: { open_id: bot }, name: '机器人' }];
+    assert.equal(groupMentionChatId(mentionBot, bot), 'oc_1', '群里 @ 机器人应回执');
+
+    const mentionOther = mkP2pMessage();
+    mentionOther.message!.chat_type = 'group';
+    mentionOther.message!.mentions = [{ key: '@_user_1', id: { open_id: 'ou_someone' }, name: '某人' }];
+    assert.equal(groupMentionChatId(mentionOther, bot), null, '@ 的是别人不应回执');
+
+    const noMention = mkP2pMessage();
+    noMention.message!.chat_type = 'group';
+    assert.equal(groupMentionChatId(noMention, bot), null, '群里未 @ 不应回执');
+
+    const p2pMention = mkP2pMessage();
+    p2pMention.message!.mentions = [{ key: '@_user_1', id: { open_id: bot } }];
+    assert.equal(groupMentionChatId(p2pMention, bot), null, 'p2p 私聊不走群回执');
+
+    assert.equal(groupMentionChatId(mentionBot, ''), null, 'bot open_id 未知时不回执');
+
+    const botSender = mentionBot;
+    botSender.sender!.sender_type = 'app';
+    assert.equal(groupMentionChatId(botSender, bot), null, 'bot 发送者不回执（防互 @ 死循环）');
   });
 
   await checkAsync('filter：bot/系统发送者被忽略，真人放行', async () => {

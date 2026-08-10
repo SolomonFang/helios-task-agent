@@ -7,7 +7,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createBotHandlers, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
+import { createBotHandlers, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import { SessionRouter } from '../src/agent/session-router';
 import { ConfirmationManager } from '../src/agent/confirm';
@@ -117,6 +117,8 @@ class FakeLlmServer {
   baseUrl = '';
   /** ok 模式返回的 assistant 文本（deliverReply 分段测试会换成超长回复）。 */
   replyText = '好的，已收到';
+  /** 收到的请求体（JSON 解析结果，解析失败为 null）：多模态 content 断言用。 */
+  bodies: unknown[] = [];
   private hanging: http.ServerResponse[] = [];
 
   constructor() {
@@ -125,6 +127,11 @@ class FakeLlmServer {
       req.on('data', (c) => (body += c));
       req.on('end', () => {
         this.requestCount++;
+        try {
+          this.bodies.push(JSON.parse(body));
+        } catch {
+          this.bodies.push(null);
+        }
         if (this.mode === 'hang') this.hanging.push(res);
         else this.respondOk(res);
       });
@@ -183,7 +190,9 @@ interface Fixture {
 function setup(
   llmBaseUrl: string,
   kanbanUrl = 'http://localhost:1',
-  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner'>> = {},
+  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'progressHeartbeatMs' | 'imageFetcher'>> & {
+    visionEnabled?: boolean;
+  } = {},
 ): Fixture {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-handler-'));
   const cfg: AgentConfig = {
@@ -197,6 +206,7 @@ function setup(
     kanbanRepoId: '',
     kanbanIteration: '',
   };
+  if (extra.visionEnabled) cfg.visionEnabled = true;
   const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
   const confirmPrompts: Fixture['confirmPrompts'] = [];
   // 短超时：用例失败时挂起的确认定时器不拖住进程
@@ -227,6 +237,8 @@ function setup(
     reportServer: extra.reportServer ?? null,
     helpText: 'HELP-TEXT',
     ...(extra.aiReviewRunner ? { aiReviewRunner: extra.aiReviewRunner } : {}),
+    ...(extra.progressHeartbeatMs ? { progressHeartbeatMs: extra.progressHeartbeatMs } : {}),
+    ...(extra.imageFetcher ? { imageFetcher: extra.imageFetcher } : {}),
   });
   return { channel, router, confirmations, handlers, tmp, confirmPrompts };
 }
@@ -265,6 +277,98 @@ async function main(): Promise<void> {
       assert.equal(f.channel.replies.length, 2);
       assert.ok(f.channel.replies[0]!.text.includes('暂只支持文字消息'));
       assert.ok(f.channel.replies[1]!.text.includes('请发送文字内容'));
+      cleanup(f);
+    });
+
+    // ---------- vision 开关关闭：image 消息（含 image_key）仍按非文字消息拒答 ----------
+    await checkAsync('handler：vision 未开启时 image 消息仍拒答，行为与文案不变', async () => {
+      const f = setup(llm.baseUrl);
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_off' }));
+      assert.deepEqual(f.channel.replies.map((r) => r.text), [
+        '暂只支持文字消息：图片/文件等内容，请把关键信息打字或粘贴成文字发给我。',
+      ]);
+      assert.equal(llm.requestCount, base, '未开启 vision 不得发 LLM 请求');
+      cleanup(f);
+    });
+
+    // ---------- vision 开启：图片下载并以多模态 content 送入 LLM，历史仅存文本占位 ----------
+    await checkAsync('handler：vision 开启时图片以 image_url 送入 LLM，后续请求不再携带 base64', async () => {
+      const raw = Buffer.from('fake-image-bytes');
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => ({ data: raw, mimeType: 'image/png' }),
+      });
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const bodyBase = llm.bodies.length;
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_1' }));
+      assert.equal(llm.requestCount, base + 1, '图片消息应产生一次 LLM 请求');
+      // 首个请求：末尾 user 消息为多模态 content 数组（image_url + text 默认提示）
+      const body = llm.bodies[bodyBase] as { messages: { role: string; content: unknown }[] };
+      const last = body.messages.at(-1)!;
+      assert.equal(last.role, 'user');
+      const content = last.content as { type: string; image_url?: { url: string }; text?: string }[];
+      assert.ok(Array.isArray(content), 'user content 应为多模态数组');
+      assert.equal(content[0]!.type, 'image_url');
+      assert.equal(
+        content[0]!.image_url!.url,
+        `data:image/png;base64,${raw.toString('base64')}`,
+        'image_url 应为下载字节的 base64 data URL',
+      );
+      assert.equal(content[1]!.type, 'text');
+      assert.ok(content[1]!.text, '无配文时应给默认提示文本');
+      // 走既有占位/进度链路：最终回复替换占位消息
+      assert.ok(f.channel.updated.includes('好的，已收到'), '应经占位消息链路投递最终回复');
+      // 会话历史不存图片：后续请求中该轮为「[图片]」文本占位，且不再携带 base64
+      await f.handlers.handle(mkMsg('u1', '继续'));
+      const body2 = llm.bodies.at(-1) as { messages: { role: string; content: unknown }[] };
+      assert.ok(
+        body2.messages.some((m) => typeof m.content === 'string' && m.content.includes('[图片]')),
+        '历史应含 [图片] 文本占位',
+      );
+      assert.ok(
+        !JSON.stringify(body2).includes(raw.toString('base64')),
+        '后续请求不得再携带图片 base64',
+      );
+      cleanup(f);
+    });
+
+    // ---------- vision 开启：超过 10MB 的图片直接拒答，不送 LLM ----------
+    await checkAsync('handler：超过大小上限的图片直接拒答，不送 LLM', async () => {
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => ({ data: Buffer.alloc(MAX_IMAGE_BYTES + 1), mimeType: 'image/png' }),
+      });
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_big' }));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('图片太大了')),
+        `超限应提示图片太大，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      assert.equal(llm.requestCount, base, '超限图片不得发 LLM 请求');
+      cleanup(f);
+    });
+
+    // ---------- vision 开启：下载失败给友好中文提示，不外抛敏感细节 ----------
+    await checkAsync('handler：图片下载失败回复友好提示，不外抛内部错误', async () => {
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => {
+          throw new Error('sdk internal: connect ECONNREFUSED 10.0.0.1:443');
+        },
+      });
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const origErr = console.error;
+      console.error = () => {}; // 下载失败会记日志，测试期间静音
+      try {
+        await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_fail' }));
+      } finally {
+        console.error = origErr;
+      }
+      const reply = f.channel.replies.at(-1)!.text;
+      assert.ok(reply.includes('图片下载失败'), `应给友好提示，实际：${reply}`);
+      assert.ok(!reply.includes('ECONNREFUSED'), '不得外抛内部错误细节');
+      assert.equal(llm.requestCount, base, '下载失败不得发 LLM 请求');
       cleanup(f);
     });
 
@@ -424,6 +528,27 @@ async function main(): Promise<void> {
       await Promise.all([pA, pB]);
       assert.equal(llm.requestCount, base + 1, '被丢弃的排队消息不得执行（不发 LLM 请求）');
       assert.ok(!f.channel.updated.includes('好的，已收到'), '被丢弃的消息不得产生最终回复');
+      cleanup(f);
+    });
+
+    // ---------- 静默期心跳：LLM 长思考时占位消息定时刷新，回复就绪即停 ----------
+    await checkAsync('handler：静默期心跳刷新占位消息，回复就绪后停止', async () => {
+      const f = setup(llm.baseUrl, undefined, { progressHeartbeatMs: 40 });
+      llm.mode = 'hang';
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const p = f.handlers.handle(mkMsg('u1', '想一会儿再回答'));
+      await waitFor(() => llm.requestCount === base + 1, '消息进入 LLM');
+      await waitFor(
+        () => f.channel.updated.some((t) => t.includes('仍在处理')),
+        '静默期心跳刷新占位消息',
+      );
+      llm.mode = 'ok';
+      llm.release();
+      await p;
+      assert.ok(f.channel.updated.includes('好的，已收到'), '最终回复应替换占位消息');
+      const settled = f.channel.updated.length;
+      await new Promise((r) => setTimeout(r, 150)); // 等若干个心跳周期
+      assert.equal(f.channel.updated.length, settled, '回复就绪后心跳应停止，不再刷新占位');
       cleanup(f);
     });
 
