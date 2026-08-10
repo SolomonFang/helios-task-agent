@@ -36,6 +36,17 @@ export type AccessDecision = 'allow' | 'claim' | 'deny';
 /** 飞书 REST 单请求超时：覆盖发消息/卡片/表情等全部 REST 调用（含 SDK 内部取 token）。 */
 export const FEISHU_HTTP_TIMEOUT_MS = 20000;
 
+/** 图片流式下载超限熔断错误：调用方可据此区分「图片太大」与「下载失败」。 */
+export class ImageTooLargeError extends Error {
+  constructor(public readonly bytes: number) {
+    super(`图片下载超过大小上限（已接收 ${bytes} 字节）`);
+    this.name = 'ImageTooLargeError';
+  }
+}
+
+/** 机器人 open_id 获取失败后的重试冷却：避免一次网络抖动导致群 @ 回执永久降级到重启。 */
+const BOT_OPENID_RETRY_MS = 10 * 60 * 1000;
+
 /**
  * Owner-claim access control: with an empty allowlist, the FIRST user to DM
  * the bot becomes the owner (persisted to .env by the caller); everyone else
@@ -118,6 +129,13 @@ export function groupMentionChatId(data: FeishuReceivePayload, botOpenId: string
   return mentioned ? message.chat_id : null;
 }
 
+/** 群 @ 回执冷却时长：同一群 24h 内最多回一句，防刷屏。 */
+export const GROUP_MENTION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/** 群 @ 回执冷却判定（纯函数便于单测）：冷却期内返回 true（跳过回执）。 */
+export function groupMentionInCooldown(replied: Map<string, number>, chatId: string, now: number): boolean {
+  return now - (replied.get(chatId) || 0) < GROUP_MENTION_COOLDOWN_MS;
+}
 /** message_id 去重表：TTL 过期清理（prune 由调用方在事件入口触发）。 */
 export interface MessageDedupe {
   /** 清理超过 TTL 的条目。 */
@@ -313,6 +331,8 @@ export class FeishuChannel implements AgentChannel {
   private deniedNotified = new Set<string>();
   /** 机器人自身 open_id（懒加载）：用于识别群里是否 @ 了机器人；null = 已尝试但获取失败。 */
   private botOpenId: string | null | undefined;
+  /** open_id 获取失败的时间戳：冷却 BOT_OPENID_RETRY_MS 后允许重试，避免一次抖动永久降级。 */
+  private botOpenIdFailedAt = 0;
   /** 群 @ 回执冷却：同一群 24h 内最多回一句，防刷屏。 */
   private groupMentionReplied = new Map<string, number>();
   /** owner 绑定写盘失败的用户（fail-closed）：重启前按拒绝处理，避免每条消息重试写盘。 */
@@ -521,15 +541,25 @@ export class FeishuChannel implements AgentChannel {
   /**
    * 下载消息内的图片资源（私聊 image 消息），内存聚合为 Buffer 返回（不落盘）。
    * SDK 该接口返回二进制流 + 响应头；MIME 取 content-type，缺失/非 image/* 时回退 jpeg。
+   * maxBytes 提供流式熔断：累计超限立即抛 ImageTooLargeError 中止读取，
+   * 避免超大资源先全量入内存再被拒。
    */
-  async downloadImage(messageId: string, imageKey: string): Promise<{ data: Buffer; mimeType: string }> {
+  async downloadImage(
+    messageId: string,
+    imageKey: string,
+    maxBytes?: number,
+  ): Promise<{ data: Buffer; mimeType: string }> {
     const res = await this.client.im.v1.messageResource.get({
       path: { message_id: messageId, file_key: imageKey },
       params: { type: 'image' },
     });
     const chunks: Buffer[] = [];
+    let total = 0;
     for await (const chunk of res.getReadableStream()) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      total += buf.length;
+      if (maxBytes !== undefined && total > maxBytes) throw new ImageTooLargeError(total);
+      chunks.push(buf);
     }
     const headers = (res.headers ?? {}) as Record<string, unknown>;
     const rawType = headers['content-type'] ?? headers['Content-Type'];
@@ -606,9 +636,14 @@ export class FeishuChannel implements AgentChannel {
     this.wsClient = null;
   }
 
-  /** 懒加载机器人自身 open_id（识别群 @）；失败记 null 不再每条消息重试。 */
+  /** 懒加载机器人自身 open_id（识别群 @）；失败记 null，冷却 BOT_OPENID_RETRY_MS 后允许重试。 */
   private async ensureBotOpenId(): Promise<string | null> {
-    if (this.botOpenId !== undefined) return this.botOpenId;
+    if (this.botOpenId !== undefined) {
+      // 成功值永久缓存；失败值在冷却期内短路，过期后重试（防一次抖动永久降级）
+      if (this.botOpenId !== null || Date.now() - this.botOpenIdFailedAt < BOT_OPENID_RETRY_MS) {
+        return this.botOpenId;
+      }
+    }
     try {
       const res = (await this.client.request({ method: 'GET', url: '/open-apis/bot/v3/info' })) as {
         bot?: { open_id?: string };
@@ -616,8 +651,9 @@ export class FeishuChannel implements AgentChannel {
       this.botOpenId = res?.bot?.open_id || null;
     } catch (err) {
       this.botOpenId = null;
-      console.warn(`[feishu] 获取机器人 open_id 失败，群 @ 回执不可用: ${errMessage(err)}`);
+      console.warn(`[feishu] 获取机器人 open_id 失败，群 @ 回执暂不可用: ${errMessage(err)}`);
     }
+    if (!this.botOpenId) this.botOpenIdFailedAt = Date.now();
     return this.botOpenId;
   }
 
@@ -629,12 +665,12 @@ export class FeishuChannel implements AgentChannel {
       const chatId = groupMentionChatId(data, botOpenId);
       if (!chatId) return;
       const now = Date.now();
-      const last = this.groupMentionReplied.get(chatId) || 0;
-      if (now - last < 24 * 60 * 60 * 1000) return;
+      if (groupMentionInCooldown(this.groupMentionReplied, chatId, now)) return;
       // Map 无清理会无界增长：超上限整体清空（代价只是老群可能再收一次指引）
       if (this.groupMentionReplied.size >= 1000) this.groupMentionReplied.clear();
-      this.groupMentionReplied.set(chatId, now);
+      // 发送成功才写冷却：失败不消耗当天额度，下个群事件自然重试（仍受每事件一次约束）
       await this.sendText(chatId, '我只处理私聊消息：请点我头像发起私聊，把需求直接发给我。');
+      this.groupMentionReplied.set(chatId, now);
     } catch (err) {
       console.warn(`[feishu] 群 @ 回执发送失败: ${errMessage(err)}`);
     }

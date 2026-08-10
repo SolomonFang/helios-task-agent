@@ -3,7 +3,13 @@
  * AI 审查按钮回调。bootstrap（向导/看板拉起/长连接建立）留在 bot.ts。
  */
 
-import { FeishuChannel, splitText, type FeishuCardAction, type FeishuInboundMessage } from '../channels/feishu';
+import {
+  FeishuChannel,
+  ImageTooLargeError,
+  splitText,
+  type FeishuCardAction,
+  type FeishuInboundMessage,
+} from '../channels/feishu';
 import { SessionRouter } from '../agent/session-router';
 import type { AgentSession } from '../agent/session';
 import { ConfirmationManager, isConfirmWord } from '../agent/confirm';
@@ -80,7 +86,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const { channel, router, confirmations, cfg, mcp, supervisor, reportServer } = deps;
   const runReview = deps.aiReviewRunner ?? runAiReview;
   const progressHeartbeatMs = deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS;
-  const fetchImage: ImageFetcher = deps.imageFetcher ?? ((mid, key) => channel.downloadImage(mid, key));
+  const fetchImage: ImageFetcher =
+    deps.imageFetcher ?? ((mid, key) => channel.downloadImage(mid, key, MAX_IMAGE_BYTES));
 
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
@@ -592,6 +599,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     try {
       img = await fetchImage(fmsg.messageId, fmsg.imageKey!);
     } catch (err) {
+      if (err instanceof ImageTooLargeError) {
+        await channel.reply(msg, '⚠️ 图片太大了（超过 10MB 上限）：请压缩后再发，或把关键信息打字发给我。');
+        return;
+      }
       // 失败原因只进日志（可能含请求细节），给用户的是通用友好提示
       console.error(`[feishu] 图片下载失败: ${errMessage(err)}`);
       await channel.reply(msg, '⚠️ 图片下载失败了，请稍后重发；也可以把图片里的关键信息打字发给我。');

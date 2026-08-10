@@ -9,7 +9,8 @@ import { collectWorkSummary, type WorkSummaryData, type WorkSummaryTask } from '
  * bot 运行期间每分钟检查一次是否到点；到点且当天未推送过则给 owner 推一条
  * 当前迭代的看板任务概览（复用 work_summary 采集）。「上次推送日期 + 已送达 owner」
  * 落盘（原子写），重启当天不重复推；部分 owner 推送失败时下一 tick 只补投未送达的。
- * 看板不可达 / 采集失败：本次跳过并记日志（不打扰用户），下一分钟 tick 再试，当天内有效。
+ * 看板不可达 / 采集失败 / 推送失败：本次跳过并记日志（不打扰用户），失败后按 1→2→4…分钟
+ * 指数退避（封顶 30 分钟）再试，当天内有效——防异常 owner 导致每分钟全量采集重试。
  * 仅 bot 形态装配（CLI 不引本模块）；owner 未认领（白名单为空）时不推、不标记，认领后当天仍可补推。
  */
 
@@ -111,6 +112,9 @@ export class DailyBrief {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private state: DailyBriefState | null;
+  /** 连续失败次数与下次允许重试时间（ms）：失败指数退避，防异常 owner 导致每分钟全量采集。 */
+  private failStreak = 0;
+  private nextRetryAt = 0;
 
   constructor(opts: DailyBriefOptions) {
     this.opts = opts;
@@ -157,6 +161,13 @@ export class DailyBrief {
     }
   }
 
+  /** 记录一次失败并设置指数退避（1→2→4…分钟，封顶 30 分钟）。 */
+  private markFailure(nowMs: number): void {
+    this.failStreak++;
+    const backoffMin = Math.min(2 ** (this.failStreak - 1), 30);
+    this.nextRetryAt = nowMs + backoffMin * 60 * 1000;
+  }
+
   /** 单 tick：到点且当天未全员送达才推送。 */
   private async tick(): Promise<void> {
     if (this.running) return;
@@ -172,13 +183,15 @@ export class DailyBrief {
       const delivered = this.state?.date === today ? this.state.delivered : [];
       const targets = owners.filter((o) => !delivered.includes(o));
       if (!targets.length) return; // 当天已全员送达
+      if (now.getTime() < this.nextRetryAt) return; // 失败退避中，等下一个窗口
 
       const health = this.opts.healthCheck
         ? await this.opts.healthCheck()
         : (await fetchKanbanHealth(this.opts.kanbanUrl)) === 'ok';
       if (!health) {
-        // 看板不可达：跳过本次推送（不推「不可达」消息打扰用户），不标记，下一 tick 当天内再试
-        this.opts.log?.(`看板不可达，本次晨报跳过（下一分钟再试）`);
+        // 看板不可达：跳过本次推送（不推「不可达」消息打扰用户），不标记，退避后当天内再试
+        this.markFailure(now.getTime());
+        this.opts.log?.(`看板不可达，本次晨报跳过（退避后再试）`);
         return;
       }
       let data: WorkSummaryData;
@@ -192,6 +205,7 @@ export class DailyBrief {
               scope: 'iteration',
             });
       } catch (err) {
+        this.markFailure(now.getTime());
         this.opts.log?.(`晨报采集失败，本次跳过: ${errMessage(err)}`);
         return;
       }
@@ -209,7 +223,14 @@ export class DailyBrief {
       }
       this.state = { date: today, delivered: sent };
       this.persist();
-      if (failed) this.opts.log?.(`${failed} 个 owner 晨报未送达，下一分钟 tick 补投`);
+      if (failed) {
+        this.markFailure(now.getTime());
+        this.opts.log?.(`${failed} 个 owner 晨报未送达，退避后补投`);
+      } else {
+        this.failStreak = 0;
+        this.nextRetryAt = 0;
+        this.opts.log?.(`晨报已送达 ${targets.length} 个 owner`);
+      }
     } catch (err) {
       this.opts.log?.(`晨报检查失败: ${errMessage(err)}`);
     } finally {

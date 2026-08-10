@@ -9,6 +9,7 @@ import path from 'path';
 import type { AddressInfo } from 'net';
 import { createBotHandlers, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
+import { ImageTooLargeError } from '../src/channels/feishu';
 import { SessionRouter } from '../src/agent/session-router';
 import { ConfirmationManager } from '../src/agent/confirm';
 import { MemoryStore } from '../src/agent/memory';
@@ -330,6 +331,45 @@ async function main(): Promise<void> {
         !JSON.stringify(body2).includes(raw.toString('base64')),
         '后续请求不得再携带图片 base64',
       );
+      cleanup(f);
+    });
+
+    // ---------- vision 开启：带配文图片——配文作为提示送 LLM，历史占位含配文 ----------
+    await checkAsync('handler：带配文图片以配文为提示送 LLM，历史占位为「[图片] 配文」', async () => {
+      const raw = Buffer.from('fake-image-bytes');
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => ({ data: raw, mimeType: 'image/png' }),
+      });
+      const bodyBase = llm.bodies.length;
+      await f.handlers.handle(mkMsg('u1', '看看这个报错', { messageType: 'image', imageKey: 'img_cap' }));
+      const body = llm.bodies[bodyBase] as { messages: { role: string; content: unknown }[] };
+      const content = body.messages.at(-1)!.content as { type: string; text?: string }[];
+      assert.equal(content[1]!.type, 'text');
+      assert.equal(content[1]!.text, '看看这个报错', '有配文时提示文本应为配文');
+      // 历史占位含配文
+      await f.handlers.handle(mkMsg('u1', '继续'));
+      const body2 = llm.bodies.at(-1) as { messages: { role: string; content: unknown }[] };
+      assert.ok(
+        body2.messages.some((m) => typeof m.content === 'string' && m.content.includes('[图片] 看看这个报错')),
+        '历史应含「[图片] 配文」占位',
+      );
+      cleanup(f);
+    });
+
+    // ---------- vision 开启：流式熔断错误按「图片太大」提示（非通用下载失败） ----------
+    await checkAsync('handler：下载中途超限熔断（ImageTooLargeError）提示图片太大，不送 LLM', async () => {
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => {
+          throw new ImageTooLargeError(MAX_IMAGE_BYTES + 1);
+        },
+      });
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_huge' }));
+      const reply = f.channel.replies.at(-1)!.text;
+      assert.ok(reply.includes('图片太大了'), `熔断应提示图片太大，实际：${reply}`);
+      assert.equal(llm.requestCount, base, '熔断图片不得发 LLM 请求');
       cleanup(f);
     });
 

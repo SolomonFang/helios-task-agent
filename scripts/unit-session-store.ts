@@ -1,15 +1,19 @@
 /**
  * 会话历史持久化单测（SessionHistoryStore + AgentSession 接线）：
- * 落盘→重建恢复；坏 JSON 宽容；/clear 清盘；文件名穿越防护；目录文件数上限清理；
- * system note 不落盘；失败轮次的 user 消息不落盘。
+ * 落盘→重建恢复；坏 JSON 宽容；版本不符视为无历史；畸形 tool_calls 条目丢弃；
+ * /clear 清盘；文件名穿越防护；目录文件数上限清理；system note 不落盘；
+ * 失败轮次的 user 消息不落盘；成功轮次落盘（happy path）；SessionRouter 透传接线。
  * 运行：tsx scripts/unit-session-store.ts
  */
 import assert from 'assert';
 import fs from 'fs';
+import http from 'http';
 import os from 'os';
 import path from 'path';
+import type { AddressInfo } from 'net';
 import { SessionHistoryStore } from '../src/agent/session-store';
 import { AgentSession } from '../src/agent/session';
+import { SessionRouter } from '../src/agent/session-router';
 import { MemoryStore } from '../src/agent/memory';
 import { check, checkAsync, finish } from './testkit';
 import type { AgentConfig, ChatMessage } from '../src/types';
@@ -31,6 +35,36 @@ function tmpHome(tag: string): string {
 }
 
 const historyOf = (s: AgentSession) => (s as unknown as { messages: ChatMessage[] }).messages;
+
+/** 最小 fake LLM：立即回固定补全（happy path 落盘断言用，不触真实网络）。 */
+async function startFakeLlm(replyText = '好的，已收到'): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          id: 'cmpl-fake',
+          object: 'chat.completion',
+          created: 0,
+          model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: replyText }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    stop: () =>
+      new Promise<void>((r) => {
+        server.closeAllConnections?.();
+        server.close(() => r());
+      }),
+  };
+}
 
 async function main(): Promise<void> {
   // ---------- 落盘 → 重建 store 恢复（system 角色被过滤，user/assistant/tool 保留） ----------
@@ -60,6 +94,8 @@ async function main(): Promise<void> {
       // 0600 权限
       const file = path.join(tmp, 'sessions', 'ou_abc.json');
       assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+      // 目录 0700 权限
+      assert.equal(fs.statSync(path.join(tmp, 'sessions')).mode & 0o777, 0o700);
       return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -221,6 +257,103 @@ async function main(): Promise<void> {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  // ---------- AgentSession：成功轮次落盘（happy path 主链路） ----------
+  await checkAsync('AgentSession：成功对话结束落盘，重建 store 可读回该轮 user/assistant', async () => {
+    const tmp = tmpHome('happy');
+    const llm = await startFakeLlm('这是回答');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      const session = new AgentSession({ ...cfg, llmBaseUrl: llm.baseUrl }, null, false, {
+        userId: 'u1',
+        memory: new MemoryStore(tmp),
+        historyStore: store,
+      });
+      await session.handleUserMessage('你好');
+      const restored = new SessionHistoryStore(tmp).load('u1');
+      assert.deepEqual(
+        restored.map((m) => m.role),
+        ['user', 'assistant'],
+      );
+      assert.equal(restored[0]!.content, '你好');
+      assert.equal(restored[1]!.content, '这是回答');
+    } finally {
+      await llm.stop();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- SessionRouter：historyStore 透传给新建会话（接线） ----------
+  check('SessionRouter：getOrCreate 新建会话时从 historyStore 恢复磁盘历史', (() => {
+    const tmp = tmpHome('router');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      store.save('ou_x', [
+        { role: 'user', content: '之前的对话' },
+        { role: 'assistant', content: '之前的回复' },
+      ]);
+      const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp), undefined, undefined, store);
+      const msgs = historyOf(router.getOrCreate('ou_x'));
+      assert.deepEqual(
+        msgs.map((m) => m.role),
+        ['system', 'user', 'assistant'],
+      );
+      assert.equal(msgs[1]!.content, '之前的对话');
+      return true;
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  })());
+
+  // ---------- 版本不符 / 畸形 tool_calls ----------
+  check('load：文件版本不符视为无历史（防旧假设解析新格式）', (() => {
+    const tmp = tmpHome('version');
+    try {
+      const dir = path.join(tmp, 'sessions');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'u1.json'),
+        JSON.stringify({ version: 999, userId: 'u1', updatedAt: '', messages: [{ role: 'user', content: 'hi' }] }),
+      );
+      assert.deepEqual(new SessionHistoryStore(tmp).load('u1'), []);
+      return true;
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  })());
+
+  check('load：畸形 tool_calls（缺 id/type/function.name）的 assistant 条目被丢弃', (() => {
+    const tmp = tmpHome('badcalls');
+    try {
+      const dir = path.join(tmp, 'sessions');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'u1.json'),
+        JSON.stringify({
+          version: 1,
+          userId: 'u1',
+          updatedAt: '',
+          messages: [
+            { role: 'user', content: 'q' },
+            { role: 'assistant', content: null, tool_calls: [{ function: { name: 't' } }] }, // 缺 id/type
+            { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function' }] }, // 缺 function.name
+            { role: 'assistant', content: null, tool_calls: 'not-array' },
+            {
+              role: 'assistant',
+              content: null,
+              tool_calls: [{ id: 'c2', type: 'function', function: { name: 't', arguments: '{}' } }],
+            },
+          ],
+        }),
+      );
+      const loaded = new SessionHistoryStore(tmp).load('u1');
+      assert.equal(loaded.length, 2); // user + 唯一合法的 assistant
+      assert.equal(loaded[1]!.role, 'assistant');
+      return true;
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  })());
 
   finish();
 }

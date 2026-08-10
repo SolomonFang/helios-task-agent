@@ -198,7 +198,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
-| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed) to the owner every day. Unset or invalid = off |
+| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed; all iterations when `HELIOS_KANBAN_ITERATION` is unset) to the owner every day. Unset or invalid = off |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
 Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example). Note: **credential/command-type high-risk keys in the cwd `.env` are ignored** (`LLM_API_KEY`, `FEISHU_*`, `HELIOS_KANBAN_MCP_COMMAND/ARGS`, `HELIOS_KANBAN_PACKAGE`, `HELIOS_KANBAN_URL`, proxy and npm registry keys, etc. — a supply-chain/command-injection guard; ignored keys only produce a one-line `console.warn`). Put such keys in `~/.helios-task-agent/.env` (or the shell environment / project `.env`).

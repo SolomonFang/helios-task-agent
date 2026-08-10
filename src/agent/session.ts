@@ -1,7 +1,7 @@
 import type { KanbanMcp } from '../kanban/mcp';
 import { MemoryStore } from './memory';
 import { createClient, runAgentTurn, trimHistory } from './llm';
-import { SessionHistoryStore } from './session-store';
+import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
 import { buildSystemPrompt } from './prompt';
 import { buildTools } from './tools';

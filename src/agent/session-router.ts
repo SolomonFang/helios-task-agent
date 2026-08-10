@@ -3,7 +3,7 @@ import type { KanbanMcp } from '../kanban/mcp';
 import type { ConfirmFn } from './guard';
 import { MemoryStore } from './memory';
 import { AgentSession } from './session';
-import { SessionHistoryStore } from './session-store';
+import type { SessionHistoryStore } from './session-store';
 
 /**
  * One AgentSession per Feishu open_id; serializes messages per user.

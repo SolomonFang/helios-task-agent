@@ -25,6 +25,15 @@ function safeFileName(userId: string): string {
   return `${name || 'user'}.json`;
 }
 
+/** tool_call 最小结构校验：缺 id/type/function.name 的畸形条目会让网关每轮 400，直接判非法。 */
+function isValidToolCall(tc: unknown): boolean {
+  if (!tc || typeof tc !== 'object') return false;
+  const t = tc as { id?: unknown; type?: unknown; function?: unknown };
+  if (typeof t.id !== 'string' || t.type !== 'function') return false;
+  const fn = t.function as { name?: unknown } | undefined;
+  return !!fn && typeof fn === 'object' && typeof fn.name === 'string';
+}
+
 /** 宽容校验：只接受结构基本合法的 user/assistant/tool 消息，坏条目直接丢弃。 */
 function isPersistable(m: unknown): m is ChatMessage {
   if (!m || typeof m !== 'object') return false;
@@ -32,7 +41,9 @@ function isPersistable(m: unknown): m is ChatMessage {
   if (msg.role === 'user') return typeof msg.content === 'string';
   if (msg.role === 'tool') return typeof msg.tool_call_id === 'string' && typeof msg.content === 'string';
   if (msg.role === 'assistant') {
-    return msg.content == null || typeof msg.content === 'string' || Array.isArray(msg.tool_calls);
+    if (msg.content != null && typeof msg.content !== 'string') return false;
+    if (msg.tool_calls == null) return true;
+    return Array.isArray(msg.tool_calls) && msg.tool_calls.every(isValidToolCall);
   }
   return false;
 }
@@ -62,13 +73,16 @@ export class SessionHistoryStore {
     return p;
   }
 
-  /** 加载磁盘历史；文件不存在/坏 JSON/格式不符一律视为无历史。 */
+  /** 加载磁盘历史；文件不存在/坏 JSON/版本不符/格式不符一律视为无历史。 */
   load(userId: string): ChatMessage[] {
     try {
       const file = this.fileFor(userId);
       if (!fs.existsSync(file)) return [];
       const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<SessionHistoryFile>;
-      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.messages)) return [];
+      // 版本不符按无历史处理：避免旧假设解析新格式，静默载入畸形历史
+      if (!raw || typeof raw !== 'object' || raw.version !== FILE_VERSION || !Array.isArray(raw.messages)) {
+        return [];
+      }
       return raw.messages.filter(isPersistable);
     } catch {
       return [];

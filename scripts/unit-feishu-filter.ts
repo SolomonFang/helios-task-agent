@@ -6,7 +6,9 @@ import {
   createAccessChecker,
   createMessageDedupe,
   filterIncomingMessage,
+  GROUP_MENTION_COOLDOWN_MS,
   groupMentionChatId,
+  groupMentionInCooldown,
   isCardActionAllowed,
   resolveAccess,
   type FeishuReceivePayload,
@@ -62,6 +64,18 @@ async function main(): Promise<void> {
     const botSender = mentionBot;
     botSender.sender!.sender_type = 'app';
     assert.equal(groupMentionChatId(botSender, bot), null, 'bot 发送者不回执（防互 @ 死循环）');
+  });
+
+  // ---------- 群 @ 回执 24h 冷却（groupMentionInCooldown） ----------
+  await checkAsync('群 @ 回执冷却：24h 内跳过，过期后可再回；未知群不在冷却', async () => {
+    const replied = new Map<string, number>();
+    const t0 = GROUP_MENTION_COOLDOWN_MS * 2;
+    assert.equal(groupMentionInCooldown(replied, 'oc_1', t0), false, '未回过的群不在冷却');
+    replied.set('oc_1', t0);
+    assert.equal(groupMentionInCooldown(replied, 'oc_1', t0 + 1000), true, '24h 内应跳过');
+    assert.equal(groupMentionInCooldown(replied, 'oc_1', t0 + GROUP_MENTION_COOLDOWN_MS - 1), true, '冷却边界内应跳过');
+    assert.equal(groupMentionInCooldown(replied, 'oc_1', t0 + GROUP_MENTION_COOLDOWN_MS), false, '满 24h 后可再回');
+    assert.equal(groupMentionInCooldown(replied, 'oc_2', t0 + 1000), false, '其他群不受影响');
   });
 
   await checkAsync('filter：bot/系统发送者被忽略，真人放行', async () => {

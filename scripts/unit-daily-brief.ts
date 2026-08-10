@@ -4,6 +4,7 @@
  * - 到点触发、当天只推一次（注入假时钟与假推送函数）
  * - 看板不可达的降级路径（跳过不推、不标记，恢复后当天补推）
  * - 推送部分失败的补投（下一 tick 只补未送达 owner）
+ * - 连续失败的指数退避（窗口内不重复采集/推送）
  * - 重启不重复推（落盘状态再加载）
  * 以 tsx 直接运行：tsx scripts/unit-daily-brief.ts
  */
@@ -94,6 +95,14 @@ async function main(): Promise<void> {
     assert.ok(text.includes('当前范围内还没有任务。'));
   });
 
+  await checkAsync('buildDailyBriefText：单组超 10 个任务时截断并提示剩余数量', () => {
+    const tasks = Array.from({ length: 13 }, (_, i) => fakeTask({ id: `t${i}`, title: `任务${i}`, status: 'done' }));
+    const text = buildDailyBriefText(fakeSummary(tasks), at(9, 30));
+    assert.ok(text.includes('【已完成】13 个'), '计数为全量');
+    assert.ok(text.includes('· 《任务9》') && !text.includes('· 《任务10》'), '只列前 10 个');
+    assert.ok(text.includes('· …还有 3 个'), `应有截断提示: ${text}`);
+  });
+
   // ---------- 到点触发 / 当天只推一次 ----------
   await checkAsync('DailyBrief：到点触发推送，当天后续 tick 不重复推；未到点不推', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-brief-'));
@@ -160,12 +169,13 @@ async function main(): Promise<void> {
   });
 
   // ---------- 看板不可达降级 ----------
-  await checkAsync('DailyBrief：看板不可达跳过本次（不推、不标记），恢复后当天下一 tick 补推', async () => {
+  await checkAsync('DailyBrief：看板不可达跳过本次（不推、不标记），恢复后退避窗口过补推', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-brief-'));
     try {
       const sent: string[] = [];
       const logs: string[] = [];
       let healthy = false;
+      let now = at(9, 35);
       const brief = new DailyBrief({
         time: { hour: 9, minute: 30 },
         statePath: path.join(tmp, 'daily-brief-state.json'),
@@ -174,7 +184,7 @@ async function main(): Promise<void> {
         notifyOwner: async (_o, text) => {
           sent.push(text);
         },
-        now: () => at(9, 35),
+        now: () => now,
         healthCheck: async () => healthy,
         collect: async () => fakeSummary([]),
         log: (m) => logs.push(m),
@@ -184,7 +194,8 @@ async function main(): Promise<void> {
       assert.equal(sent.length, 0);
       assert.ok(logs.some((l) => l.includes('看板不可达')), `应有跳过日志: ${logs}`);
       assert.equal(fs.existsSync(path.join(tmp, 'daily-brief-state.json')), false, '不可达时不得落盘标记');
-      healthy = true; // 恢复后当天下一 tick 补推
+      healthy = true;
+      now = at(9, 36); // 首次失败退避 1 分钟，窗口过后恢复即补推
       await tick();
       assert.equal(sent.length, 1);
     } finally {
@@ -197,6 +208,7 @@ async function main(): Promise<void> {
     try {
       const sent: string[] = [];
       let fail = true;
+      let now = at(9, 35);
       const brief = new DailyBrief({
         time: { hour: 9, minute: 30 },
         statePath: path.join(tmp, 'daily-brief-state.json'),
@@ -205,7 +217,7 @@ async function main(): Promise<void> {
         notifyOwner: async (_o, text) => {
           sent.push(text);
         },
-        now: () => at(9, 35),
+        now: () => now,
         healthCheck: async () => true,
         collect: async () => {
           if (fail) throw new Error('network reset');
@@ -216,6 +228,7 @@ async function main(): Promise<void> {
       await tick();
       assert.equal(sent.length, 0);
       fail = false;
+      now = at(9, 36); // 首次失败退避 1 分钟，窗口过后再试
       await tick();
       assert.equal(sent.length, 1);
     } finally {
@@ -229,6 +242,7 @@ async function main(): Promise<void> {
     try {
       const sent: string[] = [];
       let o2Down = true;
+      let now = at(9, 40);
       const brief = new DailyBrief({
         time: { hour: 9, minute: 30 },
         statePath: path.join(tmp, 'daily-brief-state.json'),
@@ -238,7 +252,7 @@ async function main(): Promise<void> {
           if (o === 'o2' && o2Down) throw new Error('o2 unreachable');
           sent.push(`${o}:${text.split('\n')[0]}`);
         },
-        now: () => at(9, 40),
+        now: () => now,
         healthCheck: async () => true,
         collect: async () => fakeSummary([]),
       });
@@ -252,6 +266,9 @@ async function main(): Promise<void> {
       assert.equal(onDisk.date, '2026-08-10');
       assert.deepEqual(onDisk.delivered, ['o1']);
       o2Down = false;
+      await tick(); // 退避窗口（1 分钟）未过：不重试
+      assert.equal(sent.length, 1);
+      now = at(9, 41);
       await tick(); // 只补投 o2
       assert.deepEqual(sent, [
         'o1:☀️ 看板晨报 · 迭代 260717（2026-08-10）',
@@ -259,6 +276,44 @@ async function main(): Promise<void> {
       ]);
       await tick(); // 全员送达后当天不再推
       assert.equal(sent.length, 2);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 失败指数退避 ----------
+  await checkAsync('DailyBrief：连续失败按 1→2 分钟退避（退避窗口内不采集不推送）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-brief-'));
+    try {
+      let now = at(9, 40);
+      let healthCalls = 0;
+      const brief = new DailyBrief({
+        time: { hour: 9, minute: 30 },
+        statePath: path.join(tmp, 'daily-brief-state.json'),
+        kanbanUrl: 'http://unused',
+        owners: () => ['o1'],
+        notifyOwner: async () => {},
+        now: () => now,
+        healthCheck: async () => {
+          healthCalls++;
+          return false; // 看板持续不可达
+        },
+        collect: async () => fakeSummary([]),
+      });
+      const tick = tickOf(brief);
+      await tick(); // 第 1 次尝试：失败，退避 1 分钟（至 09:41）
+      assert.equal(healthCalls, 1);
+      await tick(); // 09:40 退避窗口内：不重试
+      assert.equal(healthCalls, 1);
+      now = at(9, 41);
+      await tick(); // 第 2 次尝试：失败，退避 2 分钟（至 09:43）
+      assert.equal(healthCalls, 2);
+      now = at(9, 42);
+      await tick(); // 窗口内：不重试
+      assert.equal(healthCalls, 2);
+      now = at(9, 43);
+      await tick(); // 窗口过后再试
+      assert.equal(healthCalls, 3);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
