@@ -10,7 +10,7 @@ import { errMessage } from '../infra/err';
  * message queue, so there is no deadlock.
  *
  * 裁决三态：'once' = 批准仅此次；'batch' = 批准且本会话内同类免问；false = 拒绝。
- * 超时分级：可批量操作 120s；破坏性操作（无 batchKey）决策成本高，放宽到 300s。
+ * 超时分级：普通写操作 120s；破坏性操作（req.destructive）决策成本高，放宽到 300s。
  * 终态回调（onSettled）：携带确认卡片 message id，bot 层据此把卡片原地更新为
  * 终态（按钮消失），避免"点了没反应"与过期卡片误点。
  */
@@ -63,9 +63,9 @@ export class ConfirmationManager {
       timeoutMs: number,
     ) => Promise<string | undefined>,
     private opts: {
-      /** 非破坏性操作（可批量）的确认超时，默认 120s。 */
+      /** 普通写操作的确认超时，默认 120s。 */
       timeoutMs?: number;
-      /** 破坏性操作（无 batchKey：删除/取消/停止/审批/启动/归档/合并/推送/执行及飞书写）的确认超时，默认 300s。 */
+      /** 破坏性操作（req.destructive：删除/取消/停止/审批/启动/归档/合并/推送/执行及飞书写/记忆写/技能脚本）的确认超时，默认 300s。 */
       destructiveTimeoutMs?: number;
       onTimeout?: (openId: string, req: ConfirmRequest) => void;
       /** 新写操作顶掉未应答的 pending 时通知（否则用户会以为是自己拒绝的）。 */
@@ -88,7 +88,7 @@ export class ConfirmationManager {
 
   private timeoutFor(req: ConfirmRequest): number {
     const base = this.opts.timeoutMs ?? 120000;
-    return req.batchKey ? base : Math.max(base, this.opts.destructiveTimeoutMs ?? 300000);
+    return req.destructive ? Math.max(base, this.opts.destructiveTimeoutMs ?? 300000) : base;
   }
 
   /** Called from the write gate; resolves the user's verdict ('once' / 'batch' / false). */

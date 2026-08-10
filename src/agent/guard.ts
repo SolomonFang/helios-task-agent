@@ -13,11 +13,17 @@ export interface ConfirmRequest {
   /** Full command / arguments for transparency. */
   detail: string;
   /**
-   * Batch approval key: when set, an approval is remembered for the rest of
-   * the session and subsequent requests with the same key skip re-asking
-   * (批量创建场景). Omitted for destructive ops (delete/cancel/stop) and lark writes.
+   * Batch approval key: all write ops carry one（所有确认卡片都提供「同类免问」）;
+   * an approval is remembered for the rest of the session and subsequent
+   * requests with the same key skip re-asking.
    */
   batchKey?: string;
+  /**
+   * 破坏性/高影响操作（删除/取消/停止/审批/启动/归档/合并/推送/执行、飞书写、
+   * 记忆写、技能脚本）：确认超时放宽到 300s（决策成本高）。与 batchKey 解耦——
+   * 破坏性操作同样可「同类免问」，只是授权 key 仍绑定操作对象。
+   */
+  destructive?: boolean;
 }
 
 /**
@@ -52,7 +58,8 @@ export interface BatchConfirmFn extends ConfirmFn {
 
 /**
  * Remember 'batch' approvals per batchKey for the rest of the session（内存态，
- * 进程退出即失效）；destructive ops (no batchKey) always re-ask.
+ * 进程退出即失效）。所有写操作都带 batchKey；key 粒度（工具名/命令路径 + 对象 id）
+ * 由 tools.ts 的 batchKeyFor* 决定。
  */
 export function withBatchApproval(confirm: ConfirmFn): BatchConfirmFn {
   const approved = new Set<string>();
@@ -195,14 +202,14 @@ export function classifyMcp(toolName: string): 'read' | 'write' {
   return 'write'; // unknown → safe default
 }
 
-// --- 「同类免问」批量判定（唯一来源，tools.ts 引用） ---
+// --- 破坏性 / 高影响操作判定（唯一来源，tools.ts 引用） ---
 
-/** 破坏性 / 高影响操作永不批量——每次都需单独确认（词表覆盖 MCP 写动词中的高危子集）。 */
-const NO_BATCH_RE = /delete|cancel|stop|deny|approve|start|archive|merge|push|execute/i;
+/** 破坏性 / 高影响操作：确认超时放宽（词表覆盖 MCP 写动词中的高危子集）。 */
+const DESTRUCTIVE_RE = /delete|cancel|stop|deny|approve|start|archive|merge|push|execute/i;
 
-/** 该操作是否允许「同类免问」批量放行；破坏性操作（归档/合并/推送/执行等）一律逐次确认。 */
-export function isBatchable(toolName: string): boolean {
-  return !NO_BATCH_RE.test(toolName);
+/** 该操作是否破坏性/高影响（归档/合并/推送/执行等）——仅影响确认超时分级，不影响「同类免问」。 */
+export function isDestructive(toolName: string): boolean {
+  return DESTRUCTIVE_RE.test(toolName);
 }
 
 /** Short human summary for a kanban MCP write call. */

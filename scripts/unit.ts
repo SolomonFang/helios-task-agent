@@ -11,7 +11,7 @@ import {
   classifyHk,
   classifyLark,
   classifyMcp,
-  isBatchable,
+  isDestructive,
   kindLabel,
   looksLikeStrongFailure,
   withBatchApproval,
@@ -314,7 +314,7 @@ async function run(): Promise<void> {
   await checkAsync('确认管理器：无 batchKey 时「同类免问」不生效', async () => {
     const mgr = new ConfirmationManager(async () => undefined);
     const p = mgr.request('u1', { kind: 'lark', summary: 's', detail: 'd' });
-    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'ignored'); // 破坏性操作不支持免问
+    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'ignored'); // 无 batchKey 的请求不支持免问
     assert.equal(mgr.resolveFromText('u1', '确认'), 'approved');
     assert.equal(await p, 'once');
   });
@@ -739,7 +739,7 @@ async function run(): Promise<void> {
     }
   });
 
-  await checkAsync('memory 闸门：拒绝不落盘，批准才写入；kind=memory 且无 batchKey', async () => {
+  await checkAsync('memory 闸门：拒绝不落盘，批准才写入；kind=memory 且带 batchKey（可同类免问）', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memgate2-'));
     try {
       const mem = new MemoryStore(tmp);
@@ -762,9 +762,16 @@ async function run(): Promise<void> {
       for (const r of [r1, r2, r3]) assert.equal(r, DENIED_MESSAGE);
       assert.equal(mem.getFact('u1', 'k'), undefined);
       assert.equal(new MemoryStore(tmp).getUser('u1').notes.length, 0);
-      // 记忆永不批量免问：三次都过闸门且不带 batchKey
+      // 记忆写操作按动作分类带 batchKey：三次都过闸门且各类可单独「同类免问」
       assert.equal(seen.length, 3);
-      assert.ok(seen.every((s) => s.kind === 'memory' && s.batchKey === undefined));
+      assert.deepEqual(
+        seen.map((s) => [s.kind, s.batchKey]),
+        [
+          ['memory', 'memory:set'],
+          ['memory', 'memory:delete'],
+          ['memory', 'memory:note'],
+        ],
+      );
 
       const approving = buildTools({
         mcp: null,
@@ -1605,8 +1612,8 @@ async function run(): Promise<void> {
     }
   });
 
-  // ---------- 闸门 batchKey：create 可批量，start/approve/delete 始终逐次确认 ----------
-  await checkAsync('闸门 batchKey：create 可批量，start/approve/delete 始终逐次确认', async () => {
+  // ---------- 闸门 batchKey：所有写操作都可同类免问；破坏性操作仍标记 destructive ----------
+  await checkAsync('闸门 batchKey：create/start/approve/delete 均带 batchKey，破坏性操作带 destructive 标记', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-batchkey-'));
     const fakeMcp = {
       connected: true,
@@ -1615,15 +1622,16 @@ async function run(): Promise<void> {
         { name: 'start_workspace', description: '', inputSchema: { type: 'object', properties: {} } },
         { name: 'approve', description: '', inputSchema: { type: 'object', properties: {} } },
         { name: 'delete_task', description: '', inputSchema: { type: 'object', properties: {} } },
+        { name: 'stop_workspace', description: '', inputSchema: { type: 'object', properties: {} } },
       ],
       callTool: async () => '{"success":true}',
     } as unknown as KanbanMcp;
-    const seen: Array<string | undefined> = [];
+    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
       mcp: fakeMcp,
       kanbanUrl: 'http://localhost:1',
       confirm: async (req) => {
-        seen.push(req.batchKey);
+        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
         return 'once';
       },
       registry: new SourceRegistry(tmp),
@@ -1633,8 +1641,16 @@ async function run(): Promise<void> {
     await handlers.get('kanban_start_workspace')!({ task_id: 'x' });
     await handlers.get('kanban_approve')!({ approval_id: 'a' });
     await handlers.get('kanban_delete_task')!({ task_id: 'x' });
+    await handlers.get('kanban_stop_workspace')!({ workspace_id: 'w' });
     fs.rmSync(tmp, { recursive: true, force: true });
-    assert.deepEqual(seen, ['kanban:create_task', undefined, undefined, undefined]);
+    assert.deepEqual(seen, [
+      { batchKey: 'kanban:create_task', destructive: false },
+      { batchKey: 'kanban:start_workspace:x', destructive: true },
+      // approval_id / workspace_id 必须进 key：否则免问退化成类级放行（批准任意审批/停任意工作区）
+      { batchKey: 'kanban:approve:a', destructive: true },
+      { batchKey: 'kanban:delete_task:x', destructive: true },
+      { batchKey: 'kanban:stop_workspace:w', destructive: true },
+    ]);
   });
 
   // ---------- SessionRouter.busy：队列清理生效 ----------
@@ -2600,22 +2616,22 @@ async function run(): Promise<void> {
     assert.ok(out.includes('helios-kanban-remote'), '省略 name 应返回技能清单');
   });
 
-  // ---------- 批量判定唯一来源：归档/合并/推送/执行类永不批量 ----------
-  check('isBatchable：delete/archive/merge/push/execute 等不批量，create/update 可批量', (() => {
+  // ---------- 破坏性判定唯一来源：归档/合并/推送/执行类标记为破坏性（仅影响超时分级） ----------
+  check('isDestructive：delete/archive/merge/push/execute 等破坏性，create/update 非破坏性', (() => {
     return (
-      !isBatchable('archive_task') &&
-      !isBatchable('merge_workspace') &&
-      !isBatchable('push_changes') &&
-      !isBatchable('execute_command') &&
-      !isBatchable('delete_task') &&
-      !isBatchable('stop_workspace') &&
-      !isBatchable('approve') &&
-      isBatchable('create_task') &&
-      isBatchable('update_task')
+      isDestructive('archive_task') &&
+      isDestructive('merge_workspace') &&
+      isDestructive('push_changes') &&
+      isDestructive('execute_command') &&
+      isDestructive('delete_task') &&
+      isDestructive('stop_workspace') &&
+      isDestructive('approve') &&
+      !isDestructive('create_task') &&
+      !isDestructive('update_task')
     );
   })());
 
-  await checkAsync('闸门 batchKey：kanban_archive_* 不产生 batchKey（同类免问不适用）', async () => {
+  await checkAsync('闸门 batchKey：kanban_archive_* 也带 batchKey（所有写操作均可同类免问）且标记破坏性', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-nobatch-'));
     const fakeMcp = {
       connected: true,
@@ -2625,12 +2641,12 @@ async function run(): Promise<void> {
       ],
       callTool: async () => '{"success":true}',
     } as unknown as KanbanMcp;
-    const seen: Array<string | undefined> = [];
+    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
       mcp: fakeMcp,
       kanbanUrl: 'http://localhost:1',
       confirm: async (req) => {
-        seen.push(req.batchKey);
+        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
         return 'once';
       },
       registry: new SourceRegistry(tmp),
@@ -2639,7 +2655,32 @@ async function run(): Promise<void> {
     await handlers.get('kanban_archive_task')!({ task_id: 'x' });
     await handlers.get('kanban_create_task')!({ title: 't' });
     fs.rmSync(tmp, { recursive: true, force: true });
-    assert.deepEqual(seen, [undefined, 'kanban:create_task']);
+    assert.deepEqual(seen, [
+      { batchKey: 'kanban:archive_task:x', destructive: true },
+      { batchKey: 'kanban:create_task', destructive: false },
+    ]);
+  });
+
+  await checkAsync('闸门 batchKey：lark 写操作按命令路径归类（可同类免问）并标记破坏性', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-larkbatch-'));
+    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
+    const { handlers } = buildTools({
+      mcp: null,
+      kanbanUrl: 'http://localhost:1',
+      confirm: async (req) => {
+        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
+        return false; // 闸门即拒，不真正执行 lark-cli 子进程
+      },
+      registry: new SourceRegistry(tmp),
+      auditHome: tmp,
+    });
+    await handlers.get('lark_cli')!({ args: ['im', 'send', 'ou_x', 'hi'] });
+    await handlers.get('lark_cli')!({ args: ['task', 'create', 't'] });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    assert.deepEqual(seen, [
+      { batchKey: 'lark:im send', destructive: true },
+      { batchKey: 'lark:task create', destructive: true },
+    ]);
   });
 
   // ---------- 确认应答词表：两端共用同一份（并集） ----------

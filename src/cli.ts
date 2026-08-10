@@ -275,13 +275,13 @@ export async function main(): Promise<void> {
   const askWithAbort = createAskWithAbort(ask, () => currentCtl);
 
   // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「免问」（或 batch/同类免问等词）开启同类免问；Ctrl+C 视为拒绝；
-  // 超时自动拒绝（与飞书 bot 同语义：可批量 120s、破坏性 300s）。
+  // 超时自动拒绝（与飞书 bot 同语义：普通写 120s、破坏性 300s）。
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
     console.log('');
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
-    const timeoutMs = req.batchKey ? 120000 : 300000;
+    const timeoutMs = req.destructive ? 300000 : 120000;
     const options = req.batchKey ? 'y=仅此次 / 免问=同类免问（本会话）/ N=取消' : 'y=仅此次 / N=取消';
     const ans = await askWithAbort(
       c.warn(`允许执行？[${options}]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),

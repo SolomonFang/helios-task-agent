@@ -9,7 +9,7 @@ import {
   classifyHk,
   classifyLark,
   classifyMcp,
-  isBatchable,
+  isDestructive,
   looksLikeStrongFailure,
   passGate,
   summarizeMcp,
@@ -123,18 +123,18 @@ function hkCreateTitle(args: string[]): string {
 }
 
 /**
- * 批量免问判定收在 guard.isBatchable（唯一来源）：破坏性/高影响操作永不批量。
- * 免问授权绑定任务标识：授权后只允许对同一任务的同类操作免问，防止借授权改任意任务。
+ * 「同类免问」key：所有写操作都可免问；免问授权绑定任务标识，
+ * 授权后只允许对同一任务的同类操作免问，防止借授权改任意任务。
  */
-function batchKeyForMcp(name: string, args: Record<string, unknown>): string | undefined {
-  if (!isBatchable(name)) return undefined;
-  const id = String(args.task_id ?? args.taskId ?? args.id ?? '');
+function batchKeyForMcp(name: string, args: Record<string, unknown>): string {
+  // 与 summarizeMcp 的对象标识口径对齐：task/工作区/审批 id 都纳入 key，
+  // 否则 approve、stop_workspace 这类会退化成类级免问（放行任意对象）
+  const id = String(args.task_id ?? args.taskId ?? args.id ?? args.workspace_id ?? args.approval_id ?? '');
   return id ? `kanban:${name}:${id}` : `kanban:${name}`;
 }
 
-function batchKeyForHk(argv: string[]): string | undefined {
+function batchKeyForHk(argv: string[]): string {
   const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
-  if (!isBatchable(sub)) return undefined;
   // 同上：任务/项目标识（UUID）纳入 key，免问仅对同一对象的同类操作生效
   const id = argv.slice(2).map(extractUuid).find(Boolean);
   return id ? `hk:${sub}:${id}` : `hk:${sub}`;
@@ -446,7 +446,9 @@ interface GatedWriteParams {
   isStart: boolean;
   urls: string[];
   title: string;
-  batchKey?: string;
+  batchKey: string;
+  /** 破坏性/高影响操作：确认超时放宽（见 guard.isDestructive 与 ConfirmRequest.destructive）。 */
+  destructive: boolean;
   /** start 前置补全（可能改写命令参数）；返回错误消息则审计 error 并拦截。 */
   prepare?: () => Promise<string | null>;
   execute: () => Promise<string>;
@@ -525,7 +527,10 @@ function makeGatedWriter({
         return prepErr;
       }
     }
-    const gate = await passGate({ kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey }, confirm);
+    const gate = await passGate(
+      { kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey, destructive: p.destructive },
+      confirm,
+    );
     if (!gate.allowed) {
       auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason }, auditHome);
       return gate.message;
@@ -581,6 +586,7 @@ function makeKanbanMcpHandler({
       urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
       title: typeof args.title === 'string' ? args.title : '',
       batchKey: batchKeyForMcp(tool.name, args),
+      destructive: isDestructive(tool.name),
       prepare: isStart ? () => prepareMcpStartArgs(args, kanbanUrl, ctx?.signal) : undefined,
       execute: async () => {
         try {
@@ -614,7 +620,12 @@ function makeLarkCliHandler({
     if (classifyLark(argv) === 'write') {
       const summary = `飞书写操作：lark-cli ${argv.slice(0, 3).join(' ')}`;
       const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
-      const gate = await passGate({ kind: 'lark', summary, detail }, confirm);
+      // 「同类免问」按命令路径归类（如 lark:im send / lark:task create）；飞书写整体按破坏性对待（超时放宽）
+      const sub = argv[1] && !argv[1].startsWith('-') ? ` ${argv[1]}` : '';
+      const gate = await passGate(
+        { kind: 'lark', summary, detail, batchKey: `lark:${argv[0]}${sub}`, destructive: true },
+        confirm,
+      );
       if (!gate.allowed) {
         auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason }, auditHome);
         return gate.message;
@@ -686,6 +697,7 @@ function makeHkCliHandler({
       urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
       title,
       batchKey: batchKeyForHk(argv),
+      destructive: isDestructive(`${argv[0] ?? ''} ${argv[1] ?? ''}`),
       prepare: isStart
         ? async () => {
             if (!hkStartHasBranch(argv)) {
@@ -775,7 +787,7 @@ function makeSkillDocHandler(): ToolHandler {
   };
 }
 
-/** skill_exec handler：任意代码执行无法分类读写，一律逐次确认（不传 batchKey）。 */
+/** skill_exec handler：任意代码执行无法分类读写，一律过确认闸门（按破坏性对待，超时放宽）。 */
 function makeSkillExecHandler({
   uid,
   confirm,
@@ -821,8 +833,11 @@ function makeSkillExecHandler({
     }
     const summary = `执行技能脚本：${skill}/${script}`;
     const detail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
-    // 执行任意脚本 = 任意代码执行，无法可靠分类读写：一律逐次确认（不传 batchKey）
-    const gate = await passGate({ kind: 'skill', summary, detail }, confirm);
+    // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定具体脚本
+    const gate = await passGate(
+      { kind: 'skill', summary, detail, batchKey: `skill:${skill}/${script}`, destructive: true },
+      confirm,
+    );
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
@@ -900,7 +915,10 @@ function makeMemoryHandlers({
     // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
     const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
     const detail = summarizeBothEnds(`memory_set(key=${key.trim()}, value=${value})`);
-    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    const gate = await passGate(
+      { kind: 'memory', summary, detail, batchKey: 'memory:set', destructive: true },
+      confirm,
+    );
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
@@ -935,7 +953,10 @@ function makeMemoryHandlers({
     // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门
     const summary = `删除记忆「${key}」`;
     const detail = `memory_delete(key=${key})`;
-    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    const gate = await passGate(
+      { kind: 'memory', summary, detail, batchKey: 'memory:delete', destructive: true },
+      confirm,
+    );
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
@@ -957,7 +978,10 @@ function makeMemoryHandlers({
     // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门
     const summary = `追加记忆备注：${text.slice(0, 100)}`;
     const detail = summarizeBothEnds(`memory_note(text=${text})`);
-    const gate = await passGate({ kind: 'memory', summary, detail }, confirm);
+    const gate = await passGate(
+      { kind: 'memory', summary, detail, batchKey: 'memory:note', destructive: true },
+      confirm,
+    );
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
