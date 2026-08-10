@@ -37,7 +37,7 @@ import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
 import { DailyBrief, parseDailyBriefTime, type DailyBriefTime } from './bot/daily-brief';
-import { createBotHandlers } from './bot/handler';
+import { createBotHandlers, createRoundNoticeTracker } from './bot/handler';
 import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
@@ -357,8 +357,11 @@ async function main(): Promise<void> {
 
   // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）；
   // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
+  // roundNotices：确认卡片/回执插在「处理中」占位之后时标记，最终回复改发新消息保持时间线顺序
+  const roundNotices = createRoundNoticeTracker();
   const confirmations = new ConfirmationManager(
     async (openId, chatId, req, id, timeoutMs) => {
+      roundNotices.mark(openId);
       const sendText = () => {
         const batchHint = req.batchKey ? '，「同类免问」本会话内同类操作免问' : '';
         // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
@@ -387,11 +390,13 @@ async function main(): Promise<void> {
     {
       timeoutMs: 120000,
       onTimeout: (openId, req) => {
+        roundNotices.mark(openId);
         void channel
           .notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}。如仍需执行，直接再跟我说一声即可。`)
           .catch(() => {});
       },
       onSuperseded: (openId, req) => {
+        roundNotices.mark(openId);
         void channel
           .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}`)
           .catch(() => {});
@@ -406,6 +411,7 @@ async function main(): Promise<void> {
       // 卡片与文本降级都发送失败：管理器已按拒绝收尾，这里走最后可达路径告知用户，
       // 避免"操作默默没执行"（仍失败只能落日志，等待方已拿到明确拒绝、不会干等）
       onSendFailed: (openId, req, error) => {
+        roundNotices.mark(openId);
         void channel
           .notifyOpenId(openId, `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n原因：${error}\n请稍后重试或检查机器人网络。`)
           .catch((err) => {
@@ -493,6 +499,7 @@ async function main(): Promise<void> {
     supervisor,
     reportServer,
     helpText: BOT_HELP,
+    roundNotices,
   });
   channel.onCardAction = handlers.onCardAction;
 

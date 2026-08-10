@@ -7,7 +7,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createBotHandlers, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
+import { createBotHandlers, createRoundNoticeTracker, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import { ImageTooLargeError } from '../src/channels/feishu';
 import { SessionRouter } from '../src/agent/session-router';
@@ -191,7 +191,7 @@ interface Fixture {
 function setup(
   llmBaseUrl: string,
   kanbanUrl = 'http://localhost:1',
-  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'progressHeartbeatMs' | 'imageFetcher'>> & {
+  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'progressHeartbeatMs' | 'imageFetcher' | 'roundNotices'>> & {
     visionEnabled?: boolean;
   } = {},
 ): Fixture {
@@ -240,6 +240,7 @@ function setup(
     ...(extra.aiReviewRunner ? { aiReviewRunner: extra.aiReviewRunner } : {}),
     ...(extra.progressHeartbeatMs ? { progressHeartbeatMs: extra.progressHeartbeatMs } : {}),
     ...(extra.imageFetcher ? { imageFetcher: extra.imageFetcher } : {}),
+    ...(extra.roundNotices ? { roundNotices: extra.roundNotices } : {}),
   });
   return { channel, router, confirmations, handlers, tmp, confirmPrompts };
 }
@@ -593,6 +594,37 @@ async function main(): Promise<void> {
       const settled = f.channel.updated.length;
       await new Promise((r) => setTimeout(r, 150)); // 等若干个心跳周期
       assert.equal(f.channel.updated.length, settled, '回复就绪后心跳应停止，不再刷新占位');
+      cleanup(f);
+    });
+
+    // ---------- 轮次内插消息：确认卡片等插在占位之后时，最终回复另发新消息保持时间线顺序 ----------
+    await checkAsync('handler：轮次内有确认消息插入时最终回复另发新消息，占位收尾为短终态', async () => {
+      const roundNotices = createRoundNoticeTracker();
+      const f = setup(llm.baseUrl, undefined, { roundNotices });
+      llm.mode = 'hang';
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const p = f.handlers.handle(mkMsg('u1', '帮我开始任务'));
+      await waitFor(() => llm.requestCount === base + 1, '消息进入 LLM');
+      roundNotices.mark('u1'); // 模拟确认卡片在轮次中发出（插在占位消息之后）
+      llm.mode = 'ok';
+      llm.release();
+      await p;
+      assert.ok(
+        f.channel.updated.some((t) => t.includes('结果见下方')),
+        '占位应收尾为短终态，不能原地改成最终回复（会停在卡片上方）',
+      );
+      assert.ok(!f.channel.updated.includes('好的，已收到'), '最终回复不得原地替换占位');
+      assert.ok(f.channel.sent.includes('好的，已收到'), '最终回复应另发新消息落在时间线末尾');
+      cleanup(f);
+    });
+
+    // ---------- 对照：轮次内无插入消息时，最终回复仍原地替换占位（行为不变） ----------
+    await checkAsync('handler：轮次内无插入消息时最终回复仍原地替换占位', async () => {
+      const roundNotices = createRoundNoticeTracker();
+      const f = setup(llm.baseUrl, undefined, { roundNotices });
+      await f.handlers.handle(mkMsg('u1', '你好'));
+      assert.ok(f.channel.updated.includes('好的，已收到'), '最终回复应替换占位消息');
+      assert.ok(!f.channel.sent.includes('好的，已收到'), '无插入消息时不应另发新消息');
       cleanup(f);
     });
 

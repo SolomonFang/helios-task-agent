@@ -55,6 +55,26 @@ export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 /** 图片下载器：默认走飞书 SDK（FeishuChannel.downloadImage），单测注入 mock（不触网络）。 */
 export type ImageFetcher = (messageId: string, imageKey: string) => Promise<{ data: Buffer; mimeType: string }>;
 
+/**
+ * 轮次内插消息追踪：确认卡片/批准回执等独立消息若插在「⏳ 处理中…」占位之后，
+ * 最终回复不能再原地编辑占位（飞书编辑不改变消息位置，完成消息会停在卡片上方），
+ * 需另发新消息落在时间线末尾。按 openId 计数，轮次开始 reset，投递前 has 判断。
+ */
+export interface RoundNoticeTracker {
+  mark(openId: string): void;
+  has(openId: string): boolean;
+  reset(openId: string): void;
+}
+
+export function createRoundNoticeTracker(): RoundNoticeTracker {
+  const counts = new Map<string, number>();
+  return {
+    mark: (openId) => counts.set(openId, (counts.get(openId) ?? 0) + 1),
+    has: (openId) => (counts.get(openId) ?? 0) > 0,
+    reset: (openId) => counts.delete(openId),
+  };
+}
+
 /** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
 const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
 
@@ -73,6 +93,8 @@ export interface BotHandlerDeps {
   progressHeartbeatMs?: number;
   /** 测试注入用：图片下载器（默认 channel.downloadImage 走飞书 SDK）。 */
   imageFetcher?: ImageFetcher;
+  /** 轮次内插消息追踪（bot-main 在确认卡片/回执发送时 mark）；缺省时最终回复一律原地替换占位。 */
+  roundNotices?: RoundNoticeTracker;
 }
 
 export interface BotHandlers {
@@ -461,8 +483,35 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   };
 
   /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。 */
-  const deliverReply = async (msg: InboundMessage, progressId: string | undefined, reply: string): Promise<void> => {
+  const deliverReply = async (
+    msg: InboundMessage,
+    progressId: string | undefined,
+    reply: string,
+    interleaved = false,
+  ): Promise<void> => {
     const chunks = splitText(reply || '（无回复）');
+    if (progressId && interleaved) {
+      // 轮次中插入了确认卡片等独立消息：占位停在它们上方，原地改文案会时序颠倒。
+      // 占位收尾为短终态，正文另发新消息落在时间线末尾（分段各自兜底，同下方续发策略）。
+      await channel
+        .updateText(progressId, '✅ 已完成，结果见下方 ⬇️')
+        .catch((err) => console.error(`[feishu] 占位收尾更新失败: ${errMessage(err)}`));
+      let chunkFailed = false;
+      for (const chunk of chunks) {
+        try {
+          await channel.sendText(msg.sessionId, chunk);
+        } catch (err) {
+          chunkFailed = true;
+          console.error(`[feishu] 回复分段失败（后续分段继续投递）: ${errMessage(err)}`);
+        }
+      }
+      if (chunkFailed) {
+        await channel
+          .sendText(msg.sessionId, '⚠️ 上方回复有部分内容发送失败，可能不完整，可再问一次。')
+          .catch((err) => console.error(`[feishu] 分段失败提示也未送达: ${errMessage(err)}`));
+      }
+      return;
+    }
     if (progressId) {
       let firstDelivered = false;
       try {
@@ -510,6 +559,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     image?: InlineImage,
   ): Promise<void> => {
     const openId = msg.senderId;
+    // 轮次开始重置内插消息计数：之后确认卡片等独立消息发送时 mark，投递前据此决定回复是否另发新消息
+    deps.roundNotices?.reset(openId);
     // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
     const progressId = await sendPlaceholder(msg);
     const activity = { lastEventAt: Date.now() };
@@ -522,7 +573,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     try {
       const reply = await session.handleUserMessage(text, onProgress, ctl.signal, image);
       clearHeartbeat(); // 投递前停心跳：避免回复已就绪却被心跳刷回「仍在处理」
-      await deliverReply(msg, progressId, reply);
+      await deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
     } catch (err) {
       clearHeartbeat();
       // 「占位即终态」：异常路径先把「处理中」占位收尾为终态文案，占位缺失/更新失败才回退 reply。
