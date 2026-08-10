@@ -62,7 +62,7 @@ export async function buildStatusLines(
   // larkOk 只代表二进制存在，补探测授权态，区分未安装/未授权/可用
   const larkAuthed = opts.larkOk ? (await probeLarkCliAuthAsync()) === 'ok' : false;
   const mcpText = opts.mcpOk
-    ? p.ok(`ok（${opts.mcpToolCount} 个工具）`)
+    ? p.ok(`正常（${opts.mcpToolCount} 个工具）`)
     : p.warn(
         hkMissing.length
           ? `${opts.mcpDownNote}；但 hk_cli 缺少 ${hkMissing.join('、')}，降级链不可用（${HK_CLI_INSTALL_HINT}）`
@@ -71,14 +71,14 @@ export async function buildStatusLines(
   const larkText = !opts.larkOk
     ? p.warn('未安装（飞书读取不可用）')
     : larkAuthed
-      ? p.ok('ok')
+      ? p.ok('正常')
       : p.warn(`未授权（${LARK_CLI_AUTH_HINT}）`);
   const lines = [
     `模型: ${p.info(opts.model)}`,
-    `kanban: ${health === 'ok' ? p.ok('ok') : p.warn(health)}（${opts.kanbanUrl}）`,
+    `kanban: ${health === 'ok' ? p.ok('正常') : p.warn(health)}（${opts.kanbanUrl}）`,
     `MCP: ${mcpText}`,
     `lark-cli: ${larkText}`,
-    `hk_cli: ${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('ok')}`,
+    `hk_cli: ${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('正常')}`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }
@@ -177,6 +177,13 @@ export function buildMemoryLines(session: { formatMemory(): string }, header: st
 /** /clear 回复（两端一致）。 */
 export const CLEARED_TEXT = '对话历史已清空（记忆保留）。';
 
+/** /clear 回复：activeBatches > 0 时提醒「同类免问」不受清盘影响、仍生效（/confirm revoke 可恢复逐次确认）。 */
+export function clearedText(activeBatches = 0): string {
+  return activeBatches
+    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 类写操作处于「同类免问」，/confirm revoke 可恢复逐次确认）。`
+    : CLEARED_TEXT;
+}
+
 /** 「同类免问」状态查询文案；revokeHint 为通道自己的撤销方式说明（active=0 时忽略）。 */
 export function confirmStateText(active: number, revokeHint: string): string {
   return active
@@ -200,6 +207,6 @@ export function llmFailureParts(
   const tail =
     channel === 'bot'
       ? `你的上一条消息未处理：「${quoted}」，可修改后重发。`
-      : `上一条内容「${quoted}」未发送成功，可修改后重发；也可用 /config 检查模型配置。`;
-  return { head: `请求失败: ${message}`, friendly, tail };
+      : `上一条内容「${quoted}」未被处理，可修改后重发；也可用 /config 检查模型配置。`;
+  return { head: `请求失败：${message}`, friendly, tail };
 }

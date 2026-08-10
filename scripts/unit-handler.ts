@@ -534,8 +534,12 @@ async function main(): Promise<void> {
       );
       await pA;
       assert.ok(
-        f.channel.replies.some((r) => r.text === '⏹ 已中断。'),
-        '被中断的消息应收到中断回执',
+        f.channel.updated.includes('⏹ 已中断。'),
+        '被中断的消息应把占位消息收尾为中断终态',
+      );
+      assert.ok(
+        !f.channel.replies.some((r) => r.text === '⏹ 已中断。'),
+        '/stop 已回执过，不得再重复回复「已中断。」',
       );
       assert.equal(llm.requestCount, base + 1, '中断后不得再发起 LLM 请求');
       llm.release();
@@ -800,6 +804,10 @@ async function main(): Promise<void> {
         assert.ok(f.channel.sent.some((t) => t.includes('CCC')), '失败段之后的分段仍应送达');
         assert.ok(errLogs.some((m) => m.includes('续发分段失败')), '分段失败应记日志');
         assert.ok(!f.channel.updated.some((t) => t.includes('回复投递失败')), '首段成功不应报投递失败');
+        assert.ok(
+          f.channel.sent.some((t) => t.includes('部分内容发送失败，可能不完整')),
+          '分段失败后应补发不完整提示',
+        );
       } finally {
         console.error = origErr;
         llm.replyText = '好的，已收到';

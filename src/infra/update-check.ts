@@ -229,7 +229,7 @@ export async function promptVersionUpdate(deps: PromptUpdateDeps): Promise<Updat
   const log = deps.log || (() => {});
   const ans = (await deps.ask(`\n发现新版本 helios-task-agent ${info.latest}（当前 ${info.current}）。\n变更内容：${CHANGELOG_URL}\n现在更新？[y=更新 / N=跳过] `)) || '';
   if (!UPDATE_YES_RE.test(ans.trim())) {
-    log(`已跳过更新；随时可手动执行：npm i -g ${PKG_NAME}@latest（HTA_UPDATE_CHECK=0 可关闭启动检查）`);
+    log(`已跳过更新；随时可手动执行：npm i -g ${PKG_NAME}@${info.tag}（HTA_UPDATE_CHECK=0 可关闭启动检查）`);
     return 'skipped';
   }
   const run = deps.runUpdate || defaultRunUpdate;

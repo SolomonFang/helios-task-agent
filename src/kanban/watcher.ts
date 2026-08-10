@@ -11,6 +11,7 @@ import {
   type KanbanTaskRow,
   type KanbanProjectRow,
 } from './http';
+import { statusLabel } from './summary';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -61,8 +62,10 @@ export interface WatchEvent {
   attemptId?: string;
   /** 结果摘要原文（已截断，无前缀）。 */
   extra?: string;
-  /** 待审批标签列表（kind === 'approvals'）。 */
+  /** 待审批标签列表（kind === 'approvals'，最多 5 条截断）。 */
   items?: string[];
+  /** 待审批真实总数（kind === 'approvals'，截断前计数；卡片标题计数用它，不用 items.length）。 */
+  total?: number;
   /** 纯文本版本，与卡片内容等价。 */
   text: string;
 }
@@ -206,6 +209,8 @@ export class KanbanWatcher {
         cur.status === 'inreview' && old.status === 'inreview' && old.running && !cur.running && !cur.failed;
       if (enteredReview || finishedInReview) {
         const transition = enteredReview ? `${old.status} → ${cur.status}` : '跟进执行完成';
+        // 纯文本版给用户看：状态键翻译成中文；transition 字段保留原始键（卡片渲染自行映射）
+        const transitionText = enteredReview ? `${statusLabel(old.status)} → ${statusLabel(cur.status)}` : transition;
         const review = await this.reviewTarget(cur.projectId, id);
         events.push({
           id: `review:${id}:${transition}`,
@@ -215,7 +220,7 @@ export class KanbanWatcher {
             transition,
             url: review.url,
             attemptId: review.attemptId,
-            text: `🔍 看板任务待审阅：《${cur.title}》（${transition}）\n${review.url}\n点开链接人工审查 diff，或点卡片「AI 审查」让 AI 先过一遍；没问题回复「标记完成」，要继续改直接说`,
+            text: `🔍 看板任务待审阅：《${cur.title}》（${transitionText}）\n${review.url}\n点开链接人工审查 diff；没问题回复「标记完成」，要继续改直接说`,
           },
         });
         continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
@@ -241,7 +246,7 @@ export class KanbanWatcher {
             transition: `${old.status} → ${cur.status}`,
             url: link,
             extra: extra || undefined,
-            text: `${label}：《${cur.title}》（${old.status} → ${cur.status}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
+            text: `${label}：《${cur.title}》（${statusLabel(old.status)} → ${statusLabel(cur.status)}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
           },
         });
       }
@@ -269,6 +274,7 @@ export class KanbanWatcher {
           kind: 'approvals',
           title: '',
           items: newApprovals.slice(0, 5).map((a) => a.label),
+          total: newApprovals.length,
           text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
         },
       });

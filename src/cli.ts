@@ -7,7 +7,7 @@ import { AgentSession } from './agent/session';
 import { SessionHistoryStore } from './agent/session-store';
 import { connectMcp } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
-import { checkHkDeps, checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkHkDeps, checkLarkCliStatus, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -15,7 +15,7 @@ import {
   buildMemoryLines,
   buildStatusLines,
   buildToolsLines,
-  CLEARED_TEXT,
+  clearedText,
   confirmRevokedText,
   confirmStateText,
   handleSkillsCommand,
@@ -144,7 +144,7 @@ export async function main(): Promise<void> {
     cfg = await ensureConfig(ask, { choose, askSecret });
   } catch (err) {
     const message = errMessage(err);
-    console.error(c.err(`\n配置失败: ${message}`));
+    console.error(c.err(`\n配置失败：${message}`));
     rl.close();
     process.exit(1);
   }
@@ -224,10 +224,10 @@ export async function main(): Promise<void> {
   // handler 自身只做同步日志，不得再抛异常。
   process.on('unhandledRejection', (reason) => {
     const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
-    console.error(c.err(`未处理的 Promise rejection（进程保持运行）: ${msg}`));
+    console.error(c.err(`未处理的 Promise rejection（进程保持运行）：${msg}`));
   });
   process.on('uncaughtException', (err) => {
-    console.error(c.err(`未捕获异常，执行优雅退出: ${err.stack || err.message}`));
+    console.error(c.err(`未捕获异常，执行优雅退出：${err.stack || err.message}`));
     void cleanup(1);
   });
   // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
@@ -242,8 +242,14 @@ export async function main(): Promise<void> {
     },
   });
   boot.stop();
+  // 降级链探测先于告警：可用时 banner 已完整表达（不在 banner 外重复），缺依赖时改口告知看板读写暂不可用
+  const hkMissing = checkHkDeps();
   if (!mcpOk) {
-    console.log(c.warn(`MCP 连接失败，${MCP_FALLBACK_TEXT}，看板功能不受影响。`));
+    if (hkMissing.length) {
+      console.log(
+        c.warn(`MCP 连接失败，且 hk_cli 降级链缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）。`),
+      );
+    }
     if (mcpHint) console.log(c.warn(mcpHint));
   }
 
@@ -259,7 +265,7 @@ export async function main(): Promise<void> {
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
     larkOk: larkStatus !== 'missing',
     larkAuthed: larkStatus === 'ok',
-    hkMissing: checkHkDeps(),
+    hkMissing,
   });
   // banner 状态行已含未授权/未找到说明；warnStartupDeps 只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
   warnStartupDeps(larkStatus, { style: 'cli' });
@@ -268,7 +274,7 @@ export async function main(): Promise<void> {
   /** ask 的 abort/超时感知版：实现见模块级 createAskWithAbort（单测覆盖三路竞态）。 */
   const askWithAbort = createAskWithAbort(ask, () => currentCtl);
 
-  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「batch」开启同类免问；Ctrl+C 视为拒绝；
+  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「免问」（或 batch/同类免问等词）开启同类免问；Ctrl+C 视为拒绝；
   // 超时自动拒绝（与飞书 bot 同语义：可批量 120s、破坏性 300s）。
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
@@ -276,9 +282,9 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.batchKey ? 120000 : 300000;
-    const batchHint = req.batchKey ? '，batch=同类免问（本会话）' : '';
+    const options = req.batchKey ? 'y=仅此次 / 免问=同类免问（本会话）/ N=取消' : 'y=仅此次 / N=取消';
     const ans = await askWithAbort(
-      c.warn(`允许执行？[y=仅此次${batchHint} / N=取消]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
+      c.warn(`允许执行？[${options}]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
       timeoutMs,
     );
     spinner.start('思考中…（Ctrl+C 中断）');
@@ -337,7 +343,7 @@ export async function main(): Promise<void> {
         console.log(HELP);
       } else if (cmd === '/clear') {
         session.clearHistory();
-        console.log(c.gray(CLEARED_TEXT));
+        console.log(c.gray(clearedText(session.activeBatchApprovals())));
       } else if (cmd === '/confirm' || cmd === '/confirm revoke' || cmd === '/confirm on') {
         // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）
         if (cmd !== '/confirm') {
@@ -354,7 +360,9 @@ export async function main(): Promise<void> {
           );
         }
       } else if (cmd === '/memory') {
-        for (const l of buildMemoryLines(session, c.strong('用户记忆') + c.gray(`  user=${session.memoryUserId}`))) {
+        // CLI 端记忆归属恒为 local：仅在非 local（未来多用户）时展示 user= 后缀，避免无信息量的内部细节
+        const userSuffix = session.memoryUserId === 'local' ? '' : c.gray(`  user=${session.memoryUserId}`);
+        for (const l of buildMemoryLines(session, c.strong('用户记忆') + userSuffix)) {
           console.log(l);
         }
         console.log('');
@@ -364,7 +372,11 @@ export async function main(): Promise<void> {
             mcpOk,
             mcpTools: mcp.tools,
             kanbanHeader: c.strong('kanban MCP 工具:'),
-            downNote: c.warn(`MCP 未连接（${MCP_FALLBACK_TEXT}，看板功能不受影响）。`),
+            downNote: c.warn(
+              hkMissing.length
+                ? `MCP 未连接，${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，看板读写暂不可用。`
+                : `MCP 未连接，${MCP_FALLBACK_TEXT}，看板功能不受影响。`,
+            ),
             localHeader: c.strong('本地工具:'),
             bullet: '  ',
           },
@@ -392,7 +404,7 @@ export async function main(): Promise<void> {
             kanbanUrl: cfg.kanbanUrl,
             mcpOk,
             mcpToolCount: mcp.tools.length,
-            mcpDownNote: `连接失败（${MCP_FALLBACK_TEXT}）`,
+            mcpDownNote: `连接失败，${MCP_FALLBACK_TEXT}`,
             larkOk: larkStatus !== 'missing',
             // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启
             extra:
@@ -412,9 +424,14 @@ export async function main(): Promise<void> {
       } else if (cmd === '/config') {
         try {
           const prevKanbanUrl = cfg.kanbanUrl;
+          const prevModel = cfg.llmModel;
           cfg = await ensureConfig(ask, { force: true, choose, askSecret });
           session.applyConfig(cfg);
-          console.log(c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel));
+          console.log(
+            cfg.llmModel !== prevModel
+              ? c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel)
+              : c.ok(`配置已更新（模型仍为 ${cfg.llmModel}）`),
+          );
           if (cfg.kanbanUrl !== prevKanbanUrl) {
             console.log(
               c.warn(
@@ -425,7 +442,7 @@ export async function main(): Promise<void> {
           }
         } catch (err) {
           const message = errMessage(err);
-          console.error(c.err(`配置失败: ${message}`));
+          console.error(c.err(`配置失败：${message}`));
         }
       } else {
         console.log(c.warn(`未知命令 ${line}，输入 /help 查看帮助。`));

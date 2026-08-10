@@ -88,6 +88,19 @@ async function main(): Promise<void> {
     assert.ok(text.includes('【待审阅】1 个') && text.includes('【已完成】1 个') && text.includes('【失败】1 个'));
     // 纯文本消息不做 markdown 解析：含 markdown 字符的标题原样保留
     assert.ok(text.includes('《写 **加粗** 标题》'), '标题原样输出');
+    // 失败分组与状态分组正交：失败条目标注原状态，避免「同一任务出现两次」的困惑
+    assert.ok(text.includes('《写 **加粗** 标题》（进行中）'), `失败分组应标注原状态: ${text}`);
+    // 配置了迭代：引导语指向迭代总结
+    assert.ok(text.includes('总结一下这个迭代做了什么'), `迭代范围引导语: ${text}`);
+  });
+
+  await checkAsync('buildDailyBriefText：未配置迭代时引导语指向看板进展总结', () => {
+    const data = fakeSummary([fakeTask({ id: 'a', title: '任务A', status: 'inprogress' })]);
+    delete data.iteration; // 未配置 HELIOS_KANBAN_ITERATION：范围为全部迭代
+    data.sinceLabel = '全部迭代';
+    const text = buildDailyBriefText(data, at(9, 30));
+    assert.ok(text.includes('总结一下看板进展'), `全量范围引导语: ${text}`);
+    assert.ok(!text.includes('总结一下这个迭代做了什么'));
   });
 
   await checkAsync('buildDailyBriefText：空范围给兜底文案', () => {

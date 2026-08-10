@@ -193,6 +193,9 @@ export class Spinner {
 
 /** 简单 markdown 表格做列对齐渲染；结构不完整（缺分隔行 / 列数不齐）时原样返回。 */
 function renderTable(block: string): string {
+  // 行内标记（`code` / **bold**）不计列宽：外层 renderReply 在表格渲染后才给它们上色，
+  // 按含标记的原文计宽会让渲染后的整列错位
+  const stripInline = (s: string) => s.replace(/`([^`\n]+)`/g, '$1').replace(/\*\*([^*]+)\*\*/g, '$1');
   const rows = block.split('\n');
   if (rows.length < 2) return block;
   const splitRow = (row: string) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
@@ -205,8 +208,8 @@ function renderTable(block: string): string {
     if (cells.length !== header.length) return block; // 列数不齐：退化为原样
     body.push(cells);
   }
-  const widths = header.map((h, i) => Math.max(visibleLen(h), ...body.map((r) => visibleLen(r[i]!))));
-  const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - visibleLen(s)));
+  const widths = header.map((h, i) => Math.max(visibleLen(stripInline(h)), ...body.map((r) => visibleLen(stripInline(r[i]!)))));
+  const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - visibleLen(stripInline(s))));
   const line = (cells: string[]) => cells.map((cell, i) => pad(cell, widths[i]!)).join('  ');
   return [c.strong(line(header)), line(widths.map((w) => '─'.repeat(w))), ...body.map(line)].join('\n');
 }

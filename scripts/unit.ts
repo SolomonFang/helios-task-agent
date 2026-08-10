@@ -103,10 +103,11 @@ import {
   confirmRevokedText,
   llmFailureParts,
   CLEARED_TEXT,
+  clearedText,
 } from '../src/commands';
 import { renderReply, printBanner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { WorkSummaryData } from '../src/kanban/summary';
+import { statusLabel, type WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 import { check, checkAsync, finish } from './testkit';
 
@@ -840,7 +841,7 @@ async function run(): Promise<void> {
     const ENV_KEYS = ['HELIOS_TASK_AGENT_HOME', 'LLM_API_KEY', 'LLM_BASE_URL', 'FEISHU_APP_SECRET', 'HTA_UNIT_NONRESTRICTED'];
     const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
     const prevCwd = process.cwd();
-    // 静默丢弃提示（[config] cwd .env 中的高危键已被忽略…），不打断测试输出
+    // 静默丢弃提示（[config] 当前目录 .env 中的以下配置项存在安全风险…），不打断测试输出
     const origWarn = console.warn;
     console.warn = () => {};
     try {
@@ -1098,6 +1099,10 @@ async function run(): Promise<void> {
     assert.ok(authBot!.includes('bot --reconfig') && !authBot!.includes('/config'), 'bot 渠道不应提 /config');
     const ctx = friendlyLlmError("This model's maximum context length is 128000 tokens");
     assert.ok(ctx!.includes('上下文超出模型上限'), '上下文超限应映射到 /clear 建议');
+    const ctxLong = friendlyLlmError('prompt is too long: 200000 tokens > 199999 maximum');
+    assert.ok(ctxLong!.includes('上下文超出模型上限'), 'prompt is too long 应映射到 /clear 建议');
+    const ctxExceed = friendlyLlmError('requested tokens exceed the model limit');
+    assert.ok(ctxExceed!.includes('上下文超出模型上限'), 'token…exceed 应映射到 /clear 建议');
     const rate = friendlyLlmError('429 rate limit reached');
     assert.ok(rate!.includes('限流或额度不足'), '429 应映射到限流建议');
     const model = friendlyLlmError('The model `gpt-x` does not exist');
@@ -1446,7 +1451,7 @@ async function run(): Promise<void> {
     return (
       page.includes('共 1 条审查意见') &&
       page.includes('sev sev-high') &&
-      page.includes('高危 × 1') &&
+      page.includes('高 × 1') &&
       page.includes('src/a/b.js') &&
       page.includes(':10-12') &&
       page.includes('&lt;b&gt;') &&
@@ -1910,6 +1915,7 @@ async function run(): Promise<void> {
       const appr = events.filter((e) => e.kind === 'approvals');
       assert.equal(appr.length, 1);
       assert.deepEqual(appr[0]!.items, ['真的待审批']);
+      assert.equal(appr[0]!.total, 1, 'total 应为截断前真实总数');
     } finally {
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
@@ -2527,7 +2533,7 @@ async function run(): Promise<void> {
       fs.symlinkSync(process.execPath, path.join(bin, 'lark-cli'));
       process.env.NODE_OPTIONS = `--require ${probeJs}`;
       const okLines = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
-      assert.ok(okLines.includes('lark-cli: ok'));
+      assert.ok(okLines.includes('lark-cli: 正常'));
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -2695,6 +2701,18 @@ async function run(): Promise<void> {
       kindLabel('lark') === '飞书' &&
       kindLabel('memory') === '记忆' &&
       kindLabel('something-else') === 'something-else'
+    );
+  })());
+
+  // ---------- 看板状态键 → 用户可见中文 ----------
+  check('statusLabel：已知状态映射中文，未知状态回退原文', (() => {
+    return (
+      statusLabel('done') === '已完成' &&
+      statusLabel('inreview') === '待审阅' &&
+      statusLabel('inprogress') === '进行中' &&
+      statusLabel('todo') === '待办' &&
+      statusLabel('cancelled') === '已取消' &&
+      statusLabel('paused') === 'paused'
     );
   })());
 
@@ -3052,7 +3070,10 @@ async function run(): Promise<void> {
       confirmStateText(0, '') === '当前没有生效中的「同类免问」（写操作逐次确认）。' &&
       confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 类「同类免问」授权）。' &&
       confirmRevokedText(0, '无') === '无' &&
-      CLEARED_TEXT === '对话历史已清空（记忆保留）。'
+      CLEARED_TEXT === '对话历史已清空（记忆保留）。' &&
+      clearedText() === CLEARED_TEXT &&
+      clearedText(2) ===
+        '对话历史已清空（记忆保留；仍有 2 类写操作处于「同类免问」，/confirm revoke 可恢复逐次确认）。'
     );
   })());
 
@@ -3060,7 +3081,7 @@ async function run(): Promise<void> {
     const cli = llmFailureParts('401 invalid api key', 'x'.repeat(70), 'cli');
     const bot = llmFailureParts('401 invalid api key', '短消息', 'bot');
     return (
-      cli.head === '请求失败: 401 invalid api key' &&
+      cli.head === '请求失败：401 invalid api key' &&
       cli.friendly !== null &&
       cli.tail.includes('/config') &&
       cli.tail.includes('…') &&
@@ -3244,6 +3265,12 @@ async function run(): Promise<void> {
       rows[3] === '长名字bb  进行中';
     const degraded = renderReply('| a | b |\n| c | d |');
     return aligned && degraded.includes('| a | b |');
+  })());
+
+  check('renderReply：表格单元格含 `code` / **bold** 时列宽按渲染后文本对齐', (() => {
+    const out = renderReply('| 名称 | 状态 |\n| --- | --- |\n| `a` | 完成 |\n| 长名字bb | **进行中** |');
+    const rows = out.split('\n');
+    return rows.length === 4 && rows[2] === `a${' '.repeat(9)}完成  ` && rows[3] === '长名字bb  进行中';
   })());
 
   check('renderReply：代码块内的 # 与表格语法不被渲染', (() => {

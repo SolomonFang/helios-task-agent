@@ -188,16 +188,16 @@ interface SevMeta {
 const SEV_MAP: Record<string, SevMeta> = {
   critical: { cls: 'critical', label: '严重' },
   blocker: { cls: 'critical', label: '严重' },
-  high: { cls: 'high', label: '高危' },
-  major: { cls: 'high', label: '高危' },
-  medium: { cls: 'medium', label: '中危' },
-  low: { cls: 'low', label: '低危' },
-  minor: { cls: 'low', label: '低危' },
+  high: { cls: 'high', label: '高' },
+  major: { cls: 'high', label: '高' },
+  medium: { cls: 'medium', label: '中' },
+  low: { cls: 'low', label: '低' },
+  minor: { cls: 'low', label: '低' },
   info: { cls: 'info', label: '提示' },
   严重: { cls: 'critical', label: '严重' },
-  高: { cls: 'high', label: '高危' },
-  中: { cls: 'medium', label: '中危' },
-  低: { cls: 'low', label: '低危' },
+  高: { cls: 'high', label: '高' },
+  中: { cls: 'medium', label: '中' },
+  低: { cls: 'low', label: '低' },
 };
 
 function sevMeta(raw: string): SevMeta {

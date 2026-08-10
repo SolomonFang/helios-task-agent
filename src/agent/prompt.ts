@@ -53,7 +53,7 @@ export function buildSystemPrompt({
 }: SystemPromptOpts): string {
   const kanbanTools = mcpOk
     ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames.map((n) => `kanban_${n}`).join(', ')}。**优先使用这些 MCP 工具**；MCP 缺能力时再用 hk_cli。`
-    : `当前 MCP 未连接，请使用 hk_cli 工具（HTTP REST，目标 ${kanbanUrl}）操作 kanban，并提醒用户 MCP 处于降级状态。不确定子命令时先 \`["--help"]\`。`;
+    : `当前 MCP 未连接，请使用 hk_cli 工具（HTTP REST，目标 ${kanbanUrl}）操作 kanban，并告知用户：看板当前通过备用接口（hk_cli）连接，功能不受影响。不确定子命令时先 \`["--help"]\`。`;
 
   const defaults = [
     projectId ? `默认项目 ID：${projectId}` : null,
@@ -95,7 +95,7 @@ ${MEMORY_CLOSE}
 4. 其它场景提炼任务清单（中文、粒度适中）；创建前向用户复述草稿，随即发起 create，由系统闸门完成最终确认（同「飞书→看板」流程，避免双重确认）
 5. 用户明确要求「跑起来 / 用某某 agent / start」→ 再 start workspace（executor/variant/repo/branch **听用户的**；未指定则用看板 Settings 默认 / 仓库 default_target_branch）
    - **start 必须带有效 base 分支**：优先用户指定；否则用仓库 \`default_target_branch\`。不要假设存在 \`main\`。系统会在缺省时自动补全或拒绝，并在 setup 未完成时回报错误
-6. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny
+6. 「再跟它说一句」→ follow-up；「跑得怎么样」→ status；「待审批」→ approvals → approve/deny；「标记完成」→ 更新任务状态为 done；「帮我审一下」→ 读 attempt 结果并总结；「为什么失败」→ 读日志分析原因
 7. 停 agent 用 stop；取消任务用 cancel（会先 stop）；**删除**必须先确认，优先建议 cancel
 8. 需要给项目写/改说明时：\`hk_cli\` \`["projects","update",id,"--description","…"]\`（或 MCP 等价能力），**先确认再改**
 9. 用户问「这个迭代做了什么 / 今天完成了什么 / 总结一下进展或成果」→ 调用 \`work_summary\`；未说明范围时：配置了默认迭代用 \`iteration\`，否则用 \`today\`；回复只给报告文件路径 + 3~5 行文字概览，不要把整份报告贴进对话

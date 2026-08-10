@@ -166,10 +166,10 @@ export function validateRows<T>(endpoint: string, data: unknown, spec: Record<st
   for (let i = 0; i < data.length; i++) {
     const row: unknown = data[i];
     if (!row || typeof row !== 'object' || Array.isArray(row)) {
-      throw new Error(`kanban api ${endpoint} 返回校验失败：第 ${i} 行不是对象（${describe(row)}）`);
+      throw new Error(`kanban api ${endpoint} 返回校验失败：第 ${i + 1} 行不是对象（${describe(row)}）`);
     }
     const bad = checkFields(row as Record<string, unknown>, spec);
-    if (bad) throw new Error(`kanban api ${endpoint} 返回校验失败：第 ${i} 行${bad}`);
+    if (bad) throw new Error(`kanban api ${endpoint} 返回校验失败：第 ${i + 1} 行${bad}`);
   }
   return data as T[];
 }

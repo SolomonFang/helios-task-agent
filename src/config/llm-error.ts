@@ -3,9 +3,12 @@
  * 命中返回提示文案；未命中返回 null（展示原始错误）。
  * channel：终端有 /config；bot 没有该命令，首选 helios-task-agent bot --reconfig 重配，也可改 .env 后重启——建议必须指向存在的操作。
  */
+import { userEnvPath } from './config';
+import { CONTEXT_OVERFLOW_RE } from '../agent/llm';
+
 export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } = {}): string | null {
   const s = raw.toLowerCase();
-  const envFile = '~/.helios-task-agent/.env';
+  const envFile = userEnvPath();
   const reconfig = 'helios-task-agent bot --reconfig';
   const keyHint =
     opts.channel === 'bot'
@@ -18,7 +21,8 @@ export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } 
   if (/\b401\b|unauthorized|invalid[_ ]api[_ ]key|incorrect api key|authentication/.test(s)) {
     return `排查建议：API Key 无效或已过期。${keyHint}`;
   }
-  if (/context length|maximum context|context_window|too many tokens|reduce the length|exceed.*token/.test(s)) {
+  // 上下文超限特征与 agent/llm.ts 单源复用（CONTEXT_OVERFLOW_RE），自愈失败的用户也能拿到 /clear 指引
+  if (CONTEXT_OVERFLOW_RE.test(s)) {
     return '排查建议：对话上下文超出模型上限。/clear 清空历史后重试（或把任务拆小分步执行）。';
   }
   if (/\b429\b|rate limit|too many requests|quota|insufficient|余额|额度/.test(s)) {

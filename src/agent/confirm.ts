@@ -190,6 +190,9 @@ export class ConfirmationManager {
   private finish(openId: string, p: Pending, verdict: ConfirmVerdict): void {
     clearTimeout(p.timer);
     this.pendings.delete(openId);
+    // 裁决留痕：open_id 只记头尾摘要，不完整落日志
+    const maskedUser = openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
+    console.log(`[confirm] user=${maskedUser} verdict=${verdict === false ? 'denied' : verdict} summary="${p.req.summary.slice(0, 80)}"`);
     p.resolve(verdict);
     this.opts.onSettled?.(openId, p.req, verdict === false ? 'denied' : verdict, p.cardMessageId);
   }

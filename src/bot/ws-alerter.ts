@@ -42,7 +42,7 @@ export class WsAlerter {
         this.alerted = true;
         const minutes = Math.max(1, Math.round(this.graceMs / 60000));
         this.opts.notify(
-          `⚠️ 飞书长连接已断开超过 ${minutes} 分钟，仍在自动重连…（若长时间未恢复请重启机器人）`,
+          `⚠️ 飞书长连接已断开超过 ${minutes} 分钟，仍在自动重连…（若长时间未恢复，请在部署机器上重新运行 helios-task-agent bot）`,
         );
       }, this.graceMs);
       this.pending.unref();
@@ -64,7 +64,7 @@ export class WsAlerter {
       this.cancelPending();
       if (this.failedNotified) return;
       this.failedNotified = true;
-      this.opts.notify('❌ 飞书长连接重连失败，机器人已收不到消息，请重启机器人。');
+      this.opts.notify('❌ 飞书长连接重连失败，机器人已收不到消息，请在部署机器上重新运行 helios-task-agent bot。');
     }
   }
 

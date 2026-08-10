@@ -33,13 +33,13 @@ export function warnStartupDeps(larkStatus: LarkCliStatus, opts: StartupDepsWarn
     if (larkStatus === 'missing') {
       console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}`));
     } else if (larkStatus === 'unauthorized') {
-      console.log(c.warn(`lark-cli 已安装但未授权。${LARK_CLI_AUTH_HINT}`));
+      console.log(c.warn(`lark-cli ${LARK_CLI_AUTH_HINT}`));
     }
   } else if (larkStatus === 'missing') {
     console.log(c.warn(LARK_CLI_INSTALL_HINT));
   }
   if (opts.checkOcr && !checkOcrCli()) {
-    console.log(c.warn(`未检测到代码审查工具 open-code-review（AI 审查功能）。${OCR_INSTALL_HINT}`));
+    console.log(c.warn(OCR_INSTALL_HINT));
   }
 }
 
@@ -70,8 +70,9 @@ export async function ensureKanbanOrExit(opts: KanbanBootOptions): Promise<Kanba
   } catch (err) {
     const message = errMessage(err);
     opts.onFail?.();
-    console.error(c.err(`${opts.failLabel}: ${message}`));
-    console.error(c.gray(kanbanManualStartHint()));
+    console.error(c.err(`${opts.failLabel}：${message}`));
+    // kanban-ensure 的多数失败已内嵌手动启动指引，这里只为未内嵌的路径（如 npx 缺失）兜底
+    if (!message.includes('可手动执行')) console.error(c.gray(kanbanManualStartHint()));
     process.exit(1);
   }
 }

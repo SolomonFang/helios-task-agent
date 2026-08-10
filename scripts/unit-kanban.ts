@@ -136,7 +136,7 @@ async function main(): Promise<void> {
     try {
       const argv = ['start', '--repo', 'r1'];
       const err = await fillHkStartBranches(argv, mock.baseUrl);
-      assert.ok(err && err.includes('无法启动 workspace') && err.includes('r1'), `实际：${err}`);
+      assert.ok(err && err.includes('无法启动工作区') && err.includes('r1'), `实际：${err}`);
       assert.deepEqual(argv, ['start', '--repo', 'r1']); // 出错不改写 argv
     } finally {
       await mock.close();

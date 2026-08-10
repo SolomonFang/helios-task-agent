@@ -10,6 +10,7 @@
 
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 
@@ -39,6 +40,15 @@ function isLoopback(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
+/** 通配绑定地址（0.0.0.0 / ::）不能拼进链接：回退本机主机名。 */
+function isWildcard(host: string): boolean {
+  return host === '0.0.0.0' || host === '::';
+}
+
+/** 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效）。 */
+const NOT_FOUND_HTML = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>报告不存在</title></head>' +
+  '<body><p>报告不存在或已过期（报告保留 30 天，进程重启后旧链接也会失效）。</p></body></html>';
+
 /** dirs：允许服务的报告目录（可多个，如 reviews/ 与 reports/）。 */
 export function startReportServer(dirs: string | string[], kanbanUrl: string): Promise<ReportServer> {
   const roots = (Array.isArray(dirs) ? dirs : [dirs]).map((d) => path.resolve(d));
@@ -52,13 +62,13 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
       const name = pathname.replace(/^\/+/, '');
       // 仅允许根目录下的单层 .html 文件名，杜绝路径穿越
       if (!/^[\w.-]+\.html$/.test(name)) {
-        res.writeHead(404).end('not found');
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(NOT_FOUND_HTML);
         return;
       }
       // 命中任一报告目录即服务；均不存在则 404
       const file = roots.map((root) => path.join(root, name)).find((f) => fs.existsSync(f));
       if (!file) {
-        res.writeHead(404).end('not found');
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(NOT_FOUND_HTML);
         return;
       }
       // existsSync 与读流之间有竞态（报告可能恰好被 prune 删掉）：error 无监听者会以
@@ -94,9 +104,11 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
         console.error(`[report] 报告服务运行时错误: ${err.message}`);
       });
       // 链接主机：看板在本机时沿用其主机名（与既有看板链接同 reachability）；
-      // 看板是远程地址而报告服务绑在本机，则退回绑定地址，不编造局域网可达性
+      // 看板是远程地址而报告服务绑在本机，则退回绑定地址，不编造局域网可达性；
+      // 绑定地址是通配地址（0.0.0.0/::）时链接不可点击，回退本机主机名
       const kanbanHost = linkHost(kanbanUrl);
-      const host = isLoopback(kanbanHost) ? kanbanHost : bindHost;
+      let host = isLoopback(kanbanHost) ? kanbanHost : bindHost;
+      if (isWildcard(host)) host = os.hostname();
       resolve({
         baseUrl: `http://${host}:${port}`,
         close: () => server.close(),

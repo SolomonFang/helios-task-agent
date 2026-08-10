@@ -135,10 +135,10 @@ async function main() {
       // 绑定地址：cwd 的 0.0.0.0 不得生效，HELIOS_KANBAN_HOST 由 home 提供
       assert.equal(process.env.HELIOS_KANBAN_HOST, '127.0.0.1', 'HELIOS_KANBAN_HOST 应取 home 值');
       assert.equal(process.env.HELIOS_REPORT_HOST, undefined, 'HELIOS_REPORT_HOST 应被忽略');
-      // 忽略高危键必须有 warn 提示（知情权）
+      // 忽略安全风险键必须有 warn 提示（知情权）
       assert.ok(
-        warns.some((w) => w.includes('高危键') && w.includes('PATH') && w.includes('HELIOS_KANBAN_HOST')),
-        `应有高危键忽略提示，实际 warns=${JSON.stringify(warns)}`,
+        warns.some((w) => w.includes('安全风险') && w.includes('PATH') && w.includes('HELIOS_KANBAN_HOST')),
+        `应有安全风险键忽略提示，实际 warns=${JSON.stringify(warns)}`,
       );
       // 非受限键仍生效
       assert.equal(process.env.HTA_SAFETY_NONRESTRICTED, 'from-cwd');
@@ -303,8 +303,8 @@ async function main() {
     const long = `lark-cli ${'a'.repeat(1000)}--token evil-tail`;
     const out = summarizeBothEnds(long);
     return (
-      out.includes('…(中间省略') &&
-      out.includes(`共 ${long.length} 字符)…`) &&
+      out.includes('…（中间省略') &&
+      out.includes(`共 ${long.length} 字符）…`) &&
       out.endsWith('evil-tail') &&
       out.startsWith('lark-cli ') &&
       out.length < long.length

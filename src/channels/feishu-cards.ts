@@ -9,6 +9,7 @@
 
 import { kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
 import type { WatchEvent, WatchEventKind } from '../kanban/watcher';
+import { statusLabel } from '../kanban/summary';
 import { isLoopbackUrl } from '../infra/url-utils';
 
 /** 全部卡片的共同 config：宽屏 + 禁止转发（见文件头注释）。 */
@@ -21,9 +22,15 @@ function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
 }
 
-/** 嵌入 lark_md 的用户数据（任务标题等）：星号全角化，避免 `**` 误触加粗切换破坏排版。 */
+/** 嵌入 lark_md 的用户数据（任务标题等）：星号/反引号全角化并中和 [ ]( ) 链接语法，避免误触加粗/代码/链接解析破坏排版。 */
 function mdSafe(s: string): string {
-  return s.replace(/\*/g, '＊');
+  return s
+    .replace(/\*/g, '＊')
+    .replace(/`/g, '｀')
+    .replace(/\[/g, '［')
+    .replace(/\]/g, '］')
+    .replace(/\(/g, '（')
+    .replace(/\)/g, '）');
 }
 
 /** Interactive card shown for a pending write operation (legacy card schema). */
@@ -58,7 +65,8 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   return {
     config: baseCardConfig(),
     header: {
-      template: isLark ? 'blue' : 'orange',
+      // 写操作确认一律橙色警示头（蓝色只用于纯信息场景，如待审批通知）
+      template: 'orange',
       title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认` },
     },
     elements: [
@@ -67,7 +75,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
         tag: 'div',
         fields: [
           { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText} · 写操作` } },
-          { is_short: true, text: { tag: 'lark_md', content: `**确认有效期**\n${timeoutSec} 秒未操作自动拒绝` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**有效期**\n${timeoutSec} 秒（超时自动拒绝）` } },
         ],
       },
       { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
@@ -131,21 +139,32 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     done: { template: 'green', title: '✅ 看板任务已完成' },
     cancelled: { template: 'grey', title: '🚫 看板任务已取消' },
     failed: { template: 'red', title: '❌ 看板任务执行失败' },
-    approvals: { template: 'blue', title: `⏳ 看板有 ${e.items?.length ?? 0} 个新的待审批项` },
+    // 计数用 total（watcher 推送前 items 已截断到 5 条，items.length 是截断后的数字）
+    approvals: { template: 'blue', title: `⏳ 看板有 ${e.total ?? e.items?.length ?? 0} 个新的待审批项` },
   };
   const m = meta[e.kind];
   const elements: Array<Record<string, unknown>> = [];
 
   if (e.kind === 'approvals') {
     // 审批标签来自看板数据，用 plain_text 避免 markdown 字符误解析
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: (e.items ?? []).map((l) => `· ${l}`).join('\n') } });
+    const items = e.items ?? [];
+    const total = e.total ?? items.length;
+    const lines = items.map((l) => `· ${l}`);
+    // 列表被截断时补一行剩余数量，与标题计数对齐
+    if (total > items.length) lines.push(`· …还有 ${total - items.length} 个`);
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: lines.join('\n') } });
     elements.push({ tag: 'hr' });
     elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '回复「待审批」处理' }] });
   } else {
     // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
     elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
     if (e.transition) {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${e.transition}\`` } });
+      // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文
+      const rendered = e.transition
+        .split('→')
+        .map((s) => statusLabel(s.trim()))
+        .join(' → ');
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${rendered}\`` } });
     }
     if (e.kind === 'failed') {
       elements.push({ tag: 'div', text: { tag: 'plain_text', content: '请到看板查看日志定位问题。' } });

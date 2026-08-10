@@ -126,7 +126,7 @@ export function diagnoseMcpFailure(stderrTail: string): string | null {
     return (
       '提示：MCP 未能发现看板端口文件（vibe-kanban.port）。本机看板进程运行时间过长时，' +
       '该文件可能已被系统清理——重启 helios-kanban 后重新运行本程序即可恢复' +
-      `（当前${MCP_FALLBACK_TEXT}，看板功能不受影响）。`
+      `（当前${MCP_FALLBACK_TEXT}备用通道）。`
     );
   }
   return null;
@@ -150,10 +150,18 @@ export interface McpBootResult {
  */
 export async function connectMcp(
   cfg: { mcpCommand: string; mcpArgs: string[] },
-  opts: { onCreate?: (mcp: KanbanMcp) => void } = {},
+  opts: { onCreate?: (mcp: KanbanMcp) => void; onLog?: (msg: string) => void } = {},
 ): Promise<McpBootResult> {
   const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
   opts.onCreate?.(mcp);
+  // 连接窗口最长 45s：每 ~10 秒补一行进度，避免启动阶段长时间无反馈
+  const connectStartedAt = Date.now();
+  const beat = opts.onLog
+    ? setInterval(() => {
+        opts.onLog!(`仍在等待看板 MCP 连接（已等待 ${Math.round((Date.now() - connectStartedAt) / 1000)} 秒）…`);
+      }, 10000)
+    : null;
+  beat?.unref();
   try {
     await mcp.connect({ timeoutMs: 45000 });
     return { mcp, ok: true, hint: null };
@@ -161,5 +169,7 @@ export async function connectMcp(
     const e = err instanceof Error ? err : new Error(String(err));
     if (process.env.HTA_DEBUG) console.error(`\n[mcp] ${e.stack || e.message}`);
     return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail()) };
+  } finally {
+    if (beat) clearInterval(beat);
   }
 }

@@ -2,7 +2,7 @@ import fs from 'fs';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import { errMessage } from '../infra/err';
 import { fetchKanbanHealth } from '../kanban/http';
-import { collectWorkSummary, type WorkSummaryData, type WorkSummaryTask } from '../kanban/summary';
+import { collectWorkSummary, statusLabel, type WorkSummaryData, type WorkSummaryTask } from '../kanban/summary';
 
 /**
  * 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭。
@@ -42,11 +42,14 @@ function localDateStr(d: Date): string {
 /** 每个分组最多列出的任务标题数（晨报是概览，全量走「总结一下这个迭代做了什么」报告）。 */
 const MAX_LIST = 10;
 
-function listSection(label: string, tasks: WorkSummaryTask[]): string[] {
+function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatus?: boolean }): string[] {
   if (!tasks.length) return [];
   const lines = [`【${label}】${tasks.length} 个`];
   // 标题来自看板数据：文本消息无 markdown 解析，原样输出即可，不做转义
-  for (const t of tasks.slice(0, MAX_LIST)) lines.push(`· 《${t.title}》`);
+  // 失败分组与状态分组正交（同一任务两边都出现）：标注原状态消除「重复计数」困惑
+  for (const t of tasks.slice(0, MAX_LIST)) {
+    lines.push(`· 《${t.title}》${opts?.showStatus ? `（${statusLabel(t.status)}）` : ''}`);
+  }
   if (tasks.length > MAX_LIST) lines.push(`· …还有 ${tasks.length - MAX_LIST} 个`);
   return lines;
 }
@@ -69,12 +72,13 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
       listSection('进行中', inprogress),
       listSection('待审阅', inreview),
       listSection('已完成', done),
-      listSection('失败', failed),
+      listSection('失败', failed, { showStatus: true }),
     ]) {
       if (section.length) lines.push('', ...section);
     }
   }
-  lines.push('', '回复「总结一下这个迭代做了什么」看完整报告');
+  // 底部引导语与晨报范围匹配：配置了迭代引导「总结这个迭代」，未配置（范围为全部迭代）引导「总结看板进展」
+  lines.push('', data.iteration ? '回复「总结一下这个迭代做了什么」看完整报告' : '回复「总结一下看板进展」看完整报告');
   return lines.join('\n');
 }
 

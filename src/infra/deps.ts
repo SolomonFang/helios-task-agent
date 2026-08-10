@@ -102,9 +102,11 @@ export function checkOcrCli(): boolean {
   return probeSync('ocr', ['version']) !== null;
 }
 
-/** ocr 缺失时的提示文案（AI 审查仍可走 npx 兜底，仅首次较慢）。 */
-export const OCR_INSTALL_HINT =
-  '安装：npm i -g @alibaba-group/open-code-review；未安装时点击「AI 审查」会自动 npx 拉取（首次较慢）。LLM 默认复用机器人模型配置，也可用 ocr config provider 单独配置（ocr 是 open-code-review 的命令名）。';
+/** ocr 缺失时的提示文案：首行说明影响与自动兜底，安装命令单独一行（provider 细节见 README，不在此复述）。 */
+export const OCR_INSTALL_HINT = [
+  '未检测到代码审查工具 open-code-review（命令名 ocr），点击「AI 审查」时会自动下载（首次较慢）。',
+  '安装：npm i -g @alibaba-group/open-code-review',
+].join('\n');
 
 /** jq 是否可用：hk_cli 降级链（hk.sh）解析 API 响应所必需，缺失时 hk.sh 直接退出。 */
 export function checkJq(): boolean {
@@ -125,7 +127,7 @@ export function checkHkDeps(): string[] {
 }
 
 /** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器）。 */
-export const HK_CLI_INSTALL_HINT = 'macOS: brew install jq curl；Linux: 用包管理器安装 jq curl';
+export const HK_CLI_INSTALL_HINT = 'macOS：brew install jq curl；Linux：用包管理器安装 jq curl';
 
 /** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
 export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
@@ -145,12 +147,16 @@ export function kanbanPackageSpec(env: NodeJS.ProcessEnv = process.env): string 
 /**
  * 看板自动启动失败时的手动拉起提示（CLI 与 bot 共用）。
  * 不带 HOST=0.0.0.0：看板 Web/API 无鉴权，只需绑定回环。
+ * port 缺省 7964；autoStart === false 时省略「设置 HELIOS_KANBAN_AUTO_START=0」一行（用户已关闭自动启动，不复读）。
  */
-export function kanbanManualStartHint(): string {
-  return [
-    `可手动执行: PORT=7964 npx -y ${kanbanPackageSpec()}（多数情况是首次下载慢，重新运行即可）`,
-    '或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。',
-  ].join('\n');
+export function kanbanManualStartHint(opts?: { port?: string | number; autoStart?: boolean }): string {
+  const lines = [
+    `可手动执行：PORT=${opts?.port ?? 7964} npx -y ${kanbanPackageSpec()}（多数情况是首次下载慢，重新运行即可）`,
+  ];
+  if (opts?.autoStart !== false) {
+    lines.push('或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。');
+  }
+  return lines.join('\n');
 }
 
 /** ocr（open-code-review）npx 包规格，同理钉版本；OCR_PACKAGE 可覆盖。 */

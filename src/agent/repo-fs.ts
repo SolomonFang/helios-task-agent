@@ -75,7 +75,7 @@ export async function fetchRepoPath(  kanbanUrl: string,
     try {
       json = JSON.parse(text) as typeof json;
     } catch {
-      return { ok: false, error: `解析仓库信息失败 HTTP ${res.status}: ${text.slice(0, 200)}` };
+      return { ok: false, error: `解析仓库信息失败 HTTP ${res.status}：${text.slice(0, 200)}` };
     }
     const repoPath = json.data?.path;
     if (!res.ok || !repoPath) {
@@ -86,7 +86,7 @@ export async function fetchRepoPath(  kanbanUrl: string,
     }
     return { ok: true, path: repoPath };
   } catch (err) {
-    return { ok: false, error: `请求 ${url} 失败: ${errMessage(err)}` };
+    return { ok: false, error: `请求 ${url} 失败：${errMessage(err)}` };
   }
 }
 
@@ -136,10 +136,10 @@ export async function resolveRepoRoot(opts: {
   if (!root) return { ok: false, error: '参数错误：需要 root（绝对路径）或 repo_id' };
   const rootAbs = path.resolve(root);
   if (!fs.existsSync(rootAbs)) {
-    return { ok: false, error: `本地仓库路径不存在: ${rootAbs}` };
+    return { ok: false, error: `本地仓库路径不存在：${rootAbs}` };
   }
   if (!fs.statSync(rootAbs).isDirectory()) {
-    return { ok: false, error: `本地仓库路径不是目录: ${rootAbs}` };
+    return { ok: false, error: `本地仓库路径不是目录：${rootAbs}` };
   }
   // 显式 root 必须是看板已注册仓库（或其子目录），防止借道读取任意本机路径；校验失败关闭
   if (explicitRoot) {
@@ -149,7 +149,7 @@ export async function resolveRepoRoot(opts: {
     } catch (err) {
       return {
         ok: false,
-        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径: ${errMessage(err)}`,
+        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径：${errMessage(err)}`,
       };
     }
     if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
@@ -166,9 +166,9 @@ export function repoFsList(root: string, relPath = '.'): string {
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
   if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
-  if (!fs.existsSync(resolved.abs)) return `路径不存在: ${relPath || '.'}`;
+  if (!fs.existsSync(resolved.abs)) return `路径不存在：${relPath || '.'}`;
   const st = fs.statSync(resolved.abs);
-  if (!st.isDirectory()) return `不是目录: ${relPath || '.'}`;
+  if (!st.isDirectory()) return `不是目录：${relPath || '.'}`;
   const entries = fs.readdirSync(resolved.abs, { withFileTypes: true });
   const lines = entries
     .slice(0, MAX_LIST_ENTRIES)
@@ -183,9 +183,9 @@ export function repoFsRead(root: string, relPath: string): string {
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
   if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
-  if (!fs.existsSync(resolved.abs)) return `文件不存在: ${relPath}`;
+  if (!fs.existsSync(resolved.abs)) return `文件不存在：${relPath}`;
   const st = fs.statSync(resolved.abs);
-  if (!st.isFile()) return `不是文件: ${relPath}`;
+  if (!st.isFile()) return `不是文件：${relPath}`;
   const fd = fs.openSync(resolved.abs, 'r');
   try {
     const size = Math.min(st.size, MAX_READ_BYTES);
@@ -226,11 +226,11 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
   try {
     re = new RegExp(pattern, 'i');
   } catch (err) {
-    return `无效正则: ${errMessage(err)}`;
+    return `无效正则：${errMessage(err)}`;
   }
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
-  if (!fs.existsSync(resolved.abs)) return `路径不存在: ${relPath || '.'}`;
+  if (!fs.existsSync(resolved.abs)) return `路径不存在：${relPath || '.'}`;
   // 目标本身命中敏感 denylist（含 .git/ 目录）时明确拒绝（树扫描场景则静默跳过）
   if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
 
@@ -283,7 +283,7 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
     scanFile(resolved.abs);
   } else walk(resolved.abs);
 
-  if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n(无命中)`);
+  if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n（无命中）`);
   const more = hits.length >= MAX_GREP_HITS ? `\n…（已达 ${MAX_GREP_HITS} 条上限）` : '';
   return truncateOutput(`root: ${root}\npattern: ${pattern}\n\n${hits.join('\n')}${more}`);
 }

@@ -114,7 +114,7 @@ function htmlTaskCard(t: WorkSummaryTask): string {
       .slice(0, 10)
       .map((f) => `<code>${escapeHtml(f)}</code>`)
       .join('');
-    const more = t.changedFiles.length > 10 ? `<code>+${t.changedFiles.length - 10} more</code>` : '';
+    const more = t.changedFiles.length > 10 ? `<code>+${t.changedFiles.length - 10} 个</code>` : '';
     parts.push(`<div class="chips">${chips}${more}</div>`);
   }
   if (t.diffUrl) {
@@ -290,8 +290,12 @@ export function summarizeForChat(
   const lines: string[] = [`📊 工作总结报告已生成（${data.sinceLabel}）`];
   if (paths.htmlPath) {
     // bot 场景给 HTTP 链接（本机路径手机飞书打不开）；CLI 保留本机路径
-    if (opts.linkBaseUrl) lines.push(`- HTML：${opts.linkBaseUrl}/${path.basename(paths.htmlPath)}`);
-    else lines.push(`- HTML：${paths.htmlPath}`);
+    if (opts.linkBaseUrl) {
+      lines.push(`- HTML：${opts.linkBaseUrl}/${path.basename(paths.htmlPath)}`);
+      lines.push('（链接仅在本机可达，进程重启后失效）');
+    } else {
+      lines.push(`- HTML：${paths.htmlPath}`);
+    }
   }
   if (paths.mdPath) lines.push(`- Markdown：${paths.mdPath}`);
   lines.push(

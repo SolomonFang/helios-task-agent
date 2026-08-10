@@ -89,7 +89,7 @@ export function trimHistory(
 }
 
 /** 模型返回的上下文超限错误特征（用于自动恢复重试）。 */
-const CONTEXT_OVERFLOW_RE =
+export const CONTEXT_OVERFLOW_RE =
   /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|reduce the length|exceed.{0,20}token|token.{0,10}exceed/i;
 
 /**
@@ -174,7 +174,7 @@ export async function runAgentTurn({
   trimHistory(messages);
   let toolCallCount = 0;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    if (signal?.aborted) return '（已被用户中断）';
+    if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
     if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
     const createReq = () => {
       const payload = downgradeSystemNotes(messages);
@@ -232,7 +232,7 @@ export async function runAgentTurn({
 
     const toolCalls = msg.tool_calls || [];
     if (toolCalls.length === 0) {
-      return msg.content || '(模型未返回内容)';
+      return msg.content || '（模型未返回内容）';
     }
 
     for (let i = 0; i < toolCalls.length; i++) {
@@ -242,11 +242,11 @@ export async function runAgentTurn({
       // 中断/超限时先为剩余 tool_calls 补占位响应再返回，避免 orphan tool_calls 损坏后续轮次
       if (signal?.aborted) {
         fillUnanswered(messages, toolCalls.slice(i));
-        return '（已被用户中断）';
+        return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
       }
       if (toolCallCount > MAX_TOOL_CALLS) {
         fillUnanswered(messages, toolCalls.slice(i));
-        return `（工具调用次数超过上限 ${MAX_TOOL_CALLS}，已中止。请缩小任务范围或分步执行。）`;
+        return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
       }
       const name = call.function.name;
       const handler = handlers.get(name);
@@ -260,14 +260,14 @@ export async function runAgentTurn({
           args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
         } catch (err) {
           const message = errMessage(err);
-          result = `错误：工具参数 JSON 解析失败: ${message}`;
+          result = `错误：工具参数 JSON 解析失败：${message}`;
         }
         if (result === undefined) {
           try {
             result = String(await handler(args, { signal }));
           } catch (err) {
             const message = errMessage(err);
-            result = `工具 ${name} 执行异常: ${message}`;
+            result = `工具 ${name} 执行异常：${message}`;
           }
         }
       }
@@ -278,5 +278,5 @@ export async function runAgentTurn({
       });
     }
   }
-  return '（工具调用轮次过多，已中止。请缩小任务范围或分步执行。）';
+  return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
 }

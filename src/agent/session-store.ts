@@ -69,7 +69,7 @@ export class SessionHistoryStore {
   private fileFor(userId: string): string {
     const p = path.join(this.dir, safeFileName(userId));
     // 纵深防御：safeFileName 已剥离路径分隔符，这里再断言解析结果不逃出目录
-    if (path.dirname(p) !== this.dir) throw new Error(`非法会话标识: ${userId}`);
+    if (path.dirname(p) !== this.dir) throw new Error(`非法会话标识：${userId}`);
     return p;
   }
 

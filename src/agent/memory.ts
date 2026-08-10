@@ -189,7 +189,7 @@ export class MemoryStore {
     }
     const lines: string[] = [];
     if (factEntries.length) {
-      lines.push('键值：');
+      lines.push('已记住的偏好：');
       for (const [k, v] of factEntries) lines.push(`- ${k}: ${v}`);
     }
     if (user.notes.length) {

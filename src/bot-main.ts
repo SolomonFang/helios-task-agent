@@ -27,7 +27,7 @@ import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
 import { startReportServer, type ReportServer } from './report/report-server';
-import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkLarkCliStatus, checkHkDeps, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wrapUntrusted } from './agent/guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -49,17 +49,17 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /help     显示帮助
 /status   健康检查（kanban / MCP / lark-cli / 推送）
 /tools    列出当前可用工具
-/skills   列出技能；install <路径> 安装（升级不丢失）/ uninstall <名称> 卸载
+/skills   列出技能；install <路径> 安装（升级不丢失）；uninstall <名称> 卸载
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
-/stop     中断当前任务（排队消息与待确认写操作一并取消）
+/stop     中断当前任务与进行中的 AI 审查（排队消息与待确认写操作一并取消）
 /confirm  查看「同类免问」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
 · 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
 · 「确认执行」仅此次有效；「同类免问（本会话）」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
-· 普通写操作 120 秒、删除/取消/停止/审批/启动/归档/合并/推送/执行类 300 秒未操作自动拒绝
+· 普通写操作 120 秒、破坏性操作（删除/停止/审批等）300 秒未操作自动拒绝
 
 可以说
 ${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
@@ -69,15 +69,15 @@ const BOT_CLI_USAGE = `用法: helios-task-agent bot [选项]
       helios-task-agent-bot [选项]（独立入口，等同上一行）
 
 选项
-  --rebind      换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
-  --reconfig    重跑模型/看板配置向导（飞书凭证保留，换模型/Base URL/Key 不用手编 .env）
+  --rebind      换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置）
+  --reconfig    重跑模型/看板配置向导（飞书凭证保留）
   --version     打印版本号
   --help        显示本帮助`;
 
 /**
  * bot 子命令参数解析：
- * --rebind   换绑飞书机器人（只重跑飞书凭证，保留模型/看板配置）
- * --reconfig 重跑模型/看板配置向导（换模型 / Base URL / API Key，保留飞书凭证）
+ * --rebind   换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置）
+ * --reconfig 重跑模型/看板配置向导（飞书凭证保留）
  * 与独立入口 helios-task-agent-bot 行为一致：--help / --version 打印后退出（退出码 0），
  * 未知参数报错并以非零退出（此前静默忽略、直接启动 bot）。
  */
@@ -299,6 +299,13 @@ async function main(): Promise<void> {
   const larkStatus = checkLarkCliStatus();
   // bot 无 banner，lark-cli 需完整告警文案；OCR 检查为 bot 特有（AI 审查功能依赖）
   warnStartupDeps(larkStatus, { style: 'bot', checkOcr: true });
+  // hk_cli 降级链依赖（jq/curl）：缺失时 MCP 掉线后看板读写不可用，不能宣称「功能不受影响」
+  const hkMissing = checkHkDeps();
+  if (hkMissing.length) {
+    console.log(
+      c.warn(`hk_cli 降级链缺少 ${hkMissing.join('、')}：MCP 掉线时看板读写将不可用。安装：brew install jq curl（macOS）`),
+    );
+  }
   migrateAndValidateSkills();
 
   const ensured = await ensureKanbanOrExit({
@@ -332,11 +339,15 @@ async function main(): Promise<void> {
     onCreate: (instance) => {
       cleanup.mcp = instance;
     },
+    // 连接等待期每 ~10 秒覆写当前行补进度（bot 无 spinner，否则最长 45s 无反馈像卡死）
+    onLog: (msg) => process.stdout.write(c.gray(`\r${msg}`)),
   });
   if (mcpOk) {
     process.stdout.write(c.ok(`\rMCP 已连接（${mcp.tools.length} 个工具）          \n`));
   } else {
-    process.stdout.write(c.warn(`\rMCP 连接失败，${MCP_FALLBACK_TEXT}：${mcpError}\n`));
+    // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
+    if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
+    process.stdout.write(c.warn(`\rMCP 连接失败，${MCP_FALLBACK_TEXT}          \n`));
     if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
@@ -376,7 +387,9 @@ async function main(): Promise<void> {
     {
       timeoutMs: 120000,
       onTimeout: (openId, req) => {
-        void channel.notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}`).catch(() => {});
+        void channel
+          .notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}。如仍需执行，直接再跟我说一声即可。`)
+          .catch(() => {});
       },
       onSuperseded: (openId, req) => {
         void channel

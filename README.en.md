@@ -109,11 +109,15 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 ```text
 ~/.helios-task-agent/.env
 ~/.helios-task-agent/memory.json
-~/.helios-task-agent/synced-sources.json
-~/.helios-task-agent/audit.log
-~/.helios-task-agent/watch-state.json
+~/.helios-task-agent/synced-sources.json   # Feishu source → kanban task (dedupe map)
+~/.helios-task-agent/audit.log             # write-op audit (JSONL)
+~/.helios-task-agent/watch-state.json      # kanban push snapshot
 ~/.helios-task-agent/daily-brief-state.json # daily-brief last-push date (no duplicate push same day)
 ~/.helios-task-agent/sessions/             # per-user conversation history (restored on restart; /clear wipes it)
+~/.helios-task-agent/skills/               # user skills (target of /skills install)
+~/.helios-task-agent/reviews/              # AI-review reports (HTML, cleaned up after 30 days)
+~/.helios-task-agent/reports/              # work-summary reports
+~/.helios-task-agent/update-check.json     # update-check cache (24h)
 ```
 
 ### Terminal
@@ -193,8 +197,9 @@ via the `skill_doc` tool (progressive disclosure).
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
 | `OCR_LLM_TOKEN` | Dedicated LLM key for AI review; when set it wins over the derived bot key (keeps your main key away from the third-party ocr subprocess), URL/model still fall back to the bot config |
+| `OCR_LLM_URL` / `OCR_LLM_MODEL` | Explicit LLM endpoint/model for AI review; when set they win over the config derived from the bot |
 | `HELIOS_KANBAN_PROJECT_ID` / `HELIOS_KANBAN_REPO_ID` / `HELIOS_KANBAN_ITERATION` | Optional defaults; `HELIOS_KANBAN_PROJECT_ID` scopes bot watch |
-| `HELIOS_TASK_AGENT_HOME` / `ENV` | Data dir / forced `.env` path |
+| `HELIOS_TASK_AGENT_HOME` / `HELIOS_TASK_AGENT_ENV` | Data dir (default `~/.helios-task-agent`) / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |

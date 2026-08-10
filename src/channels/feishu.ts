@@ -1,6 +1,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type { AgentChannel, FeishuBotConfig, InboundMessage } from '../types';
 import { errMessage } from '../infra/err';
+import { userEnvPath } from '../config/config';
 
 export interface FeishuReceivePayload {
   sender?: {
@@ -429,7 +430,7 @@ export class FeishuChannel implements AgentChannel {
               void this.notifyOpenId(
                 openId,
                 '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系实例 owner 开通，或自行部署一个实例。\n' +
-                  `若你就是本实例的部署者，请把本账号的 open_id 加入部署目录 .env 的 FEISHU_ALLOWED_OPEN_IDS 后重启机器人：\n${openId}`,
+                  `若你就是本实例的部署者，请把本账号的 open_id 加入 ${userEnvPath()} 的 FEISHU_ALLOWED_OPEN_IDS 后重启机器人：\n${openId}`,
               ).catch(() => {});
             }
             return;
@@ -664,6 +665,15 @@ export class FeishuChannel implements AgentChannel {
       if (!botOpenId) return;
       const chatId = groupMentionChatId(data, botOpenId);
       if (!chatId) return;
+      // 白名单外用户不邀请私聊（先邀请、私聊后再拒绝自相矛盾）。
+      // 不用 access.check()：它有 owner 认领副作用，群里陌生人不许借此抢占 owner；
+      // 白名单仍为空（尚未认领）时照常邀请，首个私聊者再走认领流程。
+      const senderOpenId = data.sender?.sender_id?.open_id || '';
+      const allowed = this.access.list();
+      if (senderOpenId && allowed.length > 0 && !allowed.includes(senderOpenId)) {
+        console.warn(`[feishu] 群 @ 回执跳过：发送者不在白名单: ${senderOpenId}`);
+        return;
+      }
       const now = Date.now();
       if (groupMentionInCooldown(this.groupMentionReplied, chatId, now)) return;
       // Map 无清理会无界增长：超上限整体清空（代价只是老群可能再收一次指引）

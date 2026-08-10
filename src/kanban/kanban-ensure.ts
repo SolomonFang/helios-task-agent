@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
-import { kanbanPackageSpec } from '../infra/deps';
+import { kanbanPackageSpec, kanbanManualStartHint } from '../infra/deps';
 import { minimalChildEnv } from '../infra/proc-env';
 
 export interface KanbanEnsureResult {
@@ -119,7 +119,9 @@ export async function ensureKanbanRunning(
   }
 
   if (!autoStart) {
-    throw new Error(`helios-kanban 未运行（${url}），且已禁用自动启动（HELIOS_KANBAN_AUTO_START=0）`);
+    throw new Error(
+      `helios-kanban 未运行（${url}），且已禁用自动启动（HELIOS_KANBAN_AUTO_START=0）。\n${kanbanManualStartHint({ port, autoStart: false })}`,
+    );
   }
   if (!isLocalHost(hostname)) {
     throw new Error(`helios-kanban 未运行（${url}）。非本机地址不会自动启动，请先手动拉起看板服务。`);
@@ -157,28 +159,40 @@ export async function ensureKanbanRunning(
   });
 
   const startedAt = Date.now();
+  let lastBeatAt = startedAt; // 上次进度心跳时间：等待期每 ~10 秒补一行日志
   while (Date.now() - startedAt < waitMs) {
     // 拷贝到局部变量：TS 会把闭包内才赋值的属性窄化为 null，分支内变成 never
     const spawnErr: Error | null = spawnFailure.err;
     if (spawnErr) {
       throw new Error(
-        `无法启动 helios-kanban：执行 npx 失败（npx 不可执行或未安装 Node.js/npm）: ${spawnErr.message}`,
+        `无法启动 helios-kanban：执行 npx 失败（npx 不可执行或未安装 Node.js/npm）：${spawnErr.message}`,
       );
     }
     if (child.exitCode !== null) {
+      // 用户面只给退出码 + 手动启动指引；stderr 尾部（原始报错）收进 HTA_DEBUG 日志
+      if (process.env.HTA_DEBUG && stderrBuf.trim()) {
+        console.error(`[kanban] 进程退出前 stderr 尾部：\n${stderrBuf.slice(-800)}`);
+      }
       throw new Error(
-        `helios-kanban 进程已退出（code=${child.exitCode}）\n${stderrBuf.slice(-800) || '(无 stderr)'}`,
+        `helios-kanban 进程已退出（code=${child.exitCode}）。\n${kanbanManualStartHint({ port })}`,
       );
     }
     if (await fetchHealth(url)) {
       log(`helios-kanban 已就绪（${url}）`);
       return { started: true, child, url };
     }
+    // 等待期间每 ~10 秒补一行进度，避免启动阶段长时间无反馈
+    if (Date.now() - lastBeatAt >= 10000) {
+      lastBeatAt = Date.now();
+      log(`仍在等待看板就绪（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒）…`);
+    }
     await sleep(800);
   }
 
   await stopKanbanChild(child);
-  throw new Error(`等待 helios-kanban 就绪超时（${Math.round(waitMs / 1000)} 秒）：${url}。多数是首次 npx 下载慢，重试或手动启动后再试。`);
+  throw new Error(
+    `等待 helios-kanban 就绪超时（${Math.round(waitMs / 1000)} 秒）：${url}。\n${kanbanManualStartHint({ port })}`,
+  );
 }
 
 /** 按进程组发信号（spawn 时 detached: true）；组杀失败（如平台不支持负 pid）回退只杀 child。 */

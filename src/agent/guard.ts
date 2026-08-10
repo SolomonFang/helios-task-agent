@@ -219,8 +219,8 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
   if (/delete/i.test(toolName)) return `删除看板任务 ${id}`;
   if (/cancel/i.test(toolName)) return `取消看板任务 ${id}`;
   if (/update/i.test(toolName)) return `更新看板任务 ${id}${title ? `（新标题「${title}」）` : ''}`;
-  if (/start/i.test(toolName)) return `启动任务 ${id} 的 workspace`;
-  if (/stop/i.test(toolName)) return `停止 workspace ${id}`;
+  if (/start/i.test(toolName)) return `启动任务 ${id} 的工作区`;
+  if (/stop/i.test(toolName)) return `停止工作区 ${id}`;
   if (/follow/i.test(toolName)) return `向任务 ${id} 发送跟进消息`;
   if (/approve/i.test(toolName)) return `批准审批 ${id}`;
   if (/deny/i.test(toolName)) return `拒绝审批 ${id}`;

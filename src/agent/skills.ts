@@ -82,21 +82,24 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   try {
     raw = fs.readFileSync(skillFile, 'utf8');
   } catch (err) {
-    return { digest: { name: dirName, description: '', digest: '', dir: rel }, problems: [`${dirName}: SKILL.md 读取失败（${errMessage(err)}）`] };
+    return {
+      digest: { name: dirName, description: '', digest: '', dir: rel },
+      problems: [`技能「${dirName}」配置问题：SKILL.md 读取失败（${errMessage(err)}）；文件：${skillFile}`],
+    };
   }
   const { data, body } = parseFrontmatter(raw);
   const name = typeof data.name === 'string' && data.name ? data.name : dirName;
   const description = typeof data.description === 'string' ? data.description.trim() : '';
-  if (!data.name) problems.push(`${dirName}: frontmatter 缺少 name（已回退为目录名）`);
-  if (!description) problems.push(`${dirName}: frontmatter 缺少 description（技能路由将不可靠）`);
+  if (!data.name) problems.push(`技能「${dirName}」配置问题：frontmatter 缺少 name（已回退为目录名）；文件：${skillFile}`);
+  if (!description) problems.push(`技能「${dirName}」配置问题：frontmatter 缺少 description（技能路由将不可靠）；文件：${skillFile}`);
   const sections = Array.isArray(data.digest_sections) ? data.digest_sections : [];
   const digest = digestSkillBody(body, sections);
   for (const s of sections) {
     if (!new RegExp(`^## .*${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'im').test(body)) {
-      problems.push(`${dirName}: digest_sections「${s}」未匹配到任何章节（拼写或章节已改名？）`);
+      problems.push(`技能「${dirName}」配置问题：digest_sections「${s}」未匹配到任何章节（拼写或章节已改名？）；文件：${skillFile}`);
     }
   }
-  if (!sections.length) problems.push(`${dirName}: 未声明 digest_sections（仅注入 description，细节靠 skill_doc 按需读取）`);
+  if (!sections.length) problems.push(`技能「${dirName}」配置问题：未声明 digest_sections（仅注入 description，细节靠 skill_doc 按需读取）；文件：${skillFile}`);
   return { digest: { name, description, digest, dir: rel }, problems };
 }
 
@@ -224,9 +227,9 @@ export function uninstallSkill(name: string): void {
   const dir = path.join(userSkillsDir(), trimmed);
   if (!fs.existsSync(dir)) {
     if (fs.existsSync(path.join(SKILLS_DIR, trimmed))) {
-      throw new Error(`「${trimmed}」是包内内置技能，不能卸载（可用同名目录放数据目录 skills/ 下覆盖它）`);
+      throw new Error(`「${trimmed}」是包内内置技能，不能卸载（可放到 ${path.join(userSkillsDir(), trimmed)} 下覆盖它）`);
     }
-    throw new Error(`未找到技能「${trimmed}」（数据目录 skills/ 下不存在）`);
+    throw new Error(`未找到技能「${trimmed}」（${userSkillsDir()} 下不存在）`);
   }
   fs.rmSync(dir, { recursive: true, force: true });
 }

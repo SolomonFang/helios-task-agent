@@ -58,7 +58,7 @@ const ALLOWED_INTERPRETERS = new Set(['bash', 'sh', 'node', 'python3', 'python']
 export function summarizeBothEnds(s: string, head = 600, tail = 200): string {
   if (s.length <= head + tail) return s;
   const omitted = s.length - head - tail;
-  return `${s.slice(0, head)}…(中间省略 ${omitted} 字符，共 ${s.length} 字符)…${s.slice(s.length - tail)}`;
+  return `${s.slice(0, head)}…（中间省略 ${omitted} 字符，共 ${s.length} 字符）…${s.slice(s.length - tail)}`;
 }
 
 function truncate(s: unknown): string {
@@ -73,7 +73,7 @@ function run(
 ): Promise<string> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
-      resolve('（命令已被用户中断）');
+      resolve('⏹ 已中断（未完成的操作未执行，可继续对话）。');
       return;
     }
     // 最小环境（见 proc-env.ts）：不向 lark-cli / hk.sh / 技能脚本泄露 LLM_API_KEY 等敏感变量
@@ -83,7 +83,7 @@ function run(
       { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: minimalChildEnv(env), signal, cwd },
       (error, stdout, stderr) => {
         if (signal?.aborted) {
-          resolve('（命令已被用户中断）');
+          resolve('⏹ 已中断（未完成的操作未执行，可继续对话）。');
           return;
         }
         if (error && !stdout) {
@@ -92,14 +92,14 @@ function run(
             resolve(`未找到可执行命令「${command}」。${hint}`.trim());
             return;
           }
-          resolve(`命令执行失败: ${error.message}\n${truncate(stderr || '')}`.trim());
+          resolve(`命令执行失败：${error.message}\n${truncate(stderr || '')}`.trim());
         } else if (error) {
           // 非零退出但有 stdout：不能只回 stdout 让模型误判成功；失败信号放在开头
           // （looksLikeStrongFailure 只扫前 300 字符，放末尾会漏判）
-          resolve(`命令执行失败（非零退出）: ${error.message}\n${truncate(stderr || '')}\n--- stdout ---\n${truncate(stdout || '')}`.trim());
+          resolve(`命令执行失败（非零退出）：${error.message}\n${truncate(stderr || '')}\n--- stdout ---\n${truncate(stdout || '')}`.trim());
         } else {
           const out = truncate(stdout || '');
-          resolve(stderr && !out ? truncate(stderr) : out || '(无输出)');
+          resolve(stderr && !out ? truncate(stderr) : out || '（无输出）');
         }
       },
     );
@@ -184,14 +184,17 @@ async function appendWorkspaceReadyCheck(
   if (!workspaceId) return result;
   const ready = await waitForWorkspaceReady(kanbanUrl, workspaceId, { signal });
   if (ready.ok) {
-    return `${result}\n\n（workspace setup 已就绪：container 已创建）`;
+    return `${result}\n\n（工作区已就绪，可以开始执行任务）`;
   }
   return `${result}\n\n⚠️ setup 未完成：\n${ready.message || '未知原因'}`;
 }
 
 /** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
 const MAX_CREATES_PER_SESSION = 10;
-const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，代码层强制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
+const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，系统安全限制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
+
+/** 确认卡片展示的优先级中文映射（看板内部值为英文枚举）。 */
+const PRIORITY_LABELS: Record<string, string> = { urgent: '紧急', high: '高', medium: '中', low: '低' };
 
 /** 闸门卡片 detail：create 类结构化展示（标题/项目/描述预览），其余保持命令行原文。 */
 function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
@@ -203,8 +206,8 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
     `标题：${title}`,
-    project ? `项目：${project}` : '',
-    priority ? `优先级：${priority}` : '',
+    project ? `项目 ID：${project}` : '',
+    priority ? `优先级：${PRIORITY_LABELS[priority] ?? priority}` : '',
     preview,
   ]
     .filter(Boolean)
@@ -480,9 +483,11 @@ function makeGatedWriter({
       if (!hit) continue;
       const exists = hit.taskId === 'unknown' ? true : await kanbanTaskExists(kanbanUrl, hit.taskId);
       if (exists) {
+        // 时间戳截断到分钟：ISO 毫秒精度对用户无核对价值
+        const createdShort = hit.createdAt.replace('T', ' ').slice(0, 16);
         return (
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
-          `- 已创建：${hit.createdAt} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
+          `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
           '如确需重建，请先在 kanban 中删除原任务（或告知用户该任务已存在）；\n' +
           '如用户是想把最新内容合并进原任务，改用 update 更新该任务，不要重建。'
         );
@@ -559,7 +564,7 @@ function makeKanbanMcpHandler({
         return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
       } catch (err) {
         const message = errMessage(err);
-        return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+        return `MCP 工具 ${tool.name} 调用失败：${message}`;
       }
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
@@ -582,7 +587,7 @@ function makeKanbanMcpHandler({
           return await mcp.callTool(tool.name, args, ctx?.signal);
         } catch (err) {
           const message = errMessage(err);
-          return `MCP 工具 ${tool.name} 调用失败: ${message}`;
+          return `MCP 工具 ${tool.name} 调用失败：${message}`;
         }
       },
       signal: ctx?.signal,
@@ -670,7 +675,7 @@ function makeHkCliHandler({
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
-    const summary = isCreate ? `创建看板任务「${title}」（hk_cli）` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
+    const summary = isCreate ? `创建看板任务「${title}」` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
     // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
     return runGatedWrite({
       kind: 'hk',
@@ -867,8 +872,8 @@ function makeWorkSummaryHandler({
       return wrapUntrusted(empty + summarizeForChat(data, paths, { linkBaseUrl: reportLinkBaseUrl }));
     } catch (err) {
       return (
-        `生成工作总结失败: ${errMessage(err)}\n` +
-        `请确认 kanban 服务可访问（${kanbanUrl}）后重试。`
+        `生成工作总结失败：${errMessage(err)}\n` +
+        `请确认看板服务可访问（${kanbanUrl}）后重试。`
       );
     }
   };
@@ -908,7 +913,7 @@ function makeMemoryHandlers({
     } catch (err) {
       // setFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_set 失败: ${errMessage(err)}`;
+      return `memory_set 失败：${errMessage(err)}`;
     }
   };
 
@@ -943,7 +948,7 @@ function makeMemoryHandlers({
     } catch (err) {
       // deleteFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_delete 失败: ${errMessage(err)}`;
+      return `memory_delete 失败：${errMessage(err)}`;
     }
   };
 
@@ -965,7 +970,7 @@ function makeMemoryHandlers({
     } catch (err) {
       // addNote 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_note 失败: ${errMessage(err)}`;
+      return `memory_note 失败：${errMessage(err)}`;
     }
   };
 

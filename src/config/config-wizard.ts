@@ -34,14 +34,14 @@ export function makeNeed(
 ): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string> } {
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
-    if (ans === null) throw new Error('输入已结束');
+    if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
     return ans.trim();
   };
   /** 敏感信息（API Key / App Secret）：TTY 下掩码回显；非 TTY 或未提供时回退普通输入。 */
   const needSecret = async (promptText: string): Promise<string> => {
     if (!askSecret) return need(promptText);
     const ans = await askSecret(promptText);
-    if (ans === null) throw new Error('输入已结束');
+    if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
     return ans.trim();
   };
   return { need, needSecret };
@@ -67,12 +67,19 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     let u = url;
     for (;;) {
       if (/^https:\/\//i.test(u)) return u;
+      // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
+      if (!/^http:\/\//i.test(u)) {
+        console.log(c.err('Base URL 需要以 https:// 或 http:// 开头（如 https://api.deepseek.com/v1），请重新输入。'));
+        u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+        if (!u) throw new Error('Base URL 不能为空');
+        continue;
+      }
       // loopback 放行：IPv6 本机地址在 URL 中带方括号（http://[::1]:8080），一并覆盖
       if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(u)) return u;
       console.log(
         c.err(`⚠️ 警告：Base URL 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
       );
-      const ok = (await need('确认继续使用该明文端点？[输入 YES 继续 / 回车 = 重新输入 Base URL]: ')).toUpperCase();
+      const ok = (await need('确认继续使用该明文端点？（输入 YES 继续 / 回车 = 重新输入 Base URL）: ')).toUpperCase();
       if (ok === 'YES' || ok === 'Y') return u;
       u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
       if (!u) throw new Error('Base URL 不能为空');
@@ -87,8 +94,19 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     PRESETS.forEach((p, i) => {
       console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
     });
-    const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
-    idx = Math.min(Math.max(parseInt(pick || '1', 10) || 1, 1), PRESETS.length) - 1;
+    for (;;) {
+      const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
+      if (!pick) {
+        idx = 0;
+        break;
+      }
+      const n = Number(pick);
+      if (Number.isInteger(n) && n >= 1 && n <= PRESETS.length) {
+        idx = n - 1;
+        break;
+      }
+      console.log(c.err(`无效选择，请输入 1-${PRESETS.length}`));
+    }
   }
   const preset = PRESETS[idx]!;
   console.log(c.gray(`已选择 ${preset.name}`));
@@ -102,12 +120,12 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   const apiKeyInput = await needSecret('API Key（输入显示为 *）: ');
   if (!apiKeyInput) throw new Error('API Key 不能为空');
   let apiKey = apiKeyInput;
-  const modelInput = await need(`模型名（默认 ${preset.model || '必填'}）: `);
+  const modelInput = await need(preset.model ? `模型名（默认 ${preset.model}）: ` : '模型名（必填，如 gpt-4o）: ');
   let model = modelInput || preset.model;
   if (!model) throw new Error('模型名不能为空');
 
   // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
-  // 两个失败分支的默认动作统一为「修改重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
+  // 两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
   for (;;) {
     console.log(c.gray('正在联网校验模型配置…'));
     const check = await verifyLlmConfig(baseUrl, apiKey);
@@ -120,20 +138,20 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     } else {
       console.log(c.err(`模型配置校验失败：${check.message}`));
     }
-    const save = (await need('回车 = 修改配置重试；输入 s = 仍然保存: ')).toLowerCase();
-    if (save === 's' || save === 'save' || save === '保存') break;
-    const which = (await need('修改哪项？[k=API Key（默认）/ b=Base URL / m=模型名]: ')).toLowerCase();
-    if (which === 'b' || which === 'base' || which === 'url') {
-      baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+    const act = (await need('回车 = 直接重试；输入 k/b/m 修改某项；输入 s = 仍然保存: ')).toLowerCase();
+    if (act === 's' || act === 'save' || act === '保存') break;
+    if (act === 'b' || act === 'base' || act === 'url') {
+      baseUrl = await need(`Base URL（当前 ${baseUrl}）: `);
       if (!baseUrl) throw new Error('Base URL 不能为空');
       baseUrl = await ensureSecureBaseUrl(baseUrl);
-    } else if (which === 'm' || which === 'model') {
-      model = await need('模型名: ');
+    } else if (act === 'm' || act === 'model') {
+      model = await need(`模型名（当前 ${model}）: `);
       if (!model) throw new Error('模型名不能为空');
-    } else {
+    } else if (act === 'k' || act === 'key') {
       apiKey = await needSecret('API Key（输入显示为 *）: ');
       if (!apiKey) throw new Error('API Key 不能为空');
     }
+    // 其余输入（含回车）= 不修改，用当前配置直接重试
   }
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
   const kanbanUrl = (await need(`helios-kanban 地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
@@ -185,11 +203,15 @@ async function promptFeishuConfig(
   let appId = '';
   let appSecret = '';
   // 联网校验凭证：无效凭证/未启用机器人在此暴露，而不是等长连接失败
+  // 失败后回车 = 用当前凭证直接重试（网络抖动场景）；输入 r 才重新输入凭证
+  let reenter = true;
   for (;;) {
-    appId = await need('FEISHU_APP_ID (cli_...): ');
-    if (!appId) throw new Error('App ID 不能为空');
-    appSecret = await needSecret('FEISHU_APP_SECRET (输入显示为 *): ');
-    if (!appSecret) throw new Error('App Secret 不能为空');
+    if (reenter) {
+      appId = await need('FEISHU_APP_ID（cli_...）: ');
+      if (!appId) throw new Error('App ID 不能为空');
+      appSecret = await needSecret('FEISHU_APP_SECRET（输入显示为 *）: ');
+      if (!appSecret) throw new Error('App Secret 不能为空');
+    }
     console.log(c.gray('正在联网校验凭证…'));
     const check = await verifyFeishuApp(appId, appSecret);
     if (check.ok) {
@@ -198,12 +220,13 @@ async function promptFeishuConfig(
     }
     console.log(c.err(`凭证校验失败：${check.message}`));
     // 与模型校验分支统一交互：回车 = 重试；保存必须显式输入 s
-    const save = (await need('回车 = 重新输入；输入 s = 仍然保存: ')).toLowerCase();
-    if (save === 's' || save === 'save' || save === '保存') break;
+    const act = (await need('回车 = 直接重试；输入 r = 重新输入凭证；输入 s = 仍然保存: ')).toLowerCase();
+    if (act === 's' || act === 'save' || act === '保存') break;
+    reenter = act === 'r';
   }
   const allowedPrompt = existing.allowedOpenIds.length
-    ? `允许的 open_id（可选，逗号分隔；回车=保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : '允许的 open_id（可选，逗号分隔；回车=不限制）: ';
+    ? `允许的 open_id（可选，逗号分隔；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
+    : '允许的 open_id（可选，逗号分隔；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再用 bot --rebind 回填）: ';
   const allowedRaw = await need(allowedPrompt);
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };

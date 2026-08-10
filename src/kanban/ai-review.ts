@@ -233,16 +233,17 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     stderr = out.stderr || '';
   } catch (err) {
     const e = err as { killed?: boolean; stdout?: string; stderr?: string; message?: string };
-    const tail = sanitizeCliOutput(e.stderr || e.stdout || '')
-      .trim()
-      .split('\n')
-      .slice(-8)
-      .join('\n');
+    // 完整输出进日志；消息里只带尾部 3 行，避免整段 stderr 倾倒给终端用户
+    const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
+    const tail = full.split('\n').slice(-3).join('\n');
+    if (full) console.error(`[ai-review] 代码审查工具完整输出：\n${full}`);
     if (e.killed) {
-      throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。${tail ? `\n${tail}` : ''}`);
+      throw new Error(
+        `AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。可再次点击「AI 审查」重试。${tail ? `\n${tail}` : ''}`,
+      );
     }
-    throw new Error(`ocr 执行失败：${tail || e.message || '未知错误'}`);
+    throw new Error(`代码审查工具执行失败：${tail || e.message || '未知错误'}`);
   }
   const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
-  return text || '（ocr 无输出：可能没有可审查的变更）';
+  return text || '（代码审查工具未产生输出：可能没有可审查的变更）';
 }

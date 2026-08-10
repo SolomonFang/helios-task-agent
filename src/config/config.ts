@@ -100,7 +100,9 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
       process.env[k] = v;
     }
     if (dropped.length) {
-      console.warn(`[config] cwd .env 中的高危键已被忽略（改由用户 home .env 提供）: ${dropped.join(', ')}`);
+      console.warn(
+        `[config] 当前目录 .env 中的以下配置项存在安全风险（凭证/命令注入），已被忽略；请改写到 ${userEnvPath()}: ${dropped.join(', ')}`,
+      );
     }
     loaded.push(cwd);
   }

@@ -45,10 +45,10 @@ export function applyRepoBaseBranches(
 
 export function formatMissingBaseBranchError(repoIds: string[]): string {
   return (
-    `无法启动 workspace：以下仓库未配置 default_target_branch，且调用未传 base_branch：\n` +
+    `无法启动工作区：以下仓库未在看板配置默认目标分支，且本次未指定分支：\n` +
     repoIds.map((id) => `- ${id}`).join('\n') +
-    `\n请在看板仓库设置里填写默认目标分支（如 hly-dev），或在 start 时显式传入 base_branch / --branch。` +
-    `\n（若省略后回退到 main 而仓库没有 main，会创建空 workspace 并在 UI 一直 loading。）`
+    `\n请在看板的仓库设置里填写默认目标分支（如 develop），或在创建任务时显式指定分支（base_branch / --branch）。` +
+    `\n（若不指定，看板会回退到 main 分支；仓库没有 main 时会创建出空工作区，看板详情页会一直转圈加载。）`
   );
 }
 
@@ -125,15 +125,15 @@ export function formatWorkspaceSetupFailure(opts: {
   elapsedMs: number;
 }): string {
   const secs = Math.round(opts.elapsedMs / 1000);
-  const branches = opts.targetBranches.length ? opts.targetBranches.join(', ') : '(unknown)';
+  const branches = opts.targetBranches.length ? opts.targetBranches.join(', ') : '（未知）';
   const mainHint = opts.targetBranches.some((b) => b === 'main')
-    ? `\n检测到 target_branch=main。若仓库没有 main（例如实际是 hly-dev），worktree 会创建失败，看板任务状态不会变成进行中，详情页会一直 loading。`
+    ? `\n检测到目标分支为 main。若仓库实际没有 main 分支（例如主分支叫 develop），工作区会创建失败：任务状态不会变成「进行中」，看板详情页会一直转圈加载。`
     : '';
   return (
-    `workspace ${opts.workspaceId} 在 ${secs}s 内未完成 setup（container_ref 仍为空）。\n` +
-    `当前 target_branch：${branches}` +
+    `工作区 ${opts.workspaceId} 初始化超过 ${secs} 秒仍未就绪（看板分配的执行目录一直为空）。\n` +
+    `当前目标分支：${branches}` +
     mainHint +
-    `\n请检查：仓库 default_target_branch、start 的 base_branch/--branch 是否存在；必要时归档该空 workspace 后用正确分支重试。`
+    `\n请检查：仓库在看板里的默认分支设置、以及创建任务时指定的分支是否存在；必要时归档该工作区后用正确分支重试。`
   );
 }
 
@@ -213,7 +213,7 @@ export async function waitForWorkspaceReady(
 ): Promise<WaitReadyResult> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (signal?.aborted) return { ok: false, message: '（等待 workspace setup 时被中断）' };
+    if (signal?.aborted) return { ok: false, message: '（等待工作区初始化时被中断）' };
     const snap = await fetchWorkspaceSnapshot(kanbanUrl, workspaceId, signal);
     const state = classifyWorkspaceSetup(snap);
     if (state === 'ready') return { ok: true };

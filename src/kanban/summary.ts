@@ -50,6 +50,19 @@ export interface WorkSummaryTotals {
 /** 任务状态键（totals 还含 filesChanged 等数值键，计数时必须用显式集合判定，不能用 in）。 */
 const SUMMARY_STATUS_KEYS = ['done', 'inreview', 'inprogress', 'todo', 'cancelled'] as const;
 
+/** 状态键 → 用户可见中文（与 report.ts 的 STATUS_META 口径一致）；未知状态回退原文。 */
+const STATUS_LABELS: Record<string, string> = {
+  done: '已完成',
+  inreview: '待审阅',
+  inprogress: '进行中',
+  todo: '待办',
+  cancelled: '已取消',
+};
+
+export function statusLabel(status: string): string {
+  return STATUS_LABELS[status] ?? status;
+}
+
 export interface WorkSummaryData {
   scope: WorkSummaryScope;
   iteration?: string;

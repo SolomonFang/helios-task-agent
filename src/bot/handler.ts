@@ -17,13 +17,13 @@ import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
 import { buildAiReviewCard } from '../channels/feishu-cards';
 import { isAllPass, writeReviewReport } from '../report/review-report';
 import type { ReportServer } from '../report/report-server';
-import { checkLarkCliAsync, checkOcrCliAsync } from '../infra/deps';
+import { checkLarkCliAsync, checkOcrCliAsync, checkHkDepsAsync, HK_CLI_INSTALL_HINT } from '../infra/deps';
 import { wrapUntrusted } from '../agent/guard';
 import {
   buildMemoryLines,
   buildStatusLines,
   buildToolsLines,
-  CLEARED_TEXT,
+  clearedText,
   confirmRevokedText,
   confirmStateText,
   handleSkillsCommand,
@@ -109,7 +109,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 全局并发上限：超出时拒收并提示稍后再试（按 attempt 去重挡不住不同 attempt 的叠加）
     if (aiReviewRunning.size >= AI_REVIEW_MAX_CONCURRENT) {
       await channel
-        .notifyOpenId(openId, `🤖 同时进行的 AI 审查已达上限（${AI_REVIEW_MAX_CONCURRENT} 个），请等现有审查完成后再试：《${title}》`)
+        .notifyOpenId(
+          openId,
+          `🤖 同时进行的 AI 审查已达上限（${AI_REVIEW_MAX_CONCURRENT} 个）：《${title}》本次未开始。请等现有审查完成后，重新点击看板通知卡片上的「AI 审查」。`,
+        )
         .catch(() => {});
       return;
     }
@@ -190,7 +193,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         await channel.notifyOpenId(openId, `⏹ AI 审查已中断：《${title}》`).catch(() => {});
       } else {
         const message = errMessage(err);
-        await channel.notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}`).catch(() => {});
+        await channel
+          .notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}\n可稍后重新点击卡片上的「AI 审查」重试。`)
+          .catch(() => {});
       }
     } finally {
       aiReviewRunning.delete(attemptId);
@@ -283,9 +288,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         mcpDownNote: `${MCP_FALLBACK_TEXT}，自动重连中`,
         larkOk,
         extra: [
-          `代码审查工具: ${ocrOk ? 'ok' : '未安装（点「AI 审查」时自动 npx 拉取，首次较慢）'}`,
-          `看板推送: ${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
-          `飞书长连接: ${channel.connectionState() ?? '未启动'}，最近事件 ${
+          `代码审查工具：${ocrOk ? 'ok' : '未安装（首次点「AI 审查」时自动下载，耗时稍长）'}`,
+          `看板推送：${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
+          `飞书长连接：${channel.connectionState() ?? '未启动'}，最近事件 ${
             lastEventAt ? new Date(lastEventAt).toLocaleString('zh-CN') : '暂无'
           }`,
         ],
@@ -296,12 +301,16 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   };
 
   const handleTools = async (msg: InboundMessage): Promise<void> => {
+    // hk_cli 降级链依赖缺失时「功能不受影响」是谎言：按探测结果条件化 downNote
+    const hkMissing = await checkHkDepsAsync();
     const lines = buildToolsLines(
       {
         mcpOk: supervisor.isAlive && mcp.tools.length > 0,
         mcpTools: mcp.tools,
         kanbanHeader: `看板工具（MCP，${mcp.tools.length} 个）`,
-        downNote: `看板工具：MCP 未连接（${MCP_FALLBACK_TEXT}，功能不受影响）`,
+        downNote: hkMissing.length
+          ? `看板工具：MCP 未连接，且降级链 hk_cli 缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
+          : `看板工具：MCP 未连接（${MCP_FALLBACK_TEXT}，功能不受影响）`,
         localHeader: '本地工具',
         bullet: '· ',
       },
@@ -468,13 +477,21 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
         }
       }
-      // 续发逐段独立兜底：一段失败记日志继续发后续段，不再让剩余段静默丢失
+      // 续发逐段独立兜底：一段失败记日志继续发后续段，不再让剩余段静默丢失；
+      // 任一段失败后最后补发一条提示，否则用户拿到残文却不知情
+      let chunkFailed = false;
       for (const chunk of chunks.slice(1)) {
         try {
           await channel.sendText(msg.sessionId, chunk);
         } catch (err) {
+          chunkFailed = true;
           console.error(`[feishu] 回复续发分段失败（后续分段继续投递）: ${errMessage(err)}`);
         }
+      }
+      if (chunkFailed) {
+        await channel
+          .sendText(msg.sessionId, '⚠️ 上方回复有部分内容发送失败，可能不完整，可再问一次。')
+          .catch((err) => console.error(`[feishu] 分段失败提示也未送达: ${errMessage(err)}`));
       }
       if (!firstDelivered) {
         // 首段彻底失败：占位消息还停在「处理中」，尽量更新为失败提示，别让用户干等
@@ -508,12 +525,24 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       await deliverReply(msg, progressId, reply);
     } catch (err) {
       clearHeartbeat();
+      // 「占位即终态」：异常路径先把「处理中」占位收尾为终态文案，占位缺失/更新失败才回退 reply。
+      // /stop 的回执已由 handleStop 发出（「已中断当前任务…」），这里只收尾占位，不重复回复。
       if (ctl.signal.aborted) {
-        await channel.reply(msg, '⏹ 已中断。');
+        if (progressId) {
+          await channel
+            .updateText(progressId, '⏹ 已中断。')
+            .catch(() => channel.reply(msg, '⏹ 已中断。').catch(() => {}));
+        }
       } else {
         const message = errMessage(err);
         const parts = llmFailureParts(message, text, 'bot');
-        await channel.reply(msg, [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n'));
+        const failText = [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n');
+        if (progressId) {
+          await channel
+            .updateText(progressId, '⚠️ 处理失败，详见下方')
+            .catch(() => {});
+        }
+        await channel.reply(msg, failText);
       }
     } finally {
       supervisor.exitTurn();
@@ -537,7 +566,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
     if (cmd === '/clear') {
       session.clearHistory();
-      await channel.reply(msg, CLEARED_TEXT);
+      await channel.reply(msg, clearedText(session.activeBatchApprovals()));
       return;
     }
     if (cmd) {
@@ -569,7 +598,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         '⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复「确认」/「取消」，超时自动拒绝）。本条消息已排队，会按顺序处理。',
       );
     } else if (router.busy(openId)) {
-      await channel.reply(msg, '📥 已收到并排队：当前任务完成后依次处理。');
+      // 回执带排队位置：queuedCount 为已排在前面的条数（不含正在执行的那条，由后半句覆盖）
+      const ahead = router.queuedCount(openId);
+      await channel.reply(
+        msg,
+        ahead > 0
+          ? `📥 已收到并排队（前面还有 ${ahead} 条），当前任务完成后依次处理。`
+          : '📥 已收到并排队，当前任务完成后依次处理。',
+      );
     }
     // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
     // 排在队列里时表情先行，用户立刻知道消息已被收到。
@@ -634,9 +670,13 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const fmsg = msg as FeishuInboundMessage;
 
     if (fmsg.messageType && fmsg.messageType !== 'text' && fmsg.messageType !== 'post') {
-      // 图片消息：仅 vision 开关打开且解析到 image_key 时放行，其余维持既有拒答文案
-      if (fmsg.messageType === 'image' && cfg.visionEnabled && fmsg.imageKey) {
-        await handleImageMessage(msg, fmsg);
+      // 图片消息：仅 vision 开关打开时放行；image_key 解析失败说明这张图读不出来，让用户重发
+      if (fmsg.messageType === 'image' && cfg.visionEnabled) {
+        if (fmsg.imageKey) {
+          await handleImageMessage(msg, fmsg);
+        } else {
+          await channel.reply(msg, '这张图片读取失败，请重新发送。');
+        }
         return;
       }
       await channel.reply(msg, '暂只支持文字消息：图片/文件等内容，请把关键信息打字或粘贴成文字发给我。');
