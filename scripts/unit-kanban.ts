@@ -337,7 +337,9 @@ async function main(): Promise<void> {
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
     const port = (server.address() as AddressInfo).port;
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-exit-'));
-    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\nsleep 0.5\nexit 0\n', { mode: 0o755 });
+    // sleep 用绝对路径：子进程经 minimalChildEnv 只继承 PATH=bin，裸 `sleep` 会 not found
+    // 导致壳瞬间退出（Linux 回收更快，首轮轮询即误判「进程已退出」，macOS 靠时序侥幸通过）
+    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\n/bin/sleep 0.5\nexit 0\n', { mode: 0o755 });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
     try {
