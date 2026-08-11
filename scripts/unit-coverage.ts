@@ -325,10 +325,13 @@ async function run(): Promise<void> {
           res.end(JSON.stringify({ success: true, data }));
         };
         if (url === '/api/task-attempts/att-1') {
-          return json({ container_ref: null, branch: 'feature-x', agent_working_dir: null });
+          return json({ container_ref: null, branch: 'feature-x', agent_working_dir: null, task_id: 'task-1' });
         }
         if (url === '/api/task-attempts/att-1/repos') {
           return json([{ path: repoDir, name: 'repo', target_branch: 'main' }]);
+        }
+        if (url === '/api/tasks/task-1') {
+          return json({ title: '审查任务标题', description: '实现登录限流：连续失败 5 次锁定 10 分钟' });
         }
         res.writeHead(404);
         res.end('{}');
@@ -386,6 +389,9 @@ async function run(): Promise<void> {
         const log = fs.readFileSync(ocrLog, 'utf8');
         assert.equal(log.split('--repo').length - 1, 1, `ocr 调用次数应为 1，日志：${log}`);
         assert.ok(log.includes('--from main --to feature-x'), `diff 引用不符：${log}`);
+        // 需求上下文：标题 + 任务描述都应进入 --background
+        assert.ok(log.includes('任务标题：审查任务标题'), `--background 缺任务标题：${log}`);
+        assert.ok(log.includes('连续失败 5 次锁定 10 分钟'), `--background 缺任务描述：${log}`);
         const resultNotify = channel.notifies.find((n) => n.text.includes('🤖 AI 审查结果'))!;
         assert.ok(resultNotify.text.includes('审查任务标题'));
         assert.ok(resultNotify.text.includes('AI-REVIEW-STUB-RESULT'), '结果应含 ocr 输出原文');

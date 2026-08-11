@@ -88,7 +88,14 @@ import {
   LARK_CLI_AUTH_HINT,
   MCP_FALLBACK_TEXT,
 } from '../src/infra/deps';
-import { buildOcrEnv, findOcrCommand, resolveReviewTarget, sanitizeCliOutput } from '../src/kanban/ai-review';
+import {
+  buildOcrEnv,
+  buildReviewBackground,
+  findOcrCommand,
+  pickTaskDescription,
+  resolveReviewTarget,
+  sanitizeCliOutput,
+} from '../src/kanban/ai-review';
 import { isAllPass, parseOcrReview, renderReviewHtml, renderReviewMarkdown, writeReviewReport } from '../src/report/review-report';
 import { startReportServer, newReportToken } from '../src/report/report-server';
 import { summarizeForChat, writeSummaryReports } from '../src/report/report';
@@ -1705,12 +1712,18 @@ async function run(): Promise<void> {
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
       // container_ref + agent_working_dir 命中最优先
-      routes['/api/task-attempts/a1'] = { container_ref: path.join(tmp, 'ws'), agent_working_dir: 'myrepo', branch: 'er/x' };
+      routes['/api/task-attempts/a1'] = {
+        container_ref: path.join(tmp, 'ws'),
+        agent_working_dir: 'myrepo',
+        branch: 'er/x',
+        task_id: 'task-1',
+      };
       routes['/api/task-attempts/a1/repos'] = [{ path: origRepo, name: 'myrepo', target_branch: 'dev' }];
       const t1 = await resolveReviewTarget(base, 'a1');
       assert.equal(t1.repoDir, wsRepo);
       assert.equal(t1.fromRef, 'dev');
       assert.equal(t1.toRef, 'er/x');
+      assert.equal(t1.taskId, 'task-1');
       // workspace 目录不存在 → 兜底原始仓库 path
       routes['/api/task-attempts/a2'] = { container_ref: path.join(tmp, 'gone'), agent_working_dir: null, branch: 'main' };
       routes['/api/task-attempts/a2/repos'] = [{ path: origRepo, name: 'myrepo', target_branch: 'main' }];
@@ -1725,6 +1738,28 @@ async function run(): Promise<void> {
       await new Promise((r) => server.close(r));
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // ---------- AI 审查：--background 需求上下文组装 ----------
+  await checkAsync('buildReviewBackground / pickTaskDescription：标题+描述+中文要求，缺省兜底', async () => {
+    const bg = buildReviewBackground(' 标题甲 ', ' 描述乙 ');
+    assert.ok(bg.includes('任务标题：标题甲'));
+    assert.ok(bg.includes('任务描述：\n描述乙'));
+    assert.ok(bg.includes('简体中文'));
+    // 空标题/空描述：只剩语言要求，不留空标签
+    const bare = buildReviewBackground('', '  ');
+    assert.equal(bare.includes('任务标题'), false);
+    assert.equal(bare.includes('任务描述'), false);
+    assert.ok(bare.includes('简体中文'));
+    // 超长收敛：标题 200 字、描述 2000 字
+    const long = buildReviewBackground('t'.repeat(500), 'd'.repeat(5000));
+    assert.ok(long.includes('t'.repeat(200)) && !long.includes('t'.repeat(201)));
+    assert.ok(long.includes('d'.repeat(2000)) && !long.includes('d'.repeat(2001)));
+    // pickTaskDescription 宽松解析
+    assert.equal(pickTaskDescription({ description: ' 需求 x ' }), '需求 x');
+    assert.equal(pickTaskDescription({ description: 1 }), '');
+    assert.equal(pickTaskDescription(null), '');
+    assert.equal(pickTaskDescription({}), '');
   });
 
   // ---------- 闸门 batchKey：所有写操作都可同类免问；破坏性操作仍标记 destructive ----------

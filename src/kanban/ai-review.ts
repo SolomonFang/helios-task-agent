@@ -19,11 +19,12 @@ import { apiGet, validateRows } from './http';
 
 const execFileP = promisify(execFile);
 
-/** attempt 详情里与定位审查目录相关的字段（宽松解析，看板版本间字段可能不同）。 */
+/** attempt 详情里与定位审查目录/所属任务相关的字段（宽松解析，看板版本间字段可能不同）。 */
 interface AttemptRow {
   container_ref?: string | null;
   branch?: string | null;
   agent_working_dir?: string | null;
+  task_id?: string | null;
 }
 
 interface AttemptRepoRow {
@@ -48,6 +49,8 @@ export interface ReviewTarget {
   fromRef?: string;
   /** diff 终点（attempt 分支）。 */
   toRef?: string;
+  /** 所属看板任务 id（取任务描述作审查背景用）；看板版本不带该字段时为空。 */
+  taskId?: string;
 }
 
 export interface OcrLlmConfig {
@@ -122,7 +125,8 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
     if (fs.existsSync(dir) && (await isGitRepo(dir))) {
       const fromRef = repos.map((r) => (r.target_branch || '').trim()).find(Boolean) || undefined;
       const toRef = (attempt.branch || '').trim() || undefined;
-      return { repoDir: dir, fromRef, toRef };
+      const taskId = typeof attempt.task_id === 'string' ? attempt.task_id.trim() || undefined : undefined;
+      return { repoDir: dir, fromRef, toRef, taskId };
     }
   }
   throw new Error(
@@ -203,7 +207,7 @@ export function sanitizeCliOutput(text: string): string {
 export interface RunAiReviewOptions {
   kanbanUrl: string;
   attemptId: string;
-  /** 任务标题，作为 --background 传给 ocr 提供需求上下文。 */
+  /** 任务标题，与按 task_id 拉取的任务描述一起作为 --background 传给 ocr 提供需求上下文。 */
   title?: string;
   llm: OcrLlmConfig;
   /** 整体超时（默认 15 分钟；ocr 内部单任务超时另计）。 */
@@ -215,6 +219,36 @@ export interface RunAiReviewOptions {
 
 /** ocr 无语言选项，通过 --background 注入输出语言要求。 */
 const LANG_HINT = '输出要求：请全程使用简体中文撰写审查结论与建议。';
+
+/** 任务描述注入 --background 的长度上限（描述只是需求背景，超长收敛避免 prompt 膨胀）。 */
+const DESCRIPTION_MAX_CHARS = 2000;
+
+/** 宽松提取任务详情里的描述字段（看板版本间字段可能不同，取不到返回空串）。 */
+export function pickTaskDescription(detail: unknown): string {
+  if (!detail || typeof detail !== 'object') return '';
+  const d = (detail as Record<string, unknown>).description;
+  return typeof d === 'string' ? d.trim() : '';
+}
+
+/** 取 attempt 所属任务的描述；任何一步失败都静默兜底为空（描述只是审查背景，不阻断审查）。 */
+export async function fetchTaskDescription(kanbanUrl: string, taskId: string): Promise<string> {
+  try {
+    return pickTaskDescription(await apiGet(kanbanUrl, `/tasks/${taskId}`));
+  } catch {
+    return '';
+  }
+}
+
+/** 组装 ocr --background：任务标题 + 任务描述（需求上下文）+ 中文输出要求。 */
+export function buildReviewBackground(title: string, description: string): string {
+  const parts: string[] = [];
+  const t = title.trim();
+  if (t) parts.push(`任务标题：${t.slice(0, 200)}`);
+  const d = description.trim();
+  if (d) parts.push(`任务描述：\n${d.slice(0, DESCRIPTION_MAX_CHARS)}`);
+  parts.push(LANG_HINT);
+  return parts.join('\n');
+}
 
 /** 执行 AI 审查，返回完整文本结果（不截断，完整内容供 HTML 报告使用）；失败抛出带排查信息的中文错误。 */
 export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
@@ -228,8 +262,9 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     args.push('--from', target.fromRef, '--to', target.toRef);
   }
   args.push('--audience', 'agent', '--format', 'text');
-  const bg = (opts.title || '').trim();
-  args.push('--background', bg ? `${bg.slice(0, 200)}\n${LANG_HINT}` : LANG_HINT);
+  // 需求上下文：卡片只带标题，任务描述按 task_id 现场拉取（取不到不阻断审查）
+  const description = target.taskId ? await fetchTaskDescription(opts.kanbanUrl, target.taskId) : '';
+  args.push('--background', buildReviewBackground(opts.title || '', description));
 
   const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
   let stdout = '';
