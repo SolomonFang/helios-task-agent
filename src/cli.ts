@@ -27,12 +27,23 @@ import { kindLabel, type ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
 
-type LineReader = (() => Promise<string | null>) & { drain: () => void };
+type LineReader = (() => Promise<string | null>) & { drain: () => void; cancelPending: () => void };
 
 function createLineReader(rl: readline.Interface): LineReader {
   const queue: string[] = [];
   let waiter: ((line: string | null) => void) | null = null;
   let closed = false;
+  /**
+   * 取消挂起的 waiter（以 null resolve）：askWithAbort 因 Ctrl+C/超时提前返回后，
+   * 陈旧 waiter 若继续挂着，会把主循环下一次 ask('› ') 之前用户敲入的一行静默吞掉。
+   */
+  const cancelPending = () => {
+    if (waiter) {
+      const w = waiter;
+      waiter = null;
+      w(null);
+    }
+  };
   rl.on('line', (line) => {
     if (waiter) {
       const w = waiter;
@@ -44,11 +55,7 @@ function createLineReader(rl: readline.Interface): LineReader {
   });
   rl.on('close', () => {
     closed = true;
-    if (waiter) {
-      const w = waiter;
-      waiter = null;
-      w(null);
-    }
+    cancelPending();
   });
   const nextLine = (() =>
     new Promise<string | null>((resolve) => {
@@ -59,6 +66,7 @@ function createLineReader(rl: readline.Interface): LineReader {
   nextLine.drain = () => {
     queue.length = 0;
   };
+  nextLine.cancelPending = cancelPending;
   return nextLine;
 }
 
@@ -82,14 +90,17 @@ ${TRY_EXAMPLES.map((e) => `  · ${e}`).join('\n')}
 export const ASK_TIMEOUT: unique symbol = Symbol('ask-timeout');
 
 /**
- * ask 的 abort/超时感知版（纯逻辑抽出以便单测；main 内用 createAskWithAbort(ask, () => currentCtl) 构造）：
+ * ask 的 abort/超时感知版（纯逻辑抽出以便单测；main 内用 createAskWithAbort(ask, () => currentCtl, …) 构造）：
  * 闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）；
- * 超时未操作按拒绝处理（对齐飞书 bot：可批量 120s / 破坏性 300s）。
+ * 超时未操作按拒绝处理（对齐飞书 bot：普通写 120s / 破坏性 300s）。
  * getCtl 返回当前运行轮次的 AbortController（无轮次时为 null）。
+ * cancelPending：abort/超时等非回答路径收尾时调用，取消底层挂起的行读 waiter，
+ * 否则陈旧 waiter 会吞掉主循环下一次 ask 之前用户敲入的一行。
  */
 export function createAskWithAbort(
   ask: AskFn,
   getCtl: () => AbortController | null,
+  cancelPending?: () => void,
 ): (promptText: string, timeoutMs?: number) => Promise<string | null | typeof ASK_TIMEOUT> {
   return (promptText, timeoutMs) => {
     const ctl = getCtl();
@@ -98,20 +109,23 @@ export function createAskWithAbort(
     return new Promise((resolve) => {
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
-      const onAbort = () => finish(null);
-      const finish = (v: string | null | typeof ASK_TIMEOUT) => {
+      const onAbort = () => finish(null, true);
+      // stale=true 表示非回答路径（abort/超时）：底层 ask 的 waiter 还挂着，先取消再收尾
+      //（waiter 以 null 被 resolve 后触发的 finish 因 settled 短路，不会覆盖本次结果）
+      const finish = (v: string | null | typeof ASK_TIMEOUT, stale = false) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
         ctl?.signal.removeEventListener('abort', onAbort);
+        if (stale) cancelPending?.();
         resolve(v);
       };
       ctl?.signal.addEventListener('abort', onAbort, { once: true });
       if (timeoutMs) {
-        timer = setTimeout(() => finish(ASK_TIMEOUT), timeoutMs);
+        timer = setTimeout(() => finish(ASK_TIMEOUT, true), timeoutMs);
         timer.unref();
       }
-      void ask(promptText).then(finish);
+      void ask(promptText).then((v) => finish(v));
     });
   };
 }
@@ -152,21 +166,13 @@ export async function main(): Promise<void> {
   // npm 更新检查：与看板/MCP 启动并发进行，banner 打印后再请示（结果缓存 24h，离线静默）
   const pendingUpdate = !updateCheckDisabled() && isTTY ? checkForUpdate({ current: version }) : null;
 
+  /**
+   * 信号处理尽早注册 + 资源创建即登记（对齐 bot-main 的模式）：
+   * ensureKanbanOrExit（最长 90s）与 connectMcp（最长 45s）窗口内收到 SIGINT/SIGTERM，
+   * 走默认终止会把 in-flight 的看板 / MCP stdio（npx）子进程丢成孤儿，Ctrl+C 也不退出；
+   * 这里保证 cleanup 在启动全程可用，只清理已登记的资源。
+   */
   let kanbanChild: ChildProcess | null = null;
-  const bootKanban = new Spinner('检查 helios-kanban…').start();
-  const ensured = await ensureKanbanOrExit({
-    kanbanUrl: cfg.kanbanUrl,
-    onLog: (msg) => bootKanban.setText(msg),
-    onFail: () => {
-      bootKanban.stop();
-      rl.close();
-    },
-    failLabel: '看板不可用',
-  });
-  kanbanChild = ensured.child;
-  bootKanban.stop();
-  if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
-
   /** 当前运行中的 agent 轮次；非 null 时 Ctrl+C 只中断任务不退出进程。 */
   let currentCtl: AbortController | null = null;
   const spinner = new Spinner('思考中…');
@@ -213,12 +219,13 @@ export async function main(): Promise<void> {
     console.log('\n' + c.gray('再见 👋'));
     void cleanup(0);
   };
-  // 信号处理在 MCP 连接（最长 45s）之前注册：连接窗口内收到 SIGINT 时 cleanup 已可用，
-  // 配合 onCreate 登记能把 in-flight 的 MCP 子进程一并收掉，不留孤儿。
+  // 信号处理在看板拉起（最长 90s）与 MCP 连接（最长 45s）之前注册：两个窗口内收到信号时
+  // cleanup 已可用，配合 onSpawn/onCreate 登记能把 in-flight 子进程一并处置，不留孤儿。
   // terminal 模式下 readline 会拦截 ^C：rl 无 SIGINT listener 时默认 rl.close()，
   // 任务运行中按 Ctrl+C 会关闭输入流而非中断当前任务；两级 handler 同一函数，天然幂等。
   process.on('SIGINT', onSigint);
   rl.on('SIGINT', onSigint);
+  process.on('SIGTERM', () => void cleanup(0));
   // 长驻 REPL 兜底（与 bot 同策略）：漏网 rejection 记日志不退出；
   // uncaughtException 复用 cleanup 优雅退出（退出码 1，见 cleanup 注释）。
   // handler 自身只做同步日志，不得再抛异常。
@@ -233,6 +240,24 @@ export async function main(): Promise<void> {
   // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
   // 验证崩溃退出码为 1（setImmediate 抛出才走 uncaughtException，同步 throw 只会 reject main）
   if (process.env.HTA_TEST_CRASH) setImmediate(() => { throw new Error('HTA_TEST_CRASH'); });
+
+  const bootKanban = new Spinner('检查 helios-kanban…').start();
+  const ensured = await ensureKanbanOrExit({
+    kanbanUrl: cfg.kanbanUrl,
+    onLog: (msg) => bootKanban.setText(msg),
+    // 就绪等待期间（最长 90s）收到退出信号时，cleanup 需要拿到 child 才能处置
+    onSpawn: (child) => {
+      kanbanChild = child;
+    },
+    onFail: () => {
+      bootKanban.stop();
+      rl.close();
+    },
+    failLabel: '看板不可用',
+  });
+  kanbanChild = ensured.child;
+  bootKanban.stop();
+  if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
 
   const boot = new Spinner('正在连接 helios-kanban MCP…').start();
   const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg, {
@@ -271,8 +296,8 @@ export async function main(): Promise<void> {
   warnStartupDeps(larkStatus, { style: 'cli' });
   migrateAndValidateSkills();
 
-  /** ask 的 abort/超时感知版：实现见模块级 createAskWithAbort（单测覆盖三路竞态）。 */
-  const askWithAbort = createAskWithAbort(ask, () => currentCtl);
+  /** ask 的 abort/超时感知版：实现见模块级 createAskWithAbort（单测覆盖三路竞态 + 陈旧 waiter 取消）。 */
+  const askWithAbort = createAskWithAbort(ask, () => currentCtl, nextLine.cancelPending);
 
   // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「免问」（或 batch/同类免问等词）开启同类免问；Ctrl+C 视为拒绝；
   // 超时自动拒绝（与飞书 bot 同语义：普通写 120s、破坏性 300s）。

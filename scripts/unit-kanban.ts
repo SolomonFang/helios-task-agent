@@ -1,14 +1,17 @@
-// Unit tests: kanban 进程清理与 hk start 分支补全。真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
+// Unit tests: kanban 进程清理、拉起轮询竞态、http 层错误分类、ai-review 返回体校验与 hk start 分支补全。真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
 
 import assert from 'node:assert/strict';
-import { execFile, spawn, type ChildProcess } from 'child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
+import fs from 'fs';
 import http from 'http';
+import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { stopKanbanChild } from '../src/kanban/kanban-ensure';
+import { ensureKanbanRunning, stopKanbanChild } from '../src/kanban/kanban-ensure';
 import { fillHkStartBranches, type RepoStartInput } from '../src/kanban/workspace-ready';
-import { apiGet, fetchKanbanHealth, taskPageUrl } from '../src/kanban/http';
-import { checkAsync, finish } from './testkit';
+import { apiGet, fetchKanbanHealth, KanbanHttpError, taskPageUrl } from '../src/kanban/http';
+import { resolveReviewTarget } from '../src/kanban/ai-review';
+import { check, checkAsync, finish } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
 function groupAlive(pid: number): boolean {
@@ -193,6 +196,24 @@ async function main(): Promise<void> {
 
   const HK_SH = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
 
+  // hk.sh 契约用例以真实子进程跑 bash 脚本，依赖 bash/jq/curl：缺失属环境问题而非产品缺陷，
+  // 按 SKIP 处理（同 unit.ts 的 jq 探测 / smoke.ts 的 SKIP 惯例），避免干净 CI 上误红；
+  // HTA_REQUIRE_E2E=1 时转 FAIL，防止「全绿」掩盖契约用例未真跑
+  const hkDepsMissing = ['bash', 'jq', 'curl'].filter((cmd) => {
+    try {
+      execFileSync(cmd, ['--version'], { stdio: 'ignore' });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  const runHkContract = (name: string, fn: () => Promise<void>): Promise<void> | void => {
+    if (!hkDepsMissing.length) return checkAsync(name, fn);
+    const detail = `本机缺少 ${hkDepsMissing.join('、')}（hk.sh 运行时依赖）`;
+    if (process.env.HTA_REQUIRE_E2E === '1') check(name, false, `HTA_REQUIRE_E2E=1 禁止跳过：${detail}`);
+    else console.log(`SKIP  ${name}  — ${detail}`);
+  };
+
   interface HkResult {
     code: number;
     stdout: string;
@@ -235,7 +256,7 @@ async function main(): Promise<void> {
     };
   }
 
-  await checkAsync('契约：信封成功路径一致——hk.sh 与 apiGet 提取同一份 data', async () => {
+  await runHkContract('契约：信封成功路径一致——hk.sh 与 apiGet 提取同一份 data', async () => {
     const info = { version: '9.9.9', config: { executor_profile: { executor: 'KIMI_CLI' } } };
     const mock = await contractMock(() => ({ body: { success: true, data: info } }));
     try {
@@ -249,7 +270,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await checkAsync('契约：信封失败路径一致——success:false 时两侧都以 message 报错', async () => {
+  await runHkContract('契约：信封失败路径一致——success:false 时两侧都以 message 报错', async () => {
     const mock = await contractMock(() => ({ body: { success: false, message: 'boom-msg-contract' } }));
     try {
       const hk = await runHk(['info'], mock.baseUrl);
@@ -261,7 +282,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await checkAsync('契约：健康端点路径一致——两侧都打 /api/health', async () => {
+  await runHkContract('契约：健康端点路径一致——两侧都打 /api/health', async () => {
     const mock = await contractMock(() => ({ body: { success: true, data: { status: 'ok' } } }));
     try {
       const hk = await runHk(['health'], mock.baseUrl);
@@ -274,7 +295,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await checkAsync('契约：任务详情 URL 规则一致——/local-projects/<pid>/tasks/<tid>', async () => {
+  await runHkContract('契约：任务详情 URL 规则一致——/local-projects/<pid>/tasks/<tid>', async () => {
     const tid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
     const mock = await contractMock((url) => {
       if (url === `/api/tasks/${tid}`) {
@@ -293,6 +314,120 @@ async function main(): Promise<void> {
       const out = JSON.parse(hk.stdout) as { url?: string };
       assert.equal(out.url, taskPageUrl(mock.baseUrl, 'p1', tid));
       assert.equal(out.url, `${mock.baseUrl}/local-projects/p1/tasks/${tid}`);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  // ---------- ensureKanbanRunning：拉起轮询竞态（先探健康再判退出码） ----------
+  await checkAsync('ensureKanbanRunning：npx 壳先退出但看板已就绪时不误报失败', async () => {
+    // 模拟 detached npx 壳退出与看板就绪几乎同时发生：假 npx 在 ~500ms 后退出，
+    // mock 看板在 ~400ms 后回健康。第二轮轮询（~800ms）时「壳已退出」与「看板就绪」同时成立，
+    // 旧逻辑（先判 exitCode）必误报「进程已退出」；新逻辑先探健康则正常返回。
+    const startedAt = Date.now();
+    const server = http.createServer((req, res) => {
+      if (req.url === '/api/health' && Date.now() - startedAt >= 400) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"success":true,"data":"OK","error_data":null,"message":null}');
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-exit-'));
+    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\nsleep 0.5\nexit 0\n', { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      const ret = await ensureKanbanRunning(`http://127.0.0.1:${port}`, { waitMs: 15000 });
+      assert.equal(ret.started, true);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      fs.rmSync(bin, { recursive: true, force: true });
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  // ---------- KanbanHttpError：状态码随实例传递，message 保持 'HTTP <status>' ----------
+  await checkAsync('apiGet：4xx 抛 KanbanHttpError（status 可读、message 格式不变）且不重试', async () => {
+    let hits = 0;
+    const mock = await contractMock(() => {
+      hits++;
+      return { status: 404, body: {} };
+    });
+    try {
+      const err: unknown = await apiGet(mock.baseUrl, '/missing').catch((e: unknown) => e);
+      assert.ok(err instanceof KanbanHttpError, `应为 KanbanHttpError，实际：${err}`);
+      assert.equal(err.status, 404);
+      // message 文本格式不变：既有日志与断言（如 unit-resilience 的 /HTTP 404/）按此匹配
+      assert.equal(err.message, 'HTTP 404');
+      assert.equal(hits, 1, '4xx 不应重试');
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await checkAsync('apiGet：5xx 轻量重试 1 次后仍抛 KanbanHttpError', async () => {
+    let hits = 0;
+    const mock = await contractMock(() => {
+      hits++;
+      return { status: 500, body: {} };
+    });
+    try {
+      const err: unknown = await apiGet(mock.baseUrl, '/boom').catch((e: unknown) => e);
+      assert.ok(err instanceof KanbanHttpError, `应为 KanbanHttpError，实际：${err}`);
+      assert.equal(err.status, 500);
+      assert.equal(hits, 2, '5xx 应重试 1 次，共 2 次请求');
+    } finally {
+      await mock.close();
+    }
+  });
+
+  // ---------- resolveReviewTarget：attempt/repos 返回体运行时校验（不裸 as） ----------
+  await checkAsync('resolveReviewTarget：attempt 字段类型不符时报「找不到 workspace」', async () => {
+    const mock = await contractMock(() => ({ body: { success: true, data: { container_ref: 123 } } }));
+    try {
+      await assert.rejects(() => resolveReviewTarget(mock.baseUrl, 'a1'), /找不到该任务的 workspace/);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await checkAsync('resolveReviewTarget：repos 行类型不符时兜底为无 repos，不阻断目录定位', async () => {
+    const mock = await contractMock((url) => {
+      if (url === '/api/task-attempts/a2') {
+        return { body: { success: true, data: { container_ref: null, branch: 'feat' } } };
+      }
+      if (url === '/api/task-attempts/a2/repos') return { body: { success: true, data: [{ path: 123 }] } };
+      return { status: 404, body: {} };
+    });
+    try {
+      // repos 校验失败被吞（同端点失败策略）→ 无候选目录 → 走「无法定位」而非校验错误外溢
+      await assert.rejects(() => resolveReviewTarget(mock.baseUrl, 'a2'), /无法定位该任务的代码目录/);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await checkAsync('resolveReviewTarget：合法 repos 行通过校验并进入候选目录', async () => {
+    const missing = path.join(os.tmpdir(), 'hta-unit-nonexistent-repo-dir');
+    const mock = await contractMock((url) => {
+      if (url === '/api/task-attempts/a3') {
+        return { body: { success: true, data: { container_ref: null, branch: null } } };
+      }
+      if (url === '/api/task-attempts/a3/repos') {
+        return { body: { success: true, data: [{ path: missing, name: 'r', target_branch: 'main' }] } };
+      }
+      return { status: 404, body: {} };
+    });
+    try {
+      const err: unknown = await resolveReviewTarget(mock.baseUrl, 'a3').catch((e: unknown) => e);
+      assert.ok(err instanceof Error && err.message.includes('无法定位该任务的代码目录'), `实际：${err}`);
+      assert.ok(err.message.includes(missing), '合法 repos 行的 path 应进入候选目录列表');
     } finally {
       await mock.close();
     }

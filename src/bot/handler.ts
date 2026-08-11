@@ -98,8 +98,8 @@ export interface BotHandlerDeps {
 }
 
 export interface BotHandlers {
-  /** 私聊消息入口（传给 channel.start）。 */
-  handle: (msg: InboundMessage) => Promise<void>;
+  /** 私聊消息入口（传给 channel.start；通道为飞书实现，直接收 FeishuInboundMessage）。 */
+  handle: (msg: FeishuInboundMessage) => Promise<void>;
   /** 卡片按钮回调（确认卡片 / AI 审查）。 */
   onCardAction: (action: CardAction) => void;
 }
@@ -630,12 +630,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
   /** 排队入口：排队上限拒收、排队/闸门回执、敲键盘表情、串行入队。 */
   const enqueueMessage = async (
-    msg: InboundMessage,
     fmsg: FeishuInboundMessage,
     text: string,
     cmd: string | null,
     image?: InlineImage,
   ): Promise<void> => {
+    const msg: InboundMessage = fmsg;
     const openId = msg.senderId;
     // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
     if (router.queueFull(openId)) {
@@ -681,7 +681,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
    * 作为普通对话排入既有串行队列（占位/进度/心跳不变，不占确认闸门）。
    * 会话历史只存文本占位「[图片] 配文」，图片仅透传给当次 LLM 请求（不落盘、不进审计）。
    */
-  const handleImageMessage = async (msg: InboundMessage, fmsg: FeishuInboundMessage): Promise<void> => {
+  const handleImageMessage = async (fmsg: FeishuInboundMessage): Promise<void> => {
+    const msg: InboundMessage = fmsg;
     let img: { data: Buffer; mimeType: string };
     try {
       img = await fetchImage(fmsg.messageId, fmsg.imageKey!);
@@ -713,18 +714,18 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       dataUrl: `data:${img.mimeType};base64,${img.data.toString('base64')}`,
       prompt: caption || '请分析这张图片并回应。',
     };
-    await enqueueMessage(msg, fmsg, caption ? `[图片] ${caption}` : '[图片]', null, image);
+    await enqueueMessage(fmsg, caption ? `[图片] ${caption}` : '[图片]', null, image);
   };
 
   /** 消息入口：类型/长度门禁 → 确认应答 → 即时命令分发 → 串行排队。 */
-  const handle = async (msg: InboundMessage): Promise<void> => {
-    const fmsg = msg as FeishuInboundMessage;
+  const handle = async (fmsg: FeishuInboundMessage): Promise<void> => {
+    const msg: InboundMessage = fmsg;
 
     if (fmsg.messageType && fmsg.messageType !== 'text' && fmsg.messageType !== 'post') {
       // 图片消息：仅 vision 开关打开时放行；image_key 解析失败说明这张图读不出来，让用户重发
       if (fmsg.messageType === 'image' && cfg.visionEnabled) {
         if (fmsg.imageKey) {
-          await handleImageMessage(msg, fmsg);
+          await handleImageMessage(fmsg);
         } else {
           await channel.reply(msg, '这张图片读取失败，请重新发送。');
         }
@@ -754,7 +755,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const cmd = parseCommand(text);
     if (await dispatchInstantCommand(msg, text, cmd)) return;
 
-    await enqueueMessage(msg, fmsg, text, cmd);
+    await enqueueMessage(fmsg, text, cmd);
   };
 
   return { handle, onCardAction };

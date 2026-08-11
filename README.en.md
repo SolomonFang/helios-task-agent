@@ -178,7 +178,7 @@ via the `skill_doc` tool (progressive disclosure).
 
 - Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` — surfaced as **startup warnings** (CLI and bot) and covered by unit tests, instead of silently degrading.
 - Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
-- Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution never joins batch approvals), and the child process inherits only a minimal environment.
+- Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution — treated as destructive with a 300-second timeout; "approve same kind" batching applies per specific script), and the child process inherits only a minimal environment.
 
 **Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up. Note: the kanban API has no authentication — when `HELIOS_KANBAN_URL` points off-box, traffic is plaintext and unauthenticated; use only on trusted networks (LAN / Tailscale).
 
@@ -204,6 +204,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
 | `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed; all iterations when `HELIOS_KANBAN_ITERATION` is unset) to the owner every day. Unset or invalid = off |
+| `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
 Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example). Note: **credential/command-type high-risk keys in the cwd `.env` are ignored** (`LLM_API_KEY`, `FEISHU_*`, `HELIOS_KANBAN_MCP_COMMAND/ARGS`, `HELIOS_KANBAN_PACKAGE`, `HELIOS_KANBAN_URL`, proxy and npm registry keys, etc. — a supply-chain/command-injection guard; ignored keys only produce a one-line `console.warn`). Put such keys in `~/.helios-task-agent/.env` (or the shell environment / project `.env`).
@@ -238,7 +239,7 @@ Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the l
 | `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
 | `work_summary` | Generate work-summary reports (HTML/MD) |
 | `skill_doc` | Read an installed skill's full doc (SKILL.md) on demand |
-| `skill_exec` | Run scripts inside a skill directory (user confirmation every time) |
+| `skill_exec` | Run scripts inside a skill directory (confirmation per run by default; "approve same kind" applies per specific script) |
 | `memory_*` | Persistent prefs & notes |
 
 Bundled skill: `skills/helios-kanban-remote/`.

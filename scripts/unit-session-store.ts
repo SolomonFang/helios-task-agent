@@ -2,7 +2,8 @@
  * 会话历史持久化单测（SessionHistoryStore + AgentSession 接线）：
  * 落盘→重建恢复；坏 JSON 宽容；版本不符视为无历史；畸形 tool_calls 条目丢弃；
  * /clear 清盘；文件名穿越防护；目录文件数上限清理；system note 不落盘；
- * 失败轮次的 user 消息不落盘；成功轮次落盘（happy path）；SessionRouter 透传接线。
+ * 失败轮次的 user 消息不落盘；成功轮次落盘（happy path，异步 fire-and-forget）；
+ * prune 节流；SessionRouter 透传接线。
  * 运行：tsx scripts/unit-session-store.ts
  */
 import assert from 'assert';
@@ -36,6 +37,20 @@ function tmpHome(tag: string): string {
 
 const historyOf = (s: AgentSession) => (s as unknown as { messages: ChatMessage[] }).messages;
 
+/** 等待 store 内部异步写队列排空（fire-and-forget 落盘后的断言前置）。 */
+async function drainQueue(store: SessionHistoryStore): Promise<void> {
+  await (store as unknown as { queue: Promise<void> }).queue;
+}
+
+/** 轮询等待条件成立（异步落盘断言用）。 */
+async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor 超时');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 /** 最小 fake LLM：立即回固定补全（happy path 落盘断言用，不触真实网络）。 */
 async function startFakeLlm(replyText = '好的，已收到'): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
   const server = http.createServer((req, res) => {
@@ -68,7 +83,7 @@ async function startFakeLlm(replyText = '好的，已收到'): Promise<{ baseUrl
 
 async function main(): Promise<void> {
   // ---------- 落盘 → 重建 store 恢复（system 角色被过滤，user/assistant/tool 保留） ----------
-  check('save→load 往返：仅持久化 user/assistant/tool，system note 被过滤', (() => {
+  await checkAsync('save→load 往返：仅持久化 user/assistant/tool，system note 被过滤', async () => {
     const tmp = tmpHome('roundtrip');
     try {
       const store = new SessionHistoryStore(tmp);
@@ -84,7 +99,9 @@ async function main(): Promise<void> {
         },
         { role: 'tool', tool_call_id: 'call_1', content: '工具结果' },
       ];
-      store.save('ou_abc', messages);
+      const saved = store.save('ou_abc', messages);
+      assert.ok(typeof (saved as Promise<void>).then === 'function', 'save 应返回 Promise（异步落盘）');
+      await saved;
       const restored = new SessionHistoryStore(tmp).load('ou_abc');
       assert.deepEqual(
         restored.map((m) => m.role),
@@ -96,11 +113,10 @@ async function main(): Promise<void> {
       assert.equal(fs.statSync(file).mode & 0o777, 0o600);
       // 目录 0700 权限
       assert.equal(fs.statSync(path.join(tmp, 'sessions')).mode & 0o777, 0o700);
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
 
   // ---------- 坏 JSON / 格式不符宽容 ----------
   check('坏 JSON / 格式不符：视为无历史', (() => {
@@ -126,29 +142,28 @@ async function main(): Promise<void> {
   })());
 
   // ---------- clear 清盘 ----------
-  check('clear：删除磁盘历史，再次 load 为空；重复 clear 不抛错', (() => {
+  await checkAsync('clear：删除磁盘历史，再次 load 为空；重复 clear 不抛错', async () => {
     const tmp = tmpHome('clear');
     try {
       const store = new SessionHistoryStore(tmp);
-      store.save('u1', [{ role: 'user', content: 'hi' }]);
+      await store.save('u1', [{ role: 'user', content: 'hi' }]);
       assert.equal(store.load('u1').length, 1);
       store.clear('u1');
       assert.deepEqual(store.load('u1'), []);
       store.clear('u1'); // 幂等
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
 
   // ---------- 文件名穿越防护 ----------
-  check('恶意 open_id（../evil 等）：不能写出 sessions 目录', (() => {
+  await checkAsync('恶意 open_id（../evil 等）：不能写出 sessions 目录', async () => {
     const tmp = tmpHome('traversal');
     try {
       const store = new SessionHistoryStore(tmp);
-      store.save('../evil', [{ role: 'user', content: 'x' }]);
-      store.save('..%2f..%2fetc', [{ role: 'user', content: 'x' }]);
-      store.save('', [{ role: 'user', content: 'x' }]);
+      await store.save('../evil', [{ role: 'user', content: 'x' }]);
+      await store.save('..%2f..%2fetc', [{ role: 'user', content: 'x' }]);
+      await store.save('', [{ role: 'user', content: 'x' }]);
       // 目录外不得出现任何文件
       assert.equal(fs.existsSync(path.join(tmp, 'evil.json')), false);
       assert.deepEqual(fs.readdirSync(tmp), ['sessions']);
@@ -159,41 +174,56 @@ async function main(): Promise<void> {
         assert.equal(path.dirname(path.join(tmp, 'sessions', f)), path.join(tmp, 'sessions'));
       }
       assert.equal(store.load('../evil').length, 1);
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
 
-  // ---------- 目录文件数上限清理（按 mtime 删最老） ----------
-  check('文件总数超上限：按 mtime 清最老，新文件保留', (() => {
+  // ---------- 目录文件数上限清理（按 mtime 删最老；pruneIntervalMs=0 关闭节流） ----------
+  await checkAsync('文件总数超上限：按 mtime 清最老，新文件保留', async () => {
     const tmp = tmpHome('prune');
     try {
-      const store = new SessionHistoryStore(tmp, 3);
-      for (let i = 0; i < 5; i++) store.save(`u${i}`, [{ role: 'user', content: `m${i}` }]);
+      const store = new SessionHistoryStore(tmp, 3, 0);
+      for (let i = 0; i < 5; i++) await store.save(`u${i}`, [{ role: 'user', content: `m${i}` }]);
       // 人为拉开 mtime：u0 最老，u4 最新
       const dir = path.join(tmp, 'sessions');
       for (let i = 0; i < 5; i++) {
         const f = path.join(dir, `u${i}.json`);
         if (fs.existsSync(f)) fs.utimesSync(f, new Date(1000 * (i + 1)), new Date(1000 * (i + 1)));
       }
-      store.save('u5', [{ role: 'user', content: 'm5' }]); // 触发 prune
+      await store.save('u5', [{ role: 'user', content: 'm5' }]); // 触发 prune
       const files = fs.readdirSync(dir).sort();
       assert.equal(files.length, 3);
       assert.ok(!files.includes('u0.json') && !files.includes('u1.json') && !files.includes('u2.json'));
       assert.ok(files.includes('u5.json'));
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
+
+  // ---------- prune 节流：间隔窗口内重复 save 不重复清理，窗口到期后恢复 ----------
+  await checkAsync('prune 节流：间隔内 save 跳过清理，到期后按上限清最老', async () => {
+    const tmp = tmpHome('throttle');
+    try {
+      const store = new SessionHistoryStore(tmp, 1, 60_000);
+      await store.save('u1', [{ role: 'user', content: '1' }]); // 首次 save 触发 prune（未超上限，无操作）
+      await store.save('u2', [{ role: 'user', content: '2' }]); // 节流窗口内：不 prune，文件数可暂时超上限
+      assert.deepEqual(fs.readdirSync(store.dir).sort(), ['u1.json', 'u2.json']);
+      // 模拟节流窗口到期 → prune 恢复，清到上限 1（u3 最新，保留）
+      (store as unknown as { lastPruneAt: number }).lastPruneAt = 0;
+      await store.save('u3', [{ role: 'user', content: '3' }]);
+      assert.deepEqual(fs.readdirSync(store.dir), ['u3.json']);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   // ---------- AgentSession：重建时恢复磁盘历史 ----------
-  check('AgentSession：新建会话从磁盘恢复历史（system prompt 之后）', (() => {
+  await checkAsync('AgentSession：新建会话从磁盘恢复历史（system prompt 之后）', async () => {
     const tmp = tmpHome('restore');
     try {
       const store = new SessionHistoryStore(tmp);
-      store.save('u1', [
+      await store.save('u1', [
         { role: 'user', content: '之前的问题' },
         { role: 'assistant', content: '之前的回答' },
       ]);
@@ -207,11 +237,10 @@ async function main(): Promise<void> {
       assert.equal(msgs[0]!.role, 'system');
       assert.equal(msgs[1]!.content, '之前的问题');
       assert.equal(msgs[2]!.content, '之前的回答');
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
 
   // ---------- AgentSession：clearHistory 同步清盘 ----------
   await checkAsync('AgentSession：clearHistory 清掉磁盘历史，重建不再恢复', async () => {
@@ -228,7 +257,7 @@ async function main(): Promise<void> {
       } catch {
         /* 预期失败 */
       }
-      store.save('u1', [{ role: 'user', content: '旧历史' }]); // 模拟此前已落盘
+      await store.save('u1', [{ role: 'user', content: '旧历史' }]); // 模拟此前已落盘（同时排空失败轮次的异步写）
       session.clearHistory();
       assert.deepEqual(store.load('u1'), []);
     } finally {
@@ -252,13 +281,14 @@ async function main(): Promise<void> {
       } catch {
         /* LLM 不可达，预期失败 */
       }
+      await drainQueue(store); // persistHistory 为 fire-and-forget 异步写，先排空再断言/清理
       assert.deepEqual(store.load('u1'), []);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 
-  // ---------- AgentSession：成功轮次落盘（happy path 主链路） ----------
+  // ---------- AgentSession：成功轮次落盘（happy path 主链路，异步 fire-and-forget） ----------
   await checkAsync('AgentSession：成功对话结束落盘，重建 store 可读回该轮 user/assistant', async () => {
     const tmp = tmpHome('happy');
     const llm = await startFakeLlm('这是回答');
@@ -270,6 +300,8 @@ async function main(): Promise<void> {
         historyStore: store,
       });
       await session.handleUserMessage('你好');
+      // persistHistory 不阻塞对话返回：轮询等异步写完成
+      await waitFor(() => new SessionHistoryStore(tmp).load('u1').length === 2);
       const restored = new SessionHistoryStore(tmp).load('u1');
       assert.deepEqual(
         restored.map((m) => m.role),
@@ -284,11 +316,11 @@ async function main(): Promise<void> {
   });
 
   // ---------- SessionRouter：historyStore 透传给新建会话（接线） ----------
-  check('SessionRouter：getOrCreate 新建会话时从 historyStore 恢复磁盘历史', (() => {
+  await checkAsync('SessionRouter：getOrCreate 新建会话时从 historyStore 恢复磁盘历史', async () => {
     const tmp = tmpHome('router');
     try {
       const store = new SessionHistoryStore(tmp);
-      store.save('ou_x', [
+      await store.save('ou_x', [
         { role: 'user', content: '之前的对话' },
         { role: 'assistant', content: '之前的回复' },
       ]);
@@ -299,11 +331,10 @@ async function main(): Promise<void> {
         ['system', 'user', 'assistant'],
       );
       assert.equal(msgs[1]!.content, '之前的对话');
-      return true;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
-  })());
+  });
 
   // ---------- 版本不符 / 畸形 tool_calls ----------
   check('load：文件版本不符视为无历史（防旧假设解析新格式）', (() => {

@@ -7,10 +7,11 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
+import { Readable } from 'stream';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseBotArgs } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
-import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS } from '../src/channels/feishu';
+import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS } from '../src/channels/feishu';
 import { check, checkAsync, finish } from './testkit';
 
 // ---------- 退出码子进程测试的共用装置 ----------
@@ -190,6 +191,37 @@ async function main(): Promise<void> {
     new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
     return Lark.defaultHttpInstance.defaults.timeout === FEISHU_HTTP_TIMEOUT_MS && FEISHU_HTTP_TIMEOUT_MS > 0;
   })());
+
+  // ---------- downloadImage：流读取有整体超时（axios timeout 只覆盖到响应头） ----------
+  // client 是私有字段：与既有 fake 注入同一手法，一次性收窄后替换 messageResource.get
+  type ImageGet = () => Promise<{ getReadableStream: () => Readable; headers: Record<string, unknown> }>;
+  const stubImageGet = (ch: FeishuChannel, get: ImageGet): void => {
+    (ch as unknown as { client: unknown }).client = { im: { v1: { messageResource: { get } } } };
+  };
+
+  await checkAsync('downloadImage：正常读取聚合 Buffer 与 MIME', async () => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    stubImageGet(ch, async () => ({
+      getReadableStream: () => Readable.from([Buffer.from('ab'), Buffer.from('cd')]),
+      headers: { 'content-type': 'image/png' },
+    }));
+    const r = await ch.downloadImage('m1', 'k1');
+    assert.equal(r.data.toString(), 'abcd');
+    assert.equal(r.mimeType, 'image/png');
+  });
+
+  await checkAsync('downloadImage：body 停滞有整体超时，超时销毁流并抛错（走「下载失败」路径）', async () => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    const stalled = new Readable({ read() {} }); // 永不产出数据：模拟 TCP 停滞
+    stubImageGet(ch, async () => ({
+      getReadableStream: () => stalled,
+      headers: {},
+    }));
+    const t0 = Date.now();
+    await assert.rejects(ch.downloadImage('m1', 'k1', undefined, 50), /超时/);
+    assert.ok(Date.now() - t0 < FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS, '超时兜底应在注入的短超时内触发');
+    assert.ok(stalled.destroyed, '超时后应销毁流，释放底层连接');
+  });
 
   // ---------- 进程退出码：崩溃路径为 1，正常信号路径为 0 ----------
   const feishuEnv = { FEISHU_APP_ID: 'cli_x', FEISHU_APP_SECRET: 's', FEISHU_ALLOWED_OPEN_IDS: 'ou_x' };

@@ -98,7 +98,13 @@ async function main(): Promise<void> {
     const listProjects = [...handlers.keys()].find((k) => k.includes('list_projects'));
     if (listProjects) {
       const out = await handlers.get(listProjects)!({});
-      check('MCP list_projects 调用', typeof out === 'string' && out.length > 0, out.slice(0, 80).replace(/\n/g, ' '));
+      // 调用失败时 handler 返回错误字符串而非抛出（见 src/agent/tools.ts），
+      // 必须断言 UNTRUSTED 包裹标记且不含「调用失败」，否则失败也会 PASS
+      check(
+        'MCP list_projects 调用',
+        out.includes('UNTRUSTED_FEISHU_CONTENT') && !out.includes('调用失败'),
+        out.slice(0, 80).replace(/\n/g, ' '),
+      );
     } else {
       check('MCP list_projects 调用', false, '未找到 list_projects 工具');
     }

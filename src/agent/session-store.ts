@@ -1,12 +1,35 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
-import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import type { ChatMessage } from '../types';
 
 /** 目录内会话历史文件总数上限：超出按 mtime 删最老，防长驻 bot 无界增长。 */
 const DEFAULT_MAX_FILES = 100;
 const FILE_VERSION = 1;
+/** prune 节流：最多每隔这么久做一次目录扫描清理（每次 save 都 readdir+逐个 stat 太贵）。 */
+const DEFAULT_PRUNE_INTERVAL_MS = 60_000;
+
+/**
+ * writeFileAtomicPrivateSync 的异步版本（tmp+rename 原子写、目录 0700、文件 0600 语义一致）。
+ * private-file.ts 的同步实现供 config/memory 等同步路径共用；会话落盘每轮都发生，走异步不阻塞事件循环。
+ */
+async function writeFileAtomicPrivate(filePath: string, content: string): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  try {
+    await fs.promises.chmod(dir, 0o700);
+  } catch {
+    /* best-effort */
+  }
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  await fs.promises.writeFile(tmp, content, { encoding: 'utf8', mode: 0o600 });
+  try {
+    await fs.promises.chmod(tmp, 0o600);
+  } catch {
+    /* best-effort */
+  }
+  await fs.promises.rename(tmp, filePath);
+}
 
 interface SessionHistoryFile {
   version: number;
@@ -60,10 +83,15 @@ function isPersistable(m: unknown): m is ChatMessage {
 export class SessionHistoryStore {
   readonly dir: string;
   private readonly maxFiles: number;
+  private readonly pruneIntervalMs: number;
+  /** save 串行队列：并发 save 共用同一 tmp 文件名（pid 后缀），排队防互相截断/错乱。 */
+  private queue: Promise<void> = Promise.resolve();
+  private lastPruneAt = 0;
 
-  constructor(homeDir?: string, maxFiles = DEFAULT_MAX_FILES) {
+  constructor(homeDir?: string, maxFiles = DEFAULT_MAX_FILES, pruneIntervalMs = DEFAULT_PRUNE_INTERVAL_MS) {
     this.dir = path.join(homeDir || defaultDataHome(), 'sessions');
     this.maxFiles = maxFiles;
+    this.pruneIntervalMs = pruneIntervalMs;
   }
 
   private fileFor(userId: string): string {
@@ -90,18 +118,31 @@ export class SessionHistoryStore {
   }
 
   /**
-   * 全量重写该用户的历史文件（原子写 0600），随后按上限清理目录。
-   * 写盘失败抛错，由调用方记日志兜底（持久化是增强，不打断对话）。
+   * 全量重写该用户的历史文件（原子写 0600），随后按上限清理目录（按 pruneIntervalMs 节流）。
+   * 异步：返回 Promise，写盘失败以 rejection 上报，由调用方记日志兜底（持久化是增强，不打断对话）；
+   * fire-and-forget 调用方应 .catch 记日志。消息快照在入队时同步序列化，后续轮次变更不混入本次写入。
    */
-  save(userId: string, messages: ChatMessage[]): void {
+  save(userId: string, messages: ChatMessage[]): Promise<void> {
     const data: SessionHistoryFile = {
       version: FILE_VERSION,
       userId,
       updatedAt: new Date().toISOString(),
       messages: messages.filter(isPersistable),
     };
-    writeFileAtomicPrivateSync(this.fileFor(userId), JSON.stringify(data) + '\n');
-    this.prune();
+    const content = JSON.stringify(data) + '\n';
+    const file = this.fileFor(userId);
+    const job = this.queue.then(() => this.writeAndMaybePrune(file, content));
+    // 失败只回报本次调用方，不污染后续队列
+    this.queue = job.catch(() => undefined);
+    return job;
+  }
+
+  private async writeAndMaybePrune(file: string, content: string): Promise<void> {
+    await writeFileAtomicPrivate(file, content);
+    const now = Date.now();
+    if (now - this.lastPruneAt < this.pruneIntervalMs) return;
+    this.lastPruneAt = now;
+    await this.prune();
   }
 
   /** 删除该用户的磁盘历史（/clear 同步清盘）；文件不存在静默忽略。 */
@@ -110,25 +151,27 @@ export class SessionHistoryStore {
   }
 
   /** 文件总数超上限时按 mtime 删最老（mtime 读取失败的排最前优先删）。 */
-  private prune(): void {
+  private async prune(): Promise<void> {
     let files: string[];
     try {
-      files = fs.readdirSync(this.dir).filter((f) => f.endsWith('.json'));
+      files = (await fs.promises.readdir(this.dir)).filter((f) => f.endsWith('.json'));
     } catch {
       return;
     }
     if (files.length <= this.maxFiles) return;
-    const withMtime = files.map((f) => {
-      try {
-        return { f, mtime: fs.statSync(path.join(this.dir, f)).mtimeMs };
-      } catch {
-        return { f, mtime: 0 };
-      }
-    });
+    const withMtime = await Promise.all(
+      files.map(async (f) => {
+        try {
+          return { f, mtime: (await fs.promises.stat(path.join(this.dir, f))).mtimeMs };
+        } catch {
+          return { f, mtime: 0 };
+        }
+      }),
+    );
     withMtime.sort((a, b) => a.mtime - b.mtime);
     for (const { f } of withMtime.slice(0, withMtime.length - this.maxFiles)) {
       try {
-        fs.rmSync(path.join(this.dir, f), { force: true });
+        await fs.promises.rm(path.join(this.dir, f), { force: true });
       } catch {
         /* best-effort */
       }

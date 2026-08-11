@@ -209,6 +209,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `LLM_VISION` | `1` 时 bot 支持图片消息：下载图片随当次请求发给模型（**需模型支持图片输入**；图片不进会话历史、不落盘，单张上限 10MB）。默认关，关闭时图片消息仍提示仅支持文字 |
 | `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向 owner 推送当前迭代看板概览（进行中/待审阅/已完成/失败；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部迭代）。未设置或非法值 = 关闭 |
+| `HTA_TURN_TIMEOUT_MIN` | 单轮对话的墙钟时间上限（分钟），默认 30；超时按「已中止」收尾并提示 |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
 加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。注意：**当前目录 `.env` 中的凭证/命令类高危键不参与覆盖**（`LLM_API_KEY`、`FEISHU_*`、`HELIOS_KANBAN_MCP_COMMAND/ARGS`、`HELIOS_KANBAN_PACKAGE`、`HELIOS_KANBAN_URL`、代理与 npm registry 等，防供应链/命令注入；被忽略时仅输出一行 `console.warn`）——这类键请写入 `~/.helios-task-agent/.env`（或 shell 环境 / 项目 `.env`）。
@@ -250,7 +251,7 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 | `repo_fs` | 可选：对看板关联仓库本机 path 做 `list` / `read` / `grep`（不可越界） |
 | `work_summary` | 生成工作总结报告（HTML/MD） |
 | `skill_doc` | 按需读取已安装技能完整文档（SKILL.md） |
-| `skill_exec` | 运行技能目录内脚本（每次需用户确认） |
+| `skill_exec` | 运行技能目录内脚本（默认逐次确认，同类免问按具体脚本生效） |
 | `memory_*` | 持久化偏好与备注 |
 
 包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.sh`）。

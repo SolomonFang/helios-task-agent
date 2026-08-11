@@ -510,6 +510,102 @@ async function run(): Promise<void> {
     for (const id of toolCallIds(messages)) assert.ok(answered.has(id), `缺少 ${id} 的 tool 响应`);
   });
 
+  await checkAsync('runAgentTurn 轮次上限与调用次数上限文案区分', async () => {
+    const handlers = new Map([['noop', async () => 'ok']]);
+    // 轮次上限：每轮 1 个工具调用，25 轮耗尽（共 25 次调用，不触 30 次上限）
+    const messages1: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    const reply1 = await runAgentTurn({
+      client: mockClient([assistantWithCalls([['c0', 'noop', '{}']])]),
+      model: 'm',
+      messages: messages1,
+      tools: [],
+      handlers,
+    });
+    assert.ok(reply1.includes('轮次已达上限 25 轮'), reply1);
+    assert.ok(!reply1.includes('30 次'), reply1);
+    // 调用次数上限：单轮 31 个调用，耗尽于第 31 个
+    const calls: ToolCallSpec[] = Array.from({ length: 31 }, (_, i) => [`c${i}`, 'noop', '{}']);
+    const messages2: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    const reply2 = await runAgentTurn({
+      client: mockClient([assistantWithCalls(calls)]),
+      model: 'm',
+      messages: messages2,
+      tools: [],
+      handlers,
+    });
+    assert.ok(reply2.includes('工具调用已达上限 30 次'), reply2);
+    assert.ok(!reply2.includes('轮次'), reply2);
+  });
+
+  await checkAsync('runAgentTurn 墙钟超时：工具执行中到点，剩余调用补占位响应', async () => {
+    const client = mockClient([
+      assistantWithCalls([
+        ['c1', 'slow', '{}'],
+        ['c2', 'slow', '{}'],
+      ]),
+      finalText('不应到达'),
+    ]);
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    let ran = 0;
+    const handlers = new Map([
+      [
+        'slow',
+        async () => {
+          ran++;
+          await new Promise((r) => setTimeout(r, 60)); // 执行期间越过 30ms 墙钟
+          return 'ok';
+        },
+      ],
+    ]);
+    const reply = await runAgentTurn({ client, model: 'm', messages, tools: [], handlers, wallClockMs: 30 });
+    assert.ok(reply.includes('时间上限'), reply);
+    assert.ok(!reply.includes('中断'), reply); // 超时与用户 /stop 文案区分
+    assert.equal(ran, 1); // 超时后剩余工具未执行
+    const answered = toolResponseIds(messages);
+    for (const id of ['c1', 'c2']) assert.ok(answered.has(id), `缺少 ${id} 的 tool 响应`);
+  });
+
+  await checkAsync('runAgentTurn 墙钟超时：在途 LLM 请求被掐断并按超时文案收尾', async () => {
+    const client = {
+      chat: {
+        completions: {
+          create: async (_req: unknown, opts?: { signal?: AbortSignal }) => {
+            await new Promise<void>((resolve, reject) => {
+              const t = setTimeout(resolve, 5000);
+              opts?.signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(t);
+                  reject(new Error('This operation was aborted'));
+                },
+                { once: true },
+              );
+            });
+            return finalText('不应到达');
+          },
+        },
+      },
+    } as unknown as OpenAiClient;
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    const t0 = Date.now();
+    const reply = await runAgentTurn({ client, model: 'm', messages, tools: [], handlers: new Map(), wallClockMs: 30 });
+    assert.ok(Date.now() - t0 < 2000, '应在墙钟附近返回，不干等在途请求');
+    assert.ok(reply.includes('时间上限'), reply);
+    assert.equal(messages[messages.length - 1]!.role, 'user'); // 请求未入历史，无残留
+  });
+
   await checkAsync('runAgentTurn 上下文超限：自动丢最旧轮次并恢复', async () => {
     let calls = 0;
     const client = {

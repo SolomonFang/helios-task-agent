@@ -35,7 +35,18 @@ import { minimalChildEnv } from '../infra/proc-env';
 import { packageRoot } from '../infra/paths';
 import { errMessage } from '../infra/err';
 
+/** hk.sh 包内兜底路径（用户目录无覆盖版本时使用，见 resolveHkScript）。 */
 const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+
+/**
+ * hk.sh 定位：与 skill_doc 同一套 resolveSkillDir（用户目录优先覆盖），找不到回退包内路径。
+ * 每次调用重新解析：运行中新装/更新用户技能即时生效，且与 skill_doc 读到的文档版本一致。
+ */
+function resolveHkScript(): string {
+  const dir = resolveSkillDir('helios-kanban-remote');
+  return dir ? path.join(dir, 'scripts', 'hk.sh') : HK_SCRIPT;
+}
+
 const MAX_OUTPUT = 8000;
 const EXEC_TIMEOUT = 60000;
 
@@ -192,6 +203,15 @@ async function appendWorkspaceReadyCheck(
 /** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
 const MAX_CREATES_PER_SESSION = 10;
 const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，系统安全限制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
+
+/**
+ * 会话级创建计数：由 AgentSession 持有并经 options 传入 buildTools。
+ * MCP 重连 / /config 会重建全部工具闭包，计数若放闭包里会被清零、上限形同虚设；
+ * 提升为会话级状态后跨重建存活，仅 clearHistory 显式重置。
+ */
+export interface CreateCounter {
+  count: number;
+}
 
 /** 确认卡片展示的优先级中文映射（看板内部值为英文枚举）。 */
 const PRIORITY_LABELS: Record<string, string> = { urgent: '紧急', high: '高', medium: '中', low: '低' };
@@ -469,14 +489,15 @@ function makeGatedWriter({
   kanbanUrl,
   confirm,
   auditHome,
+  createCounter,
 }: {
   uid: string;
   registry: SourceRegistry;
   kanbanUrl: string;
   confirm?: ConfirmFn;
   auditHome?: string;
+  createCounter: CreateCounter;
 }): GatedWrite {
-  let createCount = 0;
 
   /** Returns a block message if any source URL was already synced; cleans stale mappings. */
   const checkDuplicates = async (urls: string[]): Promise<string | null> => {
@@ -516,7 +537,7 @@ function makeGatedWriter({
         return dup;
       }
     }
-    if (p.isCreate && createCount >= MAX_CREATES_PER_SESSION) {
+    if (p.isCreate && createCounter.count >= MAX_CREATES_PER_SESSION) {
       auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'denied' }, auditHome);
       return CREATE_CAP_MESSAGE;
     }
@@ -545,7 +566,7 @@ function makeGatedWriter({
       auditHome,
     );
     if (ok && p.urls.length) recordSources(p.urls, result, p.title);
-    if (ok && p.isCreate) createCount++;
+    if (ok && p.isCreate) createCounter.count++;
     return wrapUntrusted(result);
   };
 }
@@ -574,13 +595,14 @@ function makeKanbanMcpHandler({
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
     const summary = summarizeMcp(tool.name, args);
-    const detail = formatMcpDetail(tool.name, args);
     const isCreate = /create/i.test(tool.name);
     const isStart = /start_workspace/i.test(tool.name);
     return runGatedWrite({
       kind: 'kanban',
       summary,
-      detail: () => detail,
+      // start 前置补全会原地改写 args.repos（补 base_branch），detail 取 getter 在闸门/审计时
+      // 按最终参数重算（确认卡片须展示实际执行的参数，同 hk 路径，见 makeHkCliHandler）
+      detail: () => formatMcpDetail(tool.name, args),
       isCreate,
       isStart,
       urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
@@ -681,7 +703,7 @@ function makeHkCliHandler({
     }
     const argv = args as string[];
     if (classifyHk(argv) === 'read') {
-      return wrapUntrusted(await run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal }));
+      return wrapUntrusted(await run('bash', [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }));
     }
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
@@ -725,7 +747,7 @@ function makeHkCliHandler({
             return null;
           }
         : undefined,
-      execute: () => run('bash', [HK_SCRIPT, ...argv], { env: hkEnv, signal: ctx?.signal }),
+      execute: () => run('bash', [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }),
       signal: ctx?.signal,
     });
   };
@@ -1019,6 +1041,7 @@ export function buildTools({
   registry,
   auditHome,
   reportLinkBaseUrl,
+  createCounter,
 }: {
   mcp: KanbanMcp | null;
   kanbanUrl: string;
@@ -1037,12 +1060,21 @@ export function buildTools({
   auditHome?: string;
   /** bot 场景传入报告静态服务基地址：work_summary 报告改推 HTTP 链接（CLI 不传，保留本机路径）。 */
   reportLinkBaseUrl?: string;
+  /** 会话级创建计数（缺省每次 buildTools 新建；AgentSession 传入以跨工具闭包重建存活）。 */
+  createCounter?: CreateCounter;
 }): { openAiTools: OpenAiTool[]; handlers: ToolHandlers } {
   const openAiTools: OpenAiTool[] = [];
   const handlers: ToolHandlers = new Map();
   const uid = userId || 'local';
   const reg = registry || new SourceRegistry();
-  const runGatedWrite = makeGatedWriter({ uid, registry: reg, kanbanUrl, confirm, auditHome });
+  const runGatedWrite = makeGatedWriter({
+    uid,
+    registry: reg,
+    kanbanUrl,
+    confirm,
+    auditHome,
+    createCounter: createCounter || { count: 0 },
+  });
 
   if (mcp && mcp.connected) {
     for (const tool of mcp.tools) {

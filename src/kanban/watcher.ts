@@ -93,10 +93,13 @@ export class KanbanWatcher {
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
   private state: WatchState | null;
+  /** 最近一次落盘快照的序列化结果（tasks/approvals）：tick 里比较与写盘复用它，不再每轮重复 stringify。 */
+  private lastSnapshotJson: { tasks: string; approvals: string } | null;
 
   constructor(opts: KanbanWatcherOptions) {
     this.opts = opts;
     this.state = this.load();
+    this.lastSnapshotJson = this.state ? KanbanWatcher.serializeSnapshot(this.state) : null;
   }
 
   start(): void {
@@ -155,9 +158,23 @@ export class KanbanWatcher {
     }
   }
 
-  private persist(): void {
+  /** 快照序列化（tasks/approvals 各一份，与 state 文件内的缩进口径一致）：每 tick 只算一次，比较与写盘复用。 */
+  private static serializeSnapshot(state: WatchState): { tasks: string; approvals: string } {
+    return { tasks: JSON.stringify(state.tasks, null, 2), approvals: JSON.stringify(state.approvals, null, 2) };
+  }
+
+  /** 落盘 state：由调用方已算好的快照序列化结果拼装（pending 增量序列化），不再整树重复 stringify。 */
+  private persist(snapshotJson: { tasks: string; approvals: string }): void {
     try {
-      writeFileAtomicPrivateSync(this.opts.statePath, JSON.stringify(this.state, null, 2) + '\n');
+      // 与 JSON.stringify(state, null, 2) 等价的拼装：嵌套部分每行补两格缩进
+      const indent = (json: string) => json.replace(/\n/g, '\n  ');
+      const pending = this.state?.pending;
+      const pendingPart = pending ? `,\n  "pending": ${indent(JSON.stringify(pending, null, 2))}` : '';
+      writeFileAtomicPrivateSync(
+        this.opts.statePath,
+        `{\n  "tasks": ${indent(snapshotJson.tasks)},\n  "approvals": ${indent(snapshotJson.approvals)}${pendingPart}\n}\n`,
+      );
+      this.lastSnapshotJson = snapshotJson;
     } catch {
       /* best-effort */
     }
@@ -174,9 +191,11 @@ export class KanbanWatcher {
         // 否则恢复后 diff 会把全部 pending 审批当成「新的待审批」再推一遍
         if (approvalsUnknown) current.approvals = prev.approvals;
       }
+      // 快照序列化每 tick 只算这一次：下方基线落盘、persistIfChanged 的比较与写盘都复用它
+      const snapshotJson = KanbanWatcher.serializeSnapshot(current);
       if (!prev) {
         this.state = current;
-        this.persist();
+        this.persist(snapshotJson);
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
         return;
       }
@@ -185,7 +204,7 @@ export class KanbanWatcher {
       const next: WatchState = { ...current };
       if (Object.keys(pending).length) next.pending = pending;
       this.state = next;
-      this.persistIfChanged(current, prev, pendingTouched);
+      this.persistIfChanged(prev, pendingTouched, snapshotJson);
       if (failed) {
         this.opts.log?.(`${failed} 个 (事件, owner) 组合推送失败，已记入待重投队列，下轮仅重试未送达组合`);
       }
@@ -338,12 +357,16 @@ export class KanbanWatcher {
   }
 
   /** 仅在快照有变化或本轮碰过待重投队列（含刚清零需落盘出队的）时写盘，无变化的空转 tick 不重复写 state 文件。 */
-  private persistIfChanged(current: WatchState, prev: WatchState, pendingTouched: boolean): void {
+  private persistIfChanged(
+    prev: WatchState,
+    pendingTouched: boolean,
+    snapshotJson: { tasks: string; approvals: string },
+  ): void {
+    const last = this.lastSnapshotJson;
     const snapshotChanged =
-      JSON.stringify(current.tasks) !== JSON.stringify(prev.tasks) ||
-      JSON.stringify(current.approvals) !== JSON.stringify(prev.approvals);
+      !last || snapshotJson.tasks !== last.tasks || snapshotJson.approvals !== last.approvals;
     const touched = pendingTouched || Boolean(prev.pending && Object.keys(prev.pending).length);
-    if (snapshotChanged || touched) this.persist();
+    if (snapshotChanged || touched) this.persist(snapshotJson);
   }
 
   /** 拉取一轮快照；approvals 端点失败时 approvalsUnknown=true（调用方沿用旧快照，见 tick）。 */

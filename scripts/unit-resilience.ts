@@ -518,6 +518,64 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- KanbanMcp：close 后清理残留孙进程（SDK 不透传 detached，无进程组杀） ----------
+  await checkAsync('KanbanMcp：close 补杀被 reparent 的孙进程，重复 close 幂等不报错', async () => {
+    if (process.platform !== 'darwin' && process.platform !== 'linux') return; // 清理仅覆盖 darwin/linux
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-mcp-tree-'));
+    const pidFile = path.join(tmp, 'grandchild.pid');
+    try {
+      // 包装脚本：既是 MCP stdio server，又在启动时 spawn 一个孙进程 sleeper 并落 pid 文件
+      // （孙进程 stdio ignore + unref，父死後被 reparent——正是泄漏场景的最小复现）
+      const sdkRoot = path.join(__dirname, '..', 'node_modules', '@modelcontextprotocol/sdk', 'dist', 'cjs');
+      const wrapperScript = path.join(tmp, 'mock-mcp-with-grandchild.cjs');
+      fs.writeFileSync(
+        wrapperScript,
+        [
+          `const { spawn } = require('child_process');`,
+          `const fs = require('fs');`,
+          `const gc = spawn(process.execPath, ['-e', 'setInterval(()=>{}, 60000)'], { stdio: 'ignore' });`,
+          `gc.unref();`,
+          `fs.writeFileSync(${JSON.stringify(pidFile)}, String(gc.pid));`,
+          `const { Server } = require(${JSON.stringify(path.join(sdkRoot, 'server', 'index.js'))});`,
+          `const { StdioServerTransport } = require(${JSON.stringify(path.join(sdkRoot, 'server', 'stdio.js'))});`,
+          `const { ListToolsRequestSchema } = require(${JSON.stringify(path.join(sdkRoot, 'types.js'))});`,
+          `const server = new Server({ name: 'mock', version: '1.0.0' }, { capabilities: { tools: {} } });`,
+          `server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));`,
+          `server.connect(new StdioServerTransport()).catch(() => process.exit(1));`,
+        ].join('\n'),
+      );
+      const mcp = new KanbanMcp({ command: process.execPath, args: [wrapperScript] });
+      await mcp.connect({ timeoutMs: 15000 });
+      // 等孙进程 pid 落盘（spawn→写文件与 MCP 握手并发）
+      let gcPid = 0;
+      for (let i = 0; i < 50 && !gcPid; i++) {
+        if (fs.existsSync(pidFile)) gcPid = Number(fs.readFileSync(pidFile, 'utf8'));
+        if (!gcPid) await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(gcPid > 0, '孙进程应已启动并落盘 pid');
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      assert.ok(alive(gcPid), 'close 前孙进程应存活');
+      await mcp.close();
+      // close 内部已含 SIGTERM→300ms→SIGKILL：resolve 时孙进程应已被补杀（短轮询吸收信号时延）
+      let dead = !alive(gcPid);
+      for (let i = 0; i < 20 && !dead; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        dead = !alive(gcPid);
+      }
+      assert.ok(dead, `close 后孙进程 ${gcPid} 不应残留`);
+      await mcp.close(); // 幂等：无 client、无快照，不得报错
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- apiGet：signal 与超时组合 / 重试策略 ----------
   await checkAsync('apiGet：传 signal 后 timeoutMs 仍兜底（signal 未触发时按超时中断）', async () => {
     // 挂起服务：接受连接但永不响应

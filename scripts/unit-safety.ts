@@ -154,6 +154,80 @@ async function main() {
     }
   });
 
+  // ---------- loadEnvFiles：HELIOS_TASK_AGENT_ENV 自指绕过与 OCR/更新/调试键 ----------
+  await checkAsync('loadEnvFiles：cwd .env 的 HELIOS_TASK_AGENT_ENV/OCR_LLM_*/HTA_UPDATE_REGISTRY/HTA_TEST_CRASH 被忽略，第二文件不加载', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety2-home-'));
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety2-cwd-'));
+    const tmpEvil = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety2-evil-'));
+    const evilEnv = path.join(tmpEvil, 'evil.env');
+    // cwd .env 指向的第二文件：若被 forced 加载则泄露凭证/注入配置
+    fs.writeFileSync(evilEnv, 'LLM_BASE_URL=http://evil-llm\nLLM_API_KEY=evil-key\nHTA_SAFETY_EVIL_LOADED=1\n');
+    fs.writeFileSync(
+      path.join(tmpCwd, '.env'),
+      [
+        `HELIOS_TASK_AGENT_ENV=${evilEnv}`,
+        'OCR_LLM_URL=http://evil-ocr',
+        'OCR_LLM_TOKEN=evil-ocr-token',
+        'OCR_LLM_MODEL=evil-ocr-model',
+        'HTA_UPDATE_REGISTRY=http://evil-registry',
+        'HTA_TEST_CRASH=1',
+        '',
+      ].join('\n'),
+    );
+    const ENV_KEYS = [
+      'HELIOS_TASK_AGENT_ENV',
+      'OCR_LLM_URL',
+      'OCR_LLM_TOKEN',
+      'OCR_LLM_MODEL',
+      'HTA_UPDATE_REGISTRY',
+      'HTA_TEST_CRASH',
+      'LLM_BASE_URL',
+      'LLM_API_KEY',
+      'HTA_SAFETY_EVIL_LOADED',
+      'HELIOS_TASK_AGENT_HOME',
+    ];
+    const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
+    for (const k of ENV_KEYS) {
+      if (k !== 'HELIOS_TASK_AGENT_HOME') delete process.env[k];
+    }
+    const prevCwd = process.cwd();
+    try {
+      process.env.HELIOS_TASK_AGENT_HOME = tmpHome;
+      process.chdir(tmpCwd);
+      loadEnvFiles();
+      // 受限键一律不得被 cwd .env 注入
+      assert.equal(process.env.OCR_LLM_URL, undefined, 'OCR_LLM_URL 应被忽略');
+      assert.equal(process.env.OCR_LLM_TOKEN, undefined, 'OCR_LLM_TOKEN 应被忽略');
+      assert.equal(process.env.OCR_LLM_MODEL, undefined, 'OCR_LLM_MODEL 应被忽略');
+      assert.equal(process.env.HTA_UPDATE_REGISTRY, undefined, 'HTA_UPDATE_REGISTRY 应被忽略');
+      assert.equal(process.env.HTA_TEST_CRASH, undefined, 'HTA_TEST_CRASH 应被忽略');
+      // HELIOS_TASK_AGENT_ENV 自指绕过：shell 未设置时 forced 不加载，第二文件内容不进环境
+      assert.equal(process.env.HELIOS_TASK_AGENT_ENV, undefined, 'HELIOS_TASK_AGENT_ENV 应被忽略');
+      assert.equal(process.env.HTA_SAFETY_EVIL_LOADED, undefined, '恶意第二文件不得被加载');
+      assert.notEqual(process.env.LLM_BASE_URL, 'http://evil-llm');
+      assert.notEqual(process.env.LLM_API_KEY, 'evil-key');
+
+      // 快照语义：shell 提供的合法 forced 文件仍生效，cwd .env 无法将其改指向恶意文件
+      const legitEnv = path.join(tmpHome, 'legit.env');
+      fs.writeFileSync(legitEnv, 'HTA_SAFETY_LEGIT_LOADED=from-legit\n');
+      process.env.HELIOS_TASK_AGENT_ENV = legitEnv;
+      loadEnvFiles();
+      assert.equal(process.env.HTA_SAFETY_LEGIT_LOADED, 'from-legit', '合法 forced 文件应加载');
+      assert.equal(process.env.HELIOS_TASK_AGENT_ENV, legitEnv, 'cwd .env 不得覆盖 shell 的 HELIOS_TASK_AGENT_ENV');
+      assert.equal(process.env.HTA_SAFETY_EVIL_LOADED, undefined, '恶意第二文件仍不得被加载');
+    } finally {
+      process.chdir(prevCwd);
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      delete process.env.HTA_SAFETY_LEGIT_LOADED;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(tmpEvil, { recursive: true, force: true });
+    }
+  });
+
   // ---------- .env 序列化 round-trip：dotenv.parse 原样读回 ----------
   await checkAsync('writeEnvFile：含空格/#/引号的值序列化后 dotenv.parse 原样读回', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-env-'));
@@ -234,31 +308,31 @@ async function main() {
       '.docker/config.json',
       '.kube/config.json',
     ];
+    const deniedOuts = await Promise.all(denied.map((f) => repoFsRead(root, f)));
     check(
       'repoFsRead 敏感文件命中 denylist（拒绝且不泄露内容）',
-      denied.every((f) => {
-        const out = repoFsRead(root, f);
-        return (
+      deniedOuts.every(
+        (out) =>
           out.includes('已拒绝读取') &&
           !out.includes('sk-secret') &&
           !out.includes('PRIVATE KEY') &&
           !out.includes('json-cred') &&
           !out.includes('docker-secret') &&
-          !out.includes('kube-secret')
-        );
-      }),
+          !out.includes('kube-secret'),
+      ),
     );
-    const okOut = repoFsRead(root, 'app.ts');
+    const okOut = await repoFsRead(root, 'app.ts');
     check('repoFsRead 普通文件放行', okOut.includes('const token = 1;'));
     check(
       'repoFsRead 普通 config.json 放行（不误伤非 .docker/.kube 路径）',
-      repoFsRead(root, 'config.json').includes('"port":7964'),
+      (await repoFsRead(root, 'config.json')).includes('"port":7964'),
     );
     check(
       'repoFsList 拒列 .git 目录（路径整体判定，非仅 basename）',
-      repoFsList(root, '.git').includes('已拒绝读取') && repoFsList(root, '.').includes('app.ts'),
+      (await repoFsList(root, '.git')).includes('已拒绝读取') &&
+        (await repoFsList(root, '.')).includes('app.ts'),
     );
-    const grepTree = repoFsGrep(root, 'token');
+    const grepTree = await repoFsGrep(root, 'token');
     check(
       'repoFsGrep 树扫描跳过敏感文件（不泄露 .npmrc/.env/.git/凭证 JSON 内容）',
       grepTree.includes('app.ts') &&
@@ -269,29 +343,29 @@ async function main() {
         !grepTree.includes('kube-secret'),
       grepTree.split('\n').slice(0, 4).join(' | '),
     );
-    const grepDirect = repoFsGrep(root, 'token', '.env');
+    const grepDirect = await repoFsGrep(root, 'token', '.env');
     check('repoFsGrep 直接对敏感文件给出明确拒绝说明', grepDirect.includes('已拒绝读取'));
     check(
       'repoFsGrep 直接对 .git/ 目录给出明确拒绝说明',
-      repoFsGrep(root, 'token', '.git').includes('已拒绝读取') &&
-        repoFsGrep(root, 'token', '.git/config').includes('已拒绝读取'),
+      (await repoFsGrep(root, 'token', '.git')).includes('已拒绝读取') &&
+        (await repoFsGrep(root, 'token', '.git/config')).includes('已拒绝读取'),
     );
     check(
       'repoFsGrep ReDoS 防护：嵌套量词与超长 pattern 拒绝',
-      repoFsGrep(root, '(\\w+)+$').includes('参数错误') &&
-        repoFsGrep(root, 'a'.repeat(201)).includes('pattern 过长') &&
-        repoFsGrep(root, 'token').includes('app.ts'),
+      (await repoFsGrep(root, '(\\w+)+$')).includes('参数错误') &&
+        (await repoFsGrep(root, 'a'.repeat(201))).includes('pattern 过长') &&
+        (await repoFsGrep(root, 'token')).includes('app.ts'),
     );
     check(
       'repoFsGrep ReDoS 防护：无括号连续相邻量词段拒绝（.*.* / .+.* / .*\\w+）',
-      repoFsGrep(root, '.*.*.*.*.*b').includes('连续相邻的量词段') &&
-        repoFsGrep(root, '.+.*').includes('连续相邻的量词段') &&
-        repoFsGrep(root, '.*\\w+key').includes('连续相邻的量词段'),
+      (await repoFsGrep(root, '.*.*.*.*.*b')).includes('连续相邻的量词段') &&
+        (await repoFsGrep(root, '.+.*')).includes('连续相邻的量词段') &&
+        (await repoFsGrep(root, '.*\\w+key')).includes('连续相邻的量词段'),
     );
     check(
       'repoFsGrep ReDoS 防护不误伤：字符类内 .* 字面量与非相邻量词段放行',
-      repoFsGrep(root, '[.*]').includes('pattern: [.*]') && // 未被拒即放行（输出头含原 pattern）
-        repoFsGrep(root, 'a.*b.*c').includes('pattern: a.*b.*c'),
+      (await repoFsGrep(root, '[.*]')).includes('pattern: [.*]') && // 未被拒即放行（输出头含原 pattern）
+        (await repoFsGrep(root, 'a.*b.*c')).includes('pattern: a.*b.*c'),
     );
     fs.rmSync(tmp, { recursive: true, force: true });
   }

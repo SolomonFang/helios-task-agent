@@ -2,11 +2,13 @@
 // 1. kanban/summary collectWorkSummary 采集层（日期过滤 / attempt 挑选 / diff 统计合并）
 // 2. handler hta_review 按钮全链路（分发 → handleAiReview → runAiReview，PATH 桩伪造 ocr）
 // 3. cli askWithAbort 三路竞态（正常回答 / Ctrl+C abort / 超时自动拒绝；createAskWithAbort 已抽出可测）
+//    + abort/超时收尾取消挂起 waiter（fake reader 注入 waiter 语义，验证中断后输入不被吞）
 // 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径
+// 5. cli 启动窗口信号处理（信号注册前移到 ensureKanbanOrExit 之前：探测在途时 SIGTERM/SIGINT 优雅退出）
 // 仅用 loopback mock 服务与 PATH 桩，离线可跑。Run: npx tsx scripts/unit-coverage.ts
 
 import assert from 'node:assert/strict';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -54,6 +56,48 @@ class FakeChannel {
   async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
     this.cards.push({ openId, card });
   }
+}
+
+// --- fake line reader：对齐 cli createLineReader 的 waiter/队列语义（line 优先喂挂起的 waiter，
+// 无 waiter 则入队），供 askWithAbort「中断/超时收尾取消挂起 waiter」的回归测试注入 ---
+function createFakeLineReader(): {
+  feed: (line: string) => void;
+  ask: () => Promise<string | null>;
+  cancelPending: () => void;
+} {
+  const queue: string[] = [];
+  let waiter: ((line: string | null) => void) | null = null;
+  return {
+    feed(line) {
+      if (waiter) {
+        const w = waiter;
+        waiter = null;
+        w(line);
+      } else {
+        queue.push(line);
+      }
+    },
+    ask: () =>
+      new Promise<string | null>((resolve) => {
+        if (queue.length) return resolve(queue.shift()!);
+        waiter = resolve;
+      }),
+    cancelPending: () => {
+      if (waiter) {
+        const w = waiter;
+        waiter = null;
+        w(null);
+      }
+    },
+  };
+}
+
+/** 带超时的等待：waiter 若未被取消，下一次 ask 永远等不到行 → 以明确报错收尾而非挂死测试。 */
+async function askOrTimeout(ask: () => Promise<string | null>, timeoutMs = 2000): Promise<string | null> {
+  return Promise.race([
+    ask(),
+    new Promise<never>((_r, rej) => setTimeout(() => rej(new Error('输入被陈旧 waiter 吞掉')), timeoutMs)),
+  ]);
 }
 
 async function main(): Promise<void> {
@@ -434,6 +478,39 @@ async function run(): Promise<void> {
     assert.equal(await askWithAbort('问: ', 5000), '及时回答');
   });
 
+  await checkAsync('askWithAbort：abort 收尾取消挂起 waiter，中断后输入不被吞', async () => {
+    const reader = createFakeLineReader();
+    const ctl = new AbortController();
+    const askWithAbort = createAskWithAbort(reader.ask, () => ctl, reader.cancelPending);
+    const p = askWithAbort('允许执行? ');
+    ctl.abort(); // Ctrl+C：闸门按拒绝收尾，底层 ask 的 waiter 仍挂着
+    assert.equal(await p, null);
+    // 闸门收尾后、主循环下一次 ask('› ') 之前用户敲入的一行：应入队留给下一次 ask，
+    // 不被陈旧 waiter 吞掉（不取消 waiter 时 feed 会喂给旧 waiter，下一次 ask 永远等不到）
+    reader.feed('中断后的输入');
+    assert.equal(await askOrTimeout(reader.ask), '中断后的输入');
+  });
+
+  await checkAsync('askWithAbort：超时收尾同样取消挂起 waiter', async () => {
+    const reader = createFakeLineReader();
+    const askWithAbort = createAskWithAbort(reader.ask, () => null, reader.cancelPending);
+    assert.equal(await askWithAbort('允许执行? ', 50), ASK_TIMEOUT);
+    reader.feed('超时后的输入');
+    assert.equal(await askOrTimeout(reader.ask), '超时后的输入');
+  });
+
+  await checkAsync('askWithAbort：正常回答路径不触发 cancelPending（waiter 已被回答消费）', async () => {
+    const reader = createFakeLineReader();
+    const askWithAbort = createAskWithAbort(reader.ask, () => null, reader.cancelPending);
+    const p = askWithAbort('问: ', 5000);
+    reader.feed('y');
+    assert.equal(await p, 'y');
+    // 回答后再次提问能正常拿到下一行（cancelPending 若误触发会多 resolve 一个 null 出来）
+    const p2 = askWithAbort('问2: ', 5000);
+    reader.feed('n');
+    assert.equal(await p2, 'n');
+  });
+
   // ================= 盲区 4：config-wizard 非交互部分 + 链路 =================
 
   check('resolveAllowedOpenIds：回车保留现状 / 新列表覆盖 / 换绑场景 "-" 清除', (() => {
@@ -561,6 +638,100 @@ async function run(): Promise<void> {
       globalThis.fetch = origFetch;
     }
     check('feishu-verify 测试后全局 fetch 已恢复', globalThis.fetch === origFetch);
+  });
+
+  // ================= 盲区 5：cli 启动窗口信号处理 =================
+  // 信号注册已前移到 ensureKanbanOrExit 之前（对齐 bot-main「尽早注册 + 创建即登记」）：
+  // 看板拉起窗口内（健康探测在途，最长 90s）收到 SIGTERM/SIGINT 必须走优雅退出（退出码 0）——
+  // 修复前 cli 根本没有 SIGTERM handler（默认终止，in-flight 子进程成孤儿），
+  // Ctrl+C 也因 handler 未注册而不退出、启动流程继续跑。
+  // 以完整 env 启动真实 cli 入口（tsx 子进程）+ 挂起式 mock 看板，装置模式同 unit-bot 的退出码测试。
+
+  const repoRoot = path.join(__dirname, '..');
+  const tsxCli = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+  /** 挂起式 mock 看板：/api/health 接受连接但永不响应，ensureKanbanOrExit 的探测随之挂起（启动窗口在途态）。 */
+  const startHangingKanban = async (): Promise<{ server: http.Server; url: string; healthSeen: Promise<void> }> => {
+    let markSeen!: () => void;
+    const healthSeen = new Promise<void>((r) => (markSeen = r));
+    const server = http.createServer((req, res) => {
+      if ((req.url || '').startsWith('/api/health')) {
+        markSeen();
+        return; // 永不响应：探测挂起直到 fetchHealth 自身超时
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    return { server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, healthSeen };
+  };
+
+  /** 在健康探测挂起时给 cli 子进程发信号，返回退出码与输出。 */
+  const signalDuringKanbanBoot = async (
+    signal: 'SIGINT' | 'SIGTERM',
+    url: string,
+    healthSeen: Promise<void>,
+  ): Promise<{ code: number | null; out: () => string }> => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-sig-'));
+    const child = spawn(process.execPath, [tsxCli, path.join(repoRoot, 'src', 'cli.ts')], {
+      cwd: tmp, // 避免 cwd .env 干扰子进程配置
+      env: {
+        ...process.env,
+        HELIOS_TASK_AGENT_HOME: tmp, // 数据目录隔离；同时让 home .env 不存在（不会覆盖下列 env）
+        HELIOS_TASK_AGENT_ENV: path.join(tmp, 'nonexistent.env'), // 中和父进程可能带来的强制 env
+        LLM_BASE_URL: 'http://127.0.0.1:9/v1',
+        LLM_API_KEY: 'sk-x',
+        LLM_MODEL: 'm',
+        HELIOS_KANBAN_URL: url,
+        // 探测挂起期间即发信号；即使信号迟到也不许触发 npx 自动拉起看板（离线测试）
+        HELIOS_KANBAN_AUTO_START: '0',
+        HTA_UPDATE_CHECK: '0',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let buf = '';
+    child.stdout.on('data', (d: Buffer) => (buf += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (buf += d.toString()));
+    try {
+      // 探测请求在途 = 已进 ensureKanbanOrExit；信号处理注册在其之前，此刻必然已生效
+      await healthSeen;
+      child.kill(signal);
+      const code = await new Promise<number | null>((resolve, reject) => {
+        const t = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error('子进程退出超时'));
+        }, 20000);
+        child.on('exit', (c) => {
+          clearTimeout(t);
+          resolve(c);
+        });
+      });
+      return { code, out: () => buf };
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  };
+
+  await checkAsync('cli 启动窗口：看板探测在途时收到 SIGTERM，优雅退出（退出码 0）', async () => {
+    const kanban = await startHangingKanban();
+    try {
+      const { code, out } = await signalDuringKanbanBoot('SIGTERM', kanban.url, kanban.healthSeen);
+      // 修复前无 SIGTERM handler：进程被信号默认终止，exit code 为 null
+      assert.equal(code, 0, `SIGTERM 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+    } finally {
+      await stopServer(kanban.server);
+    }
+  });
+
+  await checkAsync('cli 启动窗口：看板探测在途时按 Ctrl+C 直接退出（不再吞信号继续启动）', async () => {
+    const kanban = await startHangingKanban();
+    try {
+      const { code, out } = await signalDuringKanbanBoot('SIGINT', kanban.url, kanban.healthSeen);
+      assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
+      assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+    } finally {
+      await stopServer(kanban.server);
+    }
   });
 
   finish();

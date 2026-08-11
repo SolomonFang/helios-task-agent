@@ -9,6 +9,7 @@ import { escapeHtml, renderReportPage } from './report-page';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
 import { pruneOldReports, sanitizeName } from './report-utils';
+import { TASK_STATUS_KEYS, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
 
 // escapeHtml 已移到 report-page.ts（两个报告渲染器共用）；re-export 兼容既有调用方
@@ -20,18 +21,21 @@ interface StatusMeta {
   badge: string; // css class
 }
 
-const STATUS_ORDER = ['done', 'inreview', 'inprogress', 'todo', 'cancelled'] as const;
+const STATUS_ORDER = TASK_STATUS_KEYS;
 
-const STATUS_META: Record<string, StatusMeta> = {
-  done: { emoji: '✅', label: '已完成', badge: 'done' },
-  inreview: { emoji: '🔍', label: '待审阅', badge: 'inreview' },
-  inprogress: { emoji: '🚧', label: '进行中', badge: 'inprogress' },
-  todo: { emoji: '📋', label: '待办', badge: 'todo' },
-  cancelled: { emoji: '🚫', label: '已取消', badge: 'cancelled' },
+/** 状态展示层扩展（emoji/badge）；状态键与中文 label 的唯一来源见 kanban/status.ts。 */
+const STATUS_META: Record<string, { emoji: string; badge: string }> = {
+  done: { emoji: '✅', badge: 'done' },
+  inreview: { emoji: '🔍', badge: 'inreview' },
+  inprogress: { emoji: '🚧', badge: 'inprogress' },
+  todo: { emoji: '📋', badge: 'todo' },
+  cancelled: { emoji: '🚫', badge: 'cancelled' },
 };
 
 function statusMeta(status: string): StatusMeta {
-  return STATUS_META[status] ?? { emoji: '🗂', label: status || '其他', badge: 'todo' };
+  const meta = STATUS_META[status];
+  if (meta) return { ...meta, label: statusLabel(status) };
+  return { emoji: '🗂', label: statusLabel(status) || '其他', badge: 'todo' };
 }
 
 /** 分组：已知状态按固定顺序，未知状态排在最后。 */

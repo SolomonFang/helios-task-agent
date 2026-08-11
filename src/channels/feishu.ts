@@ -37,6 +37,9 @@ export type AccessDecision = 'allow' | 'claim' | 'deny';
 /** 飞书 REST 单请求超时：覆盖发消息/卡片/表情等全部 REST 调用（含 SDK 内部取 token）。 */
 export const FEISHU_HTTP_TIMEOUT_MS = 20000;
 
+/** 图片流式下载整体超时：FEISHU_HTTP_TIMEOUT_MS 只覆盖到响应头，body 读取期间 TCP 停滞需自行兜底（超时销毁流，走「图片下载失败」路径）。 */
+export const FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS = 60000;
+
 /** 图片流式下载超限熔断错误：调用方可据此区分「图片太大」与「下载失败」。 */
 export class ImageTooLargeError extends Error {
   constructor(public readonly bytes: number) {
@@ -376,7 +379,7 @@ export class FeishuChannel implements AgentChannel {
     return this.wsClient?.getConnectionStatus().state ?? null;
   }
 
-  async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
+  async start(onMessage: (msg: FeishuInboundMessage) => Promise<void>): Promise<void> {
     this.wsClient = new Lark.WSClient({
       appId: this.cfg.appId,
       appSecret: this.cfg.appSecret,
@@ -451,7 +454,6 @@ export class FeishuChannel implements AgentChannel {
             text,
             messageId: filtered.messageId,
             messageType: filtered.messageType,
-            raw: data,
           };
           if (filtered.messageType === 'image') {
             const imageKey = parseImageKey(filtered.content);
@@ -544,23 +546,43 @@ export class FeishuChannel implements AgentChannel {
    * SDK 该接口返回二进制流 + 响应头；MIME 取 content-type，缺失/非 image/* 时回退 jpeg。
    * maxBytes 提供流式熔断：累计超限立即抛 ImageTooLargeError 中止读取，
    * 避免超大资源先全量入内存再被拒。
+   * timeoutMs 提供整体超时：SDK 的 axios timeout 只覆盖到响应头，for-await 读 body
+   * 期间 TCP 停滞会让 promise 永不 settle；超时即销毁流并抛错（走「下载失败」回复路径）。
    */
   async downloadImage(
     messageId: string,
     imageKey: string,
     maxBytes?: number,
+    timeoutMs: number = FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS,
   ): Promise<{ data: Buffer; mimeType: string }> {
     const res = await this.client.im.v1.messageResource.get({
       path: { message_id: messageId, file_key: imageKey },
       params: { type: 'image' },
     });
+    const stream = res.getReadableStream();
     const chunks: Buffer[] = [];
     let total = 0;
-    for await (const chunk of res.getReadableStream()) {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
-      total += buf.length;
-      if (maxBytes !== undefined && total > maxBytes) throw new ImageTooLargeError(total);
-      chunks.push(buf);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          for await (const chunk of stream) {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+            total += buf.length;
+            if (maxBytes !== undefined && total > maxBytes) throw new ImageTooLargeError(total);
+            chunks.push(buf);
+          }
+        })(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            // 销毁流让 for-await 随之退出；race 以这里的 reject 为最终错误
+            stream.destroy();
+            reject(new Error(`图片下载超时（${timeoutMs}ms 无数据）`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     const headers = (res.headers ?? {}) as Record<string, unknown>;
     const rawType = headers['content-type'] ?? headers['Content-Type'];

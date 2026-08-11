@@ -16,6 +16,8 @@ import type {
 const MAX_TOOL_ROUNDS = 25;
 /** Max tool invocations per user turn (covers「最多展开 10 条链接」with headroom). */
 const MAX_TOOL_CALLS = 30;
+/** 单轮对话墙钟上限（分钟，默认 30）：bot 无人值守时防止超长工具链阻塞该用户的串行队列。 */
+const TURN_WALL_CLOCK_MS = Math.max(1, Number(process.env.HTA_TURN_TIMEOUT_MIN || 30) || 30) * 60_000;
 /** Keep system + this many subsequent messages (tool-call chains trimmed intact). */
 export const MAX_HISTORY_MESSAGES = 40;
 /**
@@ -158,6 +160,7 @@ export async function runAgentTurn({
   onProgress,
   signal,
   image,
+  wallClockMs = TURN_WALL_CLOCK_MS,
 }: {
   client: OpenAiClient;
   model: string;
@@ -169,114 +172,144 @@ export async function runAgentTurn({
   signal?: AbortSignal;
   /** 当次透传的图片：仅注入首轮请求（含上下文超限重试），历史与后续工具轮次均为文本占位。 */
   image?: InlineImage;
+  /** 本轮对话墙钟上限（毫秒）：到点掐断在途请求/工具执行，按「已超时」路径收尾。 */
+  wallClockMs?: number;
 }): Promise<string> {
   sanitizeToolPairs(messages);
   trimHistory(messages);
   let toolCallCount = 0;
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
-    if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
-    const createReq = () => {
-      const payload = downgradeSystemNotes(messages);
-      // 图片只进当次首个请求：会话历史存的是文本占位（[图片] …），这里仅在请求载荷副本上
-      // 把末尾 user 消息替换为多模态 content 数组，避免 base64 随历史回放反复进上下文。
-      if (image && round === 0) {
-        const last = payload[payload.length - 1];
-        if (last && last.role === 'user') {
-          payload[payload.length - 1] = {
-            role: 'user',
-            content: [
-              { type: 'image_url', image_url: { url: image.dataUrl } },
-              { type: 'text', text: image.prompt },
-            ],
-          };
-        }
-      }
-      return client.chat.completions.create(
-        {
-          model,
-          messages: payload,
-          tools: tools.length ? tools : undefined,
-          tool_choice: tools.length ? 'auto' : undefined,
-          temperature: 0.3,
-        },
-        signal ? { signal } : {},
-      );
-    };
-    let resp: Awaited<ReturnType<typeof createReq>> | undefined;
-    try {
-      resp = await createReq();
-    } catch (err) {
-      const msgText = errMessage(err);
-      if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
-      // 上下文超限自愈：逐级丢弃最旧轮次后重试（最多 3 次），仍失败则抛出原始错误
-      let recovered = false;
-      for (let attempt = 0; attempt < 3 && !recovered; attempt++) {
-        if (!dropOldestTurn(messages)) break;
-        try {
-          resp = await createReq();
-          recovered = true;
-        } catch (retryErr) {
-          const retryText = errMessage(retryErr);
-          if (!CONTEXT_OVERFLOW_RE.test(retryText)) throw retryErr;
-        }
-      }
-      if (!recovered) throw err;
-      if (onProgress) onProgress({ type: 'continue' });
-    }
-    if (!resp) throw new Error('模型请求失败');
-    const msg = resp.choices[0]?.message;
-    if (!msg) throw new Error('模型返回为空');
-
-    messages.push(msg);
-
-    const toolCalls = msg.tool_calls || [];
-    if (toolCalls.length === 0) {
-      return msg.content || '（模型未返回内容）';
-    }
-
-    for (let i = 0; i < toolCalls.length; i++) {
-      const call = toolCalls[i]!;
-      if (call.type !== 'function') continue;
-      toolCallCount++;
-      // 中断/超限时先为剩余 tool_calls 补占位响应再返回，避免 orphan tool_calls 损坏后续轮次
-      if (signal?.aborted) {
-        fillUnanswered(messages, toolCalls.slice(i));
-        return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
-      }
-      if (toolCallCount > MAX_TOOL_CALLS) {
-        fillUnanswered(messages, toolCalls.slice(i));
-        return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
-      }
-      const name = call.function.name;
-      const handler = handlers.get(name);
-      let result: string | undefined;
-      if (onProgress) onProgress({ type: 'tool', name });
-      if (!handler) {
-        result = `错误：未知工具 ${name}`;
-      } else {
-        let args: Record<string, unknown> = {};
-        try {
-          args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
-        } catch (err) {
-          const message = errMessage(err);
-          result = `错误：工具参数 JSON 解析失败：${message}`;
-        }
-        if (result === undefined) {
-          try {
-            result = String(await handler(args, { signal }));
-          } catch (err) {
-            const message = errMessage(err);
-            result = `工具 ${name} 执行异常：${message}`;
+  // 墙钟看门狗：到点 abort 内部信号，掐断在途的 LLM 请求与工具执行；
+  // 用户 /stop 的 signal 转发进同一开关，保持即时生效。两者在收尾文案上区分。
+  let timedOut = false;
+  const watchdog = new AbortController();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    watchdog.abort();
+  }, wallClockMs);
+  timer.unref();
+  const forwardAbort = () => watchdog.abort();
+  if (signal) {
+    if (signal.aborted) watchdog.abort();
+    else signal.addEventListener('abort', forwardAbort, { once: true });
+  }
+  const turnSignal = watchdog.signal;
+  const timeoutText = `（本轮处理已超过 ${Math.max(1, Math.round(wallClockMs / 60000))} 分钟时间上限，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
+      if (timedOut) return timeoutText;
+      if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
+      const createReq = () => {
+        const payload = downgradeSystemNotes(messages);
+        // 图片只进当次首个请求：会话历史存的是文本占位（[图片] …），这里仅在请求载荷副本上
+        // 把末尾 user 消息替换为多模态 content 数组，避免 base64 随历史回放反复进上下文。
+        if (image && round === 0) {
+          const last = payload[payload.length - 1];
+          if (last && last.role === 'user') {
+            payload[payload.length - 1] = {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: image.dataUrl } },
+                { type: 'text', text: image.prompt },
+              ],
+            };
           }
         }
+        return client.chat.completions.create(
+          {
+            model,
+            messages: payload,
+            tools: tools.length ? tools : undefined,
+            tool_choice: tools.length ? 'auto' : undefined,
+            temperature: 0.3,
+          },
+          { signal: turnSignal },
+        );
+      };
+      let resp: Awaited<ReturnType<typeof createReq>> | undefined;
+      try {
+        resp = await createReq();
+      } catch (err) {
+        if (timedOut) return timeoutText; // 墙钟到点掐断在途请求：请求未入历史，直接收尾
+        const msgText = errMessage(err);
+        if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
+        // 上下文超限自愈：逐级丢弃最旧轮次后重试（最多 3 次），仍失败则抛出原始错误
+        let recovered = false;
+        for (let attempt = 0; attempt < 3 && !recovered; attempt++) {
+          if (!dropOldestTurn(messages)) break;
+          try {
+            resp = await createReq();
+            recovered = true;
+          } catch (retryErr) {
+            if (timedOut) return timeoutText;
+            const retryText = errMessage(retryErr);
+            if (!CONTEXT_OVERFLOW_RE.test(retryText)) throw retryErr;
+          }
+        }
+        if (!recovered) throw err;
+        if (onProgress) onProgress({ type: 'continue' });
       }
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: result!,
-      });
+      if (!resp) throw new Error('模型请求失败');
+      const msg = resp.choices[0]?.message;
+      if (!msg) throw new Error('模型返回为空');
+
+      messages.push(msg);
+
+      const toolCalls = msg.tool_calls || [];
+      if (toolCalls.length === 0) {
+        return msg.content || '（模型未返回内容）';
+      }
+
+      for (let i = 0; i < toolCalls.length; i++) {
+        const call = toolCalls[i]!;
+        if (call.type !== 'function') continue;
+        toolCallCount++;
+        // 中断/超时/超限时先为剩余 tool_calls 补占位响应再返回，避免 orphan tool_calls 损坏后续轮次
+        if (signal?.aborted) {
+          fillUnanswered(messages, toolCalls.slice(i));
+          return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
+        }
+        if (timedOut) {
+          fillUnanswered(messages, toolCalls.slice(i));
+          return timeoutText;
+        }
+        if (toolCallCount > MAX_TOOL_CALLS) {
+          fillUnanswered(messages, toolCalls.slice(i));
+          return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
+        }
+        const name = call.function.name;
+        const handler = handlers.get(name);
+        let result: string | undefined;
+        if (onProgress) onProgress({ type: 'tool', name });
+        if (!handler) {
+          result = `错误：未知工具 ${name}`;
+        } else {
+          let args: Record<string, unknown> = {};
+          try {
+            args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
+          } catch (err) {
+            const message = errMessage(err);
+            result = `错误：工具参数 JSON 解析失败：${message}`;
+          }
+          if (result === undefined) {
+            try {
+              result = String(await handler(args, { signal: turnSignal }));
+            } catch (err) {
+              const message = errMessage(err);
+              result = `工具 ${name} 执行异常：${message}`;
+            }
+          }
+        }
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: result!,
+        });
+      }
     }
+    return `（本轮对话轮次已达上限 ${MAX_TOOL_ROUNDS} 轮，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', forwardAbort);
   }
-  return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
 }

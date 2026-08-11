@@ -1,13 +1,19 @@
+import { execFile } from 'child_process';
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 import { MCP_FALLBACK_TEXT } from '../infra/deps';
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export class KanbanMcp {
   readonly command: string;
   readonly args: string[];
   private client: Client | null = null;
+  /** 当前 stdio transport 的直接子进程 pid（npx 壳），用于 close 后清理残留孙进程。 */
+  private transportPid: number | null = null;
   /** 子进程 stderr 尾部（连接失败时用于诊断已知模式，如端口文件缺失）。 */
   private stderrTail = '';
   /**
@@ -43,6 +49,7 @@ export class KanbanMcp {
     }, timeoutMs);
     try {
       await client.connect(transport);
+      this.transportPid = transport.pid;
       const { tools } = await client.listTools();
       this.tools = tools || [];
       this.client = client;
@@ -55,8 +62,12 @@ export class KanbanMcp {
       return this.tools;
     } catch (err) {
       // 快速失败路径（connect 在超时前 reject）：超时定时器尚未触发，transport 未关闭，
-      // 不主动关会泄漏 stdio 子进程（超时已触发过的重复 close 无害）
+      // 不主动关会泄漏 stdio 子进程（超时已触发过的重复 close 无害）。
+      // 快照须在 kill 之前：孙进程在直接子进程死后被 reparent，事后按父 pid 已找不到。
+      const snapshot = await collectDescendants(transport.pid);
       await transport.close().catch(() => {});
+      await sweepOrphanedTree(snapshot);
+      this.transportPid = null;
       throw err;
     } finally {
       clearTimeout(timer);
@@ -104,6 +115,11 @@ export class KanbanMcp {
   async close(): Promise<void> {
     // 置位挂起标志：connect 在途时本轮 close 拿不到 client，由 connect 完成后自我关闭兜底
     this.closePending = true;
+    // SDK 的 StdioClientTransport 不透传 spawn 选项（无 detached 进程组杀），只 SIGTERM/SIGKILL
+    // 直接子进程（npx 壳）；孙进程（真正的 server）被 reparent 成孤儿。close 前先快照子进程树，
+    // close 后 best-effort 补杀仍存活的孙进程（有界、失败吞掉、幂等）。
+    const snapshot = await collectDescendants(this.transportPid);
+    this.transportPid = null;
     if (this.client) {
       try {
         await this.client.close();
@@ -112,7 +128,83 @@ export class KanbanMcp {
       }
       this.client = null;
     }
+    await sweepOrphanedTree(snapshot);
   }
+}
+
+/** 批量取若干 pid 的当前命令行（pid → command，已退出的 pid 缺席）；ps 失败返回 null。 */
+function commandsOf(pids: number[]): Promise<Map<number, string> | null> {
+  if (pids.length === 0) return Promise.resolve(new Map());
+  return new Promise((resolve) => {
+    execFile('ps', ['-p', pids.join(','), '-o', 'pid=,command='], { timeout: 3000 }, (err, stdout) => {
+      if (err) return resolve(null);
+      const out = new Map<number, string>();
+      for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^(\d+)\s+(.*)$/);
+        if (m) out.set(Number(m[1]), m[2]!);
+      }
+      resolve(out);
+    });
+  });
+}
+
+/**
+ * 快照 rootPid 的全部后代进程（pid → 命令行，不含 root 自身）。仅 darwin/linux；
+ * ps 失败或平台不支持返回 null，调用方按「无可清理」处理（best-effort，不影响主流程）。
+ */
+function collectDescendants(rootPid: number | null): Promise<Map<number, string> | null> {
+  if (rootPid === null) return Promise.resolve(null);
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile('ps', ['-axo', 'pid=,ppid=,command='], { timeout: 3000 }, (err, stdout) => {
+      if (err) return resolve(null);
+      const ppidOf = new Map<number, number>();
+      const cmdOf = new Map<number, string>();
+      for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+        if (!m) continue;
+        ppidOf.set(Number(m[1]), Number(m[2]));
+        cmdOf.set(Number(m[1]), m[3]!);
+      }
+      // 自 rootPid 向下 BFS 走子树（有界：进程表本身有界）
+      const tree = new Map<number, string>();
+      const queue = [rootPid];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const [pid, ppid] of ppidOf) {
+          if (ppid === cur && !tree.has(pid) && pid !== rootPid) {
+            tree.set(pid, cmdOf.get(pid) ?? '');
+            queue.push(pid);
+          }
+        }
+      }
+      resolve(tree);
+    });
+  });
+}
+
+/**
+ * 对快照中的 pid 做 best-effort 补杀：先复核命令行与快照一致（防 pid 复用误杀无关进程），
+ * 再 SIGTERM→短等→SIGKILL。全部失败吞掉；有界（至多 2 次 ps + 300ms 等待），幂等。
+ */
+async function sweepOrphanedTree(snapshot: Map<number, string> | null): Promise<void> {
+  if (!snapshot || snapshot.size === 0) return;
+  const pids = [...snapshot.keys()];
+  const killMatching = async (signal: NodeJS.Signals): Promise<void> => {
+    const current = await commandsOf(pids);
+    if (!current) return;
+    for (const [pid, cmd] of snapshot) {
+      if (current.get(pid) !== cmd) continue;
+      try {
+        process.kill(pid, signal);
+      } catch {
+        /* 已退出 */
+      }
+    }
+  };
+  await killMatching('SIGTERM');
+  await sleep(300);
+  await killMatching('SIGKILL');
 }
 
 /**

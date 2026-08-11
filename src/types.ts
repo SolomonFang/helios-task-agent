@@ -77,6 +77,8 @@ export interface MemoryFile {
 /**
  * 消息通道抽象：当前唯一实现是飞书 bot 通道（src/channels/feishu.ts），
  * 接口形状（sessionId / open_id 风格 senderId）按飞书 IM 设计；CLI 终端不走此接口。
+ * 注意：这层抽象目前只覆盖飞书单实现，bot handler（src/bot/handler.ts）直接依赖
+ * 飞书具体类型（FeishuChannel / FeishuInboundMessage），并未面向本接口编程。
  */
 export interface AgentChannel {
   readonly name: string;
@@ -91,6 +93,4 @@ export interface InboundMessage {
   /** Human-readable sender (open_id / name). */
   senderId: string;
   text: string;
-  /** Raw channel payload for reply threading. */
-  raw?: unknown;
 }

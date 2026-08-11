@@ -15,6 +15,7 @@ import {
   type KanbanProjectRow,
   type SummaryTaskRow,
 } from './http';
+import { TASK_STATUS_KEYS } from './status';
 
 export type WorkSummaryScope = 'iteration' | 'today' | 'all';
 
@@ -47,21 +48,8 @@ export interface WorkSummaryTotals {
   deletions: number;
 }
 
-/** 任务状态键（totals 还含 filesChanged 等数值键，计数时必须用显式集合判定，不能用 in）。 */
-const SUMMARY_STATUS_KEYS = ['done', 'inreview', 'inprogress', 'todo', 'cancelled'] as const;
-
-/** 状态键 → 用户可见中文（与 report.ts 的 STATUS_META 口径一致）；未知状态回退原文。 */
-const STATUS_LABELS: Record<string, string> = {
-  done: '已完成',
-  inreview: '待审阅',
-  inprogress: '进行中',
-  todo: '待办',
-  cancelled: '已取消',
-};
-
-export function statusLabel(status: string): string {
-  return STATUS_LABELS[status] ?? status;
-}
+// statusLabel 已收口到 ./status（状态键与中文 label 的唯一来源）；re-export 兼容既有调用方
+export { statusLabel } from './status';
 
 export interface WorkSummaryData {
   scope: WorkSummaryScope;
@@ -299,7 +287,8 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     deletions: 0,
   };
   for (const t of tasks) {
-    const statusKey = SUMMARY_STATUS_KEYS.find((s) => s === t.status);
+    // totals 还含 filesChanged 等数值键，计数时必须用显式状态键集合判定，不能用 in
+    const statusKey = TASK_STATUS_KEYS.find((s) => s === t.status);
     if (statusKey) totals[statusKey]++;
     if (t.filesChanged !== undefined) totals.filesChanged += t.filesChanged;
     if (t.additions !== undefined) totals.additions += t.additions;

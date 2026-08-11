@@ -4,7 +4,7 @@ import { createClient, runAgentTurn, trimHistory } from './llm';
 import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
 import { buildSystemPrompt } from './prompt';
-import { buildTools } from './tools';
+import { buildTools, type CreateCounter } from './tools';
 import { withBatchApproval, type BatchConfirmFn, type ConfirmFn } from './guard';
 import type {
   AgentConfig,
@@ -46,6 +46,8 @@ export class AgentSession {
   private readonly reportLinkBaseUrl?: string;
   private readonly historyStore?: SessionHistoryStore;
   private batchedConfirm?: BatchConfirmFn;
+  /** 「单会话创建上限」计数：会话级状态，跨 buildRuntime 重建（MCP 重连//config）存活，仅 clearHistory 重置。 */
+  private readonly createCounter: CreateCounter = { count: 0 };
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
@@ -146,6 +148,7 @@ export class AgentSession {
       onMemoryChange: () => this.refreshSystemPrompt(),
       confirm: this.getConfirm(),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
+      createCounter: this.createCounter,
     });
     const systemPrompt = buildSystemPrompt(this.promptOpts());
     return {
@@ -204,8 +207,9 @@ export class AgentSession {
     this.pendingNotes = [];
   }
 
-  /** Clear chat history only — memory is kept. 重建工具闭包以重置「单会话创建上限」等会话级计数。 */
+  /** Clear chat history only — memory is kept. 同时显式重置「单会话创建上限」计数（会话级状态不随工具闭包重建清零）。 */
   clearHistory(): void {
+    this.createCounter.count = 0;
     this.applyConfig(this.cfg);
     this.messages = this.messages.slice(0, 1);
     // 同步清掉磁盘历史；清盘失败不阻断（内存已清，下次落盘会覆盖）
@@ -218,14 +222,12 @@ export class AgentSession {
     }
   }
 
-  /** 每轮结束后把历史落盘（失败仅记日志：持久化是增强，不打断对话）。 */
+  /** 每轮结束后把历史落盘（fire-and-forget 异步写：失败仅记日志，持久化是增强，不打断对话）。 */
   private persistHistory(): void {
     if (!this.historyStore) return;
-    try {
-      this.historyStore.save(this.userId, this.messages);
-    } catch (err) {
+    this.historyStore.save(this.userId, this.messages).catch((err) => {
       console.error(`[session] 会话历史落盘失败（不影响本次对话）: ${errMessage(err)}`);
-    }
+    });
   }
 
   /**

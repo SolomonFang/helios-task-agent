@@ -10,13 +10,13 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
-    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts && tsx scripts/unit-coverage.ts && tsx scripts/unit-feishu-filter.ts && tsx scripts/unit-daily-brief.ts && tsx scripts/unit-session-store.ts",
+    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts && tsx scripts/unit-coverage.ts && tsx scripts/unit-feishu-filter.ts && tsx scripts/unit-daily-brief.ts && tsx scripts/unit-session-store.ts && tsx scripts/unit-repo-fs.ts && tsx scripts/unit-tools.ts",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",
     "typecheck": "tsc -p tsconfig.typecheck.json",
     "prepack": "rm -rf dist && npm run build",
-    "verify": "npm run typecheck && npm test && npm run smoke && npm run test:e2e",
+    "verify": "npm run typecheck && npm test && npm run smoke && npm run test:e2e && npm run build && node bin/helios-task-agent.js --version && node -e \"require('./dist/cli');require('./dist/bot-main')\"",
     "prepublishOnly": "npm run typecheck && npm test",
     "bot": "tsx src/bot-main.ts"
   },

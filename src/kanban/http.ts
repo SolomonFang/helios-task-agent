@@ -34,7 +34,7 @@ function envelopeData(json: unknown): unknown {
 
 /**
  * 组合调用方 signal 与超时兜底：任一触发即中断。
- * AbortSignal.any 需 Node 20+（engines 要求 >=18），这里手写等价组合：
+ * AbortSignal.any 需 Node 20.3+（engines 要求 >=20），这里手写等价组合：
  * 挂起的监听器随 timeout 信号到点释放，不会无限滞留。
  */
 function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -45,6 +45,15 @@ function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): Abo
   signal.addEventListener('abort', () => ctl.abort(), { once: true });
   timeout.addEventListener('abort', () => ctl.abort(), { once: true });
   return ctl.signal;
+}
+
+/** HTTP 非 2xx 错误：状态码随实例传递，调用方按 instanceof + status 分类，不从 message 反解析。
+ * message 保持 `HTTP <status>` 文本格式（既有日志与断言按此匹配）。 */
+export class KanbanHttpError extends Error {
+  constructor(public readonly status: number) {
+    super(`HTTP ${status}`);
+    this.name = 'KanbanHttpError';
+  }
 }
 
 async function request(
@@ -58,7 +67,7 @@ async function request(
     ...init,
     signal: combinedSignal(opts.signal, opts.timeoutMs ?? 15000),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new KanbanHttpError(res.status);
   return envelopeData(await res.json());
 }
 
@@ -72,7 +81,7 @@ export async function apiGet(kanbanUrl: string, p: string, opts: KanbanApiOption
   try {
     return await request(kanbanUrl, p, {}, opts);
   } catch (err) {
-    if (isAbortError(err) || (err instanceof Error && /^HTTP 4\d\d\b/.test(err.message))) throw err;
+    if (isAbortError(err) || (err instanceof KanbanHttpError && err.status >= 400 && err.status < 500)) throw err;
     await new Promise((r) => setTimeout(r, 500));
     return request(kanbanUrl, p, {}, opts);
   }

@@ -49,11 +49,23 @@ export async function kanbanTaskExists(kanbanUrl: string, taskId: string): Promi
 export class SourceRegistry {
   readonly filePath: string;
   private data: RegistryData;
+  /** 盘上文件的解析缓存：mtime 未变时 mergeFromDisk 复用，跳过全量 readFileSync + JSON.parse。 */
+  private diskCache: { mtimeMs: number | null; data: RegistryData };
 
   constructor(homeDir?: string) {
     const root = homeDir || defaultDataHome();
     this.filePath = path.join(root, 'synced-sources.json');
     this.data = this.load();
+    this.diskCache = { mtimeMs: this.statMtimeMs(), data: this.data };
+  }
+
+  /** 文件 mtime（毫秒）；文件不存在/读取失败返回 null（缓存同为 null 即视为未变）。 */
+  private statMtimeMs(): number | null {
+    try {
+      return fs.statSync(this.filePath).mtimeMs;
+    } catch {
+      return null;
+    }
   }
 
   private load(): RegistryData {
@@ -80,6 +92,8 @@ export class SourceRegistry {
   private persist(): void {
     try {
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n');
+      // 刚写的内容与内存一致：同步缓存，避免下一次 mergeFromDisk 立刻重读自己写的文件
+      this.diskCache = { mtimeMs: this.statMtimeMs(), data: this.data };
     } catch {
       /* best-effort */
     }
@@ -88,10 +102,14 @@ export class SourceRegistry {
   /**
    * Reload disk and fold in keys written by other instances (CLI vs bot vs
    * sibling sessions share the file); our in-memory view wins on conflicts.
+   * 按 mtime 缓存解析结果：文件未变时跳过重读与 JSON.parse，合并语义不变。
    */
   private mergeFromDisk(): void {
-    const disk = this.load();
-    for (const [uid, entries] of Object.entries(disk)) {
+    const mtimeMs = this.statMtimeMs();
+    if (!this.diskCache || this.diskCache.mtimeMs !== mtimeMs) {
+      this.diskCache = { mtimeMs, data: this.load() };
+    }
+    for (const [uid, entries] of Object.entries(this.diskCache.data)) {
       this.data[uid] = { ...entries, ...(this.data[uid] || {}) };
     }
   }

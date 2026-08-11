@@ -38,7 +38,13 @@ export function projectEnvPath(): string {
  *    NODE_OPTIONS/NODE_PATH 向所有 node 子进程注入模块，LD_PRELOAD/DYLD_*
  *    向所有原生子进程注入动态库——cwd .env 注入这些键等价于任意代码执行；
  * 5) 无鉴权服务暴露：HELIOS_KANBAN_HOST/HELIOS_REPORT_HOST 决定看板与报告服务
- *    的绑定地址，恶意 cwd .env 可将其绑到 0.0.0.0 把无鉴权接口暴露给局域网。
+ *    的绑定地址，恶意 cwd .env 可将其绑到 0.0.0.0 把无鉴权接口暴露给局域网；
+ * 6) 加载链自指绕过：HELIOS_TASK_AGENT_ENV 指向的第二文件会以 override:true
+ *    强制加载，若 cwd .env 能设置该键即可完全绕过本过滤；加载前另有快照兜底；
+ * 7) AI 审查外发劫持：OCR_LLM_URL/TOKEN/MODEL 经 buildOcrEnv 透传给 ocr 子进程，
+ *    恶意值会把待审查的代码 diff 发往攻击者端点（token 随之泄露）；
+ * 8) 供应链/调试钩子：HTA_UPDATE_REGISTRY 决定更新检查查询的 registry，
+ *    HTA_TEST_CRASH 会让进程启动即抛异常（DoS）。
  * 这些键只接受 shell 环境、项目 .env、用户 home .env（及 HELIOS_TASK_AGENT_ENV
  * 强制路径）的值。
  */
@@ -76,6 +82,16 @@ const CWD_RESTRICTED_KEYS = new Set([
   'DYLD_FALLBACK_LIBRARY_PATH',
   'HELIOS_KANBAN_HOST',
   'HELIOS_REPORT_HOST',
+  // 加载链自指：cwd .env 若能把 HELIOS_TASK_AGENT_ENV 指向恶意文件，该文件会以
+  // override:true 强制加载，完全绕过本过滤（见 loadEnvFiles 末尾）
+  'HELIOS_TASK_AGENT_ENV',
+  // AI 审查 ocr 子进程外发目标与凭证（buildOcrEnv 透传）
+  'OCR_LLM_URL',
+  'OCR_LLM_TOKEN',
+  'OCR_LLM_MODEL',
+  // 更新检查 registry 覆写 / 启动即崩溃测试钩子
+  'HTA_UPDATE_REGISTRY',
+  'HTA_TEST_CRASH',
 ]);
 
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
@@ -88,6 +104,10 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
     dotenv.config({ path: project });
     loaded.push(project);
   }
+  // HELIOS_TASK_AGENT_ENV 快照：必须在应用 cwd .env 任何键之前取样，forced
+  // 加载只信快照值——cwd .env 即使设法写入该键也无法把 forced 指向恶意第二
+  // 文件（该键本身已列入 CWD_RESTRICTED_KEYS，此处为双保险）。
+  const forcedEnvSnapshot = process.env.HELIOS_TASK_AGENT_ENV;
   if (fs.existsSync(cwd) && path.resolve(cwd) !== path.resolve(project)) {
     // 不用 dotenv.config(override)：先解析再过滤高危键，其余键仍覆盖项目 .env。
     const parsed = dotenv.parse(fs.readFileSync(cwd));
@@ -113,7 +133,8 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
 
   // HELIOS_TASK_AGENT_ENV 指定的文件具有最高优先级：即使路径与前面重复，
   // 也必须在最后重新加载一次（override），确保覆盖项目/用户 .env。
-  const forced = process.env.HELIOS_TASK_AGENT_ENV;
+  // 只用 cwd .env 应用前的快照值（见上），杜绝 cwd .env 自指劫持加载链。
+  const forced = forcedEnvSnapshot;
   if (forced && fs.existsSync(forced)) {
     dotenv.config({ path: forced, override: true });
     if (!loaded.some((p) => path.resolve(p) === path.resolve(forced))) loaded.push(forced);

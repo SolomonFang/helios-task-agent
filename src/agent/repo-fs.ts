@@ -7,6 +7,11 @@ const MAX_GREP_HITS = 40;
 const MAX_LIST_ENTRIES = 200;
 const MAX_READ_BYTES = 200_000;
 const MAX_PATTERN_LEN = 200;
+// grep 树扫描总量上限：防止无命中 pattern 扫完整个大仓库拖垮事件循环
+const MAX_GREP_SCAN_FILES = 5000;
+const MAX_GREP_SCAN_BYTES = 50 * 1024 * 1024;
+// 每扫描 N 个文件让出一次事件循环（bot 主循环同线程，避免长扫描阻塞消息处理）
+const GREP_YIELD_EVERY_FILES = 100;
 
 export function truncateOutput(s: string, max = MAX_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
@@ -162,14 +167,14 @@ export async function resolveRepoRoot(opts: {
   return { ok: true, root: rootAbs };
 }
 
-export function repoFsList(root: string, relPath = '.'): string {
+export async function repoFsList(root: string, relPath = '.'): Promise<string> {
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
   if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
   if (!fs.existsSync(resolved.abs)) return `路径不存在：${relPath || '.'}`;
-  const st = fs.statSync(resolved.abs);
+  const st = await fs.promises.stat(resolved.abs);
   if (!st.isDirectory()) return `不是目录：${relPath || '.'}`;
-  const entries = fs.readdirSync(resolved.abs, { withFileTypes: true });
+  const entries = await fs.promises.readdir(resolved.abs, { withFileTypes: true });
   const lines = entries
     .slice(0, MAX_LIST_ENTRIES)
     .map((e) => e.name + (e.isDirectory() ? '/' : ''))
@@ -178,26 +183,26 @@ export function repoFsList(root: string, relPath = '.'): string {
   return truncateOutput(`root: ${root}\npath: ${relPath || '.'}\n\n${lines.join('\n')}${extra}`);
 }
 
-export function repoFsRead(root: string, relPath: string): string {
+export async function repoFsRead(root: string, relPath: string): Promise<string> {
   if (!relPath?.trim()) return '参数错误：read 需要 path（相对仓库根的文件路径）';
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
   if (isSensitiveFile(resolved.abs)) return sensitiveFileDenied(resolved.abs);
   if (!fs.existsSync(resolved.abs)) return `文件不存在：${relPath}`;
-  const st = fs.statSync(resolved.abs);
+  const st = await fs.promises.stat(resolved.abs);
   if (!st.isFile()) return `不是文件：${relPath}`;
-  const fd = fs.openSync(resolved.abs, 'r');
+  const fh = await fs.promises.open(resolved.abs, 'r');
   try {
     const size = Math.min(st.size, MAX_READ_BYTES);
     const buf = Buffer.alloc(size);
-    fs.readSync(fd, buf, 0, size, 0);
+    await fh.read(buf, 0, size, 0);
     let text = buf.toString('utf8');
     if (st.size > MAX_READ_BYTES) {
       text += `\n…（文件共 ${st.size} 字节，仅读取前 ${MAX_READ_BYTES}）`;
     }
     return truncateOutput(`# ${relPath}\n\n${text}`);
   } finally {
-    fs.closeSync(fd);
+    await fh.close();
   }
 }
 
@@ -207,7 +212,7 @@ function matchesGlob(fileName: string, relFile: string, globHint?: string): bool
   return fileName.includes(globHint) || relFile.includes(globHint);
 }
 
-export function repoFsGrep(root: string, pattern: string, relPath = '.', globHint?: string): string {
+export async function repoFsGrep(root: string, pattern: string, relPath = '.', globHint?: string): Promise<string> {
   if (!pattern) return '参数错误：grep 需要 pattern';
   // pattern 来自模型生成：限制长度缓解 ReDoS，编译异常友好报错
   if (pattern.length > MAX_PATTERN_LEN) return `参数错误：pattern 过长（>${MAX_PATTERN_LEN} 字符），请缩短后重试`;
@@ -236,20 +241,35 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
 
   const hits: string[] = [];
   const skipDir = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'target', 'vendor']);
+  // 扫描总量统计：超出 MAX_GREP_SCAN_FILES / MAX_GREP_SCAN_BYTES 即截断（scanTruncated 记录触发原因）
+  let scannedFiles = 0;
+  let scannedBytes = 0;
+  let scanTruncated = '';
 
-  const scanFile = (fileAbs: string) => {
-    if (hits.length >= MAX_GREP_HITS) return;
+  const yieldIfNeeded = async () => {
+    if (scannedFiles % GREP_YIELD_EVERY_FILES === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+
+  const scanFile = async (fileAbs: string) => {
+    if (hits.length >= MAX_GREP_HITS || scanTruncated) return;
     if (isSensitiveFile(fileAbs)) return; // 敏感文件不参与 grep（同 read 的 denylist）
     const rel = path.relative(root, fileAbs);
     if (!matchesGlob(path.basename(fileAbs), rel, globHint)) return;
     let content: string;
     try {
-      const st = fs.statSync(fileAbs);
+      const st = await fs.promises.stat(fileAbs);
       if (st.size > MAX_READ_BYTES) return;
-      content = fs.readFileSync(fileAbs, 'utf8');
+      scannedFiles++;
+      scannedBytes += st.size;
+      if (scannedFiles >= MAX_GREP_SCAN_FILES) scanTruncated = `已扫描 ${MAX_GREP_SCAN_FILES} 个文件`;
+      else if (scannedBytes >= MAX_GREP_SCAN_BYTES) scanTruncated = `已扫描 ${Math.round(MAX_GREP_SCAN_BYTES / 1024 / 1024)}MB`;
+      content = await fs.promises.readFile(fileAbs, 'utf8');
     } catch {
       return;
     }
+    await yieldIfNeeded();
     const lines = content.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       if (hits.length >= MAX_GREP_HITS) break;
@@ -259,33 +279,34 @@ export function repoFsGrep(root: string, pattern: string, relPath = '.', globHin
     }
   };
 
-  const walk = (dir: string) => {
-    if (hits.length >= MAX_GREP_HITS) return;
+  const walk = async (dir: string): Promise<void> => {
+    if (hits.length >= MAX_GREP_HITS || scanTruncated) return;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
     } catch {
       return;
     }
     for (const ent of entries) {
-      if (hits.length >= MAX_GREP_HITS) break;
+      if (hits.length >= MAX_GREP_HITS || scanTruncated) break;
       if (ent.isDirectory()) {
         if (skipDir.has(ent.name) || ent.name.startsWith('.')) continue;
-        walk(path.join(dir, ent.name));
+        await walk(path.join(dir, ent.name));
         continue;
       }
-      if (ent.isFile()) scanFile(path.join(dir, ent.name));
+      if (ent.isFile()) await scanFile(path.join(dir, ent.name));
     }
   };
 
-  const startSt = fs.statSync(resolved.abs);
+  const startSt = await fs.promises.stat(resolved.abs);
   if (startSt.isFile()) {
-    scanFile(resolved.abs);
-  } else walk(resolved.abs);
+    await scanFile(resolved.abs);
+  } else await walk(resolved.abs);
 
-  if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n（无命中）`);
+  const truncNote = scanTruncated ? `\n…（${scanTruncated}，已达扫描总量上限，结果可能不全）` : '';
+  if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n（无命中）${truncNote}`);
   const more = hits.length >= MAX_GREP_HITS ? `\n…（已达 ${MAX_GREP_HITS} 条上限）` : '';
-  return truncateOutput(`root: ${root}\npattern: ${pattern}\n\n${hits.join('\n')}${more}`);
+  return truncateOutput(`root: ${root}\npattern: ${pattern}\n\n${hits.join('\n')}${more}${truncNote}`);
 }
 
 export async function runRepoFs(
@@ -310,11 +331,11 @@ export async function runRepoFs(
   const rel = args.path || '.';
   switch (action) {
     case 'list':
-      return repoFsList(rootRes.root, rel);
+      return await repoFsList(rootRes.root, rel);
     case 'read':
-      return repoFsRead(rootRes.root, rel === '.' ? '' : rel);
+      return await repoFsRead(rootRes.root, rel === '.' ? '' : rel);
     case 'grep':
-      return repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob);
+      return await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob);
     default:
       return '参数错误：action 必须是 list | read | grep';
   }

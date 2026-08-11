@@ -168,6 +168,12 @@ export async function ensureKanbanRunning(
         `无法启动 helios-kanban：执行 npx 失败（npx 不可执行或未安装 Node.js/npm）：${spawnErr.message}`,
       );
     }
+    // 先探健康再判退出码：detached 的 npx 壳退出与看板就绪可能几乎同时发生，
+    // 壳先死而看板孙进程已就绪时（见 stopKanbanChild 注释），先看 exitCode 会误报启动失败
+    if (await fetchHealth(url)) {
+      log(`helios-kanban 已就绪（${url}）`);
+      return { started: true, child, url };
+    }
     if (child.exitCode !== null) {
       // 用户面只给退出码 + 手动启动指引；stderr 尾部（原始报错）收进 HTA_DEBUG 日志
       if (process.env.HTA_DEBUG && stderrBuf.trim()) {
@@ -176,10 +182,6 @@ export async function ensureKanbanRunning(
       throw new Error(
         `helios-kanban 进程已退出（code=${child.exitCode}）。\n${kanbanManualStartHint({ port })}`,
       );
-    }
-    if (await fetchHealth(url)) {
-      log(`helios-kanban 已就绪（${url}）`);
-      return { started: true, child, url };
     }
     // 等待期间每 ~10 秒补一行进度，避免启动阶段长时间无反馈
     if (Date.now() - lastBeatAt >= 10000) {

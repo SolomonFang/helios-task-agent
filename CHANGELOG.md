@@ -6,6 +6,34 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 「同类免问」覆盖全部写操作：此前破坏性看板操作（删除/取消/停止/审批/启动/归档/合并/推送/执行）、飞书写、记忆写、技能脚本一律逐次确认，确认卡片无「同类免问」按钮；现所有写操作都带 batchKey（看板/hk 绑定工具名+对象 id，lark 按命令路径如 `lark:im send`，技能脚本按 `skill:<名>/<脚本>`，记忆按 set/delete/note 分动作），所有确认卡片均可「同类免问」；破坏性判定改由 `ConfirmRequest.destructive` 承载（`guard.isBatchable` 更名 `isDestructive`），仅用于确认超时分级（300s vs 120s），不再影响免问资格
+- 轮次内插入独立消息时的最终回复时序（bot）：确认卡片/超时提示等独立消息插在进度占位之后时，最终回复不再原地编辑占位（飞书编辑不改变消息位置，完成消息会停在卡片上方、时序颠倒），占位收尾为「✅ 已完成，结果见下方 ⬇️」，正文改发新消息落在时间线末尾；无插入消息时仍原地替换占位（见 `src/bot/handler.ts` 的 `RoundNoticeTracker` 与 `deliverReply` interleaved 分支）
+- SourceRegistry 按文件 mtime 缓存解析结果，来源去重检查不再每次全量读盘；会话历史落盘改异步（串行队列，原子写/0600 语义不变），目录清理按 60s 节流；watcher 快照每 tick 只序列化一次，比较与写盘复用
+- 任务状态元数据（key/中文 label）收口到 `src/kanban/status.ts` 唯一来源，report 层只保留 emoji/badge 展示扩展；删除 `InboundMessage.raw` 死字段，bot handler 签名直接收 `FeishuInboundMessage`（去掉入口强转）
+- 测试与发布链路：新增 `scripts/unit-repo-fs.ts` / `scripts/unit-tools.ts`；smoke 的 MCP 调用断言修复永真问题（失败时返回错误字符串也会 PASS）；unit-kanban 契约用例补 jq/curl 探测（缺失时 SKIP）；verify 末尾补 `npm run build` + bin/dist 加载检查
+
+### Security
+
+- cwd .env 高危键过滤收口：`HELIOS_TASK_AGENT_ENV` 加入受限键（此前恶意仓库可借它把强制加载指向第二文件，完全绕过受限键过滤，注入 MCP 命令/LLM 外发地址），且强制加载改用 cwd .env 应用前的快照值；`OCR_LLM_URL/OCR_LLM_TOKEN/OCR_LLM_MODEL`（可劫持 AI 审查的代码 diff 外发）、`HTA_UPDATE_REGISTRY`、`HTA_TEST_CRASH` 一并纳入受限键
+
+### Fixed
+
+- CLI 启动窗口的信号处理：SIGINT/SIGTERM/异常处理与资源登记移到看板拉起与 MCP 连接之前（此前窗口内 SIGTERM 直接终止并遗留 MCP 孤儿子进程、Ctrl+C 不退出），并补齐此前缺失的 SIGTERM 处理
+- `repo_fs` grep/list/read 异步化：大仓库的同步全树扫描不再阻塞 bot 事件循环（每 100 个文件让出一次），并新增扫描总量上限（5000 文件 / 50MB，截断时输出注明）
+- 单会话创建上限（10 个）不再随 MCP 掉线重连被静默重置：创建计数提升为会话级状态，仅 `/clear` 重置（与「同类免问」授权的生命周期对齐）
+- MCP start_workspace 的确认卡片/审计按分支补全后的最终参数展示（此前显示补全前旧值，与 hk 路径的惰性求值口径不一致）
+- `hk_cli` 脚本定位与技能系统同口径：用户数据目录的 helios-kanban-remote 覆盖版优先，找不到回退包内脚本（此前 skill_doc 读用户版、hk_cli 却永远执行包内版）
+- CLI 闸门确认因超时/Ctrl+C 中断后，不再吞掉用户在下一个提示符出现前输入的一行
+- 看板自动拉起轮询先查健康再判子进程退出码，修复 detached npx 壳退出与看板就绪同时发生时的误报失败
+- 飞书图片下载流加 60 秒整体超时：此前 body 读取中途 TCP 停滞会让该消息处理永久挂起且无任何用户反馈
+- MCP close/重连失败时补杀残留孙进程（close 前快照子进程树、复核命令行防 pid 复用后 SIGTERM→SIGKILL），修复 supervisor 重连累积孤儿 MCP server 进程
+- LLM 单轮对话加墙钟上限（默认 30 分钟，`HTA_TURN_TIMEOUT_MIN` 可覆盖），到点按「已中止」收尾并提示；轮次上限（25 轮）与工具调用上限（30 次）的提示文案区分开（此前轮次耗尽误报「工具调用已达上限 30 次」）
+- kanban HTTP 层错误从 message 文本正则反解析升级为 `KanbanHttpError`（带 status 字段，message 格式不变）；ai-review 的看板响应补 validateRows/类型谓词校验，去掉裸 `as`
+
+## [1.0.22] - 2026-08-10
+
 ### Added
 
 - 图片消息接入（bot，`LLM_VISION=1` 开启，默认关）：图片消息下载后随当次请求以多模态 content 发给模型（需模型支持图片输入）；字节全程内存不落盘、不进会话历史（历史只存 `[图片] 配文` 占位），单张上限 10MB，流式下载中途超限即熔断，超限/下载失败均有友好中文提示；单测可注入 imageFetcher，不触网络
@@ -16,7 +44,6 @@
 
 ### Changed
 
-- 「同类免问」覆盖全部写操作：此前破坏性看板操作（删除/取消/停止/审批/启动/归档/合并/推送/执行）、飞书写、记忆写、技能脚本一律逐次确认，确认卡片无「同类免问」按钮；现所有写操作都带 batchKey（看板/hk 绑定工具名+对象 id，lark 按命令路径如 `lark:im send`，技能脚本按 `skill:<名>/<脚本>`，记忆按 set/delete/note 分动作），所有确认卡片均可「同类免问」；破坏性判定改由 `ConfirmRequest.destructive` 承载（`guard.isBatchable` 更名 `isDestructive`），仅用于确认超时分级（300s vs 120s），不再影响免问资格
 - README 进度描述与实际行为对齐（原为「约每 2 秒原地更新」，实为工具调用事件驱动 + 静默期心跳），并补明群消息处理策略、会话历史持久化与图片消息/定时晨报两个新开关
 
 ## [1.0.21] - 2026-08-07

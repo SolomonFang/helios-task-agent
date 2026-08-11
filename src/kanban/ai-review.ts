@@ -5,7 +5,7 @@ import os from 'os';
 import path from 'path';
 import { ocrPackageSpec } from '../infra/deps';
 import { minimalChildEnv } from '../infra/proc-env';
-import { apiGet } from './http';
+import { apiGet, validateRows } from './http';
 
 /**
  * AI 审查（open-code-review）：根据看板 attempt 定位代码目录，调用 ocr CLI
@@ -30,6 +30,15 @@ interface AttemptRepoRow {
   path?: string;
   name?: string;
   target_branch?: string | null;
+}
+
+/** attempt 详情的运行时校验（宽容：字段缺失/null 容忍，存在则必须是 string）。 */
+function isAttemptRow(v: unknown): v is AttemptRow {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const r = v as Record<string, unknown>;
+  return (['container_ref', 'branch', 'agent_working_dir'] as const).every(
+    (f) => r[f] === undefined || r[f] === null || typeof r[f] === 'string',
+  );
 }
 
 export interface ReviewTarget {
@@ -77,14 +86,20 @@ async function isGitRepo(dir: string): Promise<boolean> {
  * 本身 → 看板注册的原始仓库 path（use_worktree=false 时 agent 直接在原仓库提交）。
  */
 export async function resolveReviewTarget(kanbanUrl: string, attemptId: string): Promise<ReviewTarget> {
-  const attempt = (await apiGet(kanbanUrl, `/task-attempts/${attemptId}`)) as AttemptRow | null;
-  if (!attempt || typeof attempt !== 'object') {
+  const raw: unknown = await apiGet(kanbanUrl, `/task-attempts/${attemptId}`);
+  if (!isAttemptRow(raw)) {
     throw new Error('找不到该任务的 workspace（attempt）记录，可能已被清理。');
   }
+  const attempt: AttemptRow = raw;
   let repos: AttemptRepoRow[] = [];
   try {
-    const list = (await apiGet(kanbanUrl, `/task-attempts/${attemptId}/repos`)) as AttemptRepoRow[];
-    if (Array.isArray(list)) repos = list.filter((r): r is AttemptRepoRow => Boolean(r && typeof r === 'object'));
+    // 宽容校验：字段缺失/null 容忍（看板版本间字段可能不同），类型不符或返回非数组时抛错，
+    // 由下方 catch 兜底为「无 repos 信息」，不阻断 workspace 目录路径
+    repos = validateRows<AttemptRepoRow>(`/task-attempts/${attemptId}/repos`, await apiGet(kanbanUrl, `/task-attempts/${attemptId}/repos`), {
+      path: 'string',
+      name: 'string',
+      target_branch: 'string',
+    });
   } catch {
     /* repos 端点失败不阻断，仍可尝试 workspace 目录 */
   }
