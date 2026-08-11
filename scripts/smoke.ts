@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     const listProjects = [...handlers.keys()].find((k) => k.includes('list_projects'));
     if (listProjects) {
       const out = await handlers.get(listProjects)!({});
-      // 调用失败时 handler 返回错误字符串而非抛出（见 src/agent/tools.ts），
+      // 调用失败时 handler 返回错误字符串而非抛出（见 src/agent/tools/kanban-mcp.ts），
       // 必须断言 UNTRUSTED 包裹标记且不含「调用失败」，否则失败也会 PASS
       check(
         'MCP list_projects 调用',

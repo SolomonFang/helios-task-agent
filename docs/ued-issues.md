@@ -158,7 +158,7 @@
 - [x] **F17 bot 把 MCP 原始英文错误内联糊给用户**：用户面只留中文结论 + 已知模式诊断 hint，原文收 HTA_DEBUG（`bot-main.ts`）；mcp.ts 诊断 hint 结尾不再无条件承诺「不受影响」。
 - [x] **F18 确认超时通知无自救路径**：追加「如仍需执行，直接再跟我说一声即可。」（`bot-main.ts`）。
 - [x] **F19 被拒文案「部署目录 .env」不具体**：改 `userEnvPath()` 确切路径（`feishu.ts`）。
-- [x] **F20 确认卡片项目字段展示原始 UUID**：用户无法核对落点，标注为「项目 ID」（项目名解析留待后续）（`src/agent/tools.ts`）。
+- [x] **F20 确认卡片项目字段展示原始 UUID**：用户无法核对落点，标注为「项目 ID」（项目名解析留待后续）（`src/agent/tools/kanban-mcp.ts`）。
 - [x] **F21 /clear 不重置「同类免问」且文案未告知**：新增 `clearedText(n)`，清空后仍有免问授权时明确提示并可 `/confirm revoke`（`src/commands.ts`、CLI 与 bot 两端接线）。
 - [x] **F22 技能报错指路不给地址**：卸载/未找到两处报错附数据目录绝对路径（`src/agent/skills.ts`）。
 - [x] **F23 中断/超限口径统一**：「已被用户中断」三套措辞统一为带出路的一条；工具超限两处统一为同文案同数字（30）并交代「已完成的操作不受影响，可问刚才完成了哪些」（`src/agent/llm.ts`、`tools.ts`）。
