@@ -49,20 +49,25 @@ export async function kanbanTaskExists(kanbanUrl: string, taskId: string): Promi
 export class SourceRegistry {
   readonly filePath: string;
   private data: RegistryData;
-  /** 盘上文件的解析缓存：mtime 未变时 mergeFromDisk 复用，跳过全量 readFileSync + JSON.parse。 */
-  private diskCache: { mtimeMs: number | null; data: RegistryData };
+  /**
+   * 盘上文件的解析缓存：内容指纹（mtimeNs:size）未变时 mergeFromDisk 复用，
+   * 跳过全量 readFileSync + JSON.parse。不能只用 mtime：文件系统时间戳粒度有限
+   * （CI 上快速连写可落同一刻度），叠加 size 才能识别同刻度内的内容变化。
+   */
+  private diskCache: { fingerprint: string | null; data: RegistryData };
 
   constructor(homeDir?: string) {
     const root = homeDir || defaultDataHome();
     this.filePath = path.join(root, 'synced-sources.json');
     this.data = this.load();
-    this.diskCache = { mtimeMs: this.statMtimeMs(), data: this.data };
+    this.diskCache = { fingerprint: this.statFingerprint(), data: this.data };
   }
 
-  /** 文件 mtime（毫秒）；文件不存在/读取失败返回 null（缓存同为 null 即视为未变）。 */
-  private statMtimeMs(): number | null {
+  /** 内容指纹（mtimeNs:size）；文件不存在/读取失败返回 null（缓存同为 null 即视为未变）。 */
+  private statFingerprint(): string | null {
     try {
-      return fs.statSync(this.filePath).mtimeMs;
+      const s = fs.statSync(this.filePath, { bigint: true });
+      return `${s.mtimeNs}:${s.size}`;
     } catch {
       return null;
     }
@@ -93,7 +98,7 @@ export class SourceRegistry {
     try {
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n');
       // 刚写的内容与内存一致：同步缓存，避免下一次 mergeFromDisk 立刻重读自己写的文件
-      this.diskCache = { mtimeMs: this.statMtimeMs(), data: this.data };
+      this.diskCache = { fingerprint: this.statFingerprint(), data: this.data };
     } catch {
       /* best-effort */
     }
@@ -102,12 +107,12 @@ export class SourceRegistry {
   /**
    * Reload disk and fold in keys written by other instances (CLI vs bot vs
    * sibling sessions share the file); our in-memory view wins on conflicts.
-   * 按 mtime 缓存解析结果：文件未变时跳过重读与 JSON.parse，合并语义不变。
+   * 按内容指纹缓存解析结果：文件未变时跳过重读与 JSON.parse，合并语义不变。
    */
   private mergeFromDisk(): void {
-    const mtimeMs = this.statMtimeMs();
-    if (!this.diskCache || this.diskCache.mtimeMs !== mtimeMs) {
-      this.diskCache = { mtimeMs, data: this.load() };
+    const fingerprint = this.statFingerprint();
+    if (this.diskCache.fingerprint !== fingerprint) {
+      this.diskCache = { fingerprint, data: this.load() };
     }
     for (const [uid, entries] of Object.entries(this.diskCache.data)) {
       this.data[uid] = { ...entries, ...(this.data[uid] || {}) };

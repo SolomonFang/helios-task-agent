@@ -728,6 +728,25 @@ async function run(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  // ---------- 来源查重：时间戳同刻度的跨实例写不互相覆盖（指纹含 size 兜底） ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-regtick-'));
+    const a = new SourceRegistry(tmp);
+    const b = new SourceRegistry(tmp);
+    a.record('u1', 'https://a.feishu.cn/docx/1', { taskId: 't-1', title: 'T1', createdAt: 'x' });
+    b.record('u1', 'https://a.feishu.cn/docx/2', { taskId: 't-2', title: 'T2', createdAt: 'x' });
+    // 模拟文件系统时间戳粒度不足（CI 快速连写落同一刻度）：a 的缓存 mtime 与当前文件
+    // 一致但 size 滞后；仅靠 mtime 判不变会跳过重读，remove 时把 docx/2 覆盖掉
+    const cur = fs.statSync(a.filePath, { bigint: true });
+    (a as unknown as { diskCache: { fingerprint: string | null } }).diskCache.fingerprint = `${cur.mtimeNs}:0`;
+    a.remove('u1', 'https://a.feishu.cn/docx/1');
+    check(
+      'SourceRegistry 同时钟刻度的跨实例写不互相覆盖（size 指纹兜底）',
+      new SourceRegistry(tmp).lookup('u1', 'https://a.feishu.cn/docx/2')?.taskId === 't-2',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
   // ---------- 来源查重：lookup 前合并盘上数据 ----------
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-reglookup-'));

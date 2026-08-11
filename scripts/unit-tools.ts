@@ -186,24 +186,25 @@ async function main(): Promise<void> {
   });
 
   // ---------- 任务4：SourceRegistry 按 mtime 缓存，合并语义不变 ----------
-  await checkAsync('SourceRegistry：mtime 未变走缓存跳过重读，mtime 变化重新合并', async () => {
+  await checkAsync('SourceRegistry：指纹未变走缓存跳过重读，指纹变化重新合并', async () => {
     const tmp = tmpHome('regcache');
     try {
       const reg = new SourceRegistry(tmp);
       const entry = { taskId: 't1', title: 'a', createdAt: '2026-01-01T00:00:00.000Z' };
       reg.record('u', 'https://a.feishu.cn/docx/1', entry);
-      // 外部进程写入新映射；随后把缓存基线对齐到当前文件 mtime（utimes 精度无法
-      // 精确还原旧 mtime，直接对齐私有基线模拟「该 mtime 已解析过」的合法缓存态）
+      // 外部进程写入新映射；随后把缓存基线对齐到当前文件指纹（utimes 精度无法
+      // 精确还原旧 mtime，直接对齐私有基线模拟「该版本已解析过」的合法缓存态）
       const raw = JSON.parse(fs.readFileSync(reg.filePath, 'utf8')) as Record<string, Record<string, unknown>>;
       raw.u!['https://a.feishu.cn/docx/2'] = { taskId: 't2', title: 'b', createdAt: entry.createdAt };
       fs.writeFileSync(reg.filePath, JSON.stringify(raw));
-      (reg as unknown as { diskCache: { mtimeMs: number } }).diskCache.mtimeMs = fs.statSync(reg.filePath).mtimeMs;
-      // mtime 与缓存一致 → 走缓存跳过重读，看不到盘上新键
-      assert.equal(reg.lookup('u', 'https://a.feishu.cn/docx/2'), undefined, 'mtime 未变应走缓存');
+      const boxed = reg as unknown as { diskCache: { fingerprint: string | null }; statFingerprint(): string | null };
+      boxed.diskCache.fingerprint = boxed.statFingerprint();
+      // 指纹与缓存一致 → 走缓存跳过重读，看不到盘上新键
+      assert.equal(reg.lookup('u', 'https://a.feishu.cn/docx/2'), undefined, '指纹未变应走缓存');
       assert.equal(reg.lookup('u', 'https://a.feishu.cn/docx/1')?.taskId, 't1');
-      // mtime 前进 → 缓存失效，重新读盘合并
+      // mtime 前进 → 指纹变化，缓存失效，重新读盘合并
       fs.utimesSync(reg.filePath, new Date(), new Date(Date.now() + 5000));
-      assert.equal(reg.lookup('u', 'https://a.feishu.cn/docx/2')?.taskId, 't2', 'mtime 变化应重新合并');
+      assert.equal(reg.lookup('u', 'https://a.feishu.cn/docx/2')?.taskId, 't2', '指纹变化应重新合并');
       // 多实例合并语义保持：另一实例写入后本实例可见，且不丢本实例已有键
       const reg2 = new SourceRegistry(tmp);
       reg2.record('u', 'https://a.feishu.cn/docx/3', { taskId: 't3', title: 'c', createdAt: entry.createdAt });
