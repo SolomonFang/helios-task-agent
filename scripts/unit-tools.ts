@@ -2,7 +2,9 @@
  * 工具层单测（buildTools / AgentSession 接线 / SourceRegistry）：
  * 单会话创建上限跨工具闭包重建存活、clearHistory 显式重置；
  * hk_cli 脚本用户目录优先、包内兜底；MCP start_workspace 确认卡片 detail
- * 展示前置补全后的最终参数；SourceRegistry 按 mtime 缓存盘上解析结果。
+ * 展示前置补全后的最终参数；SourceRegistry 按 mtime 缓存盘上解析结果；
+ * hk_cli/lark_cli 批量免问 key 绑定操作对象 id；hk 创建标题跳过 flag 取值；
+ * MCP 非法工具名跳过注册；localToolSummary 按 memory 启用标志拼接。
  * 运行：tsx scripts/unit-tools.ts
  */
 import assert from 'assert';
@@ -11,7 +13,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { buildTools, type CreateCounter } from '../src/agent/tools';
+import { buildTools, localToolSummary, LOCAL_TOOL_SUMMARY, type CreateCounter } from '../src/agent/tools';
 import { AgentSession } from '../src/agent/session';
 import { SourceRegistry } from '../src/agent/source-registry';
 import { MemoryStore } from '../src/agent/memory';
@@ -213,6 +215,137 @@ async function main(): Promise<void> {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // ---------- hk_cli batchKey：start/stop/approve/deny/follow-up 绑定 argv[1] 对象 id ----------
+  await checkAsync('hk_cli 批量免问 key：start/stop/approve/deny/follow-up 均绑定操作对象 id', async () => {
+    const tmp = tmpHome('hkkey');
+    try {
+      const keys: Array<string | undefined> = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: KANBAN_URL,
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+        confirm: async (req) => {
+          keys.push(req.batchKey);
+          return false; // 闸门即拒，不真正执行子进程
+        },
+      });
+      const hk = handlers.get('hk_cli')!;
+      const taskA = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      const repoB = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+      const wsA = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+      const apA = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+      // --branch 已带：start 前置补全直接放行（无需 HTTP），确认闸门先于执行
+      await hk({ args: ['start', taskA, '--repo', repoB, '--branch', 'dev'] });
+      await hk({ args: ['stop', wsA] });
+      await hk({ args: ['approve', apA] });
+      await hk({ args: ['deny', apA] });
+      await hk({ args: ['follow-up', taskA, '继续'] });
+      // sub 本身含 argv[1]（既有格式），对象 id 再经 extractUuid(argv[1]) 绑定一次
+      assert.deepEqual(
+        keys,
+        [
+          `hk:start ${taskA}:${taskA}`, // 绑定任务 id，不得被 --repo 的 repo id 抢占
+          `hk:stop ${wsA}:${wsA}`,
+          `hk:approve ${apA}:${apA}`,
+          `hk:deny ${apA}:${apA}`,
+          `hk:follow-up ${taskA}:${taskA}`,
+        ],
+        `实际 keys=${JSON.stringify(keys)}`,
+      );
+      assert.ok(!keys[0]!.includes(repoB), `start 的 key 不得绑到 --repo id: ${keys[0]}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- hk_cli 创建标题：flag 及其值不阻断标题提取 ----------
+  await checkAsync('hk_cli 创建标题：--flag value 成对跳过，取到 flag 后的标题', async () => {
+    const tmp = tmpHome('hktitle');
+    try {
+      const summaries: string[] = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: KANBAN_URL,
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+        confirm: async (req) => {
+          summaries.push(req.summary);
+          return false;
+        },
+      });
+      const hk = handlers.get('hk_cli')!;
+      await hk({ args: ['tasks', 'create', '--project', 'proj-x', '修复登录态'] });
+      assert.ok(summaries[0]?.includes('修复登录态'), `确认卡片标题为空或错位: ${summaries[0]}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- lark_cli batchKey：写操作 key 含目标实参 ----------
+  await checkAsync('lark_cli 批量免问 key：im send 绑定接收对象，不同接收人各自确认', async () => {
+    const tmp = tmpHome('larkkey');
+    try {
+      const keys: Array<string | undefined> = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: KANBAN_URL,
+        auditHome: tmp,
+        confirm: async (req) => {
+          keys.push(req.batchKey);
+          return false;
+        },
+      });
+      const lark = handlers.get('lark_cli')!;
+      await lark({ args: ['im', 'send', 'ou_aaa', '--content', 'hi'] });
+      await lark({ args: ['im', 'send', 'ou_bbb', '--content', 'hi'] });
+      assert.deepEqual(keys, ['lark:im send:ou_aaa', 'lark:im send:ou_bbb'], `实际 keys=${JSON.stringify(keys)}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- MCP 动态工具名：非法名跳过注册并 warn，不拖垮整个 tools 数组 ----------
+  await checkAsync('MCP 工具名非法（含空格/加前缀后超 64）时跳过并 warn，合法工具不受影响', async () => {
+    const tmp = tmpHome('mcpname');
+    const origWarn = console.warn;
+    const warns: string[] = [];
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      const longName = 'a'.repeat(60); // 加 kanban_ 前缀后 67 > 64
+      const mcp = {
+        connected: true,
+        tools: [
+          { name: 'bad name!', description: 'x', inputSchema: { type: 'object', properties: {} } },
+          { name: longName, description: 'x', inputSchema: { type: 'object', properties: {} } },
+          { name: 'good_tool', description: 'x', inputSchema: { type: 'object', properties: {} } },
+        ],
+        callTool: async () => 'ok',
+      } as unknown as KanbanMcp;
+      const { openAiTools, handlers } = buildTools({ mcp, kanbanUrl: KANBAN_URL, auditHome: tmp });
+      const names = openAiTools.map((t) => t.function.name);
+      assert.ok(!names.includes('kanban_bad name!'), '含空格名应跳过');
+      assert.ok(!names.includes(`kanban_${longName}`), '超长名应跳过');
+      assert.ok(names.includes('kanban_good_tool'), '合法名应注册');
+      assert.ok(handlers.has('kanban_good_tool') && !handlers.has('kanban_bad name!'));
+      assert.ok(warns.some((w) => w.includes('kanban_bad name!')), `应有跳过告警: ${JSON.stringify(warns)}`);
+    } finally {
+      console.warn = origWarn;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- localToolSummary：memory 行按启用标志拼接 ----------
+  await checkAsync('localToolSummary：memory 未启用时摘要不列 memory_*，启用时才拼入', async () => {
+    assert.ok(!LOCAL_TOOL_SUMMARY.some((t) => t.name.startsWith('memory_')), '基础摘要不应含 memory 行');
+    assert.equal(localToolSummary(false).length, LOCAL_TOOL_SUMMARY.length);
+    const withMem = localToolSummary(true);
+    assert.equal(withMem.length, LOCAL_TOOL_SUMMARY.length + 1);
+    assert.ok(withMem.some((t) => t.name === 'memory_set/get/delete/note'));
   });
 
   finish();

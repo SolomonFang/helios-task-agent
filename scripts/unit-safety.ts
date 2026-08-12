@@ -12,6 +12,9 @@ import { MemoryStore } from '../src/agent/memory';
 import { readSkillDoc } from '../src/agent/skills';
 import { isValidGitRef } from '../src/kanban/ai-review';
 import { buildTools, summarizeBothEnds } from '../src/agent/tools';
+import { classifyLark, looksLikeStrongFailure } from '../src/agent/guard';
+import { makeGatedWriter } from '../src/agent/tools/gated-write';
+import { SourceRegistry } from '../src/agent/source-registry';
 import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/infra/deps';
 import { check, checkAsync, finish } from './testkit';
 
@@ -524,6 +527,103 @@ async function main() {
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36',
     DEFAULT_KANBAN_PACKAGE,
   );
+
+  // ---------- classifyLark：--help 豁免仅适用已知读形态 ----------
+  check(
+    'classifyLark：未知动词带 --help 仍走写闸门，已知读形态仍豁免',
+    classifyLark(['doc', 'frobnicate', '--help']) === 'write' && // 未知子命令 + --help 不得豁免
+      classifyLark(['mystery-cmd', 'explode', '--help']) === 'write' &&
+      classifyLark(['task', 'list', '--help']) === 'read' && // 已知读动词路径仍豁免
+      classifyLark(['im', '--help']) === 'read' && // 裸命令组帮助仍豁免
+      classifyLark(['im', 'send', '--help']) === 'write', // 写动词不豁免（回归）
+  );
+
+  // ---------- 强失败判定：正文不误判、行首/上下文形态命中、中断判失败 ----------
+  check(
+    'looksLikeStrongFailure：正文提到 not found/denied/API error 不误判，行首/上下文形态仍命中，⏹ 已中断判失败',
+    !looksLikeStrongFailure('已创建任务：补充 not found handling 与 denied 重试逻辑') && // 正文文本不误判
+      !looksLikeStrongFailure('{"success":true,"data":{"note":"API error 处理说明"}}') &&
+      looksLikeStrongFailure('⏹ 已中断（未完成的操作未执行，可继续对话）。') && // /stop 中断 = 实际未执行
+      looksLikeStrongFailure('Error: API error 400 invalid param') && // 行首带 error: 前缀
+      looksLikeStrongFailure('not found') && // 行首锚定
+      looksLikeStrongFailure('bash: /x: permission denied') && // 带上下文形态
+      looksLikeStrongFailure('命令执行失败: exit 1'), // 原有形态回归
+  );
+
+  // ---------- runGatedWrite：/stop 中断判 ok=false（不记来源映射、不占创建配额） ----------
+  await checkAsync('runGatedWrite：中断返回（⏹ 已中断）审计 ok:false，不记来源、不占创建配额', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-gated-abort-'));
+    try {
+      const registry = new SourceRegistry(tmp);
+      const createCounter = { count: 0 };
+      const write = makeGatedWriter({
+        uid: 'u1',
+        registry,
+        kanbanUrl: 'http://localhost:1',
+        confirm: async () => 'once',
+        auditHome: tmp,
+        createCounter,
+      });
+      const out = await write({
+        kind: 'hk',
+        summary: '创建任务',
+        detail: () => 'hk tasks create x',
+        isCreate: true,
+        isStart: false,
+        urls: ['https://a.feishu.cn/docx/abort1'],
+        title: 't',
+        batchKey: 'hk:tasks:create',
+        destructive: false,
+        execute: async () => '⏹ 已中断（未完成的操作未执行，可继续对话）。',
+      });
+      assert.ok(out.includes('⏹ 已中断'), `中断结果应原样返回，实际：${out}`);
+      assert.equal(createCounter.count, 0, '中断未执行不得计入创建配额');
+      assert.equal(registry.lookup('u1', 'https://a.feishu.cn/docx/abort1'), undefined, '中断不得记录来源映射');
+      const audit = fs.readFileSync(path.join(tmp, 'audit.log'), 'utf8');
+      assert.ok(audit.includes('"decision":"approved","ok":false'), `中断应审计 ok:false，实际：${audit}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- runGatedWrite：taskId=unknown 的历史遗留映射清理后放行（不再死锁拦截） ----------
+  await checkAsync('runGatedWrite：taskId=unknown 的历史来源映射清理后放行，不再永久拦截', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-gated-unknown-'));
+    try {
+      const registry = new SourceRegistry(tmp);
+      registry.record('u1', 'https://a.feishu.cn/docx/old1', {
+        taskId: 'unknown',
+        title: '旧任务',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      });
+      const write = makeGatedWriter({
+        uid: 'u1',
+        registry,
+        kanbanUrl: 'http://localhost:1',
+        confirm: async () => 'once',
+        auditHome: tmp,
+        createCounter: { count: 0 },
+      });
+      const out = await write({
+        kind: 'hk',
+        summary: '创建任务',
+        detail: () => 'hk tasks create x',
+        isCreate: true,
+        isStart: false,
+        urls: ['https://a.feishu.cn/docx/old1'],
+        title: 't',
+        batchKey: 'hk:tasks:create',
+        destructive: false,
+        execute: async () => '已创建任务（无 uuid 输出）',
+      });
+      assert.ok(!out.includes('已同步过'), `unknown 映射不应再拦截，实际：${out}`);
+      assert.equal(registry.lookup('u1', 'https://a.feishu.cn/docx/old1'), undefined, 'unknown 映射应被清理');
+      const audit = fs.readFileSync(path.join(tmp, 'audit.log'), 'utf8');
+      assert.ok(!audit.includes('blocked_dup'), `unknown 映射不得再记 blocked_dup，实际：${audit}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   finish();
 }

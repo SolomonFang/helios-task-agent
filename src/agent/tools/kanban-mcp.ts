@@ -87,7 +87,8 @@ export function makeKanbanMcpHandler({
         return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
       } catch (err) {
         const message = errMessage(err);
-        return `MCP 工具 ${tool.name} 调用失败：${message}`;
+        // 错误文本同样来自 MCP server（可被写看板的人控制）：与成功路径一样 UNTRUSTED 包裹
+        return wrapUntrusted(`MCP 工具 ${tool.name} 调用失败：${message}`);
       }
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）

@@ -25,6 +25,11 @@ interface Pending {
   timer: NodeJS.Timeout;
   /** 确认卡片的消息 id（文本降级时无），异步回填，用于终态时原地更新卡片。 */
   cardMessageId?: string;
+  /**
+   * 已终结但终结时卡片 id 尚未回填：记录终态，待 sendPrompt 回填卡片 id 时
+   * 补发一次终态通知（否则已发出的确认卡片永远停在可点击状态）。
+   */
+  settledWithoutCard?: ConfirmSettle;
 }
 
 // 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作。
@@ -98,8 +103,13 @@ export class ConfirmationManager {
       clearTimeout(prev.timer);
       prev.resolve(false);
       this.pendings.delete(openId);
-      this.opts.onSuperseded?.(openId, prev.req);
-      this.opts.onSettled?.(openId, prev.req, 'superseded', prev.cardMessageId);
+      try {
+        this.opts.onSuperseded?.(openId, prev.req);
+        this.opts.onSettled?.(openId, prev.req, 'superseded', prev.cardMessageId);
+      } catch {
+        /* 通知回调失败不阻断新请求 */
+      }
+      if (!prev.cardMessageId) prev.settledWithoutCard = 'superseded';
     }
     const timeoutMs = this.timeoutFor(req);
     return new Promise((resolve) => {
@@ -108,20 +118,43 @@ export class ConfirmationManager {
         const p = this.pendings.get(openId);
         if (p && p.id === id) {
           this.pendings.delete(openId);
-          this.opts.onTimeout?.(openId, req);
-          this.opts.onSettled?.(openId, req, 'timeout', p.cardMessageId);
-          resolve(false);
+          // 回调在 setTimeout 里同步执行：回调抛异常不得让 resolve 漏执行
+          //（否则闸门 promise 永久挂起），resolve 放 finally 保证必达
+          try {
+            this.opts.onTimeout?.(openId, req);
+            this.opts.onSettled?.(openId, req, 'timeout', p.cardMessageId);
+          } catch {
+            /* 通知回调失败不阻断收尾 */
+          } finally {
+            resolve(false);
+          }
+          if (!p.cardMessageId) p.settledWithoutCard = 'timeout';
         }
       }, timeoutMs);
       // unref：确认超时（最长 300s）不应成为保活理由——进程若只剩这一个定时器
       //（如 shutdown 途中）应能直接退出，超时自动拒绝只是用户体验优化而非存活义务
       timer.unref();
-      this.pendings.set(openId, { id, req, resolve, timer });
+      const pending: Pending = { id, req, resolve, timer };
+      this.pendings.set(openId, pending);
       void this.sendPrompt(openId, this.chatIds.get(openId), req, id, timeoutMs)
         .then((messageId) => {
           // 回填卡片 message id 前确认 pending 仍是这一条（可能已被答复/替代）
           const p = this.pendings.get(openId);
-          if (p && p.id === id && messageId) p.cardMessageId = messageId;
+          if (p && p.id === id) {
+            if (messageId) p.cardMessageId = messageId;
+            return;
+          }
+          // 竞态：pending 已终结（如确认超时先于卡片发送完成），当时拿不到卡片 id、
+          // 终态通知落空。用回填的卡片 id 补发一次终态通知，让卡片原地更新为终态。
+          if (messageId && pending.settledWithoutCard) {
+            const settle = pending.settledWithoutCard;
+            pending.settledWithoutCard = undefined;
+            try {
+              this.opts.onSettled?.(openId, req, settle, messageId);
+            } catch {
+              /* 补发终态通知失败不影响已完成的裁决 */
+            }
+          }
         })
         .catch((err) => {
           // 卡片与文本降级都发送失败：用户无法裁决。 pending 仍属本条时才收尾——
@@ -190,10 +223,19 @@ export class ConfirmationManager {
   private finish(openId: string, p: Pending, verdict: ConfirmVerdict): void {
     clearTimeout(p.timer);
     this.pendings.delete(openId);
-    // 裁决留痕：open_id 只记头尾摘要，不完整落日志
+    // 裁决留痕：open_id 只记头尾摘要，不完整落日志；
+    // memory 写操作的 summary 含 value 摘要（memory_set 的 value 前 100 字符，
+    // 见 tools/memory-tools.ts）——裁决日志只记 key 部分（「：」前），不落 value
     const maskedUser = openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
-    console.log(`[confirm] user=${maskedUser} verdict=${verdict === false ? 'denied' : verdict} summary="${p.req.summary.slice(0, 80)}"`);
+    const loggedSummary = p.req.kind === 'memory' ? p.req.summary.split('：')[0]! : p.req.summary.slice(0, 80);
+    const settle: ConfirmSettle = verdict === false ? 'denied' : verdict;
+    console.log(`[confirm] user=${maskedUser} verdict=${settle} summary="${loggedSummary}"`);
     p.resolve(verdict);
-    this.opts.onSettled?.(openId, p.req, verdict === false ? 'denied' : verdict, p.cardMessageId);
+    try {
+      this.opts.onSettled?.(openId, p.req, settle, p.cardMessageId);
+    } catch {
+      /* 终态通知回调失败不影响已完成的裁决 */
+    }
+    if (!p.cardMessageId) p.settledWithoutCard = settle;
   }
 }

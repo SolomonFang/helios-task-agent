@@ -12,6 +12,9 @@ const MAX_GREP_SCAN_FILES = 5000;
 const MAX_GREP_SCAN_BYTES = 50 * 1024 * 1024;
 // 每扫描 N 个文件让出一次事件循环（bot 主循环同线程，避免长扫描阻塞消息处理）
 const GREP_YIELD_EVERY_FILES = 100;
+// re.test 前的单行限长兜底：ReDoS 启发式有逃逸路径（如 [ab]*[ab]*$、(a|aa)+$），
+// V8 同步正则遇超长行会卡死 bot 主循环；命中展示本就截 200 字符，限长不影响可读性
+const MAX_GREP_LINE_CHARS = 2000;
 
 export function truncateOutput(s: string, max = MAX_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
@@ -130,7 +133,7 @@ export async function resolveRepoRoot(opts: {
   kanbanUrl: string;
   root?: string;
   repoId?: string;
-}): Promise<{ ok: true; root: string } | { ok: false; error: string }> {
+}): Promise<{ ok: true; root: string } | { ok: false; error: string; denied?: boolean }> {
   const explicitRoot = Boolean(opts.root?.trim());
   let root = opts.root?.trim() || '';
   if (!root && opts.repoId?.trim()) {
@@ -154,12 +157,14 @@ export async function resolveRepoRoot(opts: {
     } catch (err) {
       return {
         ok: false,
+        denied: true,
         error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径：${errMessage(err)}`,
       };
     }
     if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
       return {
         ok: false,
+        denied: true,
         error: `路径不在看板注册仓库内，已拒绝访问（root=${rootAbs}）。请在看板中注册该仓库，或改用 repo_id 参数。`,
       };
     }
@@ -175,10 +180,11 @@ export async function repoFsList(root: string, relPath = '.'): Promise<string> {
   const st = await fs.promises.stat(resolved.abs);
   if (!st.isDirectory()) return `不是目录：${relPath || '.'}`;
   const entries = await fs.promises.readdir(resolved.abs, { withFileTypes: true });
+  // 先排序再截断：截断发生在 readdir 原始顺序上会展示任意子集且多次调用结果不稳定
   const lines = entries
-    .slice(0, MAX_LIST_ENTRIES)
     .map((e) => e.name + (e.isDirectory() ? '/' : ''))
-    .sort((a, b) => a.localeCompare(b));
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, MAX_LIST_ENTRIES);
   const extra = entries.length > MAX_LIST_ENTRIES ? `\n…（共 ${entries.length} 项，已截断）` : '';
   return truncateOutput(`root: ${root}\npath: ${relPath || '.'}\n\n${lines.join('\n')}${extra}`);
 }
@@ -195,8 +201,9 @@ export async function repoFsRead(root: string, relPath: string): Promise<string>
   try {
     const size = Math.min(st.size, MAX_READ_BYTES);
     const buf = Buffer.alloc(size);
-    await fh.read(buf, 0, size, 0);
-    let text = buf.toString('utf8');
+    // 用 bytesRead 截断：stat 与 read 之间文件被截短时，buf 尾部会残留 \0 混进输出文本
+    const { bytesRead } = await fh.read(buf, 0, size, 0);
+    let text = buf.subarray(0, bytesRead).toString('utf8');
     if (st.size > MAX_READ_BYTES) {
       text += `\n…（文件共 ${st.size} 字节，仅读取前 ${MAX_READ_BYTES}）`;
     }
@@ -273,8 +280,10 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
     const lines = content.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       if (hits.length >= MAX_GREP_HITS) break;
-      if (re.test(lines[i]!)) {
-        hits.push(`${rel}:${i + 1}:${lines[i]!.slice(0, 200)}`);
+      // 单行限长兜底：启发式放行的 ReDoS pattern 遇超长行不至于卡死事件循环
+      const line = lines[i]!.slice(0, MAX_GREP_LINE_CHARS);
+      if (re.test(line)) {
+        hits.push(`${rel}:${i + 1}:${line.slice(0, 200)}`);
       }
     }
   };
@@ -319,24 +328,29 @@ export async function runRepoFs(
     pattern?: string;
     glob?: string;
   },
-): Promise<string> {
+): Promise<{ out: string; denied: boolean }> {
   const rootRes = await resolveRepoRoot({
     kanbanUrl,
     root: args.root,
     repoId: args.repo_id,
   });
-  if (!rootRes.ok) return rootRes.error;
+  // denied 走结构化字段返回（白名单拒绝由 resolveRepoRoot 标记，敏感文件直读在下方判定），
+  // 调用方据此记审计，不再反向解析输出文案
+  if (!rootRes.ok) return { out: rootRes.error, denied: rootRes.denied === true };
 
   const action = (args.action || '').toLowerCase();
   const rel = args.path || '.';
+  // 敏感文件直读目标的结构化判定：与 repoFs* 内部 denylist 同源（内部检查保留作纵深防御）
+  const resolved = resolveUnderRoot(rootRes.root, rel);
+  const denied = resolved.ok && isSensitiveFile(resolved.abs);
   switch (action) {
     case 'list':
-      return await repoFsList(rootRes.root, rel);
+      return { out: await repoFsList(rootRes.root, rel), denied };
     case 'read':
-      return await repoFsRead(rootRes.root, rel === '.' ? '' : rel);
+      return { out: await repoFsRead(rootRes.root, rel === '.' ? '' : rel), denied };
     case 'grep':
-      return await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob);
+      return { out: await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob), denied };
     default:
-      return '参数错误：action 必须是 list | read | grep';
+      return { out: '参数错误：action 必须是 list | read | grep', denied: false };
   }
 }

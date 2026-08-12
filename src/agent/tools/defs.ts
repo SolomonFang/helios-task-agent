@@ -157,8 +157,17 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
   { name: 'work_summary', summary: '生成工作总结报告（HTML/MD）' },
   { name: 'skill_doc', summary: '按需读取已安装技能完整文档（SKILL.md）' },
   { name: 'skill_exec', summary: '运行技能目录内脚本（每次需用户确认）' },
-  { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' },
 ];
+
+/**
+ * 按 memory 启用标志拼接摘要：memory_* 工具仅在实际注册（buildTools 传入 memory）时列出，
+ * 否则摘要会展示并不存在的工具（见 buildTools 的 memory 条件注册）。
+ */
+export function localToolSummary(memoryEnabled: boolean): Array<{ name: string; summary: string }> {
+  return memoryEnabled
+    ? [...LOCAL_TOOL_SUMMARY, { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' }]
+    : LOCAL_TOOL_SUMMARY;
+}
 
 export const MEMORY_TOOLS: OpenAiTool[] = [
   {

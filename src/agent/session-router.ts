@@ -57,6 +57,9 @@ export class SessionRouter {
     }
     if (this.sessions.size >= SessionRouter.MAX_SESSIONS) {
       // 淘汰最旧的空闲会话；都在忙则暂时超额（极端情况，下轮再淘汰）
+      // 已知权衡：被淘汰会话最后一轮 persistHistory 是 fire-and-forget，若该用户立刻再说话，
+      // 下方重建的会话可能读到尚未落盘的陈旧磁盘历史（丢最后一轮）。可接受：等写队列再重建
+      // 会把淘汰路径变成异步、显著复杂化，且该用户下一轮落盘即修正。
       for (const key of this.sessions.keys()) {
         if (!this.busy(key)) {
           this.sessions.delete(key);

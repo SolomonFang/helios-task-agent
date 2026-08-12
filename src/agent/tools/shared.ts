@@ -80,7 +80,12 @@ export function run(
           resolve(`命令执行失败（非零退出）：${error.message}\n${truncate(stderr || '')}\n--- stdout ---\n${truncate(stdout || '')}`.trim());
         } else {
           const out = truncate(stdout || '');
-          resolve(stderr && !out ? truncate(stderr) : out || '（无输出）');
+          if (out && stderr) {
+            // 成功但 stderr 非空：警告不得静默丢弃，截断摘要附在输出后（同 summarizeBothEnds 风格）
+            resolve(`${out}\n[stderr] ${summarizeBothEnds(stderr.trim())}`);
+          } else {
+            resolve(stderr && !out ? truncate(stderr) : out || '（无输出）');
+          }
         }
       },
     );

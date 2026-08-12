@@ -147,8 +147,13 @@ export function classifyLark(args: string[]): 'read' | 'write' {
   const verbs = larkVerbs(args);
   // 命中写动词的一律不豁免（即使带了 --help）：启发式豁免不得放行写命令
   if (verbs.some((v) => LARK_WRITE_VERBS.has(v))) return 'write';
-  if (helpIdx === args.length - 1 && args.slice(0, helpIdx).filter((a) => !a.startsWith('-')).length <= 2) {
-    return 'read';
+  // --help 豁免仅适用已知读形态：路径含已知读动词（如 ["task","list","--help"]），
+  // 或裸命令组帮助（["im","--help"]，无子命令可执行）。未知动词/子命令带 --help
+  // 不得豁免（如 ["doc","frobnicate","--help"]）——未知命令本就 fail-closed 判写，
+  // 不能靠追加 --help 绕过闸门。
+  if (helpIdx === args.length - 1) {
+    const pathArgs = args.slice(0, helpIdx).filter((a) => !a.startsWith('-'));
+    if (pathArgs.length <= 1 || verbs.some((v) => LARK_READ_VERBS.has(v))) return 'read';
   }
   if (first === 'api') {
     const method = (args[1] || '').toUpperCase();
@@ -238,13 +243,21 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
 
 /**
  * 强失败判定：仅匹配真实的执行失败信号，用于「操作是否成功」的决策
- * （审计 ok 标记、来源映射记录、创建计数）。不包含裸 error/失败 字样，
- * 避免成功结果的内容文本（如描述里提到 error handling）被误判为失败。
+ * （审计 ok 标记、来源映射记录、创建计数）。英文失败词（API error / denied /
+ * not found）只认行首锚定（可带 error: 前缀）或带上下文的形态（permission
+ * denied），避免成功输出的正文文本（如任务描述写 "not found handling"）被误判
+ * 为失败、静默丢来源映射。「⏹ 已中断」是 /stop 中断时 run() 的固定返回
+ * （见 tools/shared.ts）——操作实际未执行，必须判失败，否则审计误记 ok:true
+ * 且白消耗创建配额。
  */
-const STRONG_FAILURE_RE = /命令执行失败|调用失败|执行异常|^错误|HTTP \d{3}\b|API error|denied|not found/i;
+const STRONG_FAILURE_RE = /^错误|命令执行失败|调用失败|执行异常|HTTP \d{3}\b|⏹ 已中断|permission denied/i;
+// 行首锚定的英文失败形态（m 标志：任一行的行首，可带 error: 前缀）——与串首锚定的
+// ^错误 分开，避免 m 标志把 ^错误 放宽成行首匹配（成功输出的正文行可能以「错误」开头）。
+const STRONG_FAILURE_LINE_RE = /^(?:error[:：]\s*)?(?:api error|denied|not found)\b/im;
 
 export function looksLikeStrongFailure(s: string): boolean {
-  return STRONG_FAILURE_RE.test(s.slice(0, 300));
+  const head = s.slice(0, 300);
+  return STRONG_FAILURE_RE.test(head) || STRONG_FAILURE_LINE_RE.test(head);
 }
 
 // --- untrusted external content marking (prompt-injection mitigation) ---

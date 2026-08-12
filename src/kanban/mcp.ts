@@ -44,8 +44,14 @@ export class KanbanMcp {
       });
     }
     const client = new Client({ name: 'helios-task-agent', version: '1.0.0' }, { capabilities: {} });
+    // 超时路径的子孙进程快照：close 会杀掉直接子进程（npx 壳），孙进程被 reparent 后按
+    // ppid 已找不到——必须在 close 前快照，否则超时场景恰好绕过 sweepOrphanedTree 清理
+    let timeoutSnapshot: Map<number, string> | null = null;
     const timer = setTimeout(() => {
-      void transport.close().catch(() => {});
+      void (async () => {
+        timeoutSnapshot = await collectDescendants(transport.pid);
+        await transport.close().catch(() => {});
+      })();
     }, timeoutMs);
     try {
       await client.connect(transport);
@@ -64,7 +70,8 @@ export class KanbanMcp {
       // 快速失败路径（connect 在超时前 reject）：超时定时器尚未触发，transport 未关闭，
       // 不主动关会泄漏 stdio 子进程（超时已触发过的重复 close 无害）。
       // 快照须在 kill 之前：孙进程在直接子进程死后被 reparent，事后按父 pid 已找不到。
-      const snapshot = await collectDescendants(transport.pid);
+      // 超时路径复用定时器里 close 前已完成的快照（此刻直接子进程已死，现采快照为空）。
+      const snapshot = timeoutSnapshot ?? (await collectDescendants(transport.pid));
       await transport.close().catch(() => {});
       await sweepOrphanedTree(snapshot);
       this.transportPid = null;

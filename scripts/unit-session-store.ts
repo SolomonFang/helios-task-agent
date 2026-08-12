@@ -1,7 +1,8 @@
 /**
  * 会话历史持久化单测（SessionHistoryStore + AgentSession 接线）：
  * 落盘→重建恢复；坏 JSON 宽容；版本不符视为无历史；畸形 tool_calls 条目丢弃；
- * /clear 清盘；文件名穿越防护；目录文件数上限清理；system note 不落盘；
+ * /clear 清盘（与在途 save 共用串行队列）；文件名穿越防护与折叠碰撞 hash；目录文件数上限清理；
+ * rename 失败 tmp 清理与过期孤儿 tmp prune；system note 不落盘；
  * 失败轮次的 user 消息不落盘；成功轮次落盘（happy path，异步 fire-and-forget）；
  * prune 节流；SessionRouter 透传接线。
  * 运行：tsx scripts/unit-session-store.ts
@@ -148,9 +149,78 @@ async function main(): Promise<void> {
       const store = new SessionHistoryStore(tmp);
       await store.save('u1', [{ role: 'user', content: 'hi' }]);
       assert.equal(store.load('u1').length, 1);
-      store.clear('u1');
+      const cleared = store.clear('u1');
+      assert.ok(typeof cleared.then === 'function', 'clear 应返回 Promise（入队异步清盘）');
+      await cleared;
       assert.deepEqual(store.load('u1'), []);
-      store.clear('u1'); // 幂等
+      await store.clear('u1'); // 幂等
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- clear 与在途 save 共用串行队列：/clear 后队列里的写不得把旧历史写回 ----------
+  await checkAsync('clear 入队：在途 save 之后触发的 clear 最终生效（旧历史不被写回）', async () => {
+    const tmp = tmpHome('clearace');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      const saving = store.save('u1', [{ role: 'user', content: '旧历史' }]);
+      const clearing = store.clear('u1'); // 不等待在途 save：clear 排在它后面
+      await Promise.all([saving, clearing]);
+      assert.deepEqual(store.load('u1'), [], 'clear 之后的队列写不得复活已清除的历史');
+      // 后续 save 仍正常（队列未被 clear 污染）
+      await store.save('u1', [{ role: 'user', content: '新历史' }]);
+      assert.equal(store.load('u1').length, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- rename 失败清理 tmp；prune 顺带清理过期孤儿 tmp ----------
+  await checkAsync('原子写：rename 失败时 tmp 被清理不残留；prune 清过期 tmp、不动新 tmp', async () => {
+    const tmp = tmpHome('tmpclean');
+    try {
+      const store = new SessionHistoryStore(tmp, 100, 0);
+      // rename 失败：save 抛出且 tmp 不残留
+      const origRename = fs.promises.rename.bind(fs.promises);
+      (fs.promises as { rename: unknown }).rename = async () => {
+        throw new Error('模拟 rename 失败');
+      };
+      try {
+        await assert.rejects(store.save('u1', [{ role: 'user', content: 'x' }]), /rename 失败/);
+      } finally {
+        (fs.promises as { rename: unknown }).rename = origRename;
+      }
+      const dir = path.join(tmp, 'sessions');
+      assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], 'rename 失败后 tmp 应被清理');
+      // prune：过期 tmp 被清理，新 tmp（可能在途写）保留
+      fs.writeFileSync(path.join(dir, 'stale.1.tmp'), 'x');
+      fs.writeFileSync(path.join(dir, 'fresh.1.tmp'), 'x');
+      const old = new Date(Date.now() - 20 * 60_000);
+      fs.utimesSync(path.join(dir, 'stale.1.tmp'), old, old);
+      await store.save('u1', [{ role: 'user', content: '触发 prune' }]);
+      const left = fs.readdirSync(dir).sort();
+      assert.ok(!left.includes('stale.1.tmp'), '过期孤儿 tmp 应被 prune 清理');
+      assert.ok(left.includes('fresh.1.tmp'), '新 tmp 视为可能在途写，不应被清理');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- safeFileName 折叠碰撞：白名单外字符的 id 追加短 hash ----------
+  await checkAsync('文件名折叠碰撞：a/b、a b、a-b 落到不同文件；合法 id 文件名不变', async () => {
+    const tmp = tmpHome('collision');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      await store.save('a/b', [{ role: 'user', content: 'slash' }]);
+      await store.save('a b', [{ role: 'user', content: 'space' }]);
+      await store.save('a-b', [{ role: 'user', content: 'dash' }]);
+      const files = fs.readdirSync(path.join(tmp, 'sessions')).sort();
+      assert.equal(files.length, 3, `折叠后不得碰撞，实际：${files.join(',')}`);
+      assert.ok(files.includes('a-b.json'), '纯白名单 id 文件名保持原样（存量会话文件不受影响）');
+      assert.equal(store.load('a/b')[0]!.content, 'slash');
+      assert.equal(store.load('a b')[0]!.content, 'space');
+      assert.equal(store.load('a-b')[0]!.content, 'dash');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -242,7 +312,7 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- AgentSession：clearHistory 同步清盘 ----------
+  // ---------- AgentSession：clearHistory 清盘（入队异步） ----------
   await checkAsync('AgentSession：clearHistory 清掉磁盘历史，重建不再恢复', async () => {
     const tmp = tmpHome('sessclear');
     try {
@@ -259,6 +329,7 @@ async function main(): Promise<void> {
       }
       await store.save('u1', [{ role: 'user', content: '旧历史' }]); // 模拟此前已落盘（同时排空失败轮次的异步写）
       session.clearHistory();
+      await drainQueue(store); // clear 与 save 共用串行队列（fire-and-forget），先排空再断言
       assert.deepEqual(store.load('u1'), []);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

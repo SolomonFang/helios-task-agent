@@ -22,10 +22,14 @@ export function makeLarkCliHandler({
     if (classifyLark(argv) === 'write') {
       const summary = `飞书写操作：lark-cli ${argv.slice(0, 3).join(' ')}`;
       const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
-      // 「同类免问」按命令路径归类（如 lark:im send / lark:task create）；飞书写整体按破坏性对待（超时放宽）
+      // 「同类免问」按命令路径 + 对象归类（如 lark:im send:ou_x）：子命令后第一个非 flag 实参
+      // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；无该实参时退化为命令路径。
+      // 飞书写整体按破坏性对待（超时放宽）
       const sub = argv[1] && !argv[1].startsWith('-') ? ` ${argv[1]}` : '';
+      const target = argv.slice(sub ? 2 : 1).find((a) => !a.startsWith('-'));
+      const batchKey = target ? `lark:${argv[0]}${sub}:${target}` : `lark:${argv[0]}${sub}`;
       const gate = await passGate(
-        { kind: 'lark', summary, detail, batchKey: `lark:${argv[0]}${sub}`, destructive: true },
+        { kind: 'lark', summary, detail, batchKey, destructive: true },
         confirm,
       );
       if (!gate.allowed) {

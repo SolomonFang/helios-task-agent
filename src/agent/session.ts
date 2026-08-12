@@ -210,15 +210,15 @@ export class AgentSession {
   /** Clear chat history only — memory is kept. 同时显式重置「单会话创建上限」计数（会话级状态不随工具闭包重建清零）。 */
   clearHistory(): void {
     this.createCounter.count = 0;
+    // 「同类免问」批次授权同属会话级状态：/clear 后恢复逐次确认，不带入新会话
+    this.batchedConfirm?.revokeBatchApprovals();
     this.applyConfig(this.cfg);
     this.messages = this.messages.slice(0, 1);
-    // 同步清掉磁盘历史；清盘失败不阻断（内存已清，下次落盘会覆盖）
+    // 清盘与 save 共用串行队列（防在途写把旧历史写回）；fire-and-forget：失败仅记日志（内存已清，下次落盘会覆盖）
     if (this.historyStore) {
-      try {
-        this.historyStore.clear(this.userId);
-      } catch (err) {
+      this.historyStore.clear(this.userId).catch((err) => {
         console.error(`[session] 磁盘会话历史清理失败: ${errMessage(err)}`);
-      }
+      });
     }
   }
 

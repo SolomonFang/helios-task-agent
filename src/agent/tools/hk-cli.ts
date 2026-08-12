@@ -13,8 +13,13 @@ import type { GatedWrite } from './gated-write';
 /** hk tasks create [project_id] <title> — title = first non-flag arg that is not a UUID. */
 function hkCreateTitle(args: string[]): string {
   const rest = args[0] === 'create-and-start' ? args.slice(1) : args.slice(2);
-  for (const a of rest) {
-    if (a.startsWith('--')) break;
+  // 遇 flag 跳过 flag 及其值继续找（--project X "标题"），不能在第一个 -- 处 break，否则取不到标题
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a.startsWith('--')) {
+      if (!a.includes('=')) i++; // --flag value 形态成对跳过；--flag=value 只占一位
+      continue;
+    }
     if (/^[0-9a-fA-F-]{36}$/.test(a)) continue;
     return a;
   }
@@ -23,8 +28,10 @@ function hkCreateTitle(args: string[]): string {
 
 function batchKeyForHk(argv: string[]): string {
   const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
-  // 同 batchKeyForMcp：任务/项目标识（UUID）纳入 key，免问仅对同一对象的同类操作生效
-  const id = argv.slice(2).map(extractUuid).find(Boolean);
+  // 同 batchKeyForMcp：任务/项目标识（UUID）纳入 key，免问仅对同一对象的同类操作生效。
+  // start/stop/approve/follow-up 的对象 id 在 argv[1]，先看它，再回退 argv[2+]（tasks <sub> <id> 形态）；
+  // 漏看 argv[1] 会把 start <task> --repo <repo> 的 key 错绑到 repo 上
+  const id = extractUuid(argv[1] ?? '') ?? argv.slice(2).map(extractUuid).find(Boolean);
   return id ? `hk:${sub}:${id}` : `hk:${sub}`;
 }
 

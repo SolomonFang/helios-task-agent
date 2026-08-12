@@ -74,12 +74,24 @@ export function makeGatedWriter({
   createCounter: CreateCounter;
 }): GatedWrite {
 
-  /** Returns a block message if any source URL was already synced; cleans stale mappings. */
+  /**
+   * Returns a block message if any source URL was already synced; cleans stale mappings.
+   * 已知限制（跨进程 TOCTOU）：checkDuplicates 与 recordSources 并非原子操作，
+   * CLI 与 bot 两个进程并发同步同一来源时可双双通过查重、各建一个任务。
+   * 单进程内串行（事件循环 + 同用户串行队列），风险仅限跨进程并发；当前以注释明示，不改行为。
+   */
   const checkDuplicates = async (urls: string[]): Promise<string | null> => {
     for (const url of urls) {
       const hit = registry.lookup(uid, url);
       if (!hit) continue;
-      const exists = hit.taskId === 'unknown' ? true : await kanbanTaskExists(kanbanUrl, hit.taskId);
+      // taskId 为 unknown 的是历史遗留数据（recordSources 只写 extractUuid 非空的记录）：
+      // 无从核验任务是否仍存活，拦截文案引导的「先删除原任务」也无从操作——
+      // 永久拦截即成死锁，清理该映射后放行
+      if (hit.taskId === 'unknown') {
+        registry.remove(uid, url);
+        continue;
+      }
+      const exists = await kanbanTaskExists(kanbanUrl, hit.taskId);
       if (exists) {
         // 时间戳截断到分钟：ISO 毫秒精度对用户无核对价值
         const createdShort = hit.createdAt.replace('T', ' ').slice(0, 16);

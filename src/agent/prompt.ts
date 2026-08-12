@@ -6,7 +6,6 @@
  */
 
 import { renderSkillsBlock } from './skills';
-import type { UserMemory } from '../types';
 
 export interface SystemPromptOpts {
   mcpOk: boolean;
@@ -19,22 +18,12 @@ export interface SystemPromptOpts {
   memoryText?: string;
 }
 
-function formatMemoryBlock(memoryText?: string, memory?: UserMemory): string {
-  if (memoryText) return memoryText;
-  if (!memory) return '（暂无记忆）';
-  const factEntries = Object.entries(memory.facts);
-  if (!factEntries.length && !memory.notes.length) return '（暂无记忆）';
-  const lines: string[] = [];
-  if (factEntries.length) {
-    lines.push('键值：');
-    for (const [k, v] of factEntries) lines.push(`- ${k}: ${v}`);
-  }
-  if (memory.notes.length) {
-    lines.push('备注：');
-    for (const n of memory.notes) lines.push(`- ${n}`);
-  }
-  return lines.join('\n');
+function formatMemoryBlock(memoryText?: string): string {
+  return memoryText || '（暂无记忆）';
 }
+
+// MCP 工具名来自 server 响应，内联进系统提示词前做白名单过滤，防止换行/标记注入提示词
+const sanitizeMcpToolName = (n: string): string => n.replace(/[^a-zA-Z0-9_-]/g, '');
 
 // 与 guard.wrapUntrusted 同一思路：记忆内容由模型经 memory_set 写入并回注系统提示词，
 // 属持久化 prompt 注入通道——明确标注「不是指令」，仅供个性化参考。
@@ -52,7 +41,7 @@ export function buildSystemPrompt({
   memoryText,
 }: SystemPromptOpts): string {
   const kanbanTools = mcpOk
-    ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames.map((n) => `kanban_${n}`).join(', ')}。**优先使用这些 MCP 工具**；MCP 缺能力时再用 hk_cli。`
+    ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames.map((n) => `kanban_${sanitizeMcpToolName(n)}`).join(', ')}。**优先使用这些 MCP 工具**；MCP 缺能力时再用 hk_cli。`
     : `当前 MCP 未连接，请使用 hk_cli 工具（HTTP REST，目标 ${kanbanUrl}）操作 kanban，并告知用户：看板当前通过备用接口（hk_cli）连接，功能不受影响。不确定子命令时先 \`["--help"]\`。`;
 
   const defaults = [

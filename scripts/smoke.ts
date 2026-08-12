@@ -229,11 +229,13 @@ async function main(): Promise<void> {
   const dupOut = await gated.handlers.get('hk_cli')!({
     args: ['tasks', 'create', '重复', '--desc', '来源 https://xxx.feishu.cn/docx/abc'],
   });
-  check('重复来源拦截且不进闸门', /已同步过/.test(dupOut) && confirmCalls === 1, dupOut.slice(0, 50));
+  // taskId 为 unknown 的历史遗留映射：清理后放行到闸门（不再死锁拦截），闸门拒绝则不执行
+  check('unknown 遗留映射清理后放行到闸门', /拒绝了该写操作/.test(dupOut) && confirmCalls === 2, dupOut.slice(0, 50));
+  check('unknown 映射已被清理', reg.lookup('local', 'https://xxx.feishu.cn/docx/abc') === undefined);
   const auditText = fs.existsSync(path.join(gateHome, 'audit.log'))
     ? fs.readFileSync(path.join(gateHome, 'audit.log'), 'utf8')
     : '';
-  check('审计日志写入', auditText.includes('blocked_dup') && auditText.includes('denied'));
+  check('审计日志写入', auditText.includes('denied') && !auditText.includes('blocked_dup'));
 
   const wrapped = await gated.handlers.get('lark_cli')!({ args: ['--version'] });
   check('lark_cli 输出带 UNTRUSTED 标记', wrapped.includes('UNTRUSTED_FEISHU_CONTENT'));

@@ -3,7 +3,8 @@
  * 异步 grep 正确性（命中格式/大小写/glob/无命中）；扫描总量上限截断（字节口径）；
  * 符号链接防逃逸（read 拒绝、grep 直扫拒绝、树扫描不跟随）；MAX_GREP_HITS 上限；
  * skipDir 与敏感文件跳过；ReDoS 启发式防护不变；list/read 异步正确性；
- * 大扫描期间事件循环不被阻塞（setTimeout 能触发）。
+ * 大扫描期间事件循环不被阻塞（setTimeout 能触发）；grep 单行限长兜底；
+ * list 超上限时先排序再截断（窗口确定）；read 按 bytesRead 截断（无残留 \0）。
  * 运行：tsx scripts/unit-repo-fs.ts
  */
 import assert from 'assert';
@@ -200,8 +201,27 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- 单行限长兜底：启发式逃逸的 pattern 只在前 2000 字符内匹配 ----------
+  await checkAsync('repoFsGrep：单行限长 2000 兜底（行内 2000 字符之后的命中不计）', async () => {
+    const root = tmpRepo('linelen');
+    try {
+      const pad = 'x'.repeat(3000);
+      // 第 1 行命中在限长窗口内；第 2 行命中在 2000 字符之后，不得计入
+      fs.writeFileSync(path.join(root, 'long.txt'), `needle ${pad}\n${pad} needle\n`);
+      const out = await repoFsGrep(root, 'needle');
+      assert.ok(out.includes('long.txt:1:'), out);
+      assert.ok(!out.includes('long.txt:2:'), out);
+      // 启发式逃逸的 pattern（[ab]*[ab]*z：剥离字符类后不被相邻量词段判定捕获）不被拒绝、扫描有界完成
+      fs.writeFileSync(path.join(root, 'ab.txt'), `${'ab'.repeat(150)}\n`);
+      const esc = await repoFsGrep(root, '[ab]*[ab]*z', 'ab.txt');
+      assert.ok(esc.includes('（无命中）'), esc);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // ---------- list 异步正确性与条目上限 ----------
-  await checkAsync('repoFsList：列目录（目录带 / 后缀、排序），超 200 项截断注明', async () => {
+  await checkAsync('repoFsList：列目录（目录带 / 后缀、排序），超 200 项先排序再截断（窗口确定且稳定）', async () => {
     const root = tmpRepo('list');
     try {
       fs.mkdirSync(path.join(root, 'sub'));
@@ -213,6 +233,11 @@ async function main(): Promise<void> {
       for (let i = 0; i < 205; i++) fs.writeFileSync(path.join(root, `e${String(i).padStart(3, '0')}`), '');
       const big = await repoFsList(root, '.');
       assert.ok(big.includes('已截断'), big);
+      // 先排序再截断：展示窗口为排序后前 200 项（a.txt + e000…e198），不随 readdir 顺序漂移
+      assert.ok(big.includes('e198'), big);
+      assert.ok(!big.includes('e199'), big);
+      assert.ok(!big.includes('sub/'), big);
+      assert.equal(await repoFsList(root, '.'), big, '多次调用结果应一致');
       const notDir = await repoFsList(root, 'a.txt');
       assert.ok(notDir.includes('不是目录'), notDir);
       const missing = await repoFsList(root, 'nope');
@@ -232,6 +257,8 @@ async function main(): Promise<void> {
       const out = await repoFsRead(root, 'hello.txt');
       assert.ok(out.includes('# hello.txt'), out);
       assert.ok(out.includes('你好世界'), out);
+      // 按 bytesRead 截断：stat 后文件被截短也不得在输出尾部残留 \0
+      assert.ok(!out.includes('\0'), '输出不得含 NUL 字符');
       const big = await repoFsRead(root, 'big.bin');
       // 200KB 正文超出 MAX_OUTPUT 截断，输出注明已截断且不含完整 210KB
       assert.ok(big.includes('输出过长，已截断'), big.slice(-200));

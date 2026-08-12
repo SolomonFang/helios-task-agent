@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
+import { errMessage } from '../infra/err';
 
 /**
  * Dedupe registry: remembers which Feishu/Lark source URLs already became
@@ -26,6 +27,9 @@ function isSyncedSource(v: unknown): v is SyncedSource {
 
 const SOURCE_URL_RE = /https?:\/\/[A-Za-z0-9.-]*(?:feishu\.cn|larksuite\.com|feishu\.net|feishu\.io)[^\s"'<>)\]，。；]*/g;
 
+/** 单用户来源映射条数上限：超出时按 createdAt 淘汰最旧，防止盘上文件与内存 Map 无界增长。 */
+const MAX_SOURCES_PER_USER = 1000;
+
 /** Extract Feishu/Lark source URLs from arbitrary text (title + description + args). */
 export function extractSourceUrls(text: string): string[] {
   const matches = text.match(SOURCE_URL_RE) || [];
@@ -36,7 +40,8 @@ export function extractSourceUrls(text: string): string[] {
 export async function kanbanTaskExists(kanbanUrl: string, taskId: string): Promise<boolean> {
   try {
     const base = kanbanUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/api/tasks/${taskId}`, { signal: AbortSignal.timeout(8000) });
+    // taskId 来自盘上文件（可能被手改），编码后才拼进 URL，防止注入路径段
+    const res = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}`, { signal: AbortSignal.timeout(8000) });
     if (res.status === 404) return false;
     if (!res.ok) return true; // unknown → conservative: keep blocking
     const json: unknown = await res.json();
@@ -95,12 +100,21 @@ export class SourceRegistry {
   }
 
   private persist(): void {
+    // 条数上限：淘汰每用户 createdAt 最旧的条目。与 remove 一样，淘汰结果可能被
+    // 持有旧内存快照的其他实例在下一次 persist 时复活（取舍见 mergeFromDisk 注释）。
+    for (const entries of Object.values(this.data)) {
+      const keys = Object.keys(entries);
+      if (keys.length <= MAX_SOURCES_PER_USER) continue;
+      const byOldest = keys.sort((a, b) => entries[a]!.createdAt.localeCompare(entries[b]!.createdAt));
+      for (const k of byOldest.slice(0, keys.length - MAX_SOURCES_PER_USER)) delete entries[k];
+    }
     try {
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n');
       // 刚写的内容与内存一致：同步缓存，避免下一次 mergeFromDisk 立刻重读自己写的文件
       this.diskCache = { fingerprint: this.statFingerprint(), data: this.data };
-    } catch {
-      /* best-effort */
+    } catch (err) {
+      // best-effort，但必须可观测：静默失败会让跨进程去重无声失效
+      console.warn(`[source-registry] 查重映射落盘失败（跨进程去重可能失效）: ${errMessage(err)}`);
     }
   }
 
@@ -108,6 +122,8 @@ export class SourceRegistry {
    * Reload disk and fold in keys written by other instances (CLI vs bot vs
    * sibling sessions share the file); our in-memory view wins on conflicts.
    * 按内容指纹缓存解析结果：文件未变时跳过重读与 JSON.parse，合并语义不变。
+   * 取舍：本实例 remove/上限淘汰掉的 key，可能被仍持有旧内存快照的其他实例在
+   * 下一次 persist 时复活——跨实例去重本就是 best-effort，接受这一点换取无锁实现。
    */
   private mergeFromDisk(): void {
     const fingerprint = this.statFingerprint();

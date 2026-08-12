@@ -36,8 +36,10 @@ export interface SkillDigest {
  * 不引入 YAML 依赖；技能 frontmatter 只应使用这三种形态。
  */
 export function parseFrontmatter(raw: string): { data: Record<string, string | string[]>; body: string } {
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n*/);
-  if (!m) return { data: {}, body: raw };
+  // 统一 CRLF → LF：Windows 换行的 SKILL.md 也应能解析
+  const text = raw.replace(/\r\n/g, '\n');
+  const m = text.match(/^---\n([\s\S]*?)\n---\n*/);
+  if (!m) return { data: {}, body: text };
   const data: Record<string, string | string[]> = {};
   const lines = m[1]!.split('\n');
   for (let i = 0; i < lines.length; i++) {
@@ -58,7 +60,7 @@ export function parseFrontmatter(raw: string): { data: Record<string, string | s
       data[key!] = rest;
     }
   }
-  return { data, body: raw.slice(m[0].length) };
+  return { data, body: text.slice(m[0].length) };
 }
 
 /** 按声明的章节名（大小写不敏感的子串匹配）摘取 `## ` 章节。 */
@@ -78,6 +80,13 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   if (!fs.existsSync(skillFile)) return null;
   const rel = path.relative(process.cwd(), absDir) || absDir;
   const problems: string[] = [];
+  // 符号链接可指向技能目录外的任意文件（含凭证），拒绝读取（与 readSkillDoc 一致）
+  if (fs.lstatSync(skillFile).isSymbolicLink()) {
+    return {
+      digest: { name: dirName, description: '', digest: '', dir: rel },
+      problems: [`技能「${dirName}」配置问题：SKILL.md 是符号链接，不予读取；文件：${skillFile}`],
+    };
+  }
   let raw: string;
   try {
     raw = fs.readFileSync(skillFile, 'utf8');
@@ -91,6 +100,8 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   const name = typeof data.name === 'string' && data.name ? data.name : dirName;
   const description = typeof data.description === 'string' ? data.description.trim() : '';
   if (!data.name) problems.push(`技能「${dirName}」配置问题：frontmatter 缺少 name（已回退为目录名）；文件：${skillFile}`);
+  if (data.name && name !== dirName)
+    problems.push(`技能「${dirName}」配置问题：frontmatter name「${name}」与目录名不一致（skill_doc/skill_exec 按目录名定位将失败）；文件：${skillFile}`);
   if (!description) problems.push(`技能「${dirName}」配置问题：frontmatter 缺少 description（技能路由将不可靠）；文件：${skillFile}`);
   const sections = Array.isArray(data.digest_sections) ? data.digest_sections : [];
   const digest = digestSkillBody(body, sections);
@@ -179,7 +190,7 @@ export function renderSkillsBlock(): string {
 /** 随包发布的内置技能目录名：启动迁移时跳过；发布新内置技能时需加入此列表。 */
 const BUILTIN_SKILLS = ['helios-kanban-remote'];
 
-/** 技能目录名规则（与 readSkillDoc 的参数校验一致，同时保证无路径分隔符）。 */
+/** 技能目录名规则（install/uninstall/readSkillDoc 共用，同时保证无路径分隔符）。 */
 const SKILL_NAME_RE = /^[\w][\w.-]*$/;
 
 /**
@@ -206,6 +217,14 @@ export function installSkill(srcPath: string): { name: string; dir: string; repl
     throw new Error(`源目录与安装位置相同或互相嵌套，不能安装：${src}`);
   }
   const tmpDest = `${dest}.tmp-${process.pid}`;
+  // 历史崩溃可能残留 <name>.tmp-<pid> 临时目录，安装前 best-effort 清理
+  try {
+    for (const e of fs.readdirSync(path.dirname(dest))) {
+      if (/\.tmp-\d+$/.test(e)) fs.rmSync(path.join(path.dirname(dest), e), { recursive: true, force: true });
+    }
+  } catch {
+    /* best-effort：skills 目录不存在等场景忽略 */
+  }
   fs.rmSync(tmpDest, { recursive: true, force: true });
   ensurePrivateDirSync(path.dirname(dest));
   try {
@@ -250,7 +269,14 @@ export function migratePackageSkills(pkgSkillsDir: string = SKILLS_DIR): string[
   for (const e of entries) {
     if (!e.isDirectory() || BUILTIN_SKILLS.includes(e.name)) continue;
     const src = path.join(pkgSkillsDir, e.name);
-    if (!fs.existsSync(path.join(src, 'SKILL.md'))) continue;
+    const skillFile = path.join(src, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) continue;
+    // 符号链接可指向包外任意文件（含凭证），不迁移（与 loadSkill/readSkillDoc 的拒绝一致）
+    try {
+      if (fs.lstatSync(skillFile).isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
     const dest = path.join(userSkillsDir(), e.name);
     if (fs.existsSync(dest)) continue;
     try {
@@ -281,7 +307,7 @@ export function readSkillDoc(name: string): string {
     if (!digests.length) return '（skills/ 下没有已安装技能）';
     return digests.map((s) => `- ${s.name}：${s.description || '（无 description）'}`).join('\n');
   }
-  if (!/^[\w][\w.-]*$/.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
+  if (!SKILL_NAME_RE.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
   const dir = resolveSkillDir(trimmed);
   if (!dir) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
   const loaded = loadSkill(dir, trimmed);

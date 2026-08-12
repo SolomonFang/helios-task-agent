@@ -14,8 +14,11 @@ import { makeWorkSummaryHandler } from './work-summary';
 import { makeMemoryHandlers } from './memory-tools';
 
 export { summarizeBothEnds } from './shared';
-export { LOCAL_TOOL_SUMMARY } from './defs';
+export { LOCAL_TOOL_SUMMARY, localToolSummary } from './defs';
 export type { CreateCounter } from './gated-write';
+
+/** OpenAI function name 约束（长度含 kanban_ 前缀后计算）：非法名会让整个 tools 数组被 API 400 拒绝。 */
+const OPENAI_FN_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export function buildTools({
   mcp,
@@ -68,6 +71,11 @@ export function buildTools({
   if (mcp && mcp.connected) {
     for (const tool of mcp.tools) {
       const name = `kanban_${tool.name}`;
+      if (!OPENAI_FN_NAME.test(name)) {
+        // MCP server 返回非法名：注册会让整个 tools 数组被 API 400 拒绝（全工具不可用），跳过并告警
+        console.warn(`[tools] 跳过非法 MCP 工具名「${name}」（须匹配 ^[a-zA-Z0-9_-]{1,64}$）`);
+        continue;
+      }
       openAiTools.push({
         type: 'function',
         function: {

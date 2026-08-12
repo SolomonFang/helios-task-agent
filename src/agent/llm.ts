@@ -110,10 +110,11 @@ export function downgradeSystemNotes(messages: ChatMessage[]): ChatMessage[] {
 
 /**
  * Repair orphaned assistant `tool_calls` (e.g. left by an interrupted turn in
- * older versions): any function call without a following `tool` response gets
- * a placeholder response inserted, otherwise the next API request is rejected
+ * older versions): any call without a following `tool` response gets a
+ * placeholder response inserted, otherwise the next API request is rejected
  * ("assistant message with tool_calls must be followed by tool messages").
- * Mutates `messages` in place.
+ * 非 function 类型的畸形 call 同样补占位：执行循环不执行它们，不配对其后的
+ * 每个请求都会被网关 400 拒绝且不自愈。Mutates `messages` in place.
  */
 export function sanitizeToolPairs(messages: ChatMessage[]): ChatMessage[] {
   for (let i = 0; i < messages.length; i++) {
@@ -127,7 +128,7 @@ export function sanitizeToolPairs(messages: ChatMessage[]): ChatMessage[] {
       j++;
     }
     for (const call of m.tool_calls) {
-      if (call.type !== 'function' || answered.has(call.id)) continue;
+      if (answered.has(call.id)) continue;
       messages.splice(j, 0, {
         role: 'tool',
         tool_call_id: call.id,
@@ -142,7 +143,6 @@ export function sanitizeToolPairs(messages: ChatMessage[]): ChatMessage[] {
 /** 提前中止时为未执行的 tool_calls 补占位响应，保持历史可继续（见 sanitizeToolPairs）。 */
 function fillUnanswered(messages: ChatMessage[], calls: ChatCompletionMessageToolCall[]): void {
   for (const call of calls) {
-    if (call.type !== 'function') continue;
     messages.push({
       role: 'tool',
       tool_call_id: call.id,
@@ -233,6 +233,9 @@ export async function runAgentTurn({
         if (timedOut) return timeoutText; // 墙钟到点掐断在途请求：请求未入历史，直接收尾
         const msgText = errMessage(err);
         if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
+        // 首轮带图：图片只注入请求载荷副本、不进 messages 历史，dropOldestTurn 减不掉它，
+        // 重试载荷不变注定失败——直接抛出，不做无谓重试
+        if (image && round === 0) throw err;
         // 上下文超限自愈：逐级丢弃最旧轮次后重试（最多 3 次），仍失败则抛出原始错误
         let recovered = false;
         for (let attempt = 0; attempt < 3 && !recovered; attempt++) {
@@ -262,7 +265,16 @@ export async function runAgentTurn({
 
       for (let i = 0; i < toolCalls.length; i++) {
         const call = toolCalls[i]!;
-        if (call.type !== 'function') continue;
+        // 非 function 类型的畸形 tool_call 不执行，但仍补占位 tool 响应保持配对闭合：
+        // 否则该 call 永远没有配对 tool 消息，之后每个请求都被网关 400 拒绝且不自愈
+        if (call.type !== 'function') {
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: '（该工具调用类型不受支持，未执行）',
+          });
+          continue;
+        }
         toolCallCount++;
         // 中断/超时/超限时先为剩余 tool_calls 补占位响应再返回，避免 orphan tool_calls 损坏后续轮次
         if (signal?.aborted) {

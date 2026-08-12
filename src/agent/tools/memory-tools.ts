@@ -1,5 +1,6 @@
 import type { ToolHandler } from '../../types';
 import type { MemoryStore } from '../memory';
+import { normalizeFactKey } from '../memory';
 import { passGate, type ConfirmFn } from '../guard';
 import { auditLog } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
@@ -21,8 +22,10 @@ export function makeMemoryHandlers({
 }): Array<[string, ToolHandler]> {
   const memorySet: ToolHandler = async (raw) => {
     const key = typeof raw.key === 'string' ? raw.key : '';
-    const value = typeof raw.value === 'string' ? raw.value : '';
     if (!key.trim()) return '参数错误：key 不能为空';
+    // 与空 key 同口径：缺失/非字符串/空 value 直接报参数错误，不静默写空串
+    if (typeof raw.value !== 'string' || !raw.value) return '参数错误：value 不能为空';
+    const value = raw.value;
     // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
     const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
     const detail = summarizeBothEnds(`memory_set(key=${key.trim()}, value=${value})`);
@@ -38,7 +41,9 @@ export function makeMemoryHandlers({
       const user = memory.setFact(uid, key, value);
       onMemoryChange?.();
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
-      return JSON.stringify({ ok: true, key: key.trim(), value, facts: user.facts });
+      // echo 实际存储值（经 clampEntry + 标记中和，可能与入参不同），key 用归一化后的存储键
+      const storedKey = normalizeFactKey(key);
+      return JSON.stringify({ ok: true, key: storedKey, value: user.facts[storedKey], facts: user.facts });
     } catch (err) {
       // setFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);

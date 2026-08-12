@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
@@ -8,6 +9,9 @@ const DEFAULT_MAX_FILES = 100;
 const FILE_VERSION = 1;
 /** prune 节流：最多每隔这么久做一次目录扫描清理（每次 save 都 readdir+逐个 stat 太贵）。 */
 const DEFAULT_PRUNE_INTERVAL_MS = 60_000;
+
+/** prune 顺带清理的孤儿 tmp 最小年龄：小于该值视为可能在途写，不动。 */
+const TMP_ORPHAN_AGE_MS = 10 * 60_000;
 
 /**
  * writeFileAtomicPrivateSync 的异步版本（tmp+rename 原子写、目录 0700、文件 0600 语义一致）。
@@ -28,7 +32,17 @@ async function writeFileAtomicPrivate(filePath: string, content: string): Promis
   } catch {
     /* best-effort */
   }
-  await fs.promises.rename(tmp, filePath);
+  try {
+    await fs.promises.rename(tmp, filePath);
+  } catch (err) {
+    // rename 失败时 tmp 会永久残留（prune 只清过期 tmp），尽力删除后原样抛出
+    try {
+      await fs.promises.rm(tmp, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    throw err;
+  }
 }
 
 interface SessionHistoryFile {
@@ -40,12 +54,19 @@ interface SessionHistoryFile {
 }
 
 /**
- * open_id / 用户标识转安全文件名：白名单字符原样保留，其余折叠为 '-'，
- * 再剥掉首尾的点与横线（防 '../evil' 这类穿越、隐藏文件与 '..' 本体）。
+ * open_id / 用户标识转安全文件名：白名单字符原样保留，再剥掉首尾的点与横线
+ * （防 '../evil' 这类穿越、隐藏文件与 '..' 本体）。
+ * 含白名单外字符时折叠为 '-' 并追加 sha1 短 hash：否则 'a/b'、'a b'、'a-b'
+ * 折叠后碰撞到同一文件；纯白名单 id（'local'、'ou_xxx' 等）文件名不变，不破坏存量会话文件。
  */
 function safeFileName(userId: string): string {
-  const name = userId.replace(/[^\w.-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
-  return `${name || 'user'}.json`;
+  if (/^[\w.-]+$/.test(userId)) {
+    const name = userId.replace(/^[.-]+|[.-]+$/g, '');
+    return `${name || 'user'}.json`;
+  }
+  const name = userId.replace(/[^\w.-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '') || 'user';
+  const hash = crypto.createHash('sha1').update(userId).digest('hex').slice(0, 8);
+  return `${name}-${hash}.json`;
 }
 
 /** tool_call 最小结构校验：缺 id/type/function.name 的畸形条目会让网关每轮 400，直接判非法。 */
@@ -145,22 +166,42 @@ export class SessionHistoryStore {
     await this.prune();
   }
 
-  /** 删除该用户的磁盘历史（/clear 同步清盘）；文件不存在静默忽略。 */
-  clear(userId: string): void {
-    fs.rmSync(this.fileFor(userId), { force: true });
+  /**
+   * 删除该用户的磁盘历史（/clear）；文件不存在静默忽略。
+   * 与 save 共用同一串行队列：否则上一轮 save 在途时 /clear 先同步删盘，
+   * 队列里的写任务随后会把已清除的历史重新写回。异步：失败以 rejection 上报，由调用方记日志。
+   */
+  clear(userId: string): Promise<void> {
+    const file = this.fileFor(userId);
+    const job = this.queue.then(() => fs.promises.rm(file, { force: true }));
+    // 失败只回报本次调用方，不污染后续队列（与 save 同形态）
+    this.queue = job.catch(() => undefined);
+    return job;
   }
 
-  /** 文件总数超上限时按 mtime 删最老（mtime 读取失败的排最前优先删）。 */
+  /** 文件总数超上限时按 mtime 删最老（mtime 读取失败的排最前优先删）；顺带清理过期的孤儿 tmp（rename 失败残留）。 */
   private async prune(): Promise<void> {
     let files: string[];
     try {
-      files = (await fs.promises.readdir(this.dir)).filter((f) => f.endsWith('.json'));
+      files = await fs.promises.readdir(this.dir);
     } catch {
       return;
     }
-    if (files.length <= this.maxFiles) return;
+    // 孤儿 tmp：只删超过一定年龄的，避免误删在途写的 tmp
+    const tmpCutoff = Date.now() - TMP_ORPHAN_AGE_MS;
+    for (const f of files) {
+      if (!f.endsWith('.tmp')) continue;
+      try {
+        const st = await fs.promises.stat(path.join(this.dir, f));
+        if (st.mtimeMs < tmpCutoff) await fs.promises.rm(path.join(this.dir, f), { force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+    const jsons = files.filter((f) => f.endsWith('.json'));
+    if (jsons.length <= this.maxFiles) return;
     const withMtime = await Promise.all(
-      files.map(async (f) => {
+      jsons.map(async (f) => {
         try {
           return { f, mtime: (await fs.promises.stat(path.join(this.dir, f))).mtimeMs };
         } catch {

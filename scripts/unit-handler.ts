@@ -911,6 +911,86 @@ async function main(): Promise<void> {
       assert.equal(await verdict, false);
     });
 
+    // ---------- confirm：超时回调抛异常不阻断收尾（resolve 必达，闸门不挂起） ----------
+    await checkAsync('confirm：onTimeout/onSettled 抛异常时超时收尾照常 resolve(false)', async () => {
+      const mgr = new ConfirmationManager(async () => undefined, {
+        timeoutMs: 40,
+        onTimeout: () => {
+          throw new Error('notify boom');
+        },
+        onSettled: () => {
+          throw new Error('notify boom');
+        },
+      });
+      const verdict = await mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+      assert.equal(verdict, false, '回调抛异常不得挂起闸门');
+    });
+
+    // ---------- confirm：onSuperseded / finish 内 onSettled 抛异常不阻断裁决与后续请求 ----------
+    await checkAsync('confirm：onSuperseded 与 finish 内 onSettled 抛异常不阻断裁决', async () => {
+      const mgr = new ConfirmationManager(async () => undefined, {
+        onSuperseded: () => {
+          throw new Error('boom');
+        },
+        onSettled: () => {
+          throw new Error('boom');
+        },
+      });
+      const p1 = mgr.request('u1', { kind: 'kanban', summary: 's1', detail: 'd' });
+      const p2 = mgr.request('u1', { kind: 'kanban', summary: 's2', detail: 'd' }); // 顶掉 p1：onSuperseded/onSettled 抛
+      assert.equal(await p1, false, '被顶掉的旧请求应按拒绝收尾');
+      assert.equal(mgr.resolveFromText('u1', '确认'), 'approved'); // finish 内 onSettled 抛
+      assert.equal(await p2, 'once', '回调抛异常不得影响裁决结果');
+    });
+
+    // ---------- confirm：裁决日志不落 memory value（只记 key 部分） ----------
+    await checkAsync('confirm：memory 类裁决日志只记 key 不落 value', async () => {
+      const origLog = console.log;
+      const logs: string[] = [];
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+      try {
+        const mgr = new ConfirmationManager(async () => undefined);
+        const p = mgr.request('u1', {
+          kind: 'memory',
+          summary: '写入记忆「feishu_task_source」：secret-value-xyz',
+          detail: 'd',
+        });
+        mgr.resolveFromText('u1', '确认');
+        assert.equal(await p, 'once');
+        const line = logs.find((l) => l.includes('[confirm]'));
+        assert.ok(line?.includes('写入记忆「feishu_task_source」'), `裁决日志应记 key，实际：${line}`);
+        assert.ok(!line?.includes('secret-value-xyz'), `裁决日志不得落 value，实际：${line}`);
+      } finally {
+        console.log = origLog;
+      }
+    });
+
+    // ---------- confirm：卡片 id 回填晚于超时终态时，用回填 id 补发终态通知 ----------
+    await checkAsync('confirm：超时先于卡片 id 回填时补发终态通知（卡片不停在可点击态）', async () => {
+      const settled: Array<{ settle: string; cardMessageId: string | undefined }> = [];
+      let releasePrompt: (id: string | undefined) => void = () => {};
+      const mgr = new ConfirmationManager(
+        () =>
+          new Promise<string | undefined>((r) => {
+            releasePrompt = r;
+          }),
+        {
+          timeoutMs: 40,
+          onSettled: (_o, _r, settle, cardMessageId) => settled.push({ settle, cardMessageId }),
+        },
+      );
+      const verdict = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+      assert.equal(await verdict, false, '超时应按拒绝处理');
+      assert.deepEqual(settled, [{ settle: 'timeout', cardMessageId: undefined }], '超时终态时卡片 id 尚未回填');
+      releasePrompt('card-late-1'); // 卡片迟后才发送完成
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(
+        settled[1],
+        { settle: 'timeout', cardMessageId: 'card-late-1' },
+        '回填后应补发一次带卡片 id 的终态通知',
+      );
+    });
+
     // ---------- 审计脱敏：写操作 resultSnippet 中的密钥字段不落盘 ----------
     await checkAsync('audit：redactSnippet 替换 token/密钥字段与 Bearer 头', async () => {
       const json = redactSnippet('{"access_token":"abc123","password": "p@ss","title":"普通内容"}');

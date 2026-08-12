@@ -17,7 +17,7 @@ export function makeRepoFsHandler({
     const action = typeof raw.action === 'string' ? raw.action : '';
     const relPath = typeof raw.path === 'string' ? raw.path : '.';
     // 仓库代码属外部内容（可能含注释型注入）：UNTRUSTED 包裹
-    const out = await runRepoFs(kanbanUrl, {
+    const { out, denied } = await runRepoFs(kanbanUrl, {
       action,
       root: typeof raw.root === 'string' ? raw.root : undefined,
       repo_id: typeof raw.repo_id === 'string' ? raw.repo_id : undefined,
@@ -26,8 +26,8 @@ export function makeRepoFsHandler({
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
     });
     // 读审计：仓库代码外发 LLM 留痕；只记 action/目标路径，不记读回内容。
-    // 被敏感文件 denylist / 仓库白名单拒绝的尝试最值得记（探测行为的信号），记 decision: 'denied'
-    const denied = out.startsWith('已拒绝读取') || out.includes('已拒绝访问');
+    // 被敏感文件 denylist / 仓库白名单拒绝的尝试最值得记（探测行为的信号），记 decision: 'denied'。
+    // denied 取 runRepoFs 的结构化字段：仓库文件内容可能恰好含拒绝文案，字符串反向解析会误判
     auditLog(
       {
         user: uid,
