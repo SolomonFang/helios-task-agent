@@ -3768,7 +3768,7 @@ async function run(): Promise<void> {
     const note = card.elements.find((e) => e.tag === 'note');
     return (
       btn === '📋 查看任务' &&
-      Boolean(note?.elements?.some((n) => (n.content || '').includes('链接仅在运行本机器人的电脑所在网络可达')))
+      Boolean(note?.elements?.some((n) => (n.content || '').includes('链接仅本机所在网络可达')))
     );
   })());
 
@@ -3799,10 +3799,10 @@ async function run(): Promise<void> {
     const loop = noteOf('http://127.0.0.1:7964/tasks/1');
     const lan = noteOf('http://192.168.1.10:7964/tasks/1');
     return (
-      loop.includes('链接仅在运行本机器人的电脑上可达') &&
+      loop.includes('链接仅本机可达') &&
       loop.includes('手机/局域网打不开') &&
       !loop.includes('所在网络可达') &&
-      lan.includes('链接仅在运行本机器人的电脑所在网络可达') &&
+      lan.includes('链接仅本机所在网络可达') &&
       !lan.includes('手机/局域网打不开')
     );
   })());

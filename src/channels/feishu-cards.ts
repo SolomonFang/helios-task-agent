@@ -59,9 +59,10 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
     value: { hta_confirm: id, decision: 'no' },
   });
+  // 精简版注脚：有效期与文本回复方式合并为一行（操作类型已在标题体现，不再单列 fields）
   const replyHint = req.batchKey
-    ? '或回复文本：「确认」仅此次 · 「同类免问」本会话 · 「取消」'
-    : '或回复文本：「确认」 · 「取消」';
+    ? `${timeoutSec} 秒内有效 · 回复「确认」/「同类免问」/「取消」`
+    : `${timeoutSec} 秒内有效 · 回复「确认」/「取消」`;
   return {
     config: baseCardConfig(),
     header: {
@@ -71,15 +72,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      {
-        tag: 'div',
-        fields: [
-          { is_short: true, text: { tag: 'lark_md', content: `**操作类型**\n${kindText} · 写操作` } },
-          { is_short: true, text: { tag: 'lark_md', content: `**有效期**\n${timeoutSec} 秒（超时自动拒绝）` } },
-        ],
-      },
       { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
-      { tag: 'hr' },
       { tag: 'action', actions },
       { tag: 'note', elements: [{ tag: 'plain_text', content: replyHint }] },
     ],
@@ -125,8 +118,8 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
       title: { tag: 'plain_text', content: m.title },
     },
     elements: [
+      // 终态卡片原地替换确认卡片，命令细节用户刚看过，不再重复展示
       { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
       { tag: 'note', elements: [{ tag: 'plain_text', content: `${m.note} · ${time}` }] },
     ],
   };
@@ -188,16 +181,16 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push({ tag: 'action', actions });
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
-      review: '「AI 审查」让 AI 先过一遍 diff；没问题回复「标记完成」，要继续改直接说',
-      done: '回复「帮我审一下」看结果，或「再跟它说一句…」继续迭代',
-      failed: '回复「为什么失败」让它分析原因',
+      review: '没问题回复「标记完成」；要继续改直接说',
+      done: '回复「帮我审一下」看结果；要继续改直接说',
+      failed: '回复「为什么失败」分析原因',
     };
     // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
     // loopback（localhost/127.x/::1）连同一局域网都不可达，注脚需区分
     const linkNote =
       e.url && isLoopbackUrl(e.url)
-        ? '链接仅在运行本机器人的电脑上可达（本机地址，手机/局域网打不开），进程重启后失效。'
-        : '链接仅在运行本机器人的电脑所在网络可达，进程重启后失效。';
+        ? '链接仅本机可达（手机/局域网打不开），重启后失效。'
+        : '链接仅本机所在网络可达，重启后失效。';
     const notes = [hints[e.kind], e.url ? linkNote : null].filter(
       (t): t is string => Boolean(t),
     );
@@ -233,7 +226,7 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: pass ? '🎉 真棒！本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。',
+          content: pass ? '本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。',
         },
       },
       {
@@ -254,10 +247,9 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
           {
             tag: 'plain_text',
             content: pass
-              ? '已注入会话上下文，可直接继续追问。'
-              : '已注入会话上下文，可直接回复「按审查意见修一下」。',
+              ? '已注入会话上下文，可继续追问 · 链接仅本机可达，重启后失效。'
+              : '可回复「按审查意见修一下」 · 链接仅本机可达，重启后失效。',
           },
-          { tag: 'plain_text', content: '报告链接仅在运行本机器人的电脑上可达，进程重启后失效。' },
         ],
       },
     ],
