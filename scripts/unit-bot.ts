@@ -12,6 +12,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseBotArgs } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
 import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS } from '../src/channels/feishu';
+import { buildAiReviewCard } from '../src/channels/feishu-cards';
 import { check, checkAsync, finish } from './testkit';
 
 // ---------- 退出码子进程测试的共用装置 ----------
@@ -222,6 +223,83 @@ async function main(): Promise<void> {
     assert.ok(Date.now() - t0 < FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS, '超时兜底应在注入的短超时内触发');
     assert.ok(stalled.destroyed, '超时后应销毁流，释放底层连接');
   });
+
+  // ---------- FeishuChannel.start：等待首次握手结果（SDK start() 不等，首次连不上会假「就绪」僵尸） ----------
+  // 补丁 WSClient.prototype.start/close 为可控假实现（namespace 对象只读，换类不灵；原型补丁对类本身生效）：
+  // ready 回调 onReady / error 回调 onError / hang 永不回调（模拟网络未就绪时 SDK 静默无限重试）。
+  // 真实构造器照跑（无网络），回调在构造时存为实例字段（this.onReady 等），补丁直接取用。
+  interface WsPatched {
+    onReady?: () => void;
+    onError?: (err: Error) => void;
+    onReconnecting?: () => void;
+    onReconnected?: () => void;
+    __htaClosed?: boolean;
+  }
+  const wsCtl: { behavior: 'ready' | 'error' | 'hang'; last: WsPatched | null } = { behavior: 'ready', last: null };
+  const wsProto = Lark.WSClient.prototype as unknown as Record<string, unknown>;
+  const realWsStart = wsProto.start;
+  const realWsClose = wsProto.close;
+  wsProto.start = async function (this: WsPatched, _params: unknown): Promise<void> {
+    wsCtl.last = this;
+    if (wsCtl.behavior === 'ready') setTimeout(() => this.onReady?.(), 5);
+    else if (wsCtl.behavior === 'error') setTimeout(() => this.onError?.(new Error('invalid app credentials')), 5);
+    // hang：永不回调（SDK 在网络未就绪时静默无限重试，不触发任何回调）
+  };
+  wsProto.close = function (this: WsPatched): void {
+    this.__htaClosed = true;
+  };
+  try {
+    await checkAsync('FeishuChannel.start：onReady 后 resolve，重连告警接线不变', async () => {
+      wsCtl.behavior = 'ready';
+      const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] }, { wsFirstConnectTimeoutMs: 1000 });
+      const states: string[] = [];
+      ch.onWsStateChange = (state) => states.push(state);
+      await ch.start(async () => {});
+      // 首次握手完成后，断线重连仍走既有 ws-alerter 接线
+      wsCtl.last!.onReconnecting?.();
+      wsCtl.last!.onReconnected?.();
+      assert.deepEqual(states, ['reconnecting', 'reconnected'], '重连状态钩子应照常透传');
+      await ch.stop();
+      assert.ok(wsCtl.last!.__htaClosed, 'stop 应关闭底层 WSClient');
+    });
+
+    await checkAsync('FeishuChannel.start：首次连接不可重试错误（onError）时 reject', async () => {
+      wsCtl.behavior = 'error';
+      const origErr = console.error;
+      console.error = () => {}; // onError 会记日志，测试期间静音
+      try {
+        const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] }, { wsFirstConnectTimeoutMs: 1000 });
+        await assert.rejects(ch.start(async () => {}), /invalid app credentials/, '不可重试错误应抛出');
+        assert.ok(wsCtl.last!.__htaClosed, '失败后应关闭底层 WSClient，不留孤儿重连');
+      } finally {
+        console.error = origErr;
+      }
+    });
+
+    await checkAsync('FeishuChannel.start：首次握手超时 reject（网络未就绪时 SDK 静默重试）', async () => {
+      wsCtl.behavior = 'hang';
+      const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] }, { wsFirstConnectTimeoutMs: 50 });
+      await assert.rejects(ch.start(async () => {}), /首次握手超时/, '超时应抛出而非假「就绪」');
+      assert.ok(wsCtl.last!.__htaClosed, '超时后应关闭底层 WSClient，不留孤儿重连');
+    });
+  } finally {
+    wsProto.start = realWsStart;
+    wsProto.close = realWsClose;
+  }
+
+  // ---------- buildAiReviewCard：注脚按 URL 是否 loopback 区分可达口径（与 buildWatchEventCard 一致） ----------
+  const aiCardNote = (url: string): string => {
+    const card = buildAiReviewCard('任务X', url, false) as {
+      elements: Array<{ tag: string; elements?: Array<{ content?: string }> }>;
+    };
+    const note = card.elements.find((e) => e.tag === 'note');
+    return note?.elements?.map((x) => x.content).join(' ') ?? '';
+  };
+  check('buildAiReviewCard：loopback URL 注脚标注仅本机可达', aiCardNote('http://127.0.0.1:7964/r.html').includes('链接仅本机可达（手机/局域网打不开）'));
+  check(
+    'buildAiReviewCard：局域网 URL 注脚标注所在网络可达（report-server 绑 0.0.0.0 时手机可达）',
+    aiCardNote('http://192.168.1.10:7964/r.html').includes('链接仅本机所在网络可达'),
+  );
 
   // ---------- 进程退出码：崩溃路径为 1，正常信号路径为 0 ----------
   const feishuEnv = { FEISHU_APP_ID: 'cli_x', FEISHU_APP_SECRET: 's', FEISHU_ALLOWED_OPEN_IDS: 'ou_x' };

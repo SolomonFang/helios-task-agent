@@ -70,6 +70,8 @@ class FakeChannel implements ChannelUnderTest {
   /** 模拟 sendText / updateText 按内容选择性失败（命中子串即抛错，占位/进度文案不受影响）。 */
   failSendIfIncludes: string | null = null;
   failUpdateIfIncludes: string | null = null;
+  /** 测试门控：非 null 时 sendText 先等其放行（模拟占位发送窗口，测窗口内 /stop）。 */
+  sendTextGate: Promise<void> | null = null;
   private reactionSeq = 0;
   private messageSeq = 0;
 
@@ -77,6 +79,7 @@ class FakeChannel implements ChannelUnderTest {
     this.replies.push({ sessionId: msg.sessionId, text });
   }
   async sendText(_chatId: string, text: string): Promise<string | undefined> {
+    if (this.sendTextGate) await this.sendTextGate;
     if (this.failSendIfIncludes && text.includes(this.failSendIfIncludes)) throw new Error('sendText mock failure');
     this.sent.push(text);
     return `ph-${++this.messageSeq}`;
@@ -547,6 +550,32 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- /stop 在占位发送窗口内也能中断（running 登记先于 sendPlaceholder） ----------
+    await checkAsync('handler：/stop 在占位消息发送窗口内也能中断当前任务', async () => {
+      const f = setup(llm.baseUrl);
+      llm.mode = 'hang';
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      let releaseGate!: () => void;
+      f.channel.sendTextGate = new Promise<void>((r) => (releaseGate = r));
+      const pA = f.handlers.handle(mkMsg('u1', '来个长任务'));
+      await new Promise((r) => setTimeout(r, 50)); // 等处理推进到 sendPlaceholder 的 await 窗口
+      await f.handlers.handle(mkMsg('u1', '/stop'));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('已中断当前任务')),
+        `占位发送窗口内 /stop 也应能中断，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      releaseGate(); // 放行占位发送，让轮次走完中断收尾
+      await pA;
+      assert.ok(
+        f.channel.updated.some((t) => t.startsWith('⏹ 已中断')),
+        `被中断轮次的占位应收尾为已中断文案，实际：${f.channel.updated.join(' | ')}`,
+      );
+      assert.equal(llm.requestCount, base, '中断于 LLM 请求之前，不得发起 LLM 请求');
+      llm.mode = 'ok';
+      llm.release();
+      cleanup(f);
+    });
+
     // ---------- /stop 丢弃排队消息 + typing 回执兜底清理 ----------
     await checkAsync('handler：/stop 丢弃排队消息并兜底清理其敲键盘表情', async () => {
       const f = setup(llm.baseUrl);
@@ -864,6 +893,29 @@ async function main(): Promise<void> {
       } finally {
         console.error = origErr;
         llm.replyText = '好的，已收到';
+        cleanup(f);
+      }
+    });
+
+    // ---------- deliverReply：首段更新失败但直发成功时，占位 best-effort 收尾为终态（不烂尾在「处理中」） ----------
+    await checkAsync('handler：首段更新失败但直发成功时占位收尾为「已完成」，不烂尾在「处理中」', async () => {
+      const f = setup(llm.baseUrl);
+      const origErr = console.error;
+      console.error = () => {}; // 首段更新失败会记日志，测试期间静音
+      try {
+        f.channel.failUpdateIfIncludes = '好的，已收到'; // 首段更新失败（进度/心跳文案不含此串，不受影响）
+        await f.handlers.handle(mkMsg('u1', '你好'));
+        assert.ok(f.channel.sent.includes('好的，已收到'), '首段应直发兜底成功');
+        assert.ok(
+          f.channel.updated.includes('✅ 已完成，结果见下方 ⬇️'),
+          `占位应 best-effort 收尾为终态，实际：${f.channel.updated.join(' | ')}`,
+        );
+        assert.ok(
+          !f.channel.updated.some((t) => t.includes('回复投递失败')),
+          '直发成功不应报投递失败',
+        );
+      } finally {
+        console.error = origErr;
         cleanup(f);
       }
     });

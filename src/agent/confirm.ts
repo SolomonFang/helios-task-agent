@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { ConfirmRequest, ConfirmSettle, ConfirmVerdict } from './guard';
+import { markSuperseded } from './guard';
 import { errMessage } from '../infra/err';
 
 /**
@@ -101,6 +102,9 @@ export class ConfirmationManager {
     const prev = this.pendings.get(openId);
     if (prev) {
       clearTimeout(prev.timer);
+      // 先标记再 resolve：闸门（passGate）据此把「被新写操作替代」与「用户拒绝」区分开。
+      // resolve 值保持 false（终态经 onSettled 的 'superseded' 区分），不改 ConfirmVerdict 口径
+      markSuperseded(prev.req);
       prev.resolve(false);
       this.pendings.delete(openId);
       try {

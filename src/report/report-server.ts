@@ -36,8 +36,9 @@ function linkHost(kanbanUrl: string): string {
   }
 }
 
+// URL.hostname 对 IPv6 地址返回带方括号的形式（[::1]），这里两种写法都认
 function isLoopback(host: string): boolean {
-  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
 }
 
 /** 通配绑定地址（0.0.0.0 / ::）不能拼进链接：回退本机主机名。 */
@@ -109,8 +110,10 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
       const kanbanHost = linkHost(kanbanUrl);
       let host = isLoopback(kanbanHost) ? kanbanHost : bindHost;
       if (isWildcard(host)) host = os.hostname();
+      // IPv6 地址拼进 URL 必须带方括号（如 http://[::1]:51234），否则是无效地址
+      const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
       resolve({
-        baseUrl: `http://${host}:${port}`,
+        baseUrl: `http://${urlHost}:${port}`,
         close: () => server.close(),
         server,
       });

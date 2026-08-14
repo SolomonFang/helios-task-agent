@@ -1,4 +1,6 @@
-// Unit tests: kanban 进程清理、拉起轮询竞态、http 层错误分类、ai-review 返回体校验与 hk start 分支补全。真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
+// Unit tests: kanban 进程清理、拉起轮询竞态、http 层错误分类、ai-review 返回体校验与 hk start 分支补全、
+// 依赖探测/ocr 探测最小环境、combinedSignal 监听器释放、MCP connect settled 护栏、workspace-ready 瞬时错误分类。
+// 真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
 
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
@@ -8,9 +10,17 @@ import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
 import { ensureKanbanRunning, stopKanbanChild } from '../src/kanban/kanban-ensure';
-import { fillHkStartBranches, type RepoStartInput } from '../src/kanban/workspace-ready';
+import {
+  classifyWorkspaceSetup,
+  fetchWorkspaceSnapshot,
+  fillHkStartBranches,
+  waitForWorkspaceReady,
+  type RepoStartInput,
+} from '../src/kanban/workspace-ready';
 import { apiGet, fetchKanbanHealth, KanbanHttpError, taskPageUrl } from '../src/kanban/http';
-import { resolveReviewTarget } from '../src/kanban/ai-review';
+import { findOcrCommand, resolveReviewTarget } from '../src/kanban/ai-review';
+import { KanbanMcp } from '../src/kanban/mcp';
+import { checkLarkCli, checkLarkCliAsync } from '../src/infra/deps';
 import { check, checkAsync, finish } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
@@ -432,6 +442,241 @@ async function main(): Promise<void> {
       assert.ok(err.message.includes(missing), '合法 repos 行的 path 应进入候选目录列表');
     } finally {
       await mock.close();
+    }
+  });
+
+  // ---------- 依赖探测最小环境：第三方 CLI 不继承完整 process.env（含敏感变量） ----------
+  /** 造一个把自身 env dump 到文件的假 CLI，返回 bin 目录与 dump 文件路径。 */
+  function fakeCliDumpingEnv(name: string): { bin: string; dump: string } {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), `hta-unit-probe-${name}-`));
+    const dump = path.join(bin, 'dump.txt');
+    // dump 路径烧进脚本：子进程走 minimalChildEnv，读不到测试进程自定义的传值变量
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n/usr/bin/env > ${dump}\n`, { mode: 0o755 });
+    return { bin, dump };
+  }
+
+  await checkAsync('依赖探测：probeSync/probeAsync 走最小环境，敏感变量不进第三方 CLI 子进程', async () => {
+    const { bin, dump } = fakeCliDumpingEnv('lark-cli');
+    const prevPath = process.env.PATH;
+    process.env.PATH = bin;
+    process.env.HTA_UNIT_SECRET = 'should-not-leak';
+    try {
+      assert.equal(checkLarkCli(), true, 'probeSync 应探测到假 lark-cli');
+      let leaked = fs.readFileSync(dump, 'utf8');
+      assert.ok(!leaked.includes('HTA_UNIT_SECRET'), `probeSync 子进程不应看到敏感变量，实际 env：${leaked}`);
+      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+      fs.rmSync(dump, { force: true });
+      assert.equal(await checkLarkCliAsync(), true, 'probeAsync 应探测到假 lark-cli');
+      leaked = fs.readFileSync(dump, 'utf8');
+      assert.ok(!leaked.includes('HTA_UNIT_SECRET'), `probeAsync 子进程不应看到敏感变量，实际 env：${leaked}`);
+      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      delete process.env.HTA_UNIT_SECRET;
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('findOcrCommand：ocr 探测同样套最小环境（与 buildOcrEnv 同一防线）', async () => {
+    const { bin, dump } = fakeCliDumpingEnv('ocr');
+    try {
+      const cmd = await findOcrCommand({ PATH: bin, LLM_API_KEY: 'secret-marker' });
+      assert.equal(cmd.via, 'path', 'PATH 上有假 ocr，应命中 path 形态');
+      const leaked = fs.readFileSync(dump, 'utf8');
+      assert.ok(!leaked.includes('LLM_API_KEY'), `探测子进程不应看到 LLM_API_KEY，实际 env：${leaked}`);
+      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- combinedSignal：调用方 signal 上的 abort 监听器随组合信号触发即摘除，不累积 ----------
+  await checkAsync('apiGet：请求结束后调用方 signal 上不留滞留 abort 监听器', async () => {
+    const mock = await contractMock(() => ({ body: { success: true, data: 'ok' } }));
+    try {
+      const controller = new AbortController();
+      const signal = controller.signal;
+      let added = 0;
+      let removed = 0;
+      const origAdd = signal.addEventListener.bind(signal) as unknown as (t: string, l: unknown, o?: unknown) => void;
+      const origRemove = signal.removeEventListener.bind(signal) as unknown as (t: string, l: unknown, o?: unknown) => void;
+      signal.addEventListener = ((type: string, listener: unknown, options: unknown) => {
+        if (type === 'abort') added++;
+        origAdd(type, listener, options);
+      }) as unknown as AbortSignal['addEventListener'];
+      signal.removeEventListener = ((type: string, listener: unknown, options: unknown) => {
+        if (type === 'abort') removed++;
+        origRemove(type, listener, options);
+      }) as unknown as AbortSignal['removeEventListener'];
+      // 逐发请求 + 等超时兜底到点：旧逻辑只在 abort 事件触发时移除监听器（removed 恒 0），
+      // 新逻辑随 timeout 分支触发即摘除（removed 追上 added）
+      for (let i = 0; i < 5; i++) {
+        await apiGet(mock.baseUrl, '/ok', { signal, timeoutMs: 30 });
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(removed, added, `第 ${i + 1} 发后滞留 ${added - removed} 个监听器`);
+      }
+      assert.ok(added >= 5, 'combinedSignal 应确实挂过监听器');
+      controller.abort(); // 收尾：不残留对已 abort signal 的引用
+    } finally {
+      await mock.close();
+    }
+  });
+
+  // ---------- KanbanMcp.connect：settled 护栏（超时回调不误关已建立的连接） ----------
+  /** 写一个最小 fake MCP stdio server（NDJSON/JSON-RPC 应答 initialize 与 tools/list）。 */
+  function fakeMcpServerScript(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakemcp-'));
+    const script = path.join(dir, 'server.js');
+    fs.writeFileSync(
+      script,
+      `let buf = '';
+const delay = Number(process.argv[2] || 0);
+process.stdin.on('data', (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.id === undefined) continue; // 通知不应答
+    const respond = () => {
+      const result = msg.method === 'initialize'
+        ? { protocolVersion: msg.params.protocolVersion, capabilities: {}, serverInfo: { name: 'fake', version: '0' } }
+        : { tools: [] };
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');
+    };
+    if (delay) setTimeout(respond, delay);
+    else respond();
+  }
+});
+`,
+    );
+    return script;
+  }
+
+  await checkAsync('KanbanMcp.connect：正常路径连接成功、可 ping（settled 护栏不破坏成功路径）', async () => {
+    const script = fakeMcpServerScript();
+    const mcp = new KanbanMcp({ command: process.execPath, args: [script, '0'] });
+    try {
+      const tools = await mcp.connect({ timeoutMs: 10000 });
+      assert.deepEqual(tools, []);
+      assert.equal(mcp.connected, true);
+      await mcp.ping();
+      await mcp.close();
+      assert.equal(mcp.connected, false);
+    } finally {
+      await mcp.close().catch(() => {});
+      fs.rmSync(path.dirname(script), { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('KanbanMcp.connect：对端无响应时按时超时抛错（settled 护栏不破坏超时清理）', async () => {
+    const script = fakeMcpServerScript();
+    const mcp = new KanbanMcp({ command: process.execPath, args: [script, '5000'] });
+    const started = Date.now();
+    try {
+      await assert.rejects(mcp.connect({ timeoutMs: 300 }), '应在超时内抛错');
+      assert.ok(Date.now() - started < 3000, `超时应及时返回，实际耗时 ${Date.now() - started}ms`);
+      assert.equal(mcp.connected, false);
+    } finally {
+      await mcp.close().catch(() => {});
+      fs.rmSync(path.dirname(script), { recursive: true, force: true });
+    }
+  });
+
+  // ---------- workspace-ready：瞬时错误归 unknown 继续轮询，仅 404 判 failed，abort 归被中断 ----------
+  await checkAsync('fetchWorkspaceSnapshot：仅 404 判 failed（null），瞬时错误归 unknown', async () => {
+    const mock404 = await contractMock(() => ({ status: 404, body: {} }));
+    try {
+      const snap = await fetchWorkspaceSnapshot(mock404.baseUrl, 'w1');
+      assert.equal(snap, null);
+      assert.equal(classifyWorkspaceSetup(snap), 'failed');
+    } finally {
+      await mock404.close();
+    }
+    const mock500 = await contractMock(() => ({ status: 500, body: {} }));
+    try {
+      const snap = await fetchWorkspaceSnapshot(mock500.baseUrl, 'w2');
+      assert.equal(snap, 'unknown', '5xx 属瞬时错误，不应误诊为初始化失败');
+      assert.equal(classifyWorkspaceSetup(snap), 'unknown');
+    } finally {
+      await mock500.close();
+    }
+    // 连接拒绝（看板未起）：1 号端口必拒
+    const snap = await fetchWorkspaceSnapshot('http://127.0.0.1:1', 'w3');
+    assert.equal(snap, 'unknown', '连接拒绝属瞬时错误，不应误诊为初始化失败');
+  });
+
+  await checkAsync('waitForWorkspaceReady：瞬时错误继续轮询直至 ready', async () => {
+    let hits = 0;
+    const mock = await contractMock((url) => {
+      if (url === '/api/task-attempts/w4') {
+        hits++;
+        // apiGet 对 5xx 内部重试 1 次：首轮 snapshot 消耗 2 次 hits 且归 unknown，第二轮即 ready
+        if (hits <= 2) return { status: 500, body: {} };
+        return { body: { success: true, data: { container_ref: '/tmp/ws4' } } };
+      }
+      return { status: 404, body: {} };
+    });
+    try {
+      const ret = await waitForWorkspaceReady(mock.baseUrl, 'w4', { timeoutMs: 10000, intervalMs: 30 });
+      assert.equal(ret.ok, true, `瞬时错误后应继续轮询到 ready，实际：${ret.message}`);
+      assert.equal(hits, 3);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await checkAsync('waitForWorkspaceReady：404 判 failed 立即返回诊断文案（不轮询）', async () => {
+    let attemptsHits = 0;
+    const mock = await contractMock((url) => {
+      if (url === '/api/task-attempts/w5') {
+        attemptsHits++;
+        return { status: 404, body: {} };
+      }
+      if (url === '/api/task-attempts/w5/repos') return { body: { success: true, data: [{ target_branch: 'main' }] } };
+      return { status: 404, body: {} };
+    });
+    try {
+      const ret = await waitForWorkspaceReady(mock.baseUrl, 'w5', { timeoutMs: 5000, intervalMs: 20 });
+      assert.equal(ret.ok, false);
+      assert.ok(ret.message!.includes('请检查'), `应返回分支排查文案，实际：${ret.message}`);
+      assert.equal(attemptsHits, 1, '404 应立即返回，不应继续轮询');
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await checkAsync('waitForWorkspaceReady：轮询中被 abort 归「被中断」，不报误导性失败文案', async () => {
+    // 看板 hang 住（2s 后才应答）：50ms 处 abort，应走「被中断」而不是等超时或报「请检查」
+    const started = Date.now();
+    const server = http.createServer((_req, res) => {
+      const t = setTimeout(() => {
+        try {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"success":true,"data":{}}');
+        } catch {
+          /* 连接已被 abort 关闭 */
+        }
+      }, 2000);
+      res.on('close', () => clearTimeout(t));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 50);
+      const ret = await waitForWorkspaceReady(baseUrl, 'w6', { timeoutMs: 10000, intervalMs: 30, signal: controller.signal });
+      assert.equal(ret.ok, false);
+      assert.ok(ret.message!.includes('被中断'), `应归「被中断」，实际：${ret.message}`);
+      assert.ok(!ret.message!.includes('请检查'), '中断不应报误导性的分支排查文案');
+      assert.ok(Date.now() - started < 1500, 'abort 应立即返回，不等看板应答');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
     }
   });
 

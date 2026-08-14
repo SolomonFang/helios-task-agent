@@ -3,7 +3,7 @@
  * (e.g. base_branch fell back to "main" but the repo has no main → UI infinite loading).
  */
 
-import { apiGet } from './http';
+import { apiGet, KanbanHttpError } from './http';
 
 export type RepoStartInput = {
   repo_id: string;
@@ -18,7 +18,7 @@ export function isRepoStartInput(v: unknown): v is RepoStartInput {
   return o.base_branch === undefined || o.base_branch === null || typeof o.base_branch === 'string';
 }
 
-export type WorkspaceSetupState = 'ready' | 'pending' | 'failed';
+export type WorkspaceSetupState = 'ready' | 'pending' | 'failed' | 'unknown';
 
 export interface WorkspaceSnapshot {
   container_ref: string | null;
@@ -113,7 +113,13 @@ export function extractWorkspaceId(startResult: string): string | null {
   return m?.[1] || null;
 }
 
-export function classifyWorkspaceSetup(ws: WorkspaceSnapshot | null): WorkspaceSetupState {
+/**
+ * 分类工作区初始化状态。'unknown' 表示快照因瞬时错误（5xx/连接拒绝/网络抖动）
+ * 拉取失败、状态不明——与 'failed'（已确认初始化失败，仅 404 判定）区分，
+ * 调用方据此继续轮询而不是立即报「请检查分支设置」的误导文案。
+ */
+export function classifyWorkspaceSetup(ws: WorkspaceSnapshot | null | 'unknown'): WorkspaceSetupState {
+  if (ws === 'unknown') return 'unknown';
   if (!ws) return 'failed';
   if (ws.container_ref) return 'ready';
   return 'pending';
@@ -165,7 +171,7 @@ export async function fetchWorkspaceSnapshot(
   kanbanUrl: string,
   workspaceId: string,
   signal?: AbortSignal,
-): Promise<WorkspaceSnapshot | null> {
+): Promise<WorkspaceSnapshot | null | 'unknown'> {
   try {
     const data: unknown = await apiGet(kanbanUrl, `/task-attempts/${workspaceId}`, { timeoutMs: 8000, signal });
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
@@ -175,8 +181,13 @@ export async function fetchWorkspaceSnapshot(
       container_ref: typeof o.container_ref === 'string' ? o.container_ref : null,
       setup_completed_at: typeof o.setup_completed_at === 'string' ? o.setup_completed_at : null,
     };
-  } catch {
-    return null;
+  } catch (err) {
+    // 调用方中断（/stop）：向上抛，由 waitForWorkspaceReady 归入既有的「被中断」分支
+    if (signal?.aborted) throw err;
+    // 仅 404 判定工作区不存在/已清理 → failed（null）；其余瞬时错误（5xx/连接拒绝/网络抖动、
+    // 含单次请求自身的超时）状态不明 → 'unknown'，让轮询继续而不是立即报误导性的「初始化失败」
+    if (err instanceof KanbanHttpError && err.status === 404) return null;
+    return 'unknown';
   }
 }
 
@@ -214,7 +225,14 @@ export async function waitForWorkspaceReady(
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (signal?.aborted) return { ok: false, message: '（等待工作区初始化时被中断）' };
-    const snap = await fetchWorkspaceSnapshot(kanbanUrl, workspaceId, signal);
+    let snap: Awaited<ReturnType<typeof fetchWorkspaceSnapshot>>;
+    try {
+      snap = await fetchWorkspaceSnapshot(kanbanUrl, workspaceId, signal);
+    } catch (err) {
+      // fetchWorkspaceSnapshot 仅在调用方 signal 中断时向上抛：归入「被中断」，不走误导性的失败文案
+      if (signal?.aborted) return { ok: false, message: '（等待工作区初始化时被中断）' };
+      throw err;
+    }
     const state = classifyWorkspaceSetup(snap);
     if (state === 'ready') return { ok: true };
     if (state === 'failed') {
@@ -228,6 +246,7 @@ export async function waitForWorkspaceReady(
         }),
       };
     }
+    // pending / unknown（瞬时错误、状态不明）都继续轮询，由整体 timeoutMs 兜底
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   const branches = await fetchWorkspaceTargetBranches(kanbanUrl, workspaceId, signal);

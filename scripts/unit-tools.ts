@@ -307,6 +307,39 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- skill_exec batchKey：绑定脚本与实际参数（同脚本换参数各自确认） ----------
+  await checkAsync('skill_exec 批量免问 key：绑定脚本与 argv，同脚本不同参数不共用免问', async () => {
+    const tmp = tmpHome('skillkey');
+    try {
+      const keys: Array<string | undefined> = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: KANBAN_URL,
+        auditHome: tmp,
+        confirm: async (req) => {
+          keys.push(req.batchKey);
+          return false; // 闸门即拒，不真正执行脚本
+        },
+      });
+      const exec = handlers.get('skill_exec')!;
+      // 仓库自带技能脚本（skills/helios-kanban-remote/scripts/hk.sh），闸门在执行前拦截
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh', args: ['tasks', 'list'] });
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh', args: ['tasks', 'delete', 'abc'] });
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh' });
+      assert.deepEqual(
+        keys,
+        [
+          'skill:helios-kanban-remote/scripts/hk.sh:tasks list',
+          'skill:helios-kanban-remote/scripts/hk.sh:tasks delete abc',
+          'skill:helios-kanban-remote/scripts/hk.sh', // 无参数不拼尾随冒号
+        ],
+        `实际 keys=${JSON.stringify(keys)}`,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- MCP 动态工具名：非法名跳过注册并 warn，不拖垮整个 tools 数组 ----------
   await checkAsync('MCP 工具名非法（含空格/加前缀后超 64）时跳过并 warn，合法工具不受影响', async () => {
     const tmp = tmpHome('mcpname');

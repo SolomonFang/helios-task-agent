@@ -70,6 +70,19 @@ function createLineReader(rl: readline.Interface): LineReader {
   return nextLine;
 }
 
+/**
+ * 进程组是否还有存活成员：与 kanban-ensure.ts 的 treeAlive 同一判定（spawn 时 detached: true，
+ * npx 壳退出后被 reparent 的看板孙进程仍在组里）。exitCode 不能作依据，见 stopKanbanChild 注释。
+ */
+function kanbanTreeAlive(child: ChildProcess): boolean {
+  try {
+    process.kill(-child.pid!, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const HELP = `
   ${c.strong('命令')}
   ${c.info('/help')}     显示帮助
@@ -200,12 +213,15 @@ export async function main(): Promise<void> {
     } catch {
       /* 尽力清理，失败照常退出 */
     }
-    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可
-    if (kanbanChild && kanbanChild.exitCode === null) {
+    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可。
+    // 存活判定与 stopKanbanChild 一致用进程组（kanban-ensure.ts 的 treeAlive）：
+    // detached 的 npx 壳可能先退、被 reparent 的看板孙进程仍在组里占端口，exitCode===null 会漏提示；
+    // 停止命令也按进程组给（壳已死时 kill <pid> 打的是死壳，杀不到看板孙进程）。
+    if (kanbanChild && kanbanTreeAlive(kanbanChild)) {
       kanbanChild.stdout?.destroy();
       kanbanChild.stderr?.destroy();
       kanbanChild.unref();
-      console.log(c.gray(`看板服务保留运行（PID ${kanbanChild.pid}），停止：kill ${kanbanChild.pid}`));
+      console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：kill -- -${kanbanChild.pid}（进程组）`));
     }
     rl.close();
     clearTimeout(forceTimer);
@@ -345,6 +361,10 @@ export async function main(): Promise<void> {
   if (pendingUpdate) {
     const info = await pendingUpdate;
     if (info) {
+      // 先 drain 行队列：看板拉起 + MCP 连接期间用户敲入的行会缓存在 createLineReader 的 queue 里，
+      // 不 drain 的话更新确认的 ask 会立即消费最早缓存的陈旧行——恰好是 y/yes 就会在用户
+      // 没看到提示时执行 npm i -g（与向导交互后 drain 同一模式，见 wizardChoose/wizardAskSecret 调用处）
+      nextLine.drain();
       const outcome = await promptVersionUpdate({ info, ask, log: (m) => console.log(c.gray(m)) });
       if (outcome === 'updated') {
         console.log(c.ok('请重新运行 helios-task-agent 使用新版本。'));

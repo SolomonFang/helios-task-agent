@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   createAccessChecker,
   createMessageDedupe,
+  FeishuChannel,
   filterIncomingMessage,
   GROUP_MENTION_COOLDOWN_MS,
   groupMentionChatId,
@@ -217,6 +218,69 @@ async function main(): Promise<void> {
     assert.equal(blocked.size, 1, '超上限应整体清空后仅保留新条目');
     assert.ok(blocked.has('ou_new'));
     assert.ok(!blocked.has('ou_old0'), '老条目应被清空');
+  });
+
+  // ---------- 群 @ 回执冷却竞态（maybeReplyGroupMention）：并发同群 @ 只发一条；失败回补可重试 ----------
+  type GroupMentioner = { maybeReplyGroupMention: (d: FeishuReceivePayload) => Promise<void> };
+  const mkGroupMention = (): FeishuReceivePayload => {
+    const data = mkP2pMessage();
+    data.message!.chat_type = 'group';
+    data.message!.mentions = [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: '机器人' }];
+    return data;
+  };
+  /** stub 飞书 client（与 unit-bot 同一收窄手法）：bot open_id 固定 ou_bot，发消息行为由调用方定制。 */
+  const stubChannelClient = (
+    ch: FeishuChannel,
+    create: () => Promise<{ code: number; msg?: string; data?: { message_id: string } }>,
+  ): void => {
+    (ch as unknown as { client: unknown }).client = {
+      request: async () => ({ bot: { open_id: 'ou_bot' } }),
+      im: { v1: { message: { create } } },
+    };
+  };
+
+  await checkAsync('群 @ 回执：并发同群 @ 事件只发一条指引（冷却先写后发）', async () => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    let sent = 0;
+    let releaseFirst!: () => void;
+    const firstHang = new Promise<void>((r) => (releaseFirst = r));
+    stubChannelClient(ch, async () => {
+      sent++;
+      if (sent === 1) await firstHang; // 第一条挂在发送窗口里，制造并发
+      return { code: 0, data: { message_id: `m-${sent}` } };
+    });
+    const mention = (ch as unknown as GroupMentioner).maybeReplyGroupMention.bind(ch);
+    const p1 = mention(mkGroupMention());
+    await new Promise((r) => setTimeout(r, 20)); // 等第一条进入 sendText 挂起
+    const p2 = mention(mkGroupMention());
+    releaseFirst();
+    await Promise.all([p1, p2]);
+    assert.equal(sent, 1, '并发同群 @ 应只发一条指引');
+  });
+
+  await checkAsync('群 @ 回执：发送失败回补冷却额度，下个群事件可重试', async () => {
+    const origWarn = console.warn;
+    console.warn = () => {}; // 发送失败会记日志，测试期间静音
+    try {
+      const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+      let sent = 0;
+      let fail = true;
+      stubChannelClient(ch, async () => {
+        if (fail) return { code: 500, msg: 'boom' };
+        sent++;
+        return { code: 0, data: { message_id: `m-${sent}` } };
+      });
+      const mention = (ch as unknown as GroupMentioner).maybeReplyGroupMention.bind(ch);
+      await mention(mkGroupMention()); // 发送失败：不占冷却
+      assert.equal(sent, 0);
+      fail = false;
+      await mention(mkGroupMention()); // 失败已回补：重试成功
+      assert.equal(sent, 1, '失败回补后下个事件应可重试发送');
+      await mention(mkGroupMention()); // 成功后冷却期内不再发
+      assert.equal(sent, 1, '成功后冷却期内应跳过');
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   finish();

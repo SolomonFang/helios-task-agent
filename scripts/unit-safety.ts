@@ -12,7 +12,8 @@ import { MemoryStore } from '../src/agent/memory';
 import { readSkillDoc } from '../src/agent/skills';
 import { isValidGitRef } from '../src/kanban/ai-review';
 import { buildTools, summarizeBothEnds } from '../src/agent/tools';
-import { classifyLark, looksLikeStrongFailure } from '../src/agent/guard';
+import { classifyLark, looksLikeStrongFailure, passGate, DENIED_MESSAGE, SUPERSEDED_MESSAGE } from '../src/agent/guard';
+import { ConfirmationManager } from '../src/agent/confirm';
 import { makeGatedWriter } from '../src/agent/tools/gated-write';
 import { SourceRegistry } from '../src/agent/source-registry';
 import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/infra/deps';
@@ -537,6 +538,48 @@ async function main() {
       classifyLark(['im', '--help']) === 'read' && // 裸命令组帮助仍豁免
       classifyLark(['im', 'send', '--help']) === 'write', // 写动词不豁免（回归）
   );
+
+  // ---------- classifyLark：本地落盘 flag（--output/-o/--output-dir）一律判写 ----------
+  check(
+    'classifyLark：读命令携带落盘 flag（含等号形态）判写，不经确认不得覆盖本地文件',
+    classifyLark(['api', 'GET', '/open-apis/drive/v1/files/t/download', '--output', '~/.zshrc']) === 'write' && // 实测误例
+      classifyLark(['drive', '+version-get', '--output', './f', '--overwrite']) === 'write' &&
+      classifyLark(['markdown', '+fetch', '--output', './a.md']) === 'write' &&
+      classifyLark(['doc', 'get', '--output=./x.json']) === 'write' && // 等号形态
+      classifyLark(['drive', 'get', '-o', './x']) === 'write' && // -o 独立 argv 元素
+      classifyLark(['task', 'list']) === 'read' && // 无落盘 flag 的读命令不受影响（回归）
+      classifyLark(['task', 'list', '--help']) === 'read', // --help 豁免不受影响（回归）
+  );
+
+  // ---------- 强失败判定：正文中的失败字样（非行首）不误判 ----------
+  check(
+    'looksLikeStrongFailure：JSON 回显标题含「HTTP 500」「命令执行失败」不误判，行首/带前缀形态仍命中',
+    !looksLikeStrongFailure('{"title":"修复 HTTP 500 报错"}') && // 实测误例：串内 HTTP 状态码
+      !looksLikeStrongFailure('{"title":"排查命令执行失败的原因"}') && // 串内中文失败短语
+      !looksLikeStrongFailure('{"title":"记录一次调用失败与执行异常复盘"}') &&
+      looksLikeStrongFailure('命令执行失败: exit 1') && // 真失败：串首（run() 子进程失败）
+      looksLikeStrongFailure('已创建 1 个任务\nHTTP 502 Bad Gateway') && // 真失败：多行输出某行行首
+      looksLikeStrongFailure('MCP 工具 create_task 调用失败: boom') && // 带前缀的真实失败（unit.ts 同形态）
+      looksLikeStrongFailure('工具 hk_cli 执行异常: spawn fail'), // 带前缀的真实失败（llm.ts 同形态）
+  );
+
+  // ---------- 闸门文案：被新写操作顶掉的确认返回「被替代」而非「用户拒绝」 ----------
+  await checkAsync('passGate：superseded 与「用户拒绝」文案可区分，request() 对顶掉仍收尾 false', async () => {
+    const mgr = new ConfirmationManager(async () => undefined);
+    const gateOld = passGate({ kind: 'kanban', summary: 'old', detail: 'd' }, (req) => mgr.request('u1', req));
+    const gateNew = passGate({ kind: 'kanban', summary: 'new', detail: 'd' }, (req) => mgr.request('u1', req));
+    const resOld = await gateOld; // 旧请求被新请求顶掉
+    assert.ok(!resOld.allowed && resOld.message === SUPERSEDED_MESSAGE, `顶掉应返回「被替代」文案，实际：${JSON.stringify(resOld)}`);
+    assert.notEqual(SUPERSEDED_MESSAGE, DENIED_MESSAGE);
+    mgr.resolveFromText('u1', '取消'); // 新请求用户真实拒绝
+    const resNew = await gateNew;
+    assert.ok(!resNew.allowed && resNew.message === DENIED_MESSAGE, `真实拒绝仍返回 DENIED 文案，实际：${JSON.stringify(resNew)}`);
+    // request() 对顶掉的旧请求仍收尾 false（与既有测试口径一致，仅闸门文案可区分）
+    const p1 = mgr.request('u2', { kind: 'kanban', summary: 's1', detail: 'd' });
+    void mgr.request('u2', { kind: 'kanban', summary: 's2', detail: 'd' });
+    assert.equal(await p1, false);
+    mgr.cancel('u2'); // 清理 u2 的 pending，避免悬挂定时器
+  });
 
   // ---------- 强失败判定：正文不误判、行首/上下文形态命中、中断判失败 ----------
   check(

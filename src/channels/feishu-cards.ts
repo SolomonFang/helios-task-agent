@@ -212,6 +212,11 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
  * 纯函数（不含流程与 IO），便于单测与复用。
  */
 export function buildAiReviewCard(title: string, url: string, pass: boolean): Record<string, unknown> {
+  // 链接可达性与 buildWatchEventCard 同口径：report-server 绑 0.0.0.0/局域网地址时手机/局域网可达，
+  // 仅 loopback（localhost/127.x/::1）才是「仅本机可达」
+  const linkNote = isLoopbackUrl(url)
+    ? '链接仅本机可达（手机/局域网打不开），重启后失效。'
+    : '链接仅本机所在网络可达，重启后失效。';
   return {
     config: baseCardConfig(),
     header: {
@@ -247,8 +252,8 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
           {
             tag: 'plain_text',
             content: pass
-              ? '已注入会话上下文，可继续追问 · 链接仅本机可达，重启后失效。'
-              : '可回复「按审查意见修一下」 · 链接仅本机可达，重启后失效。',
+              ? `已注入会话上下文，可继续追问 · ${linkNote}`
+              : `可回复「按审查意见修一下」 · ${linkNote}`,
           },
         ],
       },

@@ -9,6 +9,7 @@ import path from 'path';
 import type { AddressInfo } from 'net';
 import { createClient, downgradeSystemNotes, runAgentTurn } from '../src/agent/llm';
 import { KanbanWatcher } from '../src/kanban/watcher';
+import { collectWorkSummary } from '../src/kanban/summary';
 import { McpSupervisor } from '../src/bot/supervisor';
 import { KanbanMcp, connectMcp } from '../src/kanban/mcp';
 import { fetchHealth } from '../src/kanban/kanban-ensure';
@@ -752,6 +753,204 @@ async function main(): Promise<void> {
     } finally {
       await stopServer(server);
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- KanbanWatcher：无人认领期间事件保留待重投，不误判「已送达」丢弃 ----------
+  await checkAsync('KanbanWatcher：perOwner 且 owners() 为空时跳过投递并保留 pending，认领后正常补投', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-noowner-'));
+    const kanbanState = { taskStatus: 'inprogress' };
+    const { server, base } = await startMockKanban(kanbanState);
+    const statePath = path.join(tmp, 'watch-state.json');
+    try {
+      const sent: Array<{ kind: string; owner: string }> = [];
+      const logs: string[] = [];
+      let ownerList: string[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath,
+        notify: async () => undefined, // perOwner 模式下不调用
+        owners: () => ownerList,
+        notifyOwner: async (e, owner) => {
+          sent.push({ kind: e.kind, owner });
+        },
+        log: (m) => logs.push(m),
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 基线
+      kanbanState.taskStatus = 'done';
+      await tick(); // 无人认领：不得投递、不得把事件标记已送达丢弃
+      assert.equal(sent.length, 0);
+      const onDisk = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+        pending?: Record<string, { delivered: string[] }>;
+      };
+      assert.deepEqual(onDisk.pending?.['done:t1']?.delivered, [], '事件应保留在 pending 且无任何送达记录');
+      assert.ok(logs.some((m) => m.includes('暂无认领 owner')), '跳过投递应记日志');
+      ownerList = ['o1']; // 有人认领后补投
+      await tick();
+      assert.deepEqual(sent, [{ kind: 'done', owner: 'o1' }]);
+      const after = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { pending?: unknown };
+      assert.equal(after.pending, undefined, '送达后应出队');
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- KanbanWatcher：失败判定看 failed 跳变，不强依赖观测到 running 翻转 ----------
+  await checkAsync('KanbanWatcher：两次轮询之间启动并失败的任务（running 全程不可见）也能收到失败通知', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-fail-'));
+    const task = { status: 'inprogress', running: false, failed: false };
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/tasks?')) {
+        return json([
+          {
+            id: 't1',
+            title: '任务1',
+            status: task.status,
+            has_in_progress_attempt: task.running,
+            last_attempt_failed: task.failed,
+          },
+        ]);
+      }
+      if (url.startsWith('/api/task-attempts')) return json([]);
+      if (url.startsWith('/api/approvals')) return json([]);
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const sent: string[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        notify: async (e) => {
+          sent.push(e.kind);
+        },
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 基线：running=false, failed=false
+      assert.equal(sent.length, 0);
+      // 轮询间隔内任务启动并失败：old.running=false（旧条件 old.running && !cur.running 不成立）
+      task.failed = true;
+      await tick();
+      assert.deepEqual(sent, ['failed'], 'failed 标志跳变应触发失败通知');
+      await tick(); // 快照已推进（old.failed=true）：同一失败不重推
+      assert.deepEqual(sent, ['failed']);
+      // 重启场景：failed 首轮即存在时基线机制兜底，不刷历史失败
+      const w2 = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state2.json'), // 全新 state：首轮只建基线
+        notify: async (e) => {
+          sent.push(`restart:${e.kind}`);
+        },
+      });
+      await tickOf(w2)();
+      assert.deepEqual(sent, ['failed'], '首轮基线不应把既有 failed 当新事件推送');
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- KanbanWatcher：首轮 approvals 端点失败时延迟建基线 ----------
+  await checkAsync('KanbanWatcher：首轮 approvals 失败不落基线，恢复后不把既有待审批当新审批推送', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-appr-first-'));
+    let approvalsFail = true;
+    const approvalsList: Array<Record<string, unknown>> = [{ id: 'a1', status: 'pending', title: '审批1' }];
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/approvals')) {
+        if (approvalsFail) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{}');
+          return;
+        }
+        return json(approvalsList);
+      }
+      if (url.startsWith('/api/tasks?')) return json([]);
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const statePath = path.join(tmp, 'watch-state.json');
+    try {
+      const sent: string[] = [];
+      const logs: string[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath,
+        notify: async (e) => {
+          sent.push(e.kind);
+        },
+        log: (m) => logs.push(m),
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 首轮 approvals 未知：不得拿 [] 落基线
+      assert.equal(fs.existsSync(statePath), false, '首轮 approvals 未知时不应落盘基线');
+      assert.ok(logs.some((m) => m.includes('延迟到下一轮建立基线')), '延迟建基线应记日志');
+      approvalsFail = false;
+      await tick(); // 端点恢复：a1 纳入基线，不当「新的待审批」推送
+      assert.deepEqual(sent, [], '首轮不刷通知契约：既有待审批不得推送');
+      const onDisk = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { approvals: Array<{ id: string }> };
+      assert.deepEqual(onDisk.approvals.map((a) => a.id), ['a1'], '恢复后基线应含既有待审批');
+      approvalsList.push({ id: 'a2', status: 'pending', title: '审批2' });
+      await tick(); // 真正新增的审批仍要推
+      assert.deepEqual(sent, ['approvals']);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- collectWorkSummary：状态计数按截断前全量，enrich 样本仍截断 ----------
+  await checkAsync('collectWorkSummary：范围内任务超 50 条时状态概览计数仍覆盖全量（不受截断影响）', async () => {
+    // 60 条任务：40 done + 20 todo，超过 MAX_TASKS(50) 截断线
+    const rows = Array.from({ length: 60 }, (_, i) => ({
+      id: `t${i}`,
+      title: `任务${i}`,
+      status: i < 40 ? 'done' : 'todo',
+      updated_at: `2026-08-01T00:${String(i).padStart(2, '0')}:00Z`,
+    }));
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (req.method === 'POST' && url.startsWith('/api/task-attempts/summary')) return json([]);
+      if (url.startsWith('/api/tasks?')) return json(rows);
+      if (url.startsWith('/api/task-attempts')) return json([]);
+      if (url.startsWith('/api/tasks/')) return json({});
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const data = await collectWorkSummary({ kanbanUrl: base, projectId: 'p1', scope: 'all' });
+      assert.equal(data.tasks.length, 50, '任务列表仍按 50 条截断');
+      assert.equal(data.totals.done, 40, '状态计数应覆盖截断前全量');
+      assert.equal(data.totals.todo, 20, '状态计数应覆盖截断前全量');
+      assert.equal(data.totals.inreview, 0);
+      assert.equal(data.totals.filesChanged, 0);
+    } finally {
+      await stopServer(server);
     }
   });
 

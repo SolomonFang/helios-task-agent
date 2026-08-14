@@ -1,5 +1,7 @@
 import { execFile, execFileSync } from 'child_process';
 
+import { minimalChildEnv } from './proc-env';
+
 /**
  * 同步探测助手：同一 try/catch execFileSync 模板的一处收口，公开探针均为一行包装。
  *
@@ -11,7 +13,13 @@ import { execFile, execFileSync } from 'child_process';
  */
 function probeSync(cmd: string, args: string[], timeoutMs = 5000): string | null {
   try {
-    return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, encoding: 'utf8' });
+    // 探测目标是第三方 CLI：不继承完整 process.env（含 LLM_API_KEY/FEISHU_APP_SECRET 等），同 proc-env.ts 策略
+    return execFileSync(cmd, args, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      env: minimalChildEnv(),
+    });
   } catch {
     return null;
   }
@@ -25,7 +33,8 @@ export function checkLarkCli(): boolean {
 /** 异步探测助手（事件循环内路径用；为何需要同步/异步双形态见上方 probeSync 注释）。 */
 function probeAsync(cmd: string, args: string[], timeoutMs = 5000): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 }, (err, stdout) => {
+    // 同 probeSync：第三方 CLI 探测不继承完整 process.env
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, env: minimalChildEnv() }, (err, stdout) => {
       resolve(err ? null : String(stdout ?? ''));
     });
   });

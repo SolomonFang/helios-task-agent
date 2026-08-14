@@ -97,9 +97,9 @@ npm i -g @larksuite/cli && lark-cli auth login
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
 - 若配置了 `HELIOS_KANBAN_PROJECT_ID`，只监控该项目  
 - `KANBAN_WATCH=0` 关闭；`KANBAN_WATCH_INTERVAL_SEC` 调间隔（最小 15）
-- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`——可用独立的 `OCR_LLM_TOKEN` 环境变量覆盖以隔离主 key），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口（绑定地址 `HELIOS_REPORT_HOST`，默认 `127.0.0.1`）；报告链接主机名取值规则：`HELIOS_KANBAN_URL` 为回环地址（localhost/127.x）时沿用其主机名（与看板链接可达性一致）；看板为非回环地址（如局域网 IP）时链接主机名取报告服务**绑定地址**——默认即 `127.0.0.1`（此时报告链接仅本机可开），绑定 `0.0.0.0` 则链接主机名会是不可拨号的 `0.0.0.0`，应显式绑定本机局域网 IP；进程存活期间有效，历史报告 30 天自动清理
+- AI 审查：`ocr` 未安装时自动 `npx` 拉取（钉版本，`OCR_PACKAGE` 可覆盖；首次较慢）；LLM 默认复用机器人模型配置（派生 `OCR_LLM_*`，即 ocr 子进程会获得你的 LLM key `OCR_LLM_TOKEN`——可用独立的 `OCR_LLM_TOKEN` 环境变量覆盖以隔离主 key），已显式配置 `OCR_LLM_URL` 或 `~/.opencodereview/config.json` 时优先用你自己的配置；整体超时 15 分钟；报告服务监听随机空闲端口（绑定地址 `HELIOS_REPORT_HOST`，默认 `127.0.0.1`）；报告链接主机名取值规则：`HELIOS_KANBAN_URL` 为回环地址（localhost/127.0.0.1/::1）时沿用其主机名（与看板链接可达性一致）；看板为非回环地址（如局域网 IP）时链接主机名取报告服务**绑定地址**——默认即 `127.0.0.1`（此时报告链接仅本机可开），绑定 `0.0.0.0` 时链接主机名会回退为本机主机名（`os.hostname()`），局域网/手机端未必能解析，建议显式绑定本机局域网 IP；进程存活期间有效，历史报告 30 天自动清理
 
-> **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）。手机审查的正确配法：`HELIOS_KANBAN_URL` 配为该机器的局域网 IP 或 Tailscale 地址，**同时**把 `HELIOS_REPORT_HOST` 显式设为同一局域网 IP（不要设 `0.0.0.0`——链接主机名会原样变成不可拨号的 `0.0.0.0`）；只改 `HELIOS_KANBAN_URL` 时报告链接主机名会退回默认绑定地址 `127.0.0.1`，手机仍打不开。若看板保持回环地址，报告链接主机名也跟随回环，**目前没有让手机访问报告的办法**。报告 URL 带随机 token。
+> **手机可达性**：推送卡片里的看板链接与 AI 审查报告链接都指向运行 bot 的机器。`HELIOS_KANBAN_URL` 为默认 `http://localhost:7964` 时这些链接**仅本机可开，手机上全是死链**（bot 启动时会就此输出警告）。手机审查的正确配法：`HELIOS_KANBAN_URL` 配为该机器的局域网 IP 或 Tailscale 地址，**同时**把 `HELIOS_REPORT_HOST` 显式设为同一局域网 IP（不要设 `0.0.0.0`——链接主机名会回退为本机主机名（`os.hostname()`），手机端未必能解析）；只改 `HELIOS_KANBAN_URL` 时报告链接主机名会退回默认绑定地址 `127.0.0.1`，手机仍打不开。若看板保持回环地址，报告链接主机名也跟随回环，**目前没有让手机访问报告的办法**。报告 URL 带随机 token。
 
 ## MCP 健康监督（bot）
 

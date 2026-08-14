@@ -699,8 +699,18 @@ async function run(): Promise<void> {
     child.stdout.on('data', (d: Buffer) => (buf += d.toString()));
     child.stderr.on('data', (d: Buffer) => (buf += d.toString()));
     try {
-      // 探测请求在途 = 已进 ensureKanbanOrExit；信号处理注册在其之前，此刻必然已生效
-      await healthSeen;
+      // 探测请求在途 = 已进 ensureKanbanOrExit；信号处理注册在其之前，此刻必然已生效。
+      // healthSeen 本身无超时：cli 在发起探测前崩溃时 promise 永不 resolve，配合 main 里 ref'd
+      // keepAlive 会无限挂起。故与「超时拒绝」及「探测前退出」竞速，失败时附带子进程输出便于定位
+      await Promise.race([
+        healthSeen,
+        new Promise<never>((_r, rej) =>
+          setTimeout(() => rej(new Error(`等待健康探测超时（30s），cli 未发起探测；输出：${buf}`)), 30000).unref(),
+        ),
+        new Promise<never>((_r, rej) =>
+          child.once('exit', (c) => rej(new Error(`cli 在发起健康探测前退出（code=${c}）；输出：${buf}`))),
+        ),
+      ]);
       child.kill(signal);
       const code = await new Promise<number | null>((resolve, reject) => {
         const t = setTimeout(() => {

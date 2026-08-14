@@ -6,6 +6,31 @@
 
 ## [Unreleased]
 
+### Security
+
+- lark-cli 写闸门补齐本地落盘 flag：`classifyLark` 此前只看命令动词，携带 `--output`/`-o`/`--output-dir` 的读动词命令（`api GET …/download --output <路径>`、`drive +version-get --output …`、`markdown +fetch --output …`）被误判为 read、不经确认直接执行，可被提示注入诱导覆盖任意本地文件；现命中落盘 flag 一律判写（`src/agent/guard.ts`）
+- 第三方 CLI 探测不再继承完整 `process.env`：lark-cli/ocr/jq/curl 的启动探测（`probeSync`/`probeAsync`）与 AI 审查的 ocr 探测（`findOcrCommand`）此前把含 `LLM_API_KEY`/`FEISHU_APP_SECRET` 的全量环境交给第三方二进制，现统一走 `minimalChildEnv`，与正式执行路径同一防线（`src/infra/deps.ts`、`src/kanban/ai-review.ts`）
+- `skill_exec` 的「同类免问」授权键绑定脚本参数：此前 batchKey 只到 `skill:<名>/<脚本>`，用户批量批准一次后同脚本任意参数（如 `tasks delete <id>`）都不再弹确认，与 hk_cli「授权绑定操作对象」口径矛盾；现 batchKey 纳入实际参数（`src/agent/tools/skill-tools.ts`）
+
+### Fixed
+
+- 飞书长连接首次握手失败不再假「就绪」：SDK 的 `WSClient.start()` 不等待首次连接结果（失败后静默无限重试且不发 reconnecting/error 回调），bot 启动时网络未就绪会打印「长连接已就绪」却永远收不到消息；现 `start()` 等待首次握手（`onReady`/`onError`，60s 超时），失败即抛出由既有启动失败路径退出（`src/channels/feishu.ts`）
+- 看板事件不再在 owner 未认领期间静默丢弃：perOwner 模式下 `owners()` 为空时 `[].every` 恒真，事件被误判「全员已送达」永久剔除；现空 owner 时保留待重投队列（TTL 兜底），与晨报「未认领不推不标记」口径一致（`src/kanban/watcher.ts`）
+- 任务失败通知不再依赖「观测到 running 翻转」：轮询间隔/停机/看板不可达期间启动并失败的任务此前永不通知；失败判定改为 failed 标志跳变（已通知不重推、重启不刷历史），首轮恰逢 approvals 端点失败时延迟建基线、恢复后不再把存量待审批当新审批刷一条（`src/kanban/watcher.ts`）
+- `looksLikeStrongFailure` 不再误判成功回显：创建类命令回显的 JSON 标题/描述含「HTTP 500」「命令执行失败」等字样（研发看板常见）此前被当中任意位置命中、误判失败导致来源去重映射不落盘（下次同步重复建任务）；中文/HTTP 失败词改为行首锚定（`src/agent/guard.ts`）
+- 工作区初始化等待不再误诊瞬时故障：setup 轮询期间看板重启/网络抖动/单次请求超时此前一律报「初始化失败，请检查分支设置」误导文案且不再重试，/stop 中断也走到该文案；现仅 404 判失败，瞬时错误继续轮询，中断走「被中断」收尾（`src/kanban/workspace-ready.ts`）
+- kanban HTTP 组合信号不再泄漏监听器：每次带 signal 的请求在调用方 signal 上挂的 abort 监听器此前仅触发才移除，workspace-ready 轮询一次 start 即累积数十个并触发 MaxListenersExceededWarning；现任一分支落定即摘除（`src/kanban/http.ts`）
+- MCP connect 超时回调不再误杀刚连接成功的会话：`collectDescendants` 快照等待期间 connect 成功时，超时回调恢复后此前仍会 close 已建立的 transport；现加 settled 双检（`src/kanban/mcp.ts`）
+- 回复投递的占位消息不再烂尾：首段 updateText 失败而直发新消息成功时，占位此前永远停在「⏳ 处理中…」，现补一次 best-effort 收尾「✅ 已完成，结果见下方 ⬇️」（`src/bot/handler.ts`）
+- `/stop` 不再漏中断刚开始的轮次：AbortController 登记此前在「发送占位消息」await 之后，窗口内 /stop 回「没有正在执行的任务」但任务在跑且无法中断；现登记前移至发送占位之前（`src/bot/handler.ts`）
+- 看板概览计数覆盖全量：范围内任务超 50 条时状态概览（完成/待审阅/进行中…）此前只统计截断样本、系统性偏小；状态计数改为遍历截断前全量（文件变更等需 enrich 的数值维持样本口径，有注释）（`src/kanban/summary.ts`）
+- 报告链接主机名修正两处：README「绑 0.0.0.0 链接主机名会是 0.0.0.0」与代码实际行为（回退 `os.hostname()`）漂移已更正（中英两版）；`isLoopback` 兼容 `[::1]`，报告服务绑 IPv6 地址时 baseUrl 正确加方括号（`src/report/report-server.ts`、README.md/README.en.md）
+- CLI/bot 交互三处：更新确认提示前清空启动等待期缓存的陈旧输入行（防无感触发 `npm i -g`）；bot 向导每次提问残留的 `close` 监听器改为正常回答即摘除（防 MaxListenersExceededWarning）；bot 侧跳过更新补「已跳过」反馈（与 CLI 对齐）（`src/cli.ts`、`src/bot-main.ts`）
+- CLI 退出「看板保留运行」提示改用进程组存活判定：detached npx 壳先退出而看板孙进程仍在跑时此前不提示（且文案里的 PID 是死壳），现按进程组判定并提示进程组 kill 命令与看板 URL（`src/cli.ts`）
+- 被新写操作顶掉的确认不再按「用户拒绝」转告：闸门现返回「已被新的写操作确认替代」的可区分文案（`src/agent/confirm.ts`、`src/agent/guard.ts`）
+- 杂项：群 @ 回执冷却写入前移至发送前（并发同群 @ 不再重复发指引，失败回补不耗额度）；AI 审查卡片注脚按报告地址是否回环区分「仅本机」/「本机所在网络」（与 watch 卡片同口径）；晨报底部引导语在未配置迭代时明确「全部迭代」范围（与 agent 默认 today 的口径对齐）；e2e-mock 的 lark-cli 断言与 smoke 同口径（不绑死外部 CLI 输出格式）（`src/channels/feishu.ts`、`src/channels/feishu-cards.ts`、`src/bot/daily-brief.ts`、`scripts/e2e-mock.ts`）
+- 测试与发布链路：`verify` 的 smoke/e2e 启用 `HTA_REQUIRE_E2E=1` 严格模式（发布机器缺 lark-cli 时 e2e 不再静默 SKIP 假绿）；unit-coverage 信号用例的 `healthSeen` 加 30s 超时与子进程提前退出监听（cli 启动回归时 npm test 不再永久挂死）；deps 三态用例的「已授权」模拟从 NODE_OPTIONS 注入改为 shebang 脚本（适配探测最小环境）（`package.json`、`scripts/unit-coverage.ts`、`scripts/unit.ts`）
+
 ### Changed
 
 - 「同类免问」覆盖全部写操作：此前破坏性看板操作（删除/取消/停止/审批/启动/归档/合并/推送/执行）、飞书写、记忆写、技能脚本一律逐次确认，确认卡片无「同类免问」按钮；现所有写操作都带 batchKey（看板/hk 绑定工具名+对象 id，lark 按命令路径如 `lark:im send`，技能脚本按 `skill:<名>/<脚本>`，记忆按 set/delete/note 分动作），所有确认卡片均可「同类免问」；破坏性判定改由 `ConfirmRequest.destructive` 承载（`guard.isBatchable` 更名 `isDestructive`），仅用于确认超时分级（300s vs 120s），不再影响免问资格

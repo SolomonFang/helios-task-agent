@@ -191,7 +191,9 @@ export function ocrWillDeriveBotLlm(env: NodeJS.ProcessEnv = process.env, home =
 /** ocr 可执行命令：PATH 优先，缺失回退 npx 钉版本包（首次会下载，缓存后同速）。异步探测（同 isGitRepo，避免阻塞 bot 事件循环）。 */
 export async function findOcrCommand(env: NodeJS.ProcessEnv = process.env): Promise<OcrCommand> {
   try {
-    await execFileP('ocr', ['version'], { timeout: 5000, env });
+    // 探测同样走最小环境（以传入 env 为 base 过滤放行清单）：与真正执行审查的 buildOcrEnv 同一防线，
+    // 不把含 LLM_API_KEY 等敏感变量的完整 env 交给第三方 ocr 子进程
+    await execFileP('ocr', ['version'], { timeout: 5000, env: minimalChildEnv({}, env) });
     return { cmd: 'ocr', prefixArgs: [], via: 'path' };
   } catch {
     return { cmd: 'npx', prefixArgs: ['-y', ocrPackageSpec(env)], via: 'npx' };

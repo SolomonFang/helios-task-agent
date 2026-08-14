@@ -77,8 +77,12 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
       if (section.length) lines.push('', ...section);
     }
   }
-  // 底部引导语与晨报范围匹配：配置了迭代引导「总结这个迭代」，未配置（范围为全部迭代）引导「总结看板进展」
-  lines.push('', data.iteration ? '回复「总结一下这个迭代做了什么」看完整报告' : '回复「总结一下看板进展」看完整报告');
+  // 底部引导语与晨报范围匹配：配置了迭代引导「总结这个迭代」；未配置时范围为全部迭代，
+  // 引导语须说清「全部迭代」——只说「看板进展」时 agent 默认按 today 范围总结，与晨报口径不符
+  lines.push(
+    '',
+    data.iteration ? '回复「总结一下这个迭代做了什么」看完整报告' : '回复「总结一下全部迭代的看板进展」看完整报告',
+  );
   return lines.join('\n');
 }
 

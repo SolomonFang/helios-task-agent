@@ -103,7 +103,8 @@ function startMockServer(): Promise<{ server: http.Server; state: MockState; por
           payload = toolCall('lark_cli', { args: ['--version'] });
         } else {
           const content = lastTool?.content || '';
-          if (/lark-cli version/.test(content)) state.larkOk = true;
+          // 与 smoke.ts 口径一致：只要求输出版本号语义，不绑定 lark-cli 的具体输出格式（防外部工具改格式时假 FAIL）
+          if (/\d+\.\d+\.\d+|version/i.test(content)) state.larkOk = true;
           payload = finalReply();
         }
       } catch (err) {

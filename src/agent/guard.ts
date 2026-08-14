@@ -83,7 +83,21 @@ export type GateResult =
   | { allowed: false; reason: 'denied' | 'no_gate'; message: string };
 
 export const DENIED_MESSAGE = '用户拒绝了该写操作，未执行。请如实转告用户，不要换工具或换参数重试同一操作。';
+export const SUPERSEDED_MESSAGE =
+  '该写操作的确认已被新的写操作确认替代，本次未执行（并非用户拒绝）。请如实转告用户；如仍需执行，以最新一次确认为准。';
 export const NO_GATE_MESSAGE = '当前会话未配置写操作确认通道，写操作已被安全策略阻止。';
+
+/**
+ * 被新的写操作确认顶掉的请求（confirm.ts 在 resolve 前标记）。passGate 据此把「被替代」
+ * 与「用户拒绝」区分开，避免模型把 DENIED_MESSAGE 误转告成「你拒绝了」。
+ * WeakSet：req 为每次调用的临时对象，不阻碍 GC。
+ */
+const supersededReqs = new WeakSet<ConfirmRequest>();
+
+/** 由确认管理器在顶掉旧 pending 时调用（必须先于 resolve，保证等待方读到标记）。 */
+export function markSuperseded(req: ConfirmRequest): void {
+  supersededReqs.add(req);
+}
 
 /** Ask the confirmation channel; fail closed on missing channel or errors. */
 export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefined): Promise<GateResult> {
@@ -94,7 +108,8 @@ export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefin
   } catch {
     ok = false;
   }
-  return ok ? { allowed: true } : { allowed: false, reason: 'denied', message: DENIED_MESSAGE };
+  if (ok) return { allowed: true };
+  return { allowed: false, reason: 'denied', message: supersededReqs.has(req) ? SUPERSEDED_MESSAGE : DENIED_MESSAGE };
 }
 
 // --- lark-cli classification ---
@@ -128,6 +143,7 @@ function larkVerbs(args: string[]): string[] {
 
 /**
  * lark-cli `<command> [subcommand] [method]`:
+ * - 含本地落盘 flag（--output / -o / --output-dir，含 --output=路径 等号形态）→ write
  * - help/version/schema/doctor → read
  * - `api GET /open-apis/…` → read；非 GET 或路径形态不符（完整 URL / 相对路径前缀不符）→ write
  * - any write verb in command tokens → write
@@ -136,6 +152,17 @@ function larkVerbs(args: string[]): string[] {
  */
 export function classifyLark(args: string[]): 'read' | 'write' {
   if (!args.length) return 'read';
+  // 本地落盘 flag 一律判写：--output/-o/--output-dir 会把输出写入任意本地路径——即使命令
+  // 本体是读动词（api GET .../download、+fetch、+version-get），也可借此覆盖 ~/.zshrc 等
+  // 任意文件，必须过确认闸门（-o 只认独立 argv 元素，避免误伤 --option 之类长 flag）
+  if (
+    args.some(
+      (a) =>
+        a === '-o' || a === '--output' || a === '--output-dir' || a.startsWith('--output=') || a.startsWith('--output-dir='),
+    )
+  ) {
+    return 'write';
+  }
   const first = args[0]!;
   // 注意：`update`（lark-cli 自我更新 = 替换本机代码）不在此列，按写操作走闸门
   if (['--help', '-h', '--version', '-v', 'help', 'schema', 'doctor', 'skills'].includes(first)) {
@@ -243,21 +270,24 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
 
 /**
  * 强失败判定：仅匹配真实的执行失败信号，用于「操作是否成功」的决策
- * （审计 ok 标记、来源映射记录、创建计数）。英文失败词（API error / denied /
- * not found）只认行首锚定（可带 error: 前缀）或带上下文的形态（permission
- * denied），避免成功输出的正文文本（如任务描述写 "not found handling"）被误判
- * 为失败、静默丢来源映射。「⏹ 已中断」是 /stop 中断时 run() 的固定返回
- * （见 tools/shared.ts）——操作实际未执行，必须判失败，否则审计误记 ok:true
- * 且白消耗创建配额。
+ * （审计 ok 标记、来源映射记录、创建计数）。各形态都要求行首/串首锚定或带上下文，
+ * 避免成功输出的正文文本（如 hk tasks create 回显的 JSON 里任务标题含「HTTP 500」
+ * 「命令执行失败」，或任务描述写 "not found handling"）被误判为失败、静默丢来源映射。
+ * 「⏹ 已中断」是 /stop 中断时 run() 的固定返回（见 tools/shared.ts）——操作实际未执行，
+ * 必须判失败，否则审计误记 ok:true 且白消耗创建配额。
  */
-const STRONG_FAILURE_RE = /^错误|命令执行失败|调用失败|执行异常|HTTP \d{3}\b|⏹ 已中断|permission denied/i;
-// 行首锚定的英文失败形态（m 标志：任一行的行首，可带 error: 前缀）——与串首锚定的
-// ^错误 分开，避免 m 标志把 ^错误 放宽成行首匹配（成功输出的正文行可能以「错误」开头）。
+const STRONG_FAILURE_RE = /^错误|⏹ 已中断|permission denied/i;
+// 行首锚定的中文失败形态（m 标志：任一行的行首）——真实失败输出均以这些形态起行：
+// run() 子进程失败「命令执行失败：…」（tools/shared.ts）、MCP 写失败「MCP 工具 xxx 调用失败：…」
+// （tools/kanban-mcp.ts）、handler 异常「工具 xxx 执行异常：…」（llm.ts）。与串首锚定的
+// ^错误 分开：m 标志会把 ^错误 放宽成行首匹配（成功输出的正文行可能以「错误」开头）。
+const STRONG_FAILURE_LINE_ZH_RE = /^(?:命令执行失败|调用失败|执行异常|HTTP \d{3}\b|(?:MCP )?工具 \S+ (?:调用失败|执行异常))/im;
+// 行首锚定的英文失败形态（m 标志：任一行的行首，可带 error: 前缀）。
 const STRONG_FAILURE_LINE_RE = /^(?:error[:：]\s*)?(?:api error|denied|not found)\b/im;
 
 export function looksLikeStrongFailure(s: string): boolean {
   const head = s.slice(0, 300);
-  return STRONG_FAILURE_RE.test(head) || STRONG_FAILURE_LINE_RE.test(head);
+  return STRONG_FAILURE_RE.test(head) || STRONG_FAILURE_LINE_ZH_RE.test(head) || STRONG_FAILURE_LINE_RE.test(head);
 }
 
 // --- untrusted external content marking (prompt-injection mitigation) ---

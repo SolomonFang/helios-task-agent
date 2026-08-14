@@ -522,6 +522,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         try {
           await channel.sendText(msg.sessionId, chunks[0]!);
           firstDelivered = true;
+          // 直发兜底成功：占位还停在「⏳ 处理中…」（心跳已清不再刷新），best-effort 收尾为终态
+          await channel.updateText(progressId, '✅ 已完成，结果见下方 ⬇️').catch(() => {});
         } catch (err2) {
           console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
         }
@@ -561,13 +563,15 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const openId = msg.senderId;
     // 轮次开始重置内插消息计数：之后确认卡片等独立消息发送时 mark，投递前据此决定回复是否另发新消息
     deps.roundNotices?.reset(openId);
+    // 中断登记先于占位发送：否则 sendPlaceholder 的 await 窗口内 /stop 查不到本轮，
+    // 回「没有正在执行的任务」但任务其实在跑且无法中断（失败路径清理由 finally 的 running.delete 兜底）
+    const ctl = new AbortController();
+    running.set(openId, ctl);
     // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
     const progressId = await sendPlaceholder(msg);
     const activity = { lastEventAt: Date.now() };
     const onProgress = createProgressReporter(progressId, activity);
     const clearHeartbeat = startProgressHeartbeat(progressId, activity);
-    const ctl = new AbortController();
-    running.set(openId, ctl);
     // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）
     await supervisor.enterTurn();
     try {

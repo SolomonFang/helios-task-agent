@@ -2823,12 +2823,11 @@ async function run(): Promise<void> {
 
   // ---------- deps：lark-cli 三态与 hk 降级链依赖探测（临时 PATH 注入假二进制，不依赖本机真实环境） ----------
   await checkAsync('deps：checkLarkCliStatus 三态 / probeLarkCliAuth 保守判失败 / checkHkDeps 缺失项', async () => {
-    // 本环境直接 exec 新建 shebang 脚本会挂起，假命令一律用系统二进制的符号链接：
-    // true = 退出 0 无输出（模拟「已安装但 auth status 输出异常」），false = 命令失败，
-    // node 符号链接 + NODE_OPTIONS --require 让 auth status 输出指定 JSON（模拟已授权）。
+    // 假命令用系统二进制的符号链接：true = 退出 0 无输出（模拟「已安装但 auth status
+    // 输出异常」），false = 命令失败；「已授权」用 shebang 直指 node 的脚本输出 JSON
+    // （探测走 minimalChildEnv，NODE_OPTIONS --require 注入已不可达，故改用脚本形态）。
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-deps-'));
     const prevPath = process.env.PATH;
-    const prevNodeOptions = process.env.NODE_OPTIONS;
     const link = (name: string, target: string) => {
       const p = path.join(bin, name);
       if (fs.existsSync(p)) fs.rmSync(p);
@@ -2850,15 +2849,15 @@ async function run(): Promise<void> {
       link('lark-cli', '/usr/bin/false');
       assert.equal(probeLarkCliAuth(), 'unauthorized');
       // 已授权：auth status 输出 identities.available=true 的 JSON
-      const probeJs = path.join(bin, 'probe.js');
+      // （shebang 直指 node 绝对路径，不依赖 PATH 查找解释器；忽略传入参数）
+      const fakeCli = path.join(bin, 'lark-cli');
+      if (fs.existsSync(fakeCli)) fs.rmSync(fakeCli);
       fs.writeFileSync(
-        probeJs,
-        'process.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");process.exit(0);\n',
+        fakeCli,
+        `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");\n`,
+        { mode: 0o755 },
       );
-      link('lark-cli', process.execPath);
-      process.env.NODE_OPTIONS = `--require ${probeJs}`;
       assert.equal(checkLarkCliStatus(), 'ok');
-      delete process.env.NODE_OPTIONS;
       // jq 装了、curl 没装 → 缺 curl
       link('jq', '/usr/bin/true');
       assert.equal(checkJq(), true);
@@ -2866,8 +2865,6 @@ async function run(): Promise<void> {
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
-      if (prevNodeOptions === undefined) delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = prevNodeOptions;
       fs.rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -2914,7 +2911,6 @@ async function run(): Promise<void> {
   await checkAsync('buildStatusLines：lark 未授权/未安装/ok 与 hk 缺失写入状态行', async () => {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-status-'));
     const prevPath = process.env.PATH;
-    const prevNodeOptions = process.env.NODE_OPTIONS;
     const opts = { model: 'm', kanbanUrl: 'http://127.0.0.1:1', mcpOk: false, mcpToolCount: 0, mcpDownNote: 'MCP 不可用' };
     try {
       // 未授权：lark-cli = true（--version 退出 0；auth status 无输出 → 保守判未授权），PATH 无 jq/curl
@@ -2926,22 +2922,18 @@ async function run(): Promise<void> {
       assert.ok(unauth.includes('降级链不可用')); // MCP 掉线且 hk 缺依赖时必须警示
       const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
       assert.ok(missing.includes('lark-cli: 未安装'));
-      // 已授权：node 符号链接 + NODE_OPTIONS --require 输出 available=true
-      const probeJs = path.join(bin, 'probe.js');
-      fs.writeFileSync(
-        probeJs,
-        'process.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");process.exit(0);\n',
-      );
+      // 已授权：shebang 直指 node 的假 lark-cli 输出 available=true（探测走 minimalChildEnv，NODE_OPTIONS 注入不可达）
       fs.rmSync(path.join(bin, 'lark-cli'));
-      fs.symlinkSync(process.execPath, path.join(bin, 'lark-cli'));
-      process.env.NODE_OPTIONS = `--require ${probeJs}`;
+      fs.writeFileSync(
+        path.join(bin, 'lark-cli'),
+        `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");\n`,
+        { mode: 0o755 },
+      );
       const okLines = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
       assert.ok(okLines.includes('lark-cli: 正常'));
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
-      if (prevNodeOptions === undefined) delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = prevNodeOptions;
       fs.rmSync(bin, { recursive: true, force: true });
     }
   });

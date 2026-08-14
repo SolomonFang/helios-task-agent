@@ -35,15 +35,19 @@ function envelopeData(json: unknown): unknown {
 /**
  * 组合调用方 signal 与超时兜底：任一触发即中断。
  * AbortSignal.any 需 Node 20.3+（engines 要求 >=20），这里手写等价组合：
- * 挂起的监听器随 timeout 信号到点释放，不会无限滞留。
+ * 挂在调用方 signal 上的监听器随 ctl 触发（任一分支到点）即摘除，不会在
+ * 调用方 signal 上累积滞留（waitForWorkspaceReady 以同一 turn 级 signal 高频轮询）。
  */
 function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
   if (!signal) return timeout;
   if (signal.aborted) return signal;
   const ctl = new AbortController();
-  signal.addEventListener('abort', () => ctl.abort(), { once: true });
+  const onCallerAbort = (): void => ctl.abort();
+  signal.addEventListener('abort', onCallerAbort, { once: true });
   timeout.addEventListener('abort', () => ctl.abort(), { once: true });
+  // ctl 只会被上述两个分支之一触发：无论哪个先到，都在此摘掉调用方 signal 上的监听器
+  ctl.signal.addEventListener('abort', () => signal.removeEventListener('abort', onCallerAbort), { once: true });
   return ctl.signal;
 }
 

@@ -47,9 +47,14 @@ export class KanbanMcp {
     // 超时路径的子孙进程快照：close 会杀掉直接子进程（npx 壳），孙进程被 reparent 后按
     // ppid 已找不到——必须在 close 前快照，否则超时场景恰好绕过 sweepOrphanedTree 清理
     let timeoutSnapshot: Map<number, string> | null = null;
+    // 竞态护栏：超时回调里 await 快照期间 connect 可能已成功/失败返回——回调恢复后
+    // 必须先复查 settled，否则会把已建立连接的 transport 关掉（调用方拿到 ok:true 但下次调用即失败）
+    let settled = false;
     const timer = setTimeout(() => {
       void (async () => {
+        if (settled) return;
         timeoutSnapshot = await collectDescendants(transport.pid);
+        if (settled) return; // await 期间 connect 已落定，transport 归属成功/失败路径处理，不再误关
         await transport.close().catch(() => {});
       })();
     }, timeoutMs);
@@ -77,6 +82,8 @@ export class KanbanMcp {
       this.transportPid = null;
       throw err;
     } finally {
+      // 先置 settled 再清定时器：若定时器回调恰在此刻进入，settled 保证其不再误关 transport
+      settled = true;
       clearTimeout(timer);
     }
   }

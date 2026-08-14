@@ -37,6 +37,9 @@ export type AccessDecision = 'allow' | 'claim' | 'deny';
 /** 飞书 REST 单请求超时：覆盖发消息/卡片/表情等全部 REST 调用（含 SDK 内部取 token）。 */
 export const FEISHU_HTTP_TIMEOUT_MS = 20000;
 
+/** WS 首次握手等待上限：SDK start() 不等首次连接结果，首次连不上会静默无限重试；超时抛错让启动失败路径生效。 */
+export const FEISHU_WS_FIRST_CONNECT_TIMEOUT_MS = 60000;
+
 /** 图片流式下载整体超时：FEISHU_HTTP_TIMEOUT_MS 只覆盖到响应头，body 读取期间 TCP 停滞需自行兜底（超时销毁流，走「图片下载失败」路径）。 */
 export const FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS = 60000;
 
@@ -329,6 +332,8 @@ export class FeishuChannel implements AgentChannel {
   private readonly client: Lark.Client;
   private readonly access: ReturnType<typeof createAccessChecker>;
   private wsClient: Lark.WSClient | null = null;
+  /** WS 首次握手等待上限（ms）：见 start() 的注释，测试可注入更短值。 */
+  private readonly wsFirstConnectTimeoutMs: number;
   /** 最近一次收到长连接事件（消息/卡片回传）的时间（ms；0 = 尚未收到），/status 探活用。 */
   private lastEventAtMs = 0;
   private readonly dedupe = createMessageDedupe(10 * 60 * 1000);
@@ -349,8 +354,9 @@ export class FeishuChannel implements AgentChannel {
    *  返回 false（或抛错）= 绑定未持久化：channel 撤销内存放行并阻断重试（fail-closed）。 */
   onOwnerClaim?: (openId: string) => boolean;
 
-  constructor(cfg: FeishuBotConfig) {
+  constructor(cfg: FeishuBotConfig, opts?: { wsFirstConnectTimeoutMs?: number }) {
     this.cfg = cfg;
+    this.wsFirstConnectTimeoutMs = opts?.wsFirstConnectTimeoutMs ?? FEISHU_WS_FIRST_CONNECT_TIMEOUT_MS;
     this.access = createAccessChecker(cfg.allowedOpenIds);
     // SDK 内部 axios 默认 timeout=0（永不超时）：一个挂死的 TCP 连接会让 reply/updateText
     // 永久 pending，卡死用户队列与 watcher 推送。defaultHttpInstance 是 SDK 导出的共享实例
@@ -380,10 +386,24 @@ export class FeishuChannel implements AgentChannel {
   }
 
   async start(onMessage: (msg: FeishuInboundMessage) => Promise<void>): Promise<void> {
+    // SDK start() 不等待首次连接结果（内部 reConnect(true) 未 await）：首次连不上时
+    // onReconnecting 不触发（hasEverConnected=false），默认无限重试也不触发 onError，
+    // 进程会假「就绪」却永远收不到消息。这里用一次性 Promise 等首次握手：
+    // onReady（首次连接成功，含首次重试成功）resolve；onError（不可重试错误）/超时 reject，
+    // 让调用方（bot-main）的启动失败路径生效。
+    let settleFirstConnect: ((err?: Error) => void) | null = null;
+    const firstConnect = new Promise<void>((resolve, reject) => {
+      settleFirstConnect = (err?: Error) => (err ? reject(err) : resolve());
+    });
     this.wsClient = new Lark.WSClient({
       appId: this.cfg.appId,
       appSecret: this.cfg.appSecret,
       loggerLevel: Lark.LoggerLevel.info,
+      // 首次握手成功（SDK 每次会话只在首次连接成功时回调一次）
+      onReady: () => {
+        settleFirstConnect?.();
+        settleFirstConnect = null;
+      },
       // 断线监测：SDK 负责重连，这里只透传状态给 bot 层做日志/告警，避免"进程活着但收不到消息"的僵尸态无人察觉
       onReconnecting: () => {
         console.warn('[feishu] 长连接断开，正在自动重连…');
@@ -394,6 +414,9 @@ export class FeishuChannel implements AgentChannel {
         this.onWsStateChange?.('reconnected');
       },
       onError: (err) => {
+        // 首次连接阶段的不可重试错误先喂给握手等待；已就绪后的终态错误走既有告警
+        settleFirstConnect?.(err);
+        settleFirstConnect = null;
         console.error(`[feishu] 长连接重连失败（SDK 已放弃重试）: ${err.message}`);
         this.onWsStateChange?.('failed', err);
       },
@@ -483,6 +506,32 @@ export class FeishuChannel implements AgentChannel {
         },
       }),
     });
+
+    // 等首次握手结果（超时兜底：网络未就绪时 SDK 静默无限重试且不触发任何回调，这里到点判失败）
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        firstConnect,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `飞书长连接首次握手超时（${Math.round(this.wsFirstConnectTimeoutMs / 1000)} 秒未就绪），请检查网络后重试`,
+                ),
+              ),
+            this.wsFirstConnectTimeoutMs,
+          );
+        }),
+      ]);
+    } catch (err) {
+      // 启动失败：停掉 SDK 内部重连/保活定时器，避免 shutdown 前留下孤儿重连
+      this.wsClient?.close();
+      this.wsClient = null;
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async createMessage(receiveIdType: 'chat_id' | 'open_id', receiveId: string, text: string): Promise<string | undefined> {
@@ -700,9 +749,15 @@ export class FeishuChannel implements AgentChannel {
       if (groupMentionInCooldown(this.groupMentionReplied, chatId, now)) return;
       // Map 无清理会无界增长：超上限整体清空（代价只是老群可能再收一次指引）
       if (this.groupMentionReplied.size >= 1000) this.groupMentionReplied.clear();
-      // 发送成功才写冷却：失败不消耗当天额度，下个群事件自然重试（仍受每事件一次约束）
-      await this.sendText(chatId, '我只处理私聊消息：请点我头像发起私聊，把需求直接发给我。');
+      // 先写冷却再发送：判定与 set 之间若隔着 await sendText，两个并发同群 @ 事件会各发一条；
+      // 发送失败 delete 回补：失败不消耗当天额度，下个群事件自然重试（仍受每事件一次约束）
       this.groupMentionReplied.set(chatId, now);
+      try {
+        await this.sendText(chatId, '我只处理私聊消息：请点我头像发起私聊，把需求直接发给我。');
+      } catch (err) {
+        this.groupMentionReplied.delete(chatId);
+        throw err;
+      }
     } catch (err) {
       console.warn(`[feishu] 群 @ 回执发送失败: ${errMessage(err)}`);
     }

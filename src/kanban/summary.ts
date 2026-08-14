@@ -286,10 +286,15 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     additions: 0,
     deletions: 0,
   };
-  for (const t of tasks) {
+  // 状态计数遍历截断前的 filtered（行自带 status，无需 enrich）：范围内任务超 MAX_TASKS 时
+  // 只对截断后的 50 条统计会让「概览」计数系统性偏小；filesChanged 等需 enrich 的数值仍按
+  // 截断后的样本口径统计
+  for (const { row } of filtered) {
     // totals 还含 filesChanged 等数值键，计数时必须用显式状态键集合判定，不能用 in
-    const statusKey = TASK_STATUS_KEYS.find((s) => s === t.status);
+    const statusKey = TASK_STATUS_KEYS.find((s) => s === String(row.status || ''));
     if (statusKey) totals[statusKey]++;
+  }
+  for (const t of tasks) {
     if (t.filesChanged !== undefined) totals.filesChanged += t.filesChanged;
     if (t.additions !== undefined) totals.additions += t.additions;
     if (t.deletions !== undefined) totals.deletions += t.deletions;

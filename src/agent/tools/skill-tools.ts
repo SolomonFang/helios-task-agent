@@ -60,11 +60,10 @@ export function makeSkillExecHandler({
     }
     const summary = `执行技能脚本：${skill}/${script}`;
     const detail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
-    // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定具体脚本
-    const gate = await passGate(
-      { kind: 'skill', summary, detail, batchKey: `skill:${skill}/${script}`, destructive: true },
-      confirm,
-    );
+    // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定脚本与实际参数
+    //（与 hk_cli 的 hk:tasks delete:<id> 同口径——授权 key 绑定操作对象，换参数需重新确认）
+    const batchKey = `skill:${skill}/${script}${argv.length ? `:${argv.join(' ')}` : ''}`;
+    const gate = await passGate({ kind: 'skill', summary, detail, batchKey, destructive: true }, confirm);
     if (!gate.allowed) {
       auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;

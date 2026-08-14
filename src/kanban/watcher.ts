@@ -194,6 +194,13 @@ export class KanbanWatcher {
       // 快照序列化每 tick 只算这一次：下方基线落盘、persistIfChanged 的比较与写盘都复用它
       const snapshotJson = KanbanWatcher.serializeSnapshot(current);
       if (!prev) {
+        // 首轮 approvals 拉取失败（未知）时不落基线：[] 落盘后，下一轮端点恢复会把
+        // 全部既有待审批 diff 成「新的待审批」推一遍，违背「首轮不刷通知」契约——
+        // 延迟到下一轮 approvals 可达时再建基线
+        if (approvalsUnknown) {
+          this.opts.log?.('首轮 approvals 拉取失败，延迟到下一轮建立基线');
+          return;
+        }
         this.state = current;
         this.persist(snapshotJson);
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
@@ -269,7 +276,10 @@ export class KanbanWatcher {
           },
         });
       }
-      if (old.running && !cur.running && cur.failed) {
+      // 失败判定用 failed 标志跳变（而非观测到 running 翻转）：两次轮询之间（或停机
+      // 期间）启动并失败的任务 running 全程不可见，但 failed 会落进快照；已通知过的
+      // 轮次 old.failed=true 不重推，重启后由首轮基线兜底不刷历史失败
+      if (cur.failed && !old.failed && !cur.running) {
         events.push({
           id: `failed:${id}`,
           event: {
@@ -329,6 +339,15 @@ export class KanbanWatcher {
     }
     const perOwner = Boolean(this.opts.notifyOwner && this.opts.owners);
     const ownerList = perOwner ? this.opts.owners!() : [''];
+    // 无人认领期间（perOwner 且 owner 列表为空）跳过投递、保留全部 pending 下轮再投——
+    // [].every(...) 恒 true 会把事件误判「全员已送达」并永久丢弃（对照 daily-brief 的
+    // `if (!owners.length) return;` 语义）；超期条目仍由上方 TTL 兜底丢弃，不无界增长
+    if (perOwner && ownerList.length === 0) {
+      if (Object.keys(pending).length) {
+        this.opts.log?.(`暂无认领 owner，${Object.keys(pending).length} 条事件保留待重投队列，下轮再投递`);
+      }
+      return { pending, pendingTouched: Object.keys(pending).length > 0, failed: 0 };
+    }
     let failed = 0;
     for (const [pid, p] of Object.entries(pending)) {
       for (const owner of ownerList) {

@@ -136,8 +136,14 @@ function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: 
   });
   const ask: AskFn = (promptText) =>
     new Promise((resolve) => {
-      rl.question(promptText, (ans) => resolve(ans));
-      rl.once('close', () => resolve(null));
+      // 正常回答后必须摘掉 close 监听：rl.once('close') 每次提问挂一个、不摘则残留，
+      // 首跑向导多次提问 + 校验重试累积超过 10 个会触发 MaxListenersExceededWarning
+      const onClose = () => resolve(null);
+      rl.question(promptText, (ans) => {
+        rl.removeListener('close', onClose);
+        resolve(ans);
+      });
+      rl.once('close', onClose);
     });
   const isTTY = process.stdin.isTTY === true;
   // 与终端一致的向导体验：箭头选择列表 + 密钥掩码输入（仅 TTY），交互原语见 wizard-io
@@ -266,7 +272,8 @@ async function main(): Promise<void> {
     if (info) {
       const { ask: upAsk, close: upClose } = createAsk();
       try {
-        const outcome = await promptVersionUpdate({ info, ask: upAsk });
+        // 与 CLI 对齐传 log：跳过/失败时给用户可见反馈（不传则静默跳过，分不清是没识别还是已跳过）
+        const outcome = await promptVersionUpdate({ info, ask: upAsk, log: (m) => console.log(c.gray(m)) });
         if (outcome === 'updated') {
           console.log(c.ok('请重新运行 helios-task-agent bot 使用新版本。'));
           process.exit(0);
