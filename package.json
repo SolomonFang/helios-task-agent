@@ -1,6 +1,6 @@
 {
   "name": "helios-task-agent",
-  "version": "1.0.27",
+  "version": "1.0.28",
   "description": "从飞书消息/文档到 helios-kanban 任务的终端与私聊 agent",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
