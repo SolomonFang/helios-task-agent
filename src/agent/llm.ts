@@ -15,7 +15,7 @@ import type {
 /** Backstop on LLM rounds; real limit is on tool-call count below. */
 const MAX_TOOL_ROUNDS = 25;
 /** Max tool invocations per user turn (covers「最多展开 10 条链接」with headroom). */
-const MAX_TOOL_CALLS = 30;
+const MAX_TOOL_CALLS = 100;
 /** 单轮对话墙钟上限（分钟，默认 30）：bot 无人值守时防止超长工具链阻塞该用户的串行队列。 */
 const TURN_WALL_CLOCK_MS = Math.max(1, Number(process.env.HTA_TURN_TIMEOUT_MIN || 30) || 30) * 60_000;
 /** Keep system + this many subsequent messages (tool-call chains trimmed intact). */

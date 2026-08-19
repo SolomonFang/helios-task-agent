@@ -543,7 +543,7 @@ async function run(): Promise<void> {
   });
 
   await checkAsync('runAgentTurn 工具调用超限：剩余调用补占位响应', async () => {
-    const calls: ToolCallSpec[] = Array.from({ length: 31 }, (_, i) => [`c${i}`, 'noop', '{}']);
+    const calls: ToolCallSpec[] = Array.from({ length: 101 }, (_, i) => [`c${i}`, 'noop', '{}']);
     const client = mockClient([assistantWithCalls(calls)]);
     const messages: ChatMessage[] = [
       { role: 'system', content: 'sys' },
@@ -561,15 +561,15 @@ async function run(): Promise<void> {
     ]);
     const reply = await runAgentTurn({ client, model: 'm', messages, tools: [], handlers });
     assert.ok(reply.includes('上限'));
-    assert.equal(ran, 30); // 第 31 个未执行
+    assert.equal(ran, 100); // 第 101 个未执行
     const answered = toolResponseIds(messages);
-    assert.equal(toolCallIds(messages).length, 31);
+    assert.equal(toolCallIds(messages).length, 101);
     for (const id of toolCallIds(messages)) assert.ok(answered.has(id), `缺少 ${id} 的 tool 响应`);
   });
 
   await checkAsync('runAgentTurn 轮次上限与调用次数上限文案区分', async () => {
     const handlers = new Map([['noop', async () => 'ok']]);
-    // 轮次上限：每轮 1 个工具调用，25 轮耗尽（共 25 次调用，不触 30 次上限）
+    // 轮次上限：每轮 1 个工具调用，25 轮耗尽（共 25 次调用，不触 100 次上限）
     const messages1: ChatMessage[] = [
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'hi' },
@@ -582,9 +582,9 @@ async function run(): Promise<void> {
       handlers,
     });
     assert.ok(reply1.includes('轮次已达上限 25 轮'), reply1);
-    assert.ok(!reply1.includes('30 次'), reply1);
-    // 调用次数上限：单轮 31 个调用，耗尽于第 31 个
-    const calls: ToolCallSpec[] = Array.from({ length: 31 }, (_, i) => [`c${i}`, 'noop', '{}']);
+    assert.ok(!reply1.includes('100 次'), reply1);
+    // 调用次数上限：单轮 101 个调用，耗尽于第 101 个
+    const calls: ToolCallSpec[] = Array.from({ length: 101 }, (_, i) => [`c${i}`, 'noop', '{}']);
     const messages2: ChatMessage[] = [
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'hi' },
@@ -596,7 +596,7 @@ async function run(): Promise<void> {
       tools: [],
       handlers,
     });
-    assert.ok(reply2.includes('工具调用已达上限 30 次'), reply2);
+    assert.ok(reply2.includes('工具调用已达上限 100 次'), reply2);
     assert.ok(!reply2.includes('轮次'), reply2);
   });
 
@@ -1336,7 +1336,7 @@ async function run(): Promise<void> {
   })());
 
   // ---------- 会话创建上限（buildTools 闭包级） ----------
-  await checkAsync('单会话创建上限 10 个：第 11 个被代码层拦截', async () => {
+  await checkAsync('单会话创建上限 50 个：第 51 个被代码层拦截', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-cap-'));
     const fakeMcp = {
       connected: true,
@@ -1352,12 +1352,12 @@ async function run(): Promise<void> {
     });
     const create = handlers.get('kanban_create_task')!;
     let blocked = '';
-    for (let i = 0; i < 11; i++) {
+    for (let i = 0; i < 51; i++) {
       const out = await create({ title: `t${i}` });
       if (out.includes('已达上限')) blocked = out;
     }
     fs.rmSync(tmp, { recursive: true, force: true });
-    assert.ok(blocked.includes('已达上限'), '第 11 次创建应被上限拦截');
+    assert.ok(blocked.includes('已达上限'), '第 51 次创建应被上限拦截');
   });
 
   // ---------- npm 更新检查 ----------

@@ -5,7 +5,7 @@ import { extractWorkspaceId, waitForWorkspaceReady } from '../../kanban/workspac
 import { extractUuid } from './shared';
 
 /** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
-const MAX_CREATES_PER_SESSION = 10;
+const MAX_CREATES_PER_SESSION = 50;
 const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，系统安全限制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
 
 /**
