@@ -73,14 +73,14 @@ async function main(): Promise<void> {
           createCounter: counter,
         }).handlers;
       let create = mk().get('kanban_create_task')!;
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 50; i++) {
         const r = await create({ title: `t${i}` });
         assert.ok(!r.includes(CAP_HINT), `第 ${i + 1} 次创建不应触顶: ${r}`);
       }
-      assert.ok((await create({ title: 't11' })).includes(CAP_HINT), '第 11 次应触顶');
+      assert.ok((await create({ title: 't51' })).includes(CAP_HINT), '第 51 次应触顶');
       // 模拟 setMcpOk→applyConfig 重建全部工具闭包：计数不清零，仍触顶
       create = mk().get('kanban_create_task')!;
-      assert.ok((await create({ title: 't12' })).includes(CAP_HINT), '重建后计数应保留');
+      assert.ok((await create({ title: 't52' })).includes(CAP_HINT), '重建后计数应保留');
       // 显式重置（clearHistory 语义）后放行
       counter.count = 0;
       create = mk().get('kanban_create_task')!;
@@ -103,12 +103,12 @@ async function main(): Promise<void> {
       });
       const createOf = () =>
         (session as unknown as { handlers: ToolHandlers }).handlers.get('kanban_create_task')!;
-      for (let i = 0; i < 10; i++) await createOf()({ title: `t${i}` });
+      for (let i = 0; i < 50; i++) await createOf()({ title: `t${i}` });
       session.setMcpOk(false);
       session.setMcpOk(true); // 触发 applyConfig → 重建工具闭包
-      assert.ok((await createOf()({ title: 't11' })).includes(CAP_HINT), 'MCP 重连后计数应保留');
+      assert.ok((await createOf()({ title: 't51' })).includes(CAP_HINT), 'MCP 重连后计数应保留');
       session.clearHistory();
-      assert.ok(!(await createOf()({ title: 't12' })).includes(CAP_HINT), 'clearHistory 后应放行');
+      assert.ok(!(await createOf()({ title: 't52' })).includes(CAP_HINT), 'clearHistory 后应放行');
     } finally {
       if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
       else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
