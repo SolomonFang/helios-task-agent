@@ -43,7 +43,7 @@ helios-task-agent --version   # show installed version
 
 **Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place with a link to the changelog. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
-**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@0.1.39` (pinned by default — override with `HELIOS_KANBAN_PACKAGE`, e.g. `@latest`; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (tracks the latest release by default — override with `HELIOS_KANBAN_PACKAGE` to pin a version; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
 **Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
 
@@ -191,8 +191,8 @@ via the `skill_doc` tool (progressive disclosure).
 | `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner (first-come-first-served — anyone who can find the bot could claim it, so configure it explicitly) |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
-| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@0.1.39 --mcp` |
-| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, default pinned `helios-kanban@0.1.39`; set `@latest` or another version to override |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
+| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, default `helios-kanban@latest` (tracks the latest release); set a pinned version to override |
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |

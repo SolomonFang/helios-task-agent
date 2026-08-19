@@ -33,6 +33,7 @@
 
 ### Changed
 
+- helios-kanban 默认包规格改回 `helios-kanban@latest` 跟随最新版（不再默认钉版本）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖为指定版本（`src/infra/deps.ts`）
 - 「同类免问」覆盖全部写操作：此前破坏性看板操作（删除/取消/停止/审批/启动/归档/合并/推送/执行）、飞书写、记忆写、技能脚本一律逐次确认，确认卡片无「同类免问」按钮；现所有写操作都带 batchKey（看板/hk 绑定工具名+对象 id，lark 按命令路径如 `lark:im send`，技能脚本按 `skill:<名>/<脚本>`，记忆按 set/delete/note 分动作），所有确认卡片均可「同类免问」；破坏性判定改由 `ConfirmRequest.destructive` 承载（`guard.isBatchable` 更名 `isDestructive`），仅用于确认超时分级（300s vs 120s），不再影响免问资格
 - 轮次内插入独立消息时的最终回复时序（bot）：确认卡片/超时提示等独立消息插在进度占位之后时，最终回复不再原地编辑占位（飞书编辑不改变消息位置，完成消息会停在卡片上方、时序颠倒），占位收尾为「✅ 已完成，结果见下方 ⬇️」，正文改发新消息落在时间线末尾；无插入消息时仍原地替换占位（见 `src/bot/handler.ts` 的 `RoundNoticeTracker` 与 `deliverReply` interleaved 分支）
 - SourceRegistry 按文件 mtime 缓存解析结果，来源去重检查不再每次全量读盘；会话历史落盘改异步（串行队列，原子写/0600 语义不变），目录清理按 60s 节流；watcher 快照每 tick 只序列化一次，比较与写盘复用

@@ -26,9 +26,9 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 
 1. **Helios Kanban running** on a reachable host:
    ```bash
-   HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@0.1.39
+   HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
    ```
-   Security note: the kanban Web/API has **no authentication** — `HOST=0.0.0.0` exposes task/code operations to the whole LAN. Only do this on a trusted network (Tailscale recommended, see below); for same-machine use bind loopback `HOST=127.0.0.1` instead. The pinned version matches helios-task-agent's built-in default (`HELIOS_KANBAN_PACKAGE`); upgrade it in lockstep.
+   Security note: the kanban Web/API has **no authentication** — `HOST=0.0.0.0` exposes task/code operations to the whole LAN. Only do this on a trusted network (Tailscale recommended, see below); for same-machine use bind loopback `HOST=127.0.0.1` instead. `@latest` matches helios-task-agent's built-in default (`HELIOS_KANBAN_PACKAGE`); pin a version there if you pin one here.
 2. **Network**: bot host can reach the server (Tailscale recommended).
 3. **Env vars** (set on the bot host):
    - `HELIOS_KANBAN_URL` — base URL, e.g. `http://100.x.x.x:7964`
@@ -173,7 +173,7 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 
 ## MCP (same machine) vs this skill (remote)
 
-- **Same host as the kanban server** → prefer the MCP server. It covers the full orchestration surface: project/task CRUD, `create_project`, `create_task_and_start`, `start/stop_workspace_session`, `follow_up_session`, `queue_message`, `get_task_status`, `list_approvals` / `respond_to_approval`, `list_branches`, `list_tags`. (Tool names as of `helios-kanban@0.1.39` — they belong to the upstream package and may drift as it evolves.)
+- **Same host as the kanban server** → prefer the MCP server. It covers the full orchestration surface: project/task CRUD, `create_project`, `create_task_and_start`, `start/stop_workspace_session`, `follow_up_session`, `queue_message`, `get_task_status`, `list_approvals` / `respond_to_approval`, `list_branches`, `list_tags`. (Tool names belong to the upstream package and may drift as it evolves.)
 - **Remote (phone bot, another host)** → use `hk.sh` over HTTP, as this skill documents.
 - New capabilities land in the MCP server first; `hk.sh` mirrors them for remote use. If the two drift, the REST API in [reference.md](reference.md) is the source of truth.
 
@@ -181,7 +181,7 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 {
   "helios_kanban": {
     "command": "npx",
-    "args": ["-y", "helios-kanban@0.1.39", "--mcp"]
+    "args": ["-y", "helios-kanban@latest", "--mcp"]
   }
 }
 ```

@@ -2810,10 +2810,10 @@ async function run(): Promise<void> {
     });
   }
 
-  // ---------- npx 包规格：kanban 与 ocr 均钉版本，env 均可覆盖 ----------
+  // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
-      /^helios-kanban@\d+\.\d+\.\d+$/.test(kanbanPackageSpec({})) &&
+      kanbanPackageSpec({}) === 'helios-kanban@latest' &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36' &&
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&
