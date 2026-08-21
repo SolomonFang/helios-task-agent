@@ -559,7 +559,7 @@ async function main() {
       !looksLikeStrongFailure('{"title":"记录一次调用失败与执行异常复盘"}') &&
       looksLikeStrongFailure('命令执行失败: exit 1') && // 真失败：串首（run() 子进程失败）
       looksLikeStrongFailure('已创建 1 个任务\nHTTP 502 Bad Gateway') && // 真失败：多行输出某行行首
-      looksLikeStrongFailure('MCP 工具 create_task 调用失败: boom') && // 带前缀的真实失败（unit.ts 同形态）
+      looksLikeStrongFailure('看板工具 create_task 调用失败: boom') && // 带前缀的真实失败（unit.ts 同形态）
       looksLikeStrongFailure('工具 hk_cli 执行异常: spawn fail'), // 带前缀的真实失败（llm.ts 同形态）
   );
 

@@ -85,7 +85,8 @@ export type GateResult =
 export const DENIED_MESSAGE = '用户拒绝了该写操作，未执行。请如实转告用户，不要换工具或换参数重试同一操作。';
 export const SUPERSEDED_MESSAGE =
   '该写操作的确认已被新的写操作确认替代，本次未执行（并非用户拒绝）。请如实转告用户；如仍需执行，以最新一次确认为准。';
-export const NO_GATE_MESSAGE = '当前会话未配置写操作确认通道，写操作已被安全策略阻止。';
+export const NO_GATE_MESSAGE =
+  '当前会话未配置写操作确认通道，写操作已被安全策略阻止。这通常表示服务部署时未启用确认通道，请联系部署者检查配置。';
 
 /**
  * 被新的写操作确认顶掉的请求（confirm.ts 在 resolve 前标记）。passGate 据此把「被替代」
@@ -263,7 +264,7 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
   if (/follow/i.test(toolName)) return `向任务 ${id} 发送跟进消息`;
   if (/approve/i.test(toolName)) return `批准审批 ${id}`;
   if (/deny/i.test(toolName)) return `拒绝审批 ${id}`;
-  return `看板写操作 ${toolName}`;
+  return '看板写操作';
 }
 
 // --- failure detection for tool output ---
@@ -278,10 +279,10 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
  */
 const STRONG_FAILURE_RE = /^错误|⏹ 已中断|permission denied/i;
 // 行首锚定的中文失败形态（m 标志：任一行的行首）——真实失败输出均以这些形态起行：
-// run() 子进程失败「命令执行失败：…」（tools/shared.ts）、MCP 写失败「MCP 工具 xxx 调用失败：…」
+// run() 子进程失败「命令执行失败：…」（tools/shared.ts）、看板写失败「看板工具 xxx 调用失败：…」
 // （tools/kanban-mcp.ts）、handler 异常「工具 xxx 执行异常：…」（llm.ts）。与串首锚定的
 // ^错误 分开：m 标志会把 ^错误 放宽成行首匹配（成功输出的正文行可能以「错误」开头）。
-const STRONG_FAILURE_LINE_ZH_RE = /^(?:命令执行失败|调用失败|执行异常|HTTP \d{3}\b|(?:MCP )?工具 \S+ (?:调用失败|执行异常))/im;
+const STRONG_FAILURE_LINE_ZH_RE = /^(?:命令执行失败|调用失败|执行异常|HTTP \d{3}\b|(?:看板)?工具 \S+ (?:调用失败|执行异常))/im;
 // 行首锚定的英文失败形态（m 标志：任一行的行首，可带 error: 前缀）。
 const STRONG_FAILURE_LINE_RE = /^(?:error[:：]\s*)?(?:api error|denied|not found)\b/im;
 

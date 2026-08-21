@@ -91,7 +91,7 @@ async function isGitRepo(dir: string): Promise<boolean> {
 export async function resolveReviewTarget(kanbanUrl: string, attemptId: string): Promise<ReviewTarget> {
   const raw: unknown = await apiGet(kanbanUrl, `/task-attempts/${attemptId}`);
   if (!isAttemptRow(raw)) {
-    throw new Error('找不到该任务的 workspace（attempt）记录，可能已被清理。');
+    throw new Error('找不到该任务的执行环境记录，可能已被看板清理。可在看板上重新发起该任务后再试。');
   }
   const attempt: AttemptRow = raw;
   let repos: AttemptRepoRow[] = [];
@@ -129,10 +129,12 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
       return { repoDir: dir, fromRef, toRef, taskId };
     }
   }
+  // 宿主机绝对路径清单只进日志（对用户无意义且泄露本机目录结构）；用户面只留中文结论与可执行指引
+  if (candidates.length) {
+    console.error(`[ai-review] 无法定位代码目录，已尝试：\n${candidates.map((d) => `- ${d}`).join('\n')}`);
+  }
   throw new Error(
-    '无法定位该任务的代码目录（workspace 可能已清理，或原始仓库不可达）。\n已尝试：\n' +
-      (candidates.map((d) => `- ${d}`).join('\n') || '（无候选目录）') +
-      '\n请用「人工审查」打开看板 diff。',
+    '无法定位该任务的代码目录（工作区可能已清理，或原始仓库不可达）。请用「人工审查」打开看板 diff 查看变更。',
   );
 }
 
@@ -259,7 +261,8 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
   const args = [...ocr.prefixArgs, 'review', '--repo', target.repoDir];
   if (target.fromRef && target.toRef) {
     if (!isValidGitRef(target.fromRef) || !isValidGitRef(target.toRef)) {
-      throw new Error(`非法的 git 分支名（from=${target.fromRef}, to=${target.toRef}），已拒绝执行 AI 审查。`);
+      console.error(`[ai-review] 看板返回的分支名不合法：from=${target.fromRef}, to=${target.toRef}`);
+      throw new Error('看板返回的分支名不合法，请在看板检查该任务仓库的分支设置。');
     }
     args.push('--from', target.fromRef, '--to', target.toRef);
   }
@@ -285,16 +288,14 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     stderr = out.stderr || '';
   } catch (err) {
     const e = err as { killed?: boolean; stdout?: string; stderr?: string; message?: string };
-    // 完整输出进日志；消息里只带尾部 3 行，避免整段 stderr 倾倒给终端用户
+    // 完整输出只进日志，不倾倒给终端用户；用户面给中文定性 + 自救指引
     const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
-    const tail = full.split('\n').slice(-3).join('\n');
     if (full) console.error(`[ai-review] 代码审查工具完整输出：\n${full}`);
     if (e.killed) {
-      throw new Error(
-        `AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。可再次点击「AI 审查」重试。${tail ? `\n${tail}` : ''}`,
-      );
+      // 重试指引由 handler 统一追加，这里不再自带，避免两句重复
+      throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
     }
-    throw new Error(`代码审查工具执行失败：${tail || e.message || '未知错误'}`);
+    throw new Error('代码审查工具执行失败，请稍后重试；若持续失败请检查代码审查工具配置。');
   }
   const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
   return text || '（代码审查工具未产生输出：可能没有可审查的变更）';

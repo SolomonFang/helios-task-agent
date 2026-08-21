@@ -4,7 +4,7 @@
  * 目标：凭证/能力问题在向导里立刻暴露，而不是等到长连接失败才排查。
  */
 
-import { errMessage } from '../infra/err';
+import { netErrorDetail } from './net-error';
 
 export interface FeishuVerifyResult {
   ok: boolean;
@@ -29,14 +29,14 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0 || !json.tenant_access_token) {
       return {
         ok: false,
-        message: `App ID / App Secret 无效（${json.msg || `code=${json.code}`}）。请到开发者后台 → 凭证与基础信息重新复制。`,
+        message: `App ID / App Secret 无效，请到开发者后台 → 凭证与基础信息重新复制。（${json.msg || `code=${json.code}`}）`,
       };
     }
     token = json.tenant_access_token;
   } catch (err) {
     return {
       ok: false,
-      message: `无法连接 open.feishu.cn（${errMessage(err)}）。检查网络后重试，或选择仍然保存。`,
+      message: `无法连接 open.feishu.cn${netErrorDetail(err)}。检查网络后可重试，或在下方提示输入 s 仍然保存。`,
     };
   }
 
@@ -49,14 +49,14 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0) {
       return {
         ok: false,
-        message: `凭证有效，但「机器人」能力未启用（${json.msg || `code=${json.code}`}）。请到开发者后台 → 应用能力 → 添加「机器人」，并发布版本。`,
+        message: `凭证有效，但「机器人」能力未启用，请到开发者后台 → 应用能力 → 添加「机器人」并发布版本。（${json.msg || `code=${json.code}`}）`,
       };
     }
     return { ok: true, botName: json.bot?.app_name, message: 'ok' };
   } catch (err) {
     return {
       ok: false,
-      message: `机器人信息查询失败（${errMessage(err)}）。可重试，或选择仍然保存。`,
+      message: `机器人信息查询失败${netErrorDetail(err)}。可重试，或在下方提示输入 s 仍然保存。`,
     };
   }
 }

@@ -191,9 +191,12 @@ const SEV_MAP: Record<string, SevMeta> = {
   high: { cls: 'high', label: '高' },
   major: { cls: 'high', label: '高' },
   medium: { cls: 'medium', label: '中' },
+  warning: { cls: 'medium', label: '警告' },
   low: { cls: 'low', label: '低' },
   minor: { cls: 'low', label: '低' },
   info: { cls: 'info', label: '提示' },
+  suggestion: { cls: 'info', label: '建议' },
+  nit: { cls: 'info', label: '建议' },
   严重: { cls: 'critical', label: '严重' },
   高: { cls: 'high', label: '高' },
   中: { cls: 'medium', label: '中' },
@@ -201,7 +204,8 @@ const SEV_MAP: Record<string, SevMeta> = {
 };
 
 function sevMeta(raw: string): SevMeta {
-  return SEV_MAP[raw.trim().toLowerCase()] ?? { cls: 'info', label: raw.trim() || '提示' };
+  // 未命中映射的英文原文不上徽章，统一归到「提示」
+  return SEV_MAP[raw.trim().toLowerCase()] ?? { cls: 'info', label: '提示' };
 }
 
 /**
@@ -218,15 +222,22 @@ const CAT_LABELS: Record<string, string> = {
   bug: '缺陷',
   security: '安全',
   performance: '性能',
+  correctness: '正确性',
   maintainability: '可维护性',
   readability: '可读性',
   style: '风格',
   docs: '文档',
   test: '测试',
+  warning: '警告',
+  suggestion: '建议',
+  nit: '建议',
 };
 
 function catLabel(raw: string): string {
-  return CAT_LABELS[raw.trim().toLowerCase()] ?? raw.trim();
+  const key = raw.trim().toLowerCase();
+  if (!key) return ''; // 无类别不渲染徽章
+  // 未命中映射的英文原文不上徽章，统一归到「提示」
+  return CAT_LABELS[key] ?? '提示';
 }
 
 /** diff 候选行：带 +/- 前缀，或缩进 ≥2 的代码上下文行。 */
@@ -585,11 +596,11 @@ export function renderReviewHtml(data: ReviewReportData): string {
       ? renderStructured(parsed)
       : `<article class="report md">\n${renderReviewMarkdown(data.text)}\n  </article>`;
   return renderReportPage({
-    title: `AI 审查 · ${escapeHtml(data.title || '(无标题)')}`,
+    title: `AI 审查 · ${escapeHtml(data.title || '（无标题）')}`,
     css: REVIEW_PAGE_CSS,
     body: `  <header class="hero${pass ? ' pass' : ''}">
     <h1>${pass ? '✅' : '🤖'} AI 代码审查${pass ? ' · 全部通过' : ''}</h1>
-    <p class="subtitle">${escapeHtml(data.title || '(无标题)')}</p>
+    <p class="subtitle">${escapeHtml(data.title || '（无标题）')}</p>
     <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间 ${escapeHtml(data.generatedAt)}</p>
   </header>
   ${content}`,

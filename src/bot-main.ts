@@ -27,7 +27,7 @@ import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
 import { startReportServer, type ReportServer } from './report/report-server';
-import { checkLarkCliStatus, checkHkDeps, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkLarkCliStatus, checkHkDeps, checkHkDepsAsync, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wrapUntrusted } from './agent/guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -47,7 +47,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 命令
 /help     显示帮助
-/status   健康检查（kanban / MCP / lark-cli / 推送）
+/status   健康检查（看板 / 看板连接 / 飞书读取 / 推送）
 /tools    列出当前可用工具
 /skills   列出技能；install <路径> 安装（升级不丢失）；uninstall <名称> 卸载
 /memory   查看你的持久化记忆
@@ -56,7 +56,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /confirm  查看「同类免问」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
-· 建/改/删任务、启动 workspace、发飞书消息等写操作会收到确认卡片
+· 建/改/删任务、启动任务的工作区、发飞书消息等写操作会收到确认卡片
 · 「确认执行」仅此次有效；「同类免问（本会话）」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
 · 普通写操作 120 秒、破坏性操作（删除/停止/审批等）300 秒未操作自动拒绝
@@ -310,7 +310,7 @@ async function main(): Promise<void> {
   const hkMissing = checkHkDeps();
   if (hkMissing.length) {
     console.log(
-      c.warn(`hk_cli 降级链缺少 ${hkMissing.join('、')}：MCP 掉线时看板读写将不可用。安装：brew install jq curl（macOS）`),
+      c.warn(`hk_cli 降级链缺少 ${hkMissing.join('、')}：MCP 掉线时看板读写将不可用（${HK_CLI_INSTALL_HINT}）`),
     );
   }
   migrateAndValidateSkills();
@@ -485,8 +485,15 @@ async function main(): Promise<void> {
     },
     onLost: () => {
       router.setMcpOk(false);
-      console.log(c.warn(`MCP 连接丢失，${MCP_FALLBACK_TEXT}，将自动重连…`));
-      notifyOwners(`⚠️ 看板 MCP 连接丢失，${MCP_FALLBACK_TEXT}（恢复后自动切回）`);
+      void (async () => {
+        // hk_cli 降级链依赖（jq/curl）缺失时「已切换备用通道」是谎言：按探测结果条件化
+        const hkMissing = await checkHkDepsAsync();
+        const fallback = hkMissing.length
+          ? `看板读写暂不可用，缺少 ${hkMissing.join('/')}（${HK_CLI_INSTALL_HINT}）`
+          : MCP_FALLBACK_TEXT;
+        console.log(c.warn(`MCP 连接丢失，${fallback}，将自动重连…`));
+        notifyOwners(`⚠️ 看板 MCP 连接丢失，${fallback}（恢复后自动切回）`);
+      })();
     },
     onRecovered: () => {
       router.setMcpOk(true);

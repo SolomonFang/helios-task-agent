@@ -110,15 +110,15 @@ export function printBanner(status: BannerStatus): void {
   const mcpSuffix =
     status.mcp === 'fail'
       ? hkMissing.length
-        ? `，${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，降级链不可用`
+        ? '，备用通道不可用（详见下行）'
         : `，${MCP_FALLBACK_TEXT}，功能不受影响`
       : '';
   const mcpLine =
     status.mcp === 'ok'
-      ? c.ok('●') + ` helios-kanban MCP  已连接（${status.mcpToolCount} 个工具）`
+      ? c.ok('●') + ` 看板连接         已连接（${status.mcpToolCount} 个工具）`
       : status.mcp === 'fail'
-        ? c.warn('●') + ` helios-kanban MCP  连接失败${mcpSuffix}`
-        : c.warn('●') + ' helios-kanban MCP  连接中…';
+        ? c.warn('●') + ` 看板连接         连接失败${mcpSuffix}`
+        : c.gray('●') + ' 看板连接         连接中…';
   // larkOk 只代表二进制存在，授权态用调用方传入的 larkAuthed，区分未安装/未授权/可用
   const larkAuthed = status.larkOk && status.larkAuthed;
   const larkLine = !status.larkOk
@@ -128,7 +128,7 @@ export function printBanner(status: BannerStatus): void {
       : c.warn('●') + ' lark-cli         未授权，飞书能力不可用（运行 lark-cli auth login 完成授权）';
   const hkLine =
     hkMissing.length > 0
-      ? ['  ' + c.warn('●') + ` hk_cli 降级链    缺少 ${hkMissing.join('、')}，MCP 掉线时无法降级（${HK_CLI_INSTALL_HINT}）`]
+      ? ['  ' + c.warn('●') + ` 备用通道         缺少 ${hkMissing.join('、')}，MCP 掉线时无法降级（${HK_CLI_INSTALL_HINT}）`]
       : [];
   const lines = [
     '',
@@ -145,9 +145,9 @@ export function printBanner(status: BannerStatus): void {
     '  ' + mcpLine,
     '  ' + larkLine,
     ...hkLine,
-    // 模型与 kanban 地址只是配置展示（未做健康检查）：用中性灰点，避免与上面两行的「连接正常」绿点混淆
+    // 模型与看板地址只是配置展示（未做健康检查）：用中性灰点，避免与上面两行的「连接正常」绿点混淆
     '  ' + c.gray('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
-    '  ' + c.gray('●') + ` kanban 地址      ${status.kanbanUrl}`,
+    '  ' + c.gray('●') + ` 看板地址         ${status.kanbanUrl}`,
     '',
     c.gray('  输入 /help 查看命令，/config 重新配置模型，/exit 退出'),
     '',

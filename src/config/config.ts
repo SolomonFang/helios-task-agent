@@ -121,7 +121,7 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
     }
     if (dropped.length) {
       console.warn(
-        `[config] 当前目录 .env 中的以下配置项存在安全风险（凭证/命令注入），已被忽略；请改写到 ${userEnvPath()}: ${dropped.join(', ')}`,
+        `[config] 当前目录 .env 中的以下配置项存在安全风险（凭证/命令注入），已被忽略；请改写到 ${userEnvPath()}：${dropped.join(', ')}`,
       );
     }
     loaded.push(cwd);

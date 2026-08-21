@@ -113,7 +113,7 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **任务**: {title} (`{id}`)
 **迭代**: {iteration or —}
 **优先级**: {priority}
-**状态**: {status} | running: {yes/no} | failed: {yes/no}
+**状态**: {中文状态} | running: {yes/no} | failed: {yes/no}
 **分支**: {target_branch}
 **Executor**: {executor}
 **URL**: {url}
@@ -138,7 +138,15 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 ## Task statuses
 
-`todo` | `inprogress` | `inreview` | `done` | `cancelled`
+给用户展示时用中文状态；英文键仅用于 `--status` 过滤参数：
+
+| 英文键（`--status` 参数） | 中文状态 |
+|---|---|
+| `todo` | 待办 |
+| `inprogress` | 进行中 |
+| `inreview` | 待审阅 |
+| `done` | 已完成 |
+| `cancelled` | 已取消 |
 
 ## Task priorities
 

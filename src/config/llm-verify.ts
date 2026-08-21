@@ -6,7 +6,7 @@
  * 这种情况标记 uncertain（无法预检），由用户选择仍保存，不误拦。
  */
 
-import { errMessage } from '../infra/err';
+import { netErrorDetail } from './net-error';
 
 export interface LlmVerifyResult {
   ok: boolean;
@@ -42,7 +42,7 @@ export async function verifyLlmConfig(
     return {
       ok: false,
       uncertain: true,
-      message: `无法连接 ${baseUrl}（${errMessage(err)}）。检查网络 / 代理后重试，或选择仍然保存。`,
+      message: `无法连接 ${baseUrl}${netErrorDetail(err)}。检查网络 / 代理后可重试，或在下方提示输入 s 仍然保存。`,
     };
   }
 }

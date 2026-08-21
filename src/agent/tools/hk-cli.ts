@@ -71,7 +71,9 @@ export function makeHkCliHandler({
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
-    const summary = isCreate ? `创建看板任务「${title}」` : `看板写操作：hk ${argv.slice(0, 3).join(' ')}`;
+    const summary = isCreate
+      ? `创建看板任务${title ? `「${title}」` : ''}`
+      : `看板写操作：${argv.slice(0, 3).join(' ')}`;
     // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
     return runGatedWrite({
       kind: 'hk',
@@ -99,8 +101,8 @@ export function makeHkCliHandler({
                 return await fillHkStartBranches(argv, kanbanUrl, {
                   signal: ctx?.signal,
                   noRepoError:
-                    '无法启动 workspace：未指定 --branch / --repo ID:branch，且未配置 HELIOS_KANBAN_REPO_ID。\n' +
-                    '请显式传入目标分支（如 --branch hly-dev），避免静默回退到不存在的 main。',
+                    '无法启动工作区：未指定 --branch / --repo ID:branch，且未配置默认仓库。\n' +
+                    '请显式传入目标分支（如 --branch develop），避免静默回退到不存在的 main。',
                 });
               }
             } else if (!argv.includes('--branch')) {

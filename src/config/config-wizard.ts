@@ -25,26 +25,28 @@ export function printFeishuSetupChecklist(): void {
 
 /**
  * need/needSecret 闭包工厂：need 读取一行输入（EOF 抛错、去空白），needSecret 为密钥
- * 掩码输入（未提供 askSecret 时回退普通输入）。runWizard / rebindFeishuBot /
- * ensureBotConfig 共用——此前同一对闭包逐字复制了三份。
+ * 掩码输入（未提供 askSecret 时回退普通输入）。secretSuffix 按是否真正走掩码给出
+ * 如实提示（掩码 =「输入显示为 *」，回退明文 =「输入可见」）。
+ * runWizard / rebindFeishuBot / ensureBotConfig 共用——此前同一对闭包逐字复制了三份。
  */
 export function makeNeed(
   ask: AskFn,
   askSecret?: AskFn | null,
-): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string> } {
+): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string>; secretSuffix: string } {
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
     if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
     return ans.trim();
   };
-  /** 敏感信息（API Key / App Secret）：TTY 下掩码回显；非 TTY 或未提供时回退普通输入。 */
+  /** 敏感信息（API Key / App Secret）：TTY 下掩码回显；非 TTY 或未提供时回退普通输入（明文可见）。 */
   const needSecret = async (promptText: string): Promise<string> => {
     if (!askSecret) return need(promptText);
     const ans = await askSecret(promptText);
     if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
     return ans.trim();
   };
-  return { need, needSecret };
+  const secretSuffix = askSecret ? '（输入显示为 *）' : '（输入可见）';
+  return { need, needSecret, secretSuffix };
 }
 
 /**
@@ -57,7 +59,7 @@ export function resolveAllowedOpenIds(raw: string, existing: string[], allowClea
 }
 
 async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
-  const { need, needSecret } = makeNeed(ask, askSecret);
+  const { need, needSecret, secretSuffix } = makeNeed(ask, askSecret);
 
   /**
    * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
@@ -69,7 +71,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       if (/^https:\/\//i.test(u)) return u;
       // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
       if (!/^http:\/\//i.test(u)) {
-        console.log(c.err('Base URL 需要以 https:// 或 http:// 开头（如 https://api.deepseek.com/v1），请重新输入。'));
+        console.log(c.err('请输入以 https:// 开头的地址（http:// 仅限本机调试，会有明文警告；如 https://api.deepseek.com/v1）。'));
         u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
         if (!u) throw new Error('Base URL 不能为空');
         continue;
@@ -117,7 +119,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
     baseUrl = await ensureSecureBaseUrl(baseUrl);
   }
-  const apiKeyInput = await needSecret('API Key（输入显示为 *）: ');
+  const apiKeyInput = await needSecret(`API Key${secretSuffix}: `);
   if (!apiKeyInput) throw new Error('API Key 不能为空');
   let apiKey = apiKeyInput;
   const modelInput = await need(preset.model ? `模型名（默认 ${preset.model}）: ` : '模型名（必填，如 gpt-4o）: ');
@@ -148,7 +150,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       model = await need(`模型名（当前 ${model}）: `);
       if (!model) throw new Error('模型名不能为空');
     } else if (act === 'k' || act === 'key') {
-      apiKey = await needSecret('API Key（输入显示为 *）: ');
+      apiKey = await needSecret(`API Key${secretSuffix}: `);
       if (!apiKey) throw new Error('API Key 不能为空');
     }
     // 其余输入（含回车）= 不修改，用当前配置直接重试
@@ -193,11 +195,11 @@ export async function ensureConfig(
  * allowClear 用于换绑场景：白名单可输入 `-` 清除（换新应用后旧 open_id 可能失效）。
  */
 async function promptFeishuConfig(
-  need: (promptText: string) => Promise<string>,
-  needSecret: (promptText: string) => Promise<string>,
+  io: ReturnType<typeof makeNeed>,
   existing: FeishuBotConfig,
   { allowClear = false }: { allowClear?: boolean } = {},
 ): Promise<FeishuBotConfig> {
+  const { need, needSecret, secretSuffix } = io;
   printFeishuSetupChecklist();
   console.log(c.strong('配置飞书机器人凭证：\n'));
   let appId = '';
@@ -209,7 +211,7 @@ async function promptFeishuConfig(
     if (reenter) {
       appId = await need('FEISHU_APP_ID（cli_...）: ');
       if (!appId) throw new Error('App ID 不能为空');
-      appSecret = await needSecret('FEISHU_APP_SECRET（输入显示为 *）: ');
+      appSecret = await needSecret(`FEISHU_APP_SECRET${secretSuffix}: `);
       if (!appSecret) throw new Error('App Secret 不能为空');
     }
     console.log(c.gray('正在联网校验凭证…'));
@@ -225,8 +227,8 @@ async function promptFeishuConfig(
     reenter = act === 'r';
   }
   const allowedPrompt = existing.allowedOpenIds.length
-    ? `允许的 open_id（可选，逗号分隔；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : '允许的 open_id（可选，逗号分隔；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再用 bot --rebind 回填）: ';
+    ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
+    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再用 bot --rebind 回填）: ';
   const allowedRaw = await need(allowedPrompt);
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };
@@ -240,13 +242,11 @@ export async function rebindFeishuBot(
   ask: AskFn,
   { askSecret = null }: { askSecret?: AskFn | null } = {},
 ): Promise<{ feishu: FeishuBotConfig; envPath: string }> {
-  const { need, needSecret } = makeNeed(ask, askSecret);
-
   const existing = feishuBotConfig();
   if (existing.appId) {
     console.log(c.gray(`当前绑定 App ID: ${existing.appId}，输入新机器人的凭证即完成换绑。`));
   }
-  const feishu = await promptFeishuConfig(need, needSecret, existing, { allowClear: true });
+  const feishu = await promptFeishuConfig(makeNeed(ask, askSecret), existing, { allowClear: true });
   const envPath = writeEnv(currentConfig(), feishu);
   console.log(c.ok(`\n飞书机器人已换绑，配置保存到 ${envPath}\n`));
   return { feishu, envPath };
@@ -259,8 +259,6 @@ export async function ensureBotConfig(
   ask: AskFn,
   { force = false, choose = null, askSecret = null }: { force?: boolean; choose?: ChooseFn | null; askSecret?: AskFn | null } = {},
 ): Promise<{ agent: AgentConfig; feishu: FeishuBotConfig; envPath: string }> {
-  const { need, needSecret } = makeNeed(ask, askSecret);
-
   let agent = currentConfig();
   if (force || !isConfigured()) {
     agent = await ensureConfig(ask, { force: true, choose, askSecret });
@@ -268,7 +266,7 @@ export async function ensureBotConfig(
 
   let feishu = feishuBotConfig();
   if (force || !isFeishuBotConfigured()) {
-    feishu = await promptFeishuConfig(need, needSecret, feishu);
+    feishu = await promptFeishuConfig(makeNeed(ask, askSecret), feishu);
     const envPath = writeEnv(agent, feishu);
     console.log(c.ok(`\n飞书配置已保存到 ${envPath}\n`));
     if (!checkLarkCli()) console.log(c.warn(`未检测到 lark-cli。${LARK_CLI_INSTALL_HINT}\n`));

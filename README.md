@@ -23,7 +23,7 @@ npx helios-task-agent@latest
 ## 两种形态：CLI 与飞书 bot
 
 - **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/batch/N`）、看板操作全部可用。
-- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出几项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）、**定时晨报**（`HTA_DAILY_BRIEF=HH:MM`，每天定时向 owner 推送当前迭代看板概览）、**图片消息**（`LLM_VISION=1`，需模型支持图片输入）。
+- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出几项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）、**定时晨报**（`HTA_DAILY_BRIEF=HH:MM`，每天定时向白名单用户（owner）推送当前迭代看板概览）、**图片消息**（`LLM_VISION=1`，需模型支持图片输入）。
 
 ## 安装
 
@@ -68,7 +68,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 |------|------|------|
 | 拉任务 / 展开链接 | Task Agent + `lark_cli` | 对话里的任务/文档摘要 |
 | 写入看板 | Task Agent + MCP / `hk_cli` | kanban 任务（来源 + 需求内容） |
-| 启用任务 | **你指定** | workspace（可选） |
+| 启用任务 | **你指定** | 工作区（可选） |
 
 ## 安全机制
 
@@ -77,14 +77,14 @@ npm i -g @larksuite/cli && lark-cli auth login
 | 机制 | 说明 |
 |------|------|
 | 写操作闸门 | 建/改/删任务、start/stop/follow-up、审批、飞书发消息等，执行前必须确认。终端：`y`（仅此次）/`batch`（同类免问）/`N`（应答词表与飞书端一致：确认/批准/同意/执行、同类免问/批量允许 等）；普通写操作 120 秒、破坏性操作 300 秒未操作自动拒绝，确认提示时 Ctrl+C = 拒绝。飞书：确认卡片（所有写操作都带「同类免问（本会话）」按钮），或回复「确认 / 同类免问 / 取消」（仅严格同义词，随意「好/ok」无效）；超时策略与终端一致；决策/超时后卡片更新为终态。新确认会**作废**未处理的旧确认并通知你。闸门缺失时**全部写操作失败关闭** |
-| 批量确认 | 「同类免问」后本会话内同类型写操作自动放行（内存态授权，重启即失效）；「确认」默认**仅此次**。**所有写操作都可同类免问**，免问粒度：看板/hk 操作绑定工具名+任务标识（免问仅对同一对象的同类操作生效），飞书写按命令路径（如 `im send`、`task create` 各自成类），技能脚本按具体脚本，记忆写按 set/delete/note 分动作。删除/取消/停止/审批/启动/归档/合并/推送/执行等破坏性操作只是确认超时更长（300 秒），不再被排除在免问之外。回复「恢复确认」或 `/confirm revoke` 立即撤销（`/confirm on` 为兼容别名） |
+| 批量确认 | 「同类免问」后本会话内同类型写操作自动放行（内存态授权，重启即失效）；「确认」默认**仅此次**。**所有写操作都可同类免问**，免问粒度：看板/hk 操作绑定工具名+任务标识（免问仅对同一对象的同类操作生效），飞书写按命令路径+接收对象各自成类（如 `im send` 发给 `ou_x` 与发给 `ou_y` 不同类），技能脚本按具体脚本+参数成类，记忆写按 set/delete/note 分动作。删除/取消/停止/审批/启动/归档/合并/推送/执行等破坏性操作只是确认超时更长（300 秒），不再被排除在免问之外。回复「恢复确认」或 `/confirm revoke` 立即撤销（`/confirm on` 为兼容别名） |
 | 会话创建上限 | 单会话最多创建 **10** 个看板任务；超限需 `/clear` 后再建 |
 | 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
 | 防注入标记 | `lark_cli` / 看板工具（MCP、`hk_cli`）/ `repo_fs` 的读回内容，以及看板事件、AI 审查结果的会话注入，统一包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
 | owner 认领 | `FEISHU_ALLOWED_OPEN_IDS` 留空时，首个私聊用户自动成为 owner 并写回 `.env`；其余用户拒绝（每人只提示一次） |
 | 来源查重 | 飞书链接 → 任务映射按用户分桶存 `synced-sources.json`；重复同步拦截。原任务已删则映射清理后可再同步；看板不可达时保守拦截 |
 | 审计日志 | 批准/拒绝/重复拦截（`blocked_dup`）/无闸门/执行结果等追加到 `audit.log`（JSONL） |
-| workspace 就绪 | start 时补齐仓库 `base_branch`；检测 setup 静默失败，避免 UI 无限转圈 |
+| 工作区就绪 | start 时补齐仓库 `base_branch`；检测 setup 静默失败，避免 UI 无限转圈 |
 
 ## 看板状态推送（bot）
 
@@ -180,7 +180,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 - `name` / `description` 缺失或 `digest_sections` 匹配不到章节时，`validateSkills()` 会报出契约问题——启动时即告警（CLI 与 bot 都会打印），并有单元测试覆盖，而不是静默降级。
 - 用户侧可用 `/skills`（CLI 与飞书 bot 一致）或直接问「你有什么技能」查看已安装技能。
-- 技能自带脚本（node/shell/python 等）可直接运行：在 SKILL.md 里写明用法，agent 会用 `skill_exec` 工具执行——脚本路径限定在技能目录内（拒绝 `..`/绝对路径/符号链接逃逸），按扩展名自动选解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录，**每次执行都向用户弹确认**（任意代码执行，按破坏性对待、超时 300 秒；「同类免问」按具体脚本生效），子进程只继承最小环境变量。
+- 技能自带脚本（node/shell/python 等）可直接运行：在 SKILL.md 里写明用法，agent 会用 `skill_exec` 工具执行——脚本路径限定在技能目录内（拒绝 `..`/绝对路径/符号链接逃逸），按扩展名自动选解释器（`.sh`→bash、`.js/.mjs/.cjs`→node、`.py`→python3，其他需显式 `interpreter`，白名单 bash/sh/node/python3/python），工作目录为技能目录，**每次执行都向用户弹确认**（任意代码执行，按破坏性对待、超时 300 秒；「同类免问」按具体脚本+参数生效），子进程只继承最小环境变量。
 
 **看板进程**：仅当 `HELIOS_KANBAN_URL` 指向本机时才会自动 `npx helios-kanban`。CLI 退出**保留**自动拉起的看板；bot 退出会**停掉**该子进程。远程 URL 需自行保证看板已运行。注意：看板 API 无鉴权，`HELIOS_KANBAN_URL` 指向非本机地址时流量为明文且无认证，请仅在可信网络（内网 / Tailscale）使用。
 
@@ -208,7 +208,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HTA_UPDATE_CHECK` | 启动时检查 npm 新版本，默认开；`0` 关闭 |
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `LLM_VISION` | `1` 时 bot 支持图片消息：下载图片随当次请求发给模型（**需模型支持图片输入**；图片不进会话历史、不落盘，单张上限 10MB）。默认关，关闭时图片消息仍提示仅支持文字 |
-| `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向 owner 推送当前迭代看板概览（进行中/待审阅/已完成/失败；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部迭代）。未设置或非法值 = 关闭 |
+| `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向白名单用户（owner）推送当前迭代看板概览（进行中/待审阅/已完成/失败；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部迭代）。未设置或非法值 = 关闭 |
 | `HTA_TURN_TIMEOUT_MIN` | 单轮对话的墙钟时间上限（分钟），默认 30；超时按「已中止」收尾并提示 |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
@@ -251,7 +251,7 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 | `repo_fs` | 可选：对看板关联仓库本机 path 做 `list` / `read` / `grep`（不可越界） |
 | `work_summary` | 生成工作总结报告（HTML/MD） |
 | `skill_doc` | 按需读取已安装技能完整文档（SKILL.md） |
-| `skill_exec` | 运行技能目录内脚本（默认逐次确认，同类免问按具体脚本生效） |
+| `skill_exec` | 运行技能目录内脚本（默认逐次确认，同类免问按具体脚本+参数生效） |
 | `memory_*` | 持久化偏好与备注 |
 
 包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.sh`）。

@@ -29,7 +29,7 @@ export function resolveUnderRoot(
   const target = path.resolve(rootAbs, relPath || '.');
   const rel = path.relative(rootAbs, target);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    return { ok: false, error: `路径越界：禁止访问仓库根目录之外（root=${rootAbs}, path=${relPath}）` };
+    return { ok: false, error: `路径越界：禁止访问仓库根目录之外的路径（目标路径：${relPath}）` };
   }
   // 符号链接防逃逸：字符串路径在界内但真实路径可能在界外
   if (fs.existsSync(target)) {
@@ -68,7 +68,7 @@ function isSensitiveFile(fileAbs: string): boolean {
 }
 
 function sensitiveFileDenied(fileAbs: string): string {
-  return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会通过本工具发送给 LLM；如需查看请在本机直接打开。`;
+  return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会发送给 AI 模型；如需查看请在本机直接打开。`;
 }
 
 export async function fetchRepoPath(  kanbanUrl: string,
@@ -89,7 +89,7 @@ export async function fetchRepoPath(  kanbanUrl: string,
     if (!res.ok || !repoPath) {
       return {
         ok: false,
-        error: `无法解析 repo_id=${repoId} 的本机 path：${json.message || text.slice(0, 300)}`,
+        error: `无法解析仓库 ${repoId} 的本机路径：${json.message || text.slice(0, 300)}`,
       };
     }
     return { ok: true, path: repoPath };
@@ -158,14 +158,14 @@ export async function resolveRepoRoot(opts: {
       return {
         ok: false,
         denied: true,
-        error: `无法校验仓库白名单（kanban 不可达），已拒绝访问本机路径：${errMessage(err)}`,
+        error: `无法校验仓库白名单（看板不可达），已拒绝访问本机路径：${errMessage(err)}`,
       };
     }
     if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
       return {
         ok: false,
         denied: true,
-        error: `路径不在看板注册仓库内，已拒绝访问（root=${rootAbs}）。请在看板中注册该仓库，或改用 repo_id 参数。`,
+        error: `路径不在看板注册仓库内，已拒绝访问（路径：${rootAbs}）。请在看板中注册该仓库，或改用 repo_id 参数。`,
       };
     }
   }
@@ -225,14 +225,14 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   if (pattern.length > MAX_PATTERN_LEN) return `参数错误：pattern 过长（>${MAX_PATTERN_LEN} 字符），请缩短后重试`;
   // 简单启发式拒绝嵌套量词（如 (\w+)+ 一类灾难性回溯），不过度工程
   if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
-    return '参数错误：pattern 含嵌套量词（如 (\\w+)+），有 ReDoS 风险，请改写后重试';
+    return '参数错误：搜索表达式含嵌套量词（如 (\\w+)+），可能导致匹配卡死，请简化后重试';
   }
   // 无括号同样可 ReDoS：连续相邻的宽匹配量词段（.*.* / .+.* / \w*\w+ 等）在失配回退时
   // 会指数级回溯，V8 同步正则会阻塞 bot 事件循环。先剥离字符类再判定：
   // [.*] 里的 .* 是字面量，不算量词段，避免误伤。
   const noClasses = pattern.replace(/\[(?:\\.|[^\]])*\]/g, '');
   if (/(?:\.\*|\.\+|\.\{\d*,?\d*\}|\\[wWdDsS][*+]){2,}/.test(noClasses)) {
-    return '参数错误：pattern 含连续相邻的量词段（如 .*.*），有 ReDoS 风险，请改写后重试';
+    return '参数错误：搜索表达式含连续相邻的量词段（如 .*.*），可能导致匹配卡死，请简化后重试';
   }
   let re: RegExp;
   try {

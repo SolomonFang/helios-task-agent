@@ -20,7 +20,7 @@ export function makeLarkCliHandler({
     }
     const argv = args as string[];
     if (classifyLark(argv) === 'write') {
-      const summary = `飞书写操作：lark-cli ${argv.slice(0, 3).join(' ')}`;
+      const summary = `飞书写操作：${argv.slice(0, 3).join(' ')}`;
       const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
       // 「同类免问」按命令路径 + 对象归类（如 lark:im send:ou_x）：子命令后第一个非 flag 实参
       // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；无该实参时退化为命令路径。

@@ -8,7 +8,7 @@
  */
 
 import { kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
-import type { WatchEvent, WatchEventKind } from '../kanban/watcher';
+import { WATCH_HINT_DONE, WATCH_HINT_FAILED, type WatchEvent, type WatchEventKind } from '../kanban/watcher';
 import { statusLabel } from '../kanban/summary';
 import { isLoopbackUrl } from '../infra/url-utils';
 
@@ -101,7 +101,7 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     timeout: {
       template: 'grey',
       title: `⏰ ${kindText} · 写操作确认超时`,
-      note: '超时未处理，已自动拒绝，操作未执行。',
+      note: '超时未处理，已自动拒绝，操作未执行。如仍需执行，直接再跟我说一声即可。',
     },
     superseded: {
       template: 'grey',
@@ -152,12 +152,17 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
     elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
     if (e.transition) {
-      // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文
-      const rendered = e.transition
-        .split('→')
-        .map((s) => statusLabel(s.trim()))
-        .join(' → ');
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**状态变更** \`${rendered}\`` } });
+      // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文；原文过 mdSafe 再进 lark_md 内联代码
+      const hasArrow = e.transition.includes('→');
+      const rendered = mdSafe(
+        e.transition
+          .split('→')
+          .map((s) => statusLabel(s.trim()))
+          .join(' → '),
+      );
+      // 无「→」时是 watcher 塞的进展短语（如「跟进执行完成」），不是状态流转，标签用「进展」
+      const label = hasArrow ? '状态变更' : '进展';
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${label}** \`${rendered}\`` } });
     }
     if (e.kind === 'failed') {
       elements.push({ tag: 'div', text: { tag: 'plain_text', content: '请到看板查看日志定位问题。' } });
@@ -182,8 +187,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
       review: '没问题回复「标记完成」；要继续改直接说',
-      done: '回复「帮我审一下」看结果；要继续改直接说',
-      failed: '回复「为什么失败」分析原因',
+      done: WATCH_HINT_DONE,
+      failed: WATCH_HINT_FAILED,
     };
     // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
     // loopback（localhost/127.x/::1）连同一局域网都不可达，注脚需区分
@@ -220,7 +225,7 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
   return {
     config: baseCardConfig(),
     header: {
-      template: pass ? 'green' : 'blue',
+      template: pass ? 'green' : 'yellow',
       title: {
         tag: 'plain_text',
         content: pass ? `✅ AI 审查全部通过：《${title}》` : `🤖 AI 审查完成：《${title}》`,
@@ -252,7 +257,7 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
           {
             tag: 'plain_text',
             content: pass
-              ? `已注入会话上下文，可继续追问 · ${linkNote}`
+              ? `可继续追问审查结论 · ${linkNote}`
               : `可回复「按审查意见修一下」 · ${linkNote}`,
           },
         ],

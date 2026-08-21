@@ -252,7 +252,7 @@ async function run(): Promise<void> {
   check(
     'looksLikeStrongFailure 命中真实失败',
     looksLikeStrongFailure('命令执行失败: exit 1') &&
-      looksLikeStrongFailure('MCP 工具 create_task 调用失败: boom') &&
+      looksLikeStrongFailure('看板工具 create_task 调用失败: boom') &&
       looksLikeStrongFailure('HTTP 500'),
   );
   check(
@@ -1483,8 +1483,8 @@ async function run(): Promise<void> {
     const portFileStderr =
       '2026-07-29T02:22:26Z DEBUG utils::port_file: Reading port from "/var/folders/…/vibe-kanban/vibe-kanban.port"\nError: No such file or directory (os error 2)';
     const hint = diagnoseMcpFailure(portFileStderr);
-    assert.ok(hint!.includes('vibe-kanban.port'), '诊断应点明端口文件');
-    assert.ok(hint!.includes('重启 helios-kanban'), '诊断应给出可操作的恢复动作');
+    assert.ok(hint!.includes('端口记录文件'), '诊断应点明端口文件');
+    assert.ok(hint!.includes('重新运行本程序'), '诊断应给出可操作的恢复动作');
     assert.equal(diagnoseMcpFailure('Error: spawn npx ENOENT'), null, '其他启动错误不误诊');
     assert.equal(diagnoseMcpFailure(''), null, '空 stderr 返回 null');
   });
@@ -2896,7 +2896,7 @@ async function run(): Promise<void> {
     );
     // banner 行内联精简指引（不重复 LARK_CLI_AUTH_HINT 全句，避免「未授权」出现两次）
     assert.ok(unauth.includes('lark-cli') && unauth.includes('未授权') && unauth.includes('lark-cli auth login'));
-    assert.ok(unauth.includes('缺少 jq、curl') && unauth.includes('降级链不可用'));
+    assert.ok(unauth.includes('备用通道不可用（详见下行）') && unauth.includes('缺少 jq、curl'));
     // lark 未安装（larkOk=false）→ 不看授权态，直接「未找到」
     const missing = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: false }));
     assert.ok(missing.includes('未找到') && !missing.includes('未授权'));
@@ -2917,11 +2917,11 @@ async function run(): Promise<void> {
       fs.symlinkSync('/usr/bin/true', path.join(bin, 'lark-cli'));
       process.env.PATH = bin;
       const unauth = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
-      assert.ok(unauth.includes('lark-cli: 未授权') && unauth.includes(LARK_CLI_AUTH_HINT));
-      assert.ok(unauth.includes('hk_cli: 缺少 jq、curl'));
-      assert.ok(unauth.includes('降级链不可用')); // MCP 掉线且 hk 缺依赖时必须警示
+      assert.ok(unauth.includes(`lark-cli：${LARK_CLI_AUTH_HINT}`));
+      assert.ok(unauth.includes('备用通道：缺少 jq、curl'));
+      assert.ok(unauth.includes('备用通道缺少 jq、curl，不可用')); // 看板连接掉线且备用通道缺依赖时必须警示
       const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
-      assert.ok(missing.includes('lark-cli: 未安装'));
+      assert.ok(missing.includes('lark-cli：未安装'));
       // 已授权：shebang 直指 node 的假 lark-cli 输出 available=true（探测走 minimalChildEnv，NODE_OPTIONS 注入不可达）
       fs.rmSync(path.join(bin, 'lark-cli'));
       fs.writeFileSync(
@@ -2930,7 +2930,7 @@ async function run(): Promise<void> {
         { mode: 0o755 },
       );
       const okLines = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
-      assert.ok(okLines.includes('lark-cli: 正常'));
+      assert.ok(okLines.includes('lark-cli：正常'));
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -3494,14 +3494,14 @@ async function run(): Promise<void> {
     );
   })());
 
-  check('buildToolsLines：MCP 可用列工具（描述取首行）/ 不可用输出降级说明', (() => {
+  check('buildToolsLines：MCP 可用列工具（描述取首行）/ 不可用输出降级说明；memory 行按启用标志拼接', (() => {
     const tools = [{ name: 'create_task', description: '创建任务\n第二行', inputSchema: {} }] as unknown as Tool[];
     const ok = buildToolsLines(
-      { mcpOk: true, mcpTools: tools, kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
+      { mcpOk: true, mcpTools: tools, memoryEnabled: true, kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
       plainPaint,
     );
     const down = buildToolsLines(
-      { mcpOk: false, mcpTools: [], kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
+      { mcpOk: false, mcpTools: [], memoryEnabled: false, kanbanHeader: 'H', downNote: 'D', localHeader: 'L', bullet: '· ' },
       plainPaint,
     );
     return (
@@ -3509,8 +3509,10 @@ async function run(): Promise<void> {
       ok[1] === '· kanban_create_task  创建任务' &&
       ok.includes('L') &&
       ok.some((l) => l.includes('lark_cli')) &&
+      ok.some((l) => l.includes('memory_set/get/delete/note')) &&
       down[0] === 'D' &&
-      down.includes('L')
+      down.includes('L') &&
+      !down.some((l) => l.includes('memory_set'))
     );
   })());
 
@@ -3531,8 +3533,8 @@ async function run(): Promise<void> {
       confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 类「同类免问」授权）。' &&
       confirmRevokedText(0, '无') === '无' &&
       CLEARED_TEXT === '对话历史已清空（记忆保留）。' &&
-      clearedText() === CLEARED_TEXT &&
-      clearedText(2) ===
+      clearedText(0, '') === CLEARED_TEXT &&
+      clearedText(2, '/confirm revoke 可恢复逐次确认') ===
         '对话历史已清空（记忆保留；仍有 2 类写操作处于「同类免问」，/confirm revoke 可恢复逐次确认）。'
     );
   })());
@@ -3551,9 +3553,9 @@ async function run(): Promise<void> {
     );
   })());
 
-  check('降级口径统一：诊断提示使用 hk_cli（看板 HTTP 接口）表述', (() => {
+  check('降级口径统一：诊断提示使用看板 HTTP 备用通道表述', (() => {
     const hint = diagnoseMcpFailure('Reading port from "/x/vibe-kanban.port"\nError: No such file or directory');
-    return hint !== null && hint.includes(MCP_FALLBACK_TEXT) && MCP_FALLBACK_TEXT === '已自动切换为 hk_cli（看板 HTTP 接口）';
+    return hint !== null && hint.includes(MCP_FALLBACK_TEXT) && MCP_FALLBACK_TEXT === '已自动切换为看板 HTTP 备用通道';
   })());
 
   // ---------- SessionRouter：同用户串行、跨用户并行 ----------

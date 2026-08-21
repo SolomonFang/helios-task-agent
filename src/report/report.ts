@@ -5,6 +5,7 @@
 
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
+import { isLoopbackUrl } from '../infra/url-utils';
 import { escapeHtml, renderReportPage } from './report-page';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
@@ -58,16 +59,36 @@ function diffStatsLine(t: WorkSummaryTask): string {
   return parts.join('，');
 }
 
+/** 数据层 generatedAt 保持 ISO（文件名反解依赖它）；仅渲染层转本地可读时间。 */
+function formatGeneratedAt(iso: string): string {
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
+}
+
+/** MD 侧最小转义：换行会破坏行结构（行首 # 会被当成标题），压成空格并转义行首 #。 */
+function mdText(s: string): string {
+  return s.replace(/[\r\n]+/g, ' ').replace(/^#+/, (m) => m.replace(/#/g, '\\#'));
+}
+
+/**
+ * 清单截断提示：概览状态计数遍历截断前的全量任务（见 kanban/summary.ts），
+ * 而清单只展开最近若干条；全量总数比清单条数多时补一句说明。
+ */
+function truncationNote(data: WorkSummaryData): string | null {
+  const { totals } = data;
+  const full = totals.done + totals.inreview + totals.inprogress + totals.todo + totals.cancelled;
+  return full > data.tasks.length ? `仅展示最近 ${data.tasks.length} 条，共 ${full} 条` : null;
+}
+
 export function renderMarkdown(data: WorkSummaryData): string {
   const { totals } = data;
   const lines: string[] = [
     `# 工作总结 · ${data.sinceLabel}`,
     '',
-    `> 生成时间：${data.generatedAt}`,
+    `> 生成时间：${formatGeneratedAt(data.generatedAt)}`,
     '',
     '## 概览',
     '',
-    '| 完成 | 待审阅 | 进行中 | 待办 | 已取消 | 改动文件 | +行 | -行 |',
+    '| 完成 | 待审阅 | 进行中 | 待办 | 已取消 | 改动文件 | 新增行 | 删除行 |',
     '| --- | --- | --- | --- | --- | --- | --- | --- |',
     `| ${totals.done} | ${totals.inreview} | ${totals.inprogress} | ${totals.todo} | ${totals.cancelled} | ${totals.filesChanged} | +${totals.additions} | -${totals.deletions} |`,
     '',
@@ -75,9 +96,9 @@ export function renderMarkdown(data: WorkSummaryData): string {
   for (const group of groupByStatus(data.tasks)) {
     lines.push(`## ${group.meta.emoji} ${group.meta.label}（${group.tasks.length}）`, '');
     for (const t of group.tasks) {
-      lines.push(`### ${t.title || '(无标题)'}`);
+      lines.push(`### ${mdText(t.title) || '（无标题）'}`);
       lines.push(`- 项目：${t.projectName}${t.iteration ? `（迭代 ${t.iteration}）` : ''}`);
-      if (t.attemptSummary) lines.push(`- 摘要：${t.attemptSummary}`);
+      if (t.attemptSummary) lines.push(`- 摘要：${mdText(t.attemptSummary)}`);
       const stats = diffStatsLine(t);
       if (stats) lines.push(`- 改动：${stats}`);
       if (t.changedFiles?.length) {
@@ -85,10 +106,12 @@ export function renderMarkdown(data: WorkSummaryData): string {
         const more = t.changedFiles.length > 10 ? ` 等 +${t.changedFiles.length - 10} 个` : '';
         lines.push(`- 变更文件：${files}${more}`);
       }
-      lines.push(`- [查看 diff](${t.diffUrl})`, '');
+      lines.push(`- [查看 diff](<${t.diffUrl}>)`, '');
     }
   }
   if (!data.tasks.length) lines.push('（该范围内没有匹配的任务）', '');
+  const note = truncationNote(data);
+  if (note) lines.push(`> ${note}`, '');
   return lines.join('\n');
 }
 
@@ -100,7 +123,7 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   const meta = statusMeta(t.status);
   const parts: string[] = ['<div class="card">'];
   parts.push(
-    `<div class="card-head"><h3>${escapeHtml(t.title || '(无标题)')}</h3>` +
+    `<div class="card-head"><h3>${escapeHtml(t.title || '（无标题）')}</h3>` +
       `<span class="badge ${meta.badge}">${meta.emoji} ${escapeHtml(meta.label)}</span></div>`,
   );
   const metaLine = [t.projectName, t.iteration ? `迭代 ${t.iteration}` : ''].filter(Boolean).join(' · ');
@@ -202,6 +225,7 @@ const SUMMARY_PAGE_CSS = `
   }
   .diff-link:hover { background: #eef2ff; }
   .empty { text-align: center; color: #9ca3af; margin-top: 40px; }
+  .trunc-note { text-align: center; font-size: 13px; color: #6b7280; margin-top: 20px; }
 `;
 
 export function renderHtml(data: WorkSummaryData): string {
@@ -217,23 +241,26 @@ export function renderHtml(data: WorkSummaryData): string {
   const body = sections.length
     ? sections.join('\n')
     : '<p class="empty">该范围内没有匹配的任务。</p>';
+  const note = truncationNote(data);
   return renderReportPage({
     title: `工作总结 · ${escapeHtml(data.sinceLabel)}`,
     css: SUMMARY_PAGE_CSS,
     body: `  <header class="hero">
     <h1>工作总结</h1>
     <p class="subtitle">${escapeHtml(data.sinceLabel)}</p>
-    <p class="gen">生成时间 ${escapeHtml(data.generatedAt)}</p>
+    <p class="gen">生成时间 ${escapeHtml(formatGeneratedAt(data.generatedAt))}</p>
   </header>
   <section class="stats">
     ${htmlStatCard(String(totals.done), '完成任务')}
     ${htmlStatCard(String(totals.inreview), '待审阅')}
     ${htmlStatCard(String(totals.inprogress), '进行中')}
+    ${htmlStatCard(String(totals.todo), '待办')}
+    ${htmlStatCard(String(totals.cancelled), '已取消')}
     ${htmlStatCard(String(totals.filesChanged), '改动文件')}
     ${htmlStatCard(`+${totals.additions}`, '新增行', 'add')}
     ${htmlStatCard(`-${totals.deletions}`, '删除行', 'del')}
   </section>
-  ${body}`,
+  ${body}${note ? `\n  <p class="trunc-note">${escapeHtml(note)}</p>` : ''}`,
   });
 }
 
@@ -295,8 +322,14 @@ export function summarizeForChat(
   if (paths.htmlPath) {
     // bot 场景给 HTTP 链接（本机路径手机飞书打不开）；CLI 保留本机路径
     if (opts.linkBaseUrl) {
-      lines.push(`- HTML：${opts.linkBaseUrl}/${path.basename(paths.htmlPath)}`);
-      lines.push('（链接仅在本机可达，进程重启后失效）');
+      const url = `${opts.linkBaseUrl}/${path.basename(paths.htmlPath)}`;
+      lines.push(`- HTML：${url}`);
+      // 可达性与飞书卡片同一口径：仅 loopback 才是「仅本机可达」，否则按所在网络可达表述
+      lines.push(
+        isLoopbackUrl(url)
+          ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，重启后链接失效）'
+          : '（链接仅本机所在网络可达；报告保留 30 天，重启后链接失效）',
+      );
     } else {
       lines.push(`- HTML：${paths.htmlPath}`);
     }
@@ -305,11 +338,13 @@ export function summarizeForChat(
   lines.push(
     '',
     `概览：完成 ${totals.done} · 待审阅 ${totals.inreview} · 进行中 ${totals.inprogress} · 待办 ${totals.todo} · 已取消 ${totals.cancelled}` +
-      ` · 改动文件 ${totals.filesChanged} · +${totals.additions} / -${totals.deletions}`,
+      ` · 改动文件 ${totals.filesChanged} · +${totals.additions} 行 / -${totals.deletions} 行`,
   );
   for (const t of data.tasks.slice(0, 5)) {
-    lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '(无标题)'}`);
+    lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '（无标题）'}`);
   }
   if (data.tasks.length > 5) lines.push(`· … 其余 ${data.tasks.length - 5} 条见报告文件`);
+  const note = truncationNote(data);
+  if (note) lines.push(`（${note}）`);
   return lines.join('\n');
 }

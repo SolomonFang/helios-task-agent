@@ -260,7 +260,7 @@ export async function runAgentTurn({
 
       const toolCalls = msg.tool_calls || [];
       if (toolCalls.length === 0) {
-        return msg.content || '（模型未返回内容）';
+        return msg.content || '（模型未返回内容，请重试或换个问法）';
       }
 
       for (let i = 0; i < toolCalls.length; i++) {

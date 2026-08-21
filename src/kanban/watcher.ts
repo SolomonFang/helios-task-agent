@@ -49,6 +49,12 @@ interface WatchState {
 
 export type WatchEventKind = 'review' | 'done' | 'cancelled' | 'failed' | 'approvals';
 
+/** done 事件的统一后续指引（文本版与卡片版同源，改动只动一处）。 */
+export const WATCH_HINT_DONE = '回复「帮我审一下」看结果，要继续改直接说';
+
+/** failed 事件的统一后续指引。 */
+export const WATCH_HINT_FAILED = '回复「为什么失败」分析原因';
+
 /** 一条看板状态事件：结构化字段用于渲染飞书卡片，text 为纯文本版本（会话注入 + 卡片发送失败时降级）。 */
 export interface WatchEvent {
   kind: WatchEventKind;
@@ -253,7 +259,7 @@ export class KanbanWatcher {
       }
       if (cur.status !== old.status && (cur.status === 'done' || cur.status === 'cancelled')) {
         const label = cur.status === 'done' ? '✅ 看板任务已完成' : '🚫 看板任务已取消';
-        const hint = cur.status === 'done' ? '\n回复「帮我审一下」看结果，或「再跟它说一句…」继续迭代' : '';
+        const hint = cur.status === 'done' ? `\n${WATCH_HINT_DONE}` : '';
         let extra = '';
         let link = url;
         if (cur.status === 'done') {
@@ -286,7 +292,7 @@ export class KanbanWatcher {
             kind: 'failed',
             title: cur.title,
             url,
-            text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n回复「为什么失败」让它分析原因`,
+            text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n${WATCH_HINT_FAILED}`,
           },
         });
       }

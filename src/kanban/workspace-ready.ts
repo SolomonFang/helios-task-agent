@@ -78,7 +78,7 @@ export async function fillHkStartBranches(
     // 数据可能直接来自 MCP 入参：逐元素运行时校验，坏输入直接报错而不是静默错位回填
     const rows = target as unknown[];
     const bad = rows.findIndex((r) => !isRepoStartInput(r));
-    if (bad >= 0) return `无法启动 workspace：repos[${bad}] 不是有效的 { repo_id: string } 输入`;
+    if (bad >= 0) return `无法启动工作区：第 ${bad + 1} 个仓库参数格式不正确（需要提供仓库 ID）`;
     repos = rows as RepoStartInput[];
   }
   if (!repos.length) return noRepoError ?? null;

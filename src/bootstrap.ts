@@ -49,7 +49,8 @@ export function migrateAndValidateSkills(): void {
     console.log(c.info(`已将技能「${name}」从包内目录迁移到数据目录（以后升级不再丢失）`));
   }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
-  for (const problem of validateSkills()) console.log(c.warn(`技能契约: ${problem}`));
+  // problem 自带「技能「x」配置问题：…」前缀（见 agent/skills.ts），直接打印即可
+  for (const problem of validateSkills()) console.log(c.warn(problem));
 }
 
 export interface KanbanBootOptions {
@@ -71,8 +72,10 @@ export async function ensureKanbanOrExit(opts: KanbanBootOptions): Promise<Kanba
     const message = errMessage(err);
     opts.onFail?.();
     console.error(c.err(`${opts.failLabel}：${message}`));
-    // kanban-ensure 的多数失败已内嵌手动启动指引，这里只为未内嵌的路径（如 npx 缺失）兜底
-    if (!message.includes('可手动执行')) console.error(c.gray(kanbanManualStartHint()));
+    // kanban-ensure 的多数失败已内嵌指引；npx 缺失（提示安装 Node.js）时追加「手动执行 npx」是循环指引，跳过
+    if (!message.includes('可手动执行') && !message.includes('nodejs.org')) {
+      console.error(c.gray(kanbanManualStartHint()));
+    }
     process.exit(1);
   }
 }

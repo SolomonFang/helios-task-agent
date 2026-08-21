@@ -78,6 +78,26 @@ export function createRoundNoticeTracker(): RoundNoticeTracker {
 /** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
 const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
 
+/** 飞书长连接状态英文枚举 → 中文（/status 展示）；未列入的未知值回退原文。 */
+const WS_STATE_LABEL: Record<string, string> = {
+  connected: '已连接',
+  connecting: '连接中',
+  reconnecting: '重连中',
+  failed: '连接失败',
+  idle: '空闲',
+};
+
+/** 进度占位的工具动作文案：内部工具名不直接暴露给用户，常见工具映射为中文动作，未知名称回落「调用工具」。 */
+function toolActionLabel(name: string): string {
+  if (name === 'repo_fs') return '读文件';
+  if (name === 'hk_cli' || name.startsWith('kanban_')) return '看板操作';
+  if (name === 'lark_cli') return '飞书操作';
+  if (name === 'work_summary') return '生成报告';
+  if (name.startsWith('memory_')) return '读写记忆';
+  if (name.startsWith('skill_')) return '运行技能';
+  return '调用工具';
+}
+
 export interface BotHandlerDeps {
   channel: FeishuChannel;
   router: SessionRouter;
@@ -214,10 +234,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (ctl.signal.aborted) {
         await channel.notifyOpenId(openId, `⏹ AI 审查已中断：《${title}》`).catch(() => {});
       } else {
-        const message = errMessage(err);
-        await channel
-          .notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}\n可稍后重新点击卡片上的「AI 审查」重试。`)
-          .catch(() => {});
+        // 失败原因截断防超长推送；底层文案自带「重试」时不重复追加重试后缀
+        const message = errMessage(err).slice(0, 200);
+        const retryHint = message.includes('重试') ? '' : '\n可稍后重新点击卡片上的「AI 审查」重试。';
+        await channel.notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}${retryHint}`).catch(() => {});
       }
     } finally {
       aiReviewRunning.delete(attemptId);
@@ -301,6 +321,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const lastEventAt = channel.lastEventAt();
     // 依赖探测全部异步（execFileSync 串在事件循环里最坏阻塞十几秒）
     const [larkOk, ocrOk] = await Promise.all([checkLarkCliAsync(), checkOcrCliAsync()]);
+    const wsState = channel.connectionState();
     const lines = await buildStatusLines(
       {
         model: cfg.llmModel,
@@ -310,9 +331,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         mcpDownNote: `${MCP_FALLBACK_TEXT}，自动重连中`,
         larkOk,
         extra: [
-          `代码审查工具：${ocrOk ? 'ok' : '未安装（首次点「AI 审查」时自动下载，耗时稍长）'}`,
+          `代码审查工具：${ocrOk ? '正常' : '未安装（首次点「AI 审查」时自动下载，耗时稍长）'}`,
           `看板推送：${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
-          `飞书长连接：${channel.connectionState() ?? '未启动'}，最近事件 ${
+          `飞书长连接：${wsState ? (WS_STATE_LABEL[wsState] ?? wsState) : '未启动'}，最近事件 ${
             lastEventAt ? new Date(lastEventAt).toLocaleString('zh-CN') : '暂无'
           }`,
         ],
@@ -329,10 +350,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       {
         mcpOk: supervisor.isAlive && mcp.tools.length > 0,
         mcpTools: mcp.tools,
-        kanbanHeader: `看板工具（MCP，${mcp.tools.length} 个）`,
+        // bot 会话恒持有 MemoryStore，memory_* 工具始终注册
+        memoryEnabled: true,
+        kanbanHeader: `看板工具（${mcp.tools.length} 个）`,
         downNote: hkMissing.length
-          ? `看板工具：MCP 未连接，且降级链 hk_cli 缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
-          : `看板工具：MCP 未连接（${MCP_FALLBACK_TEXT}，功能不受影响）`,
+          ? `看板工具：MCP 未连接，且备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
+          : `看板工具：MCP 未连接，${MCP_FALLBACK_TEXT}，功能不受影响`,
         localHeader: '本地工具',
         bullet: '· ',
       },
@@ -461,7 +484,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       const now = activity.lastEventAt;
       if (now - lastPush < 2000) return; // 飞书消息更新限流
       lastPush = now;
-      const text = info.type === 'tool' ? `⏳ 处理中…（调用工具 ${info.name}）` : '⏳ 思考中…';
+      const text = info.type === 'tool' ? `⏳ 处理中…（${toolActionLabel(info.name)}）` : '⏳ 思考中…';
       void channel.updateText(progressId, text).catch(() => {});
     };
   };
@@ -621,7 +644,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
     if (cmd === '/clear') {
       session.clearHistory();
-      await channel.reply(msg, clearedText(session.activeBatchApprovals()));
+      await channel.reply(msg, clearedText(session.activeBatchApprovals(), '回复「恢复确认」撤销免问'));
       return;
     }
     if (cmd) {

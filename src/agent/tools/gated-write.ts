@@ -29,7 +29,7 @@ async function appendWorkspaceReadyCheck(
   if (ready.ok) {
     return `${result}\n\n（工作区已就绪，可以开始执行任务）`;
   }
-  return `${result}\n\n⚠️ setup 未完成：\n${ready.message || '未知原因'}`;
+  return `${result}\n\n⚠️ 工作区初始化未完成：\n${ready.message || '未知原因'}`;
 }
 
 /** runGatedWrite 的单次写操作配置（见 makeGatedWriter）。 */
@@ -98,7 +98,7 @@ export function makeGatedWriter({
         return (
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
           `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
-          '如确需重建，请先在 kanban 中删除原任务（或告知用户该任务已存在）；\n' +
+          '如确需重建，请先在「看板」中删除原任务（或告知用户该任务已存在）；\n' +
           '如用户是想把最新内容合并进原任务，改用 update 更新该任务，不要重建。'
         );
       }
@@ -147,7 +147,7 @@ export function makeGatedWriter({
     if (p.isStart && !looksLikeStrongFailure(result)) {
       result = await appendWorkspaceReadyCheck(result, kanbanUrl, p.signal);
     }
-    const ok = !looksLikeStrongFailure(result) && !/⚠️ setup 未完成/.test(result);
+    const ok = !looksLikeStrongFailure(result) && !/⚠️ 工作区初始化未完成/.test(result);
     auditLog(
       { user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'approved', ok, resultSnippet: result },
       auditHome,

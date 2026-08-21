@@ -6,7 +6,7 @@
 
 import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './infra/deps';
 import { fetchKanbanHealth } from './kanban/http';
-import { LOCAL_TOOL_SUMMARY } from './agent/tools';
+import { localToolSummary } from './agent/tools';
 import { installSkill, loadSkillDigests, uninstallSkill } from './agent/skills';
 import { friendlyLlmError } from './config/llm-error';
 import { errMessage } from './infra/err';
@@ -65,29 +65,40 @@ export async function buildStatusLines(
     ? p.ok(`正常（${opts.mcpToolCount} 个工具）`)
     : p.warn(
         hkMissing.length
-          ? `${opts.mcpDownNote}；但 hk_cli 缺少 ${hkMissing.join('、')}，降级链不可用（${HK_CLI_INSTALL_HINT}）`
+          ? `${opts.mcpDownNote}；备用通道缺少 ${hkMissing.join('、')}，不可用（${HK_CLI_INSTALL_HINT}）`
           : opts.mcpDownNote,
       );
   const larkText = !opts.larkOk
     ? p.warn('未安装（飞书读取不可用）')
     : larkAuthed
       ? p.ok('正常')
-      : p.warn(`未授权（${LARK_CLI_AUTH_HINT}）`);
+      : p.warn(LARK_CLI_AUTH_HINT);
+  // HTTP 状态码包一层可读说明（http.ts 侧只返回 'HTTP <code>' 裸文本）
+  const healthText =
+    health === 'ok'
+      ? p.ok('正常')
+      : p.warn(
+          /^HTTP \d+$/.test(health)
+            ? `异常（${health}，看板服务可能正在重启，稍后可 /status 复查）`
+            : health,
+        );
   const lines = [
-    `模型: ${p.info(opts.model)}`,
-    `kanban: ${health === 'ok' ? p.ok('正常') : p.warn(health)}（${opts.kanbanUrl}）`,
-    `MCP: ${mcpText}`,
-    `lark-cli: ${larkText}`,
-    `hk_cli: ${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('正常')}`,
+    `模型：${p.info(opts.model)}`,
+    `看板：${healthText}（${opts.kanbanUrl}）`,
+    `看板连接：${mcpText}`,
+    `lark-cli：${larkText}`,
+    `备用通道：${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('正常')}`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }
 
-/** /tools 内容行：MCP 可用列工具，不可用输出降级说明；本地工具恒定。 */
+/** /tools 内容行：MCP 可用列工具，不可用输出降级说明；本地工具按 memory 启用标志拼接（defs.ts localToolSummary）。 */
 export function buildToolsLines(
   opts: {
     mcpOk: boolean;
     mcpTools: Tool[];
+    /** 本地侧是否启用持久化记忆：memory_* 工具仅在实际注册时列出，否则展示的是不存在的工具。 */
+    memoryEnabled: boolean;
     /** MCP 可用时的看板工具标题（通道文案，CLI 可上色）。 */
     kanbanHeader: string;
     /** MCP 不可用时的降级说明（整行替换看板工具段）。 */
@@ -109,7 +120,7 @@ export function buildToolsLines(
     lines.push(opts.downNote);
   }
   lines.push(opts.localHeader);
-  for (const t of LOCAL_TOOL_SUMMARY) lines.push(`${opts.bullet}${p.info(t.name)}  ${p.gray(t.summary)}`);
+  for (const t of localToolSummary(opts.memoryEnabled)) lines.push(`${opts.bullet}${p.info(t.name)}  ${p.gray(t.summary)}`);
   return lines;
 }
 
@@ -177,10 +188,10 @@ export function buildMemoryLines(session: { formatMemory(): string }, header: st
 /** /clear 回复（两端一致）。 */
 export const CLEARED_TEXT = '对话历史已清空（记忆保留）。';
 
-/** /clear 回复：activeBatches > 0 时提醒「同类免问」不受清盘影响、仍生效（/confirm revoke 可恢复逐次确认）。 */
-export function clearedText(activeBatches = 0): string {
+/** /clear 回复：activeBatches > 0 时提醒「同类免问」不受清盘影响、仍生效；revokeHint 为通道自己的撤销方式说明。 */
+export function clearedText(activeBatches = 0, revokeHint: string): string {
   return activeBatches
-    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 类写操作处于「同类免问」，/confirm revoke 可恢复逐次确认）。`
+    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 类写操作处于「同类免问」，${revokeHint}）。`
     : CLEARED_TEXT;
 }
 

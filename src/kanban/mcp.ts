@@ -230,9 +230,9 @@ export function diagnoseMcpFailure(stderrTail: string): string | null {
   if (!stderrTail) return null;
   if (/vibe-kanban\.port|Reading port from/i.test(stderrTail) && /No such file|not found|error/i.test(stderrTail)) {
     return (
-      '提示：MCP 未能发现看板端口文件（vibe-kanban.port）。本机看板进程运行时间过长时，' +
-      '该文件可能已被系统清理——重启 helios-kanban 后重新运行本程序即可恢复' +
-      `（当前${MCP_FALLBACK_TEXT}备用通道）。`
+      '看板连接失败：看板运行时间过久，其端口记录文件可能已被系统清理。' +
+      '退出并重新运行本程序即可恢复（会同时重启看板）' +
+      `（当前${MCP_FALLBACK_TEXT}）。`
     );
   }
   return null;

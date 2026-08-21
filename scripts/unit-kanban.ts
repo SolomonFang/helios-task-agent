@@ -364,8 +364,8 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- KanbanHttpError：状态码随实例传递，message 保持 'HTTP <status>' ----------
-  await checkAsync('apiGet：4xx 抛 KanbanHttpError（status 可读、message 格式不变）且不重试', async () => {
+  // ---------- KanbanHttpError：状态码随实例传递，message 为中文文案（含 HTTP <status>） ----------
+  await checkAsync('apiGet：4xx 抛 KanbanHttpError（status 可读、message 中文格式）且不重试', async () => {
     let hits = 0;
     const mock = await contractMock(() => {
       hits++;
@@ -375,8 +375,8 @@ async function main(): Promise<void> {
       const err: unknown = await apiGet(mock.baseUrl, '/missing').catch((e: unknown) => e);
       assert.ok(err instanceof KanbanHttpError, `应为 KanbanHttpError，实际：${err}`);
       assert.equal(err.status, 404);
-      // message 文本格式不变：既有日志与断言（如 unit-resilience 的 /HTTP 404/）按此匹配
-      assert.equal(err.message, 'HTTP 404');
+      // message 仍含 HTTP 状态码：既有断言（如 unit-resilience 的 /HTTP 404/）按此匹配
+      assert.equal(err.message, '看板接口异常（HTTP 404）');
       assert.equal(hits, 1, '4xx 不应重试');
     } finally {
       await mock.close();
@@ -400,10 +400,10 @@ async function main(): Promise<void> {
   });
 
   // ---------- resolveReviewTarget：attempt/repos 返回体运行时校验（不裸 as） ----------
-  await checkAsync('resolveReviewTarget：attempt 字段类型不符时报「找不到 workspace」', async () => {
+  await checkAsync('resolveReviewTarget：attempt 字段类型不符时报「找不到执行环境记录」', async () => {
     const mock = await contractMock(() => ({ body: { success: true, data: { container_ref: 123 } } }));
     try {
-      await assert.rejects(() => resolveReviewTarget(mock.baseUrl, 'a1'), /找不到该任务的 workspace/);
+      await assert.rejects(() => resolveReviewTarget(mock.baseUrl, 'a1'), /找不到该任务的执行环境记录/);
     } finally {
       await mock.close();
     }
@@ -439,7 +439,9 @@ async function main(): Promise<void> {
     try {
       const err: unknown = await resolveReviewTarget(mock.baseUrl, 'a3').catch((e: unknown) => e);
       assert.ok(err instanceof Error && err.message.includes('无法定位该任务的代码目录'), `实际：${err}`);
-      assert.ok(err.message.includes(missing), '合法 repos 行的 path 应进入候选目录列表');
+      // 候选目录清单只进日志不进用户消息（宿主机绝对路径不抛给终端用户）
+      assert.ok(!err.message.includes(missing), '候选目录路径不应出现在用户面文案');
+      assert.ok(err.message.includes('人工审查'), '用户面应给出「人工审查」指引');
     } finally {
       await mock.close();
     }

@@ -38,13 +38,18 @@ function fakeTask(over: Partial<WorkSummaryTask>): WorkSummaryTask {
 }
 
 function fakeSummary(tasks: WorkSummaryTask[]): WorkSummaryData {
+  // totals 是截断前全量计数（晨报头部用）：按任务状态推导，保持与 tasks 一致
+  const totals = { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, filesChanged: 0, additions: 0, deletions: 0 };
+  for (const t of tasks) {
+    if (t.status in totals) (totals as Record<string, number>)[t.status]!++;
+  }
   return {
     scope: 'iteration',
     iteration: '260717',
     generatedAt: '2026-08-10T01:30:00Z',
     sinceLabel: '迭代 260717',
     tasks,
-    totals: { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, filesChanged: 0, additions: 0, deletions: 0 },
+    totals,
   };
 }
 
@@ -83,7 +88,7 @@ async function main(): Promise<void> {
     ]);
     const text = buildDailyBriefText(data, at(9, 30));
     assert.ok(text.includes('☀️ 看板晨报 · 迭代 260717'), '头部含范围');
-    assert.ok(text.includes('进行中 2 · 待审阅 1 · 已完成 1 · 失败 1'), `计数行: ${text.split('\n')[1]}`);
+    assert.ok(text.includes('进行中 2 · 待审阅 1 · 已完成 1 · 失败 1（含于上方状态）'), `计数行: ${text.split('\n')[1]}`);
     assert.ok(text.includes('【进行中】2 个') && text.includes('· 《修复登录页》'));
     assert.ok(text.includes('【待审阅】1 个') && text.includes('【已完成】1 个') && text.includes('【失败】1 个'));
     // 纯文本消息不做 markdown 解析：含 markdown 字符的标题原样保留

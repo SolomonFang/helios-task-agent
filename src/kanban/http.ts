@@ -25,7 +25,7 @@ function envelopeData(json: unknown): unknown {
   const env = json as KanbanEnvelope | null;
   if (env && typeof env === 'object' && 'success' in env) {
     if (env.success === true) return env.data;
-    throw new Error(env.message || 'kanban api error');
+    throw new Error(env.message || '看板接口返回失败（未附原因）');
   }
   // 无信封宽松回退：直接返回 data 字段或原始 JSON
   if (env && typeof env === 'object' && 'data' in env) return env.data;
@@ -52,10 +52,10 @@ function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): Abo
 }
 
 /** HTTP 非 2xx 错误：状态码随实例传递，调用方按 instanceof + status 分类，不从 message 反解析。
- * message 保持 `HTTP <status>` 文本格式（既有日志与断言按此匹配）。 */
+ * message 为中文文案 `看板接口异常（HTTP <status>）`（含状态码便于日志排查；断言按 /HTTP \d+/ 匹配仍可命中）。 */
 export class KanbanHttpError extends Error {
   constructor(public readonly status: number) {
-    super(`HTTP ${status}`);
+    super(`看板接口异常（HTTP ${status}）`);
     this.name = 'KanbanHttpError';
   }
 }
@@ -101,13 +101,13 @@ export function apiPost(kanbanUrl: string, p: string, body: unknown, opts: Kanba
   );
 }
 
-/** kanban 健康探测（/api/health，5s 超时）：'ok' / 'HTTP <code>' / '不可达'。 */
+/** kanban 健康探测（/api/health，5s 超时）：'ok' / '响应异常（状态码 N）' / '不可达'。 */
 export async function fetchKanbanHealth(kanbanUrl: string): Promise<string> {
   try {
     const res = await fetch(`${kanbanUrl.replace(/\/+$/, '')}/api/health`, {
       signal: AbortSignal.timeout(5000),
     });
-    return res.ok ? 'ok' : `HTTP ${res.status}`;
+    return res.ok ? 'ok' : `响应异常（状态码 ${res.status}）`;
   } catch {
     return '不可达';
   }
@@ -156,10 +156,23 @@ export function pickLatestAttempt(list: unknown): TaskAttemptRow | null {
  */
 type FieldType = 'string' | 'number' | 'boolean' | 'string|number';
 
+/** 报错文案里的类型名中文化（端点路径保留原文）。 */
+const TYPE_LABELS: Record<FieldType, string> = {
+  string: '文本',
+  number: '数字',
+  boolean: '布尔',
+  'string|number': '文本或数字',
+};
+
 function describe(v: unknown): string {
-  if (v === null) return 'null';
-  if (Array.isArray(v)) return 'array';
-  return typeof v;
+  if (v === null) return '空值';
+  if (Array.isArray(v)) return '列表';
+  const t = typeof v;
+  if (t === 'string') return '文本';
+  if (t === 'number') return '数字';
+  if (t === 'boolean') return '布尔';
+  if (t === 'object') return '对象';
+  return t;
 }
 
 function checkFields(row: Record<string, unknown>, spec: Record<string, FieldType>): string | null {
@@ -167,7 +180,7 @@ function checkFields(row: Record<string, unknown>, spec: Record<string, FieldTyp
     const v = row[field];
     if (v === undefined || v === null) continue; // 缺省/空值容忍
     const ok = type === 'string|number' ? typeof v === 'string' || typeof v === 'number' : typeof v === type;
-    if (!ok) return `字段 ${field} 期望 ${type}，实际 ${describe(v)}`;
+    if (!ok) return `字段 ${field} 期望 ${TYPE_LABELS[type]}，实际 ${describe(v)}`;
   }
   return null;
 }

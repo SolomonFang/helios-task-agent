@@ -46,9 +46,16 @@ function isWildcard(host: string): boolean {
   return host === '0.0.0.0' || host === '::';
 }
 
-/** 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效）。 */
-const NOT_FOUND_HTML = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>报告不存在</title></head>' +
-  '<body><p>报告不存在或已过期（报告保留 30 天，进程重启后旧链接也会失效）。</p></body></html>';
+/** 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效），并给出找回报告的出路。 */
+const NOT_FOUND_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>报告不存在</title>' +
+  '<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;' +
+  'color:#1f2937;background:#f3f4f8;padding:48px 20px;line-height:1.8}' +
+  '.card{max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:32px 24px;text-align:center;' +
+  'box-shadow:0 2px 8px rgba(15,23,42,.06)}h1{font-size:18px;margin-bottom:12px}p{font-size:14px;color:#4b5563}</style></head>' +
+  '<body><div class="card"><h1>报告不存在或已过期</h1>' +
+  '<p>报告保留 30 天，进程重启后旧链接也会失效。</p>' +
+  '<p>请回到飞书重新发送指令生成新报告。</p></div></body></html>';
 
 /** dirs：允许服务的报告目录（可多个，如 reviews/ 与 reports/）。 */
 export function startReportServer(dirs: string | string[], kanbanUrl: string): Promise<ReportServer> {

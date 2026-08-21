@@ -201,3 +201,58 @@
 - 会话历史恢复失败 bot 用户零感知：边缘场景，需穿透 session-store 到 channel 的通知通道，暂缓。
 - 确认卡片项目 UUID 显示为项目名：需创建前解析 list_projects，本轮仅加「项目 ID」标注。
 - CLI 侧 MCP 连接不接心跳：启动 spinner 已提供持续反馈，不需要。
+
+## 第七轮复查（2026-08-20，1.0.21→1.0.29 新增功能后全表面复审）
+
+> 背景：第六轮后经历 AI 审查功能、卡片操作优化、飞书卡片过大精简、创建上限 10→50、kanban 包改回 @latest、tools.ts 拆目录等变更。本轮 12 路并行审查覆盖全部用户可见表面（agent 工具层、prompt、bot、卡片、看板链路、CLI、向导、报告、infra、文档、新增 diff 专项），共修复 36 项。验证：typecheck 0 错误，单测 411 条全过，smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为修复时点快照。
+
+### P1 误导与高风险
+
+- [x] **S1 prompt 降级话术谎称「功能不受影响」+ hk_cli 黑话**：`prompt.ts` 教模型原样转告「通过备用接口（hk_cli）连接，功能不受影响」——F1 已判为谎称的同类漏网实例，且把内部黑话写进给用户的口径。改为「通过备用接口连接，大部分功能可用，如遇操作失败请稍后再试」。
+- [x] **S2 MCP 掉线推送无条件宣称「已自动切换」**：`bot-main.ts` onLost 推送在 hk 降级链缺 jq/curl 时仍承诺已切换（看板读写实际不可用），是用户最常看到却漏修的一条路径。改为 `checkHkDepsAsync()` 条件化，缺依赖改口「看板读写暂不可用，缺少 jq/curl（安装提示），恢复后自动切回」。
+- [x] **S3 banner 与 CLI 告警自相矛盾**：`ui.ts` banner「连接失败，已自动切换为 hk_cli…，但缺少 jq、curl，降级链不可用」同句既断言已切换又说不可用；`cli.ts` 两处同款。缺依赖分支统一不再拼接「已自动切换」，改「备用通道不可用（详见下行）」/「看板连接失败，备用通道缺少 jq、curl…」。
+- [x] **S4 CLI 闸口无 batchKey 时输入「免问」被静默按取消**：确认词表两端共用，用户在 CLI 输入「免问/都允许」明确表达批准意图，实际落到「已取消，操作未执行。」且零解释，行为与意图相反。改为命中批量词时提示「该操作不支持同类免问，请回复 y 确认或 N 取消」并重新等待（`cli.ts` confirmWrite 改循环询问）。
+- [x] **S5 .env.example 钉版本残留谎称官方默认**：`HELIOS_KANBAN_MCP_ARGS` 两行未注释、注释谎称钉 0.1.39「与代码内置默认值一致」并恐吓「跟随 @latest 供应链风险大，不建议改」——而 @latest 正是代码当前默认（`deps.ts`、`config.ts`），用户照抄即被静默固化在旧版。两行改为注释示例，注释改如实描述（默认跟随 @latest，钉版本用 `HELIOS_KANBAN_PACKAGE`），删除反向恐吓。
+
+### P2 文案可理解性与死胡同
+
+- [x] **S6 MCP_FALLBACK_TEXT 去 hk_cli、去括号**：原值自带全角括号，被 `mcp.ts`（叠「备用通道」成病句）、`handler.ts` 嵌套成双重括号。新值「已自动切换为看板 HTTP 备用通道」，deps/mcp/handler/bot-main/ui/cli 六个拼接点同步。
+- [x] **S7 hk-cli 启动报错三重问题**：「无法启动 workspace」黑话回潮、向 bot 用户暴露本机环境变量名 `HELIOS_KANBAN_REPO_ID`、示例分支 `hly-dev` 照抄必失败。改「工作区」、去环境变量名、示例改 develop（`hk-cli.ts`）。
+- [x] **S8 确认摘要黑话与不一致**：hk 路径摘要有 `hk` 前缀、lark 路径有 `lark-cli` 前缀、guard fallback 暴露英文工具名、空标题渲染空引号「」而 MCP 路径省略。前缀全去、fallback 固定「看板写操作」、空标题省略引号（`hk-cli.ts`、`lark-cli.ts`、`guard.ts`）。
+- [x] **S9 「MCP 工具 xx 调用失败」黑话**：该文本经模型转告用户。改「看板工具 xx 调用失败」，`guard.ts` 强失败判定正则同步（`kanban-mcp.ts`、`guard.ts`）。
+- [x] **S10 NO_GATE_MESSAGE 死胡同**：「写操作已被安全策略阻止」无出路。补「这通常表示服务部署时未启用确认通道，请联系部署者检查配置」。
+- [x] **S11 prompt 模板黑话与标点**：workspace/executor/variant/default_target_branch 残留（模型易原样搬给用户）、回复模板半角冒号/括号（批量播撒到每条回复）、优先级只教英文键。黑话中文化并加「对用户回复不用英文术语」一条、模板全角化、补优先级中文展示指引（`prompt.ts`）。
+- [x] **S12 repo-fs 报错**：「发送给 LLM」→「AI 模型」、ReDoS 黑话→「可能导致匹配卡死，请简化后重试」、`root=/path=/repo_id=` 调试键值串中文化、「kanban 不可达」→「看板」（`repo-fs.ts`）。
+- [x] **S13 llm 空回复死胡同**：「（模型未返回内容）」无出路，补「请重试或换个问法」（`llm.ts`）。
+- [x] **S14 /status 大改造**：键名中文化+全角冒号（模型/看板/看板连接/备用通道/lark-cli）、飞书长连接英文枚举（connected 等）中文映射、「ok」→「正常」、裸 HTTP 状态码包装「异常（HTTP 502，看板服务可能正在重启…）」、lark-cli 未授权嵌套重复（「未授权（已安装但未授权…）」）去重（`commands.ts`、`handler.ts`、`deps.ts`）。
+- [x] **S15 /tools 三问题**：`buildToolsLines` 写死常量导致 memory 工具缺失（`localToolSummary()` 成死代码）、标题「kanban MCP 工具」黑话且 CLI/bot 两端不一致、降级说明嵌套括号。改用 `localToolSummary(memoryEnabled)` 两端接线、标题统一「看板工具（N 个）」（`commands.ts`、`cli.ts`、`handler.ts`）。
+- [x] **S16 进度占位暴露内部工具名**：「调用工具 hta_xxx」→ `toolActionLabel()` 中文动作映射（读文件/看板操作/飞书操作等），未知回落「调用工具」（`handler.ts`）。
+- [x] **S17 AI 审查错误链路**：「workspace（attempt）记录」黑话、宿主机绝对路径清单推进飞书、ocr stderr tail 原文倾倒、分支名错误暴露 `from=/to=` 且重试必败、超时路径两句措辞不同的重试指引。路径与 tail 进日志，用户面统一中文定性+可执行出路；重试指引只由 handler 追加且 message 截断 200 字符（`ai-review.ts`、`handler.ts`）。
+- [x] **S18 飞书 API 原始错误直达用户**：「飞书发卡片失败： code=230001 msg=…」被拼进用户消息。channel 层统一 `apiError()`：用户面「飞书接口拒绝了发送请求，请稍后重试」，code/msg 进日志，7 处同型抛错全改（`feishu.ts`）。
+- [x] **S19 kanban-ensure 三条死胡同**：非本机地址被追加本机 npx 指引（完全不对症）、spawn ENOENT 暴露英文原文且兜底指引循环无效（npx 已不存在还教用 npx）、进程退出只有 `code=1` 无原因。三路径各自内嵌对症指引（到该主机启动/安装 Node.js/端口占用排查），`bootstrap.ts` 兜底对 Node 缺失场景不再追加 npx 指引；另修复 macOS 下 ENOENT 以退出码 -2 落地的真实竞态（`kanban-ensure.ts`、`bootstrap.ts`）。
+- [x] **S20 http 层英文直达用户**：信封兜底「kanban api error」、裸「HTTP 404」可经 AI 审查链路原样推给飞书用户。中文化为「看板接口返回失败（未附原因）」「看板接口异常（HTTP N）」；健康探测「响应异常（状态码 N）」；validateRows 类型名中文化（`http.ts`）。
+- [x] **S21 mcp 端口文件提示黑话堆叠**：一句叠 MCP/端口文件/vibe-kanban.port 三个术语且「重启 helios-kanban」无操作入口。改现象先行：「看板运行时间过久，其端口记录文件可能已被系统清理。退出并重新运行本程序即可恢复」（`mcp.ts`）。
+- [x] **S22 配置向导六处**：bot 通道「--reconfig（推荐）」会让用户在原进程在跑时起第二个实例（先停进程再重配）；open_id 全链路无获取路径（补 API 调试台指引）；英文 errMessage/json.msg 原样拼接（新增 `net-error.ts` 模式映射：连接超时/连接被拒/域名解析失败）；「https:// 或 http:// 开头」与 http 安全警告割裂；「选择仍然保存」与「输入 s」漂移；「（输入显示为 *）」在非 TTY 明文回退时承诺不存在（动态后缀「（输入可见）」）（`config/`）。
+- [x] **S23 报告三处**：生成时间 ISO 串是 UTC（国内用户差 8 小时）且与 AI 审查报告口径漂移（渲染处改 `toLocaleString('zh-CN')`，数据层保持 ISO 供文件名反解）；404 页裸 HTML 死胡同（补样式+「请回到飞书重新发送指令生成新报告」）；聊天链接注脚固定「仅本机可达」与 `HELIOS_REPORT_HOST=0.0.0.0` 行为相反（按 isLoopbackUrl 分档，与卡片口径一致），并补 30 天保留期（`report.ts`、`report-server.ts`）。
+- [x] **S24 晨报与报告计数口径**：晨报头部计数用截断后 50 条、底部却引导去看全量概览的报告；「失败」与状态计数正交无说明。晨报头部改用全量 `data.totals` 并标注「失败 N（含于上方状态）」；报告三形态清单末尾补「仅展示最近 50 条，共 N 条」（`daily-brief.ts`、`report.ts`）。
+- [x] **S25 确认/审查卡片五处**：超时终态卡片无出路（补「直接再跟我说一声即可」与文本版对齐）；「状态变更」标签下渲染非跃迁短语「跟进执行完成」语义矛盾（无「→」时改标签「进展」）；statusLabel 未知状态回退原文未过 mdSafe；AI 审查未通过用蓝色头部（改 yellow，与「有意见需处理」匹配）；「已注入会话上下文」实现视角黑话（改「可继续追问审查结论」）（`feishu-cards.ts`）。
+- [x] **S26 watcher hints 三套措辞漂移**：done/failed 事件在纯文本版与卡片注脚各说各话，降级时用户前后看到两种说法。收敛为 `watcher.ts` 导出的 `WATCH_HINT_DONE`/`WATCH_HINT_FAILED` 两常量，文本版与卡片共用。
+- [x] **S27 CLI 三处**：/config 主动取消被打成红色「配置失败：已取消」（改中性「已取消，配置未变更」）；/skills 页脚「skill_doc」内部工具名（改「按需自动加载」）；HELP 的 /skills 行与 SKILLS_USAGE 两套措辞、「kanban」中英漂移（对齐并统一「看板」）（`cli.ts`、`commands.ts`）。
+- [x] **S28 update-check 提示与词表不符**：「现在更新？[y=更新 / N=跳过]」半角括号，且实际接受「更新/升级/确认」等词。改「（输入 y 或「更新」确认，其他输入跳过）」（`update-check.ts`）。
+- [x] **S29 文档漂移四处**：免问粒度描述过时（实为命令路径+接收对象、脚本+参数，用户按旧文档预期会觉得免问失灵）；README 中文版 workspace 黑话两处；晨报推送对象「owner」与看板推送「白名单用户」口径不一（代码实为同一集合 allowedOpenIds）；SKILL.md 回复模板让 agent 把英文状态键抛给用户（改 `{中文状态}` 并补映射表）（README×2、`.env.example`、`SKILL.md`）。
+
+### P3 细节打磨
+
+- [x] **S30 半角标点残留**：bin「未知命令：」、config.ts 列表引导冒号、/memory 输出、报告「（无标题）」5 处、CLI 闸口选项串分隔不一致（`bin/`、`config.ts`、`memory.ts`、`report/`、`cli.ts`）。
+- [x] **S31 banner 细节**：pending 瞬态误用告警黄点（改灰点）；相邻两行重复报「缺少 jq、curl」（明细只留 hk 行）；「kanban 地址」→「看板地址」；bootstrap「技能契约：」冗余前缀（problem 自带完整文案）（`ui.ts`、`bootstrap.ts`）。
+- [x] **S32 gated-write 中英混排**：「⚠️ setup 未完成」→「⚠️ 工作区初始化未完成」（判定正则同步）；「在 kanban 中删除」→「看板」（`gated-write.ts`）。
+- [x] **S33 映射未命中透传英文**：确认卡片优先级未命中 PRIORITY_LABELS 时原样漏英文枚举（省略该行）；审查报告 severity/category 未命中映射时英文上徽章（补 warning/suggestion 等映射，未知兜底「提示」）（`kanban-mcp.ts`、`review-report.ts`）。
+- [x] **S34 报告细节**：增删行单位三处漂移统一为「新增行/删除行」；HTML 概览补「待办」「已取消」统计卡（MD/聊天概览已有）；MD 侧用户可控数据（标题/摘要/diffUrl）最小转义，与 HTML 侧 escapeHtml 防护对齐（`report.ts`）。
+- [x] **S35 workspace-ready 类型字面量**：「不是有效的 { repo_id: string } 输入」→「第 N 个仓库参数格式不正确（需要提供仓库 ID）」（`workspace-ready.ts`）。
+- [x] **S36 「请联系实例 owner」中英混排**：→「请联系本实例的部署者开通」（`feishu.ts`）。
+
+### 本轮暂不修（记录在案）
+
+- 确认卡片 detailCodeBlock 把命令里的 ``` 静默替换为 `'''`，所见非所得：lark_md 是否支持四连反引号长围栏未验证，贸然改用可能破坏渲染，暂保持。
+- 报告「仅展示最近 50 条，共 N 条」的 N 由五状态计数之和推算（summary 未导出独立全量字段），未知状态任务不计入，极端情况 N 偏小。
+- unit-kanban.ts:162 测试 fixture 仍是旧「无法启动 workspace」措辞：仅透传入参，不断言用户文案，不影响产品面。

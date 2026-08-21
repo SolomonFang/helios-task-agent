@@ -16,12 +16,13 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const title = typeof args.title === 'string' ? args.title : '';
   const desc = typeof args.description === 'string' ? args.description : '';
   const project = String(args.project_id ?? args.projectId ?? '');
-  const priority = typeof args.priority === 'string' ? args.priority : '';
+  const priorityLabel = typeof args.priority === 'string' ? PRIORITY_LABELS[args.priority] : undefined;
   const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
     `标题：${title}`,
     project ? `项目 ID：${project}` : '',
-    priority ? `优先级：${PRIORITY_LABELS[priority] ?? priority}` : '',
+    // 未命中中文映射时省略该行，不把英文枚举透传到确认卡片
+    priorityLabel ? `优先级：${priorityLabel}` : '',
     preview,
   ]
     .filter(Boolean)
@@ -88,7 +89,7 @@ export function makeKanbanMcpHandler({
       } catch (err) {
         const message = errMessage(err);
         // 错误文本同样来自 MCP server（可被写看板的人控制）：与成功路径一样 UNTRUSTED 包裹
-        return wrapUntrusted(`MCP 工具 ${tool.name} 调用失败：${message}`);
+        return wrapUntrusted(`看板工具 ${tool.name} 调用失败：${message}`);
       }
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
@@ -113,7 +114,7 @@ export function makeKanbanMcpHandler({
           return await mcp.callTool(tool.name, args, ctx?.signal);
         } catch (err) {
           const message = errMessage(err);
-          return `MCP 工具 ${tool.name} 调用失败：${message}`;
+          return `看板工具 ${tool.name} 调用失败：${message}`;
         }
       },
       signal: ctx?.signal,

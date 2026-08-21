@@ -84,7 +84,7 @@ export const LARK_CLI_INSTALL_HINT =
   '安装：npm i -g @larksuite/cli，然后 lark-cli auth login 完成授权（不装则飞书任务/文档读取不可用，看板功能不受影响）。';
 
 /** lark-cli 已安装但未授权时的引导文案。 */
-export const LARK_CLI_AUTH_HINT = '已安装但未授权：运行 lark-cli auth login 完成授权后重试。';
+export const LARK_CLI_AUTH_HINT = '已安装但未授权（运行 lark-cli auth login 完成授权）';
 
 /** lark-cli 三态：未安装 / 已安装但未授权 / 已授权可用。 */
 export type LarkCliStatus = 'missing' | 'unauthorized' | 'ok';
@@ -139,7 +139,7 @@ export function checkHkDeps(): string[] {
 export const HK_CLI_INSTALL_HINT = 'macOS：brew install jq curl；Linux：用包管理器安装 jq curl';
 
 /** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
-export const MCP_FALLBACK_TEXT = '已自动切换为 hk_cli（看板 HTTP 接口）';
+export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';
 
 /**
  * 运行时 npx 拉取的 helios-kanban 包规格，默认 @latest 跟随最新版；

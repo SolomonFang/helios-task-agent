@@ -455,7 +455,7 @@ export class FeishuChannel implements AgentChannel {
               this.deniedNotified.add(openId);
               void this.notifyOpenId(
                 openId,
-                '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系实例 owner 开通，或自行部署一个实例。\n' +
+                '抱歉，这是私人专用机器人实例，已绑定给其他用户。如需使用，请联系本实例的部署者开通，或自行部署一个实例。\n' +
                   `若你就是本实例的部署者，请把本账号的 open_id 加入 ${userEnvPath()} 的 FEISHU_ALLOWED_OPEN_IDS 后重启机器人：\n${openId}`,
               ).catch(() => {});
             }
@@ -534,6 +534,12 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
+  /** 飞书接口返回非 0：code/msg 详情落日志，抛给上层（会原样拼进用户消息）的是不含内部细节的自救文案。 */
+  private apiError(action: string, res: { code?: number; msg?: string }): Error {
+    console.error(`[feishu] ${action}失败: code=${res.code} msg=${res.msg}`);
+    return new Error(`飞书接口拒绝了${action}请求，请稍后重试`);
+  }
+
   private async createMessage(receiveIdType: 'chat_id' | 'open_id', receiveId: string, text: string): Promise<string | undefined> {
     const res = await this.client.im.v1.message.create({
       params: { receive_id_type: receiveIdType },
@@ -544,7 +550,7 @@ export class FeishuChannel implements AgentChannel {
       },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书发消息失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('发送', res);
     }
     return res.data?.message_id;
   }
@@ -564,7 +570,7 @@ export class FeishuChannel implements AgentChannel {
       },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书更新消息失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('更新', res);
     }
   }
 
@@ -575,7 +581,7 @@ export class FeishuChannel implements AgentChannel {
       data: { reaction_type: { emoji_type: emojiType } },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书添加表情回复失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('表情回复', res);
     }
     return res.data?.reaction_id;
   }
@@ -586,7 +592,7 @@ export class FeishuChannel implements AgentChannel {
       path: { message_id: messageId, reaction_id: reactionId },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书删除表情回复失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('表情回复', res);
     }
   }
 
@@ -660,7 +666,7 @@ export class FeishuChannel implements AgentChannel {
       },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书发卡片失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('发送', res);
     }
     return res.data?.message_id;
   }
@@ -675,7 +681,7 @@ export class FeishuChannel implements AgentChannel {
       },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书更新卡片失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('更新', res);
     }
   }
 
@@ -697,7 +703,7 @@ export class FeishuChannel implements AgentChannel {
       },
     });
     if (res.code !== 0) {
-      throw new Error(`飞书发卡片失败: code=${res.code} msg=${res.msg}`);
+      throw this.apiError('发送', res);
     }
   }
 

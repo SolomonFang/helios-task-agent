@@ -23,7 +23,7 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 ## Two forms: CLI vs Feishu bot
 
 - **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/batch/N`), and all kanban operations included.
-- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link), **daily brief** (`HTA_DAILY_BRIEF=HH:MM`, pushes a current-iteration kanban overview to the owner every day), and **image messages** (`LLM_VISION=1`, requires a vision-capable model).
+- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link), **daily brief** (`HTA_DAILY_BRIEF=HH:MM`, pushes a current-iteration kanban overview to the allowlisted users (owner) every day), and **image messages** (`LLM_VISION=1`, requires a vision-capable model).
 
 ## Install
 
@@ -76,7 +76,7 @@ Feishu Task Center / docs / group chats
 | Mechanism | Behavior |
 |-----------|----------|
 | Write gate | Creates/updates/deletes, start/stop/follow-up, approvals, Feishu sends require confirm. Terminal: `y` (once) / `batch` (allow similar this session) / `N` (same answer vocabulary as Feishu: 确认/批准/同意/执行, 同类免问/批量允许, etc.); timeouts 120s for normal writes, 300s for destructive ops; Ctrl+C at the prompt rejects. Feishu: confirm card (every write op shows the “allow-similar (this session)” button) or strict phrases (确认 / 同类免问 / 取消 — casual “ok” ignored); same timeout policy; the card updates to a final state after decision/timeout. New confirm **supersedes** a pending one. Missing gate → all writes fail closed |
-| Batch approval | “Allow similar” for the rest of the session on the same write class (in-memory grant, lost on restart); plain confirm is **once**. **All write ops are eligible**, with per-class granularity: kanban/hk keys bind tool name + task id, lark writes group by command path (e.g. `im send`), skill scripts by script, memory writes by set/delete/note. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) only get the longer 300s timeout — they are no longer excluded from allow-similar. `/confirm revoke` or 恢复确认 revokes (`/confirm on` kept as a legacy alias) |
+| Batch approval | “Allow similar” for the rest of the session on the same write class (in-memory grant, lost on restart); plain confirm is **once**. **All write ops are eligible**, with per-class granularity: kanban/hk keys bind tool name + task id, lark writes group by command path + recipient (e.g. `im send` to `ou_x` vs `ou_y` are separate classes), skill scripts by script + arguments, memory writes by set/delete/note. Destructive ops (delete/cancel/stop/approve/start/archive/merge/push/execute) only get the longer 300s timeout — they are no longer excluded from allow-similar. `/confirm revoke` or 恢复确认 revokes (`/confirm on` kept as a legacy alias) |
 | Session create cap | Max **10** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
 | Untrusted wrap | External output (`lark_cli`, kanban MCP / `hk_cli`, `repo_fs`) plus kanban-event and AI-review context injections are wrapped UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
@@ -178,7 +178,7 @@ via the `skill_doc` tool (progressive disclosure).
 
 - Missing `name`/`description` or `digest_sections` entries that match no section are reported by `validateSkills()` — surfaced as **startup warnings** (CLI and bot) and covered by unit tests, instead of silently degrading.
 - Users can run `/skills` (same in CLI and Feishu bot) or just ask "what skills do you have".
-- Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution — treated as destructive with a 300-second timeout; "approve same kind" batching applies per specific script), and the child process inherits only a minimal environment.
+- Skills can ship runnable scripts (node/shell/python, etc.): document the usage in SKILL.md and the agent runs them via the `skill_exec` tool. The script path is confined to the skill directory (`..`/absolute paths/symlink escapes are rejected), the interpreter is inferred from the extension (`.sh`→bash, `.js/.mjs/.cjs`→node, `.py`→python3; anything else needs an explicit `interpreter` from the bash/sh/node/python3/python whitelist), and the working directory is the skill directory. **Every execution asks the user for confirmation** (arbitrary code execution — treated as destructive with a 300-second timeout; "approve same kind" batching applies per specific script + arguments), and the child process inherits only a minimal environment.
 
 **Kanban process**: auto-start only for **localhost** URLs. CLI exit **keeps** an auto-started board; bot exit **stops** that child. Remote URLs must already be up. Note: the kanban API has no authentication — when `HELIOS_KANBAN_URL` points off-box, traffic is plaintext and unauthenticated; use only on trusted networks (LAN / Tailscale).
 
@@ -203,7 +203,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
-| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed; all iterations when `HELIOS_KANBAN_ITERATION` is unset) to the owner every day. Unset or invalid = off |
+| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed; all iterations when `HELIOS_KANBAN_ITERATION` is unset) to the allowlisted users (owner) every day. Unset or invalid = off |
 | `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
@@ -239,7 +239,7 @@ Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the l
 | `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
 | `work_summary` | Generate work-summary reports (HTML/MD) |
 | `skill_doc` | Read an installed skill's full doc (SKILL.md) on demand |
-| `skill_exec` | Run scripts inside a skill directory (confirmation per run by default; "approve same kind" applies per specific script) |
+| `skill_exec` | Run scripts inside a skill directory (confirmation per run by default; "approve same kind" applies per specific script + arguments) |
 | `memory_*` | Persistent prefs & notes |
 
 Bundled skill: `skills/helios-kanban-remote/`.

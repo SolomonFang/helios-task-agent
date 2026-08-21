@@ -124,7 +124,9 @@ export async function ensureKanbanRunning(
     );
   }
   if (!isLocalHost(hostname)) {
-    throw new Error(`helios-kanban 未运行（${url}）。非本机地址不会自动启动，请先手动拉起看板服务。`);
+    throw new Error(
+      `helios-kanban 未运行（${url}）。看板地址指向非本机主机 ${hostname}，请到该主机启动 helios-kanban，或用 /config 把地址改回本机。`,
+    );
   }
 
   log(`未检测到看板，正在启动 npx ${kanbanPackageSpec()}（PORT=${port}）…`);
@@ -164,9 +166,9 @@ export async function ensureKanbanRunning(
     // 拷贝到局部变量：TS 会把闭包内才赋值的属性窄化为 null，分支内变成 never
     const spawnErr: Error | null = spawnFailure.err;
     if (spawnErr) {
-      throw new Error(
-        `无法启动 helios-kanban：执行 npx 失败（npx 不可执行或未安装 Node.js/npm）：${spawnErr.message}`,
-      );
+      // 英文原始报错（如 spawn npx ENOENT）收进 HTA_DEBUG 日志；用户面给中文定性与自救指引
+      if (process.env.HTA_DEBUG) console.error(`[kanban] 执行 npx 失败：${spawnErr.message}`);
+      throw new Error('未检测到 Node.js/npm（npx 命令不可用），请先安装 Node.js（https://nodejs.org）后重新运行。');
     }
     // 先探健康再判退出码：detached 的 npx 壳退出与看板就绪可能几乎同时发生，
     // 壳先死而看板孙进程已就绪时（见 stopKanbanChild 注释），先看 exitCode 会误报启动失败
@@ -175,12 +177,19 @@ export async function ensureKanbanRunning(
       return { started: true, child, url };
     }
     if (child.exitCode !== null) {
-      // 用户面只给退出码 + 手动启动指引；stderr 尾部（原始报错）收进 HTA_DEBUG 日志
+      // macOS 上 spawn ENOENT 可能不走 'error' 事件，而以 libuv 负 errno（-2）作为退出码落地：
+      // 与上方 spawnErr 分支同一语义（npx 不可用），不能误报成「端口被占用」
+      if (child.exitCode === -2) {
+        throw new Error('未检测到 Node.js/npm（npx 命令不可用），请先安装 Node.js（https://nodejs.org）后重新运行。');
+      }
+      // stderr 尾部（原始报错）收进 HTA_DEBUG 日志；用户面只带最后一行（截断）+ 常见原因与出路
       if (process.env.HTA_DEBUG && stderrBuf.trim()) {
         console.error(`[kanban] 进程退出前 stderr 尾部：\n${stderrBuf.slice(-800)}`);
       }
+      const lastLine = (stderrBuf.trim().split('\n').filter(Boolean).pop() || '').slice(0, 120);
       throw new Error(
-        `helios-kanban 进程已退出（code=${child.exitCode}）。\n${kanbanManualStartHint({ port })}`,
+        `helios-kanban 启动后退出（退出码 ${child.exitCode}），常见原因是端口被占用。` +
+          `可设 HTA_DEBUG=1 重新运行查看详细报错。${lastLine ? `\n最后一行报错：${lastLine}` : ''}`,
       );
     }
     // 等待期间每 ~10 秒补一行进度，避免启动阶段长时间无反馈

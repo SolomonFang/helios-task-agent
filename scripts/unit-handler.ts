@@ -684,7 +684,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：敲键盘表情瞬时错误（限流/网络）下条消息重试', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failReactions = true;
-      f.channel.reactionError = '飞书添加表情回复失败: code=99991400 msg=network timeout';
+      f.channel.reactionError = '飞书接口拒绝了表情回复请求，请稍后重试';
       await f.handlers.handle(mkMsg('u1', '/clear'));
       await f.handlers.handle(mkMsg('u1', '/clear'));
       assert.equal(f.channel.addReactionCalls, 2, '瞬时错误后下条消息应重试加表情');

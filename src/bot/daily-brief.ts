@@ -63,7 +63,8 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
   const failed = data.tasks.filter((t) => t.failed);
   const lines = [
     `☀️ 看板晨报 · ${data.sinceLabel}（${localDateStr(now)}）`,
-    `进行中 ${inprogress.length} · 待审阅 ${inreview.length} · 已完成 ${done.length} · 失败 ${failed.length}`,
+    // 头部计数用 totals（截断前全量）；列表仍取截断后的 data.tasks 抽样。失败与状态计数正交，注明口径
+    `进行中 ${data.totals.inprogress} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done} · 失败 ${failed.length}（含于上方状态）`,
   ];
   if (!data.tasks.length) {
     lines.push('', '当前范围内还没有任务。');

@@ -86,11 +86,11 @@ function kanbanTreeAlive(child: ChildProcess): boolean {
 const HELP = `
   ${c.strong('命令')}
   ${c.info('/help')}     显示帮助
-  ${c.info('/config')}   重新配置模型 / kanban 地址
-  ${c.info('/tools')}    列出当前可用的 kanban 工具
-  ${c.info('/skills')}   列出技能；install <路径> 安装（升级不丢失）/ uninstall <名称> 卸载
+  ${c.info('/config')}   重新配置模型 / 看板地址
+  ${c.info('/tools')}    列出当前可用的看板工具
+  ${c.info('/skills')}   列出技能；install <技能目录路径> 安装（npm 升级不丢失）/ uninstall <技能名> 卸载
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
-  ${c.info('/status')}   健康检查（模型 / kanban / MCP / lark-cli）
+  ${c.info('/status')}   健康检查（模型 / 看板 / 看板连接 / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
   ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（/quit 同效；任务运行中按 Ctrl+C 只中断不退出）
@@ -288,7 +288,7 @@ export async function main(): Promise<void> {
   if (!mcpOk) {
     if (hkMissing.length) {
       console.log(
-        c.warn(`MCP 连接失败，且 hk_cli 降级链缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）。`),
+        c.warn(`看板连接失败，备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）。`),
       );
     }
     if (mcpHint) console.log(c.warn(mcpHint));
@@ -323,29 +323,36 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.destructive ? 300000 : 120000;
-    const options = req.batchKey ? 'y=仅此次 / 免问=同类免问（本会话）/ N=取消' : 'y=仅此次 / N=取消';
-    const ans = await askWithAbort(
-      c.warn(`允许执行？[${options}]（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
-      timeoutMs,
-    );
-    spinner.start('思考中…（Ctrl+C 中断）');
-    if (ans === ASK_TIMEOUT) {
-      console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。'));
+    const options = req.batchKey ? 'y=仅此次 / 免问=同类免问（本会话） / N=取消' : 'y=仅此次 / N=取消';
+    for (;;) {
+      const ans = await askWithAbort(
+        c.warn(`允许执行？【${options}】（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
+        timeoutMs,
+      );
+      spinner.start('思考中…（Ctrl+C 中断）');
+      if (ans === ASK_TIMEOUT) {
+        console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。'));
+        return false;
+      }
+      const t = (ans || '').trim().toLowerCase();
+      // 无 batchKey 的操作不支持同类免问：提示后重新等待输入，而不是落到「已取消」（行为与意图相反）
+      if (!req.batchKey && CONFIRM_BATCH_RE.test(t)) {
+        console.log(c.warn('该操作不支持同类免问，请回复 y 确认或 N 取消。'));
+        continue;
+      }
+      const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
+      const once = !batch && CONFIRM_YES_RE.test(t);
+      if (batch) {
+        console.log(c.ok('已批准；同类写操作本会话内免问（/confirm revoke 撤销）。'));
+        return 'batch';
+      }
+      if (once) {
+        console.log(c.ok('已批准（仅此次），继续执行。'));
+        return 'once';
+      }
+      console.log(c.gray('已取消，操作未执行。'));
       return false;
     }
-    const t = (ans || '').trim().toLowerCase();
-    const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
-    const once = !batch && CONFIRM_YES_RE.test(t);
-    if (batch) {
-      console.log(c.ok('已批准；同类写操作本会话内免问（/confirm revoke 撤销）。'));
-      return 'batch';
-    }
-    if (once) {
-      console.log(c.ok('已批准（仅此次），继续执行。'));
-      return 'once';
-    }
-    console.log(c.gray('已取消，操作未执行。'));
-    return false;
   };
 
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, {
@@ -388,7 +395,7 @@ export async function main(): Promise<void> {
         console.log(HELP);
       } else if (cmd === '/clear') {
         session.clearHistory();
-        console.log(c.gray(clearedText(session.activeBatchApprovals())));
+        console.log(c.gray(clearedText(session.activeBatchApprovals(), '/confirm revoke 可恢复逐次确认')));
       } else if (cmd === '/confirm' || cmd === '/confirm revoke' || cmd === '/confirm on') {
         // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）
         if (cmd !== '/confirm') {
@@ -416,13 +423,15 @@ export async function main(): Promise<void> {
           {
             mcpOk,
             mcpTools: mcp.tools,
-            kanbanHeader: c.strong('kanban MCP 工具:'),
+            // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册
+            memoryEnabled: true,
+            kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
             downNote: c.warn(
               hkMissing.length
-                ? `MCP 未连接，${MCP_FALLBACK_TEXT}，但缺少 ${hkMissing.join('、')}，看板读写暂不可用。`
-                : `MCP 未连接，${MCP_FALLBACK_TEXT}，看板功能不受影响。`,
+                ? `看板连接失败，备用通道因缺少 ${hkMissing.join('、')} 不可用（${HK_CLI_INSTALL_HINT}）。`
+                : `看板连接失败，${MCP_FALLBACK_TEXT}，看板功能不受影响。`,
             ),
-            localHeader: c.strong('本地工具:'),
+            localHeader: c.strong('本地工具：'),
             bullet: '  ',
           },
           c,
@@ -434,9 +443,9 @@ export async function main(): Promise<void> {
         for (const l of handleSkillsCommand(
           line,
           {
-            header: c.strong('已安装技能:'),
+            header: c.strong('已安装技能：'),
             bullet: '  ',
-            footer: c.gray('对话中可直接问「你有什么技能」；细节由 agent 用 skill_doc 按需读取。'),
+            footer: c.gray('对话中可直接问「你有什么技能」；细节会在对话中按需自动加载。'),
           },
           c,
         )) {
@@ -487,7 +496,9 @@ export async function main(): Promise<void> {
           }
         } catch (err) {
           const message = errMessage(err);
-          console.error(c.err(`配置失败：${message}`));
+          // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，不打成红色「配置失败」
+          if (message === '已取消') console.log(c.gray('已取消，配置未变更'));
+          else console.error(c.err(`配置失败：${message}`));
         }
       } else {
         console.log(c.warn(`未知命令 ${line}，输入 /help 查看帮助。`));
