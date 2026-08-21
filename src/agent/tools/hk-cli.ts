@@ -26,13 +26,17 @@ function hkCreateTitle(args: string[]): string {
   return '';
 }
 
-function batchKeyForHk(argv: string[]): string {
-  const sub = `${argv[0] ?? ''} ${argv[1] ?? ''}`.trim();
-  // 同 batchKeyForMcp：任务/项目标识（UUID）纳入 key，免问仅对同一对象的同类操作生效。
-  // start/stop/approve/follow-up 的对象 id 在 argv[1]，先看它，再回退 argv[2+]（tasks <sub> <id> 形态）；
-  // 漏看 argv[1] 会把 start <task> --repo <repo> 的 key 错绑到 repo 上
+function batchKeyForHk(argv: string[]): { key: string; scope: 'kind' | 'object' } {
+  const cmd = argv[0] ?? '';
+  // start/create-and-start 类级免问（同 batchKeyForMcp 的启动类）：启动不改写看板数据，
+  // 批量启动多任务工作区是高频用法，对象级绑定只剩打扰
+  if (cmd === 'start' || cmd === 'create-and-start') return { key: `hk:${cmd}`, scope: 'kind' };
+  const sub = `${cmd} ${argv[1] ?? ''}`.trim();
+  // 其余写操作对象级免问：任务/项目标识（UUID）纳入 key，仅对同一对象的同类操作生效。
+  // stop/approve/follow-up 的对象 id 在 argv[1]，先看它，再回退 argv[2+]（tasks <sub> <id> 形态）；
+  // 漏看 argv[1] 会把对象 id 的 key 错绑到后续参数（如 repo id）上
   const id = extractUuid(argv[1] ?? '') ?? argv.slice(2).map(extractUuid).find(Boolean);
-  return id ? `hk:${sub}:${id}` : `hk:${sub}`;
+  return id ? { key: `hk:${sub}:${id}`, scope: 'object' } : { key: `hk:${sub}`, scope: 'kind' };
 }
 
 function hkStartHasBranch(argv: string[]): boolean {
@@ -75,6 +79,7 @@ export function makeHkCliHandler({
       ? `创建看板任务${title ? `「${title}」` : ''}`
       : `看板写操作：${argv.slice(0, 3).join(' ')}`;
     // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
+    const { key: batchKey, scope: batchScope } = batchKeyForHk(argv);
     return runGatedWrite({
       kind: 'hk',
       summary,
@@ -83,7 +88,8 @@ export function makeHkCliHandler({
       isStart,
       urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
       title,
-      batchKey: batchKeyForHk(argv),
+      batchKey,
+      batchScope,
       destructive: isDestructive(`${argv[0] ?? ''} ${argv[1] ?? ''}`),
       prepare: isStart
         ? async () => {

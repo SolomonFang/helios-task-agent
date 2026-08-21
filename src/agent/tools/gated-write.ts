@@ -42,6 +42,8 @@ export interface GatedWriteParams {
   urls: string[];
   title: string;
   batchKey: string;
+  /** 「同类免问」粒度（见 guard.ConfirmRequest.batchScope）：类级或对象级，由 key 生成处一并给出。 */
+  batchScope: 'kind' | 'object';
   /** 破坏性/高影响操作：确认超时放宽（见 guard.isDestructive 与 ConfirmRequest.destructive）。 */
   destructive: boolean;
   /** start 前置补全（可能改写命令参数）；返回错误消息则审计 error 并拦截。 */
@@ -136,7 +138,7 @@ export function makeGatedWriter({
       }
     }
     const gate = await passGate(
-      { kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey, destructive: p.destructive },
+      { kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey, batchScope: p.batchScope, destructive: p.destructive },
       confirm,
     );
     if (!gate.allowed) {

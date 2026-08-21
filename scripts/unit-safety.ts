@@ -410,6 +410,15 @@ async function main() {
       await hk({ args: ['tasks', 'update', idB, '--title', 'b'] });
       assert.ok(keys[0]?.includes(idA) && keys[1]?.includes(idB), `batchKey 应含任务标识，实际 ${JSON.stringify(keys)}`);
       assert.notEqual(keys[0], keys[1]);
+      // 对照：启动类级免问（不同任务同 key，--branch 已带跳过前置补全），删除仍对象级（各自确认）
+      await hk({ args: ['start', idA, '--branch', 'dev'] });
+      await hk({ args: ['start', idB, '--branch', 'dev'] });
+      await hk({ args: ['tasks', 'delete', idA] });
+      await hk({ args: ['tasks', 'delete', idB] });
+      assert.equal(keys[2], 'hk:start', `start 应为类级 key，实际 ${keys[2]}`);
+      assert.equal(keys[3], 'hk:start', '不同任务的 start 应共用类级免问 key');
+      assert.ok(keys[4]?.includes(idA) && keys[5]?.includes(idB), 'delete 仍须绑定任务标识');
+      assert.notEqual(keys[4], keys[5], '不同任务的 delete 不得共用免问 key');
     } finally {
       fs.rmSync(auditTmp, { recursive: true, force: true });
     }
@@ -616,6 +625,7 @@ async function main() {
         urls: ['https://a.feishu.cn/docx/abort1'],
         title: 't',
         batchKey: 'hk:tasks:create',
+        batchScope: 'kind',
         destructive: false,
         execute: async () => '⏹ 已中断（未完成的操作未执行，可继续对话）。',
       });
@@ -656,6 +666,7 @@ async function main() {
         urls: ['https://a.feishu.cn/docx/old1'],
         title: 't',
         batchKey: 'hk:tasks:create',
+        batchScope: 'kind',
         destructive: false,
         execute: async () => '已创建任务（无 uuid 输出）',
       });

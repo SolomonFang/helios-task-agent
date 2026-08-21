@@ -30,14 +30,17 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
 }
 
 /**
- * 「同类免问」key：所有写操作都可免问；免问授权绑定任务标识，
- * 授权后只允许对同一任务的同类操作免问，防止借授权改任意任务。
+ * 「同类免问」key 与粒度：
+ * - 启动类（start_workspace*）：类级 key——启动工作区不改写看板数据，且「批量启动
+ *   多个任务的工作区」是高频用法，对象级绑定只剩打扰、没有安全收益；
+ * - 其余写操作：对象级 key（task/工作区/审批 id 纳入 key，与 summarizeMcp 的对象标识
+ *   口径对齐），免问仅对同一对象的同类操作生效——否则 approve、delete 这类会退化成
+ *   类级免问（借一次授权放行任意对象）。
  */
-function batchKeyForMcp(name: string, args: Record<string, unknown>): string {
-  // 与 summarizeMcp 的对象标识口径对齐：task/工作区/审批 id 都纳入 key，
-  // 否则 approve、stop_workspace 这类会退化成类级免问（放行任意对象）
+function batchKeyForMcp(name: string, args: Record<string, unknown>): { key: string; scope: 'kind' | 'object' } {
+  if (/start/i.test(name)) return { key: `kanban:${name}`, scope: 'kind' };
   const id = String(args.task_id ?? args.taskId ?? args.id ?? args.workspace_id ?? args.approval_id ?? '');
-  return id ? `kanban:${name}:${id}` : `kanban:${name}`;
+  return id ? { key: `kanban:${name}:${id}`, scope: 'object' } : { key: `kanban:${name}`, scope: 'kind' };
 }
 
 function parseMcpStartRepos(args: Record<string, unknown>): RepoStartInput[] | null {
@@ -96,6 +99,7 @@ export function makeKanbanMcpHandler({
     const summary = summarizeMcp(tool.name, args);
     const isCreate = /create/i.test(tool.name);
     const isStart = /start_workspace/i.test(tool.name);
+    const { key: batchKey, scope: batchScope } = batchKeyForMcp(tool.name, args);
     return runGatedWrite({
       kind: 'kanban',
       summary,
@@ -106,7 +110,8 @@ export function makeKanbanMcpHandler({
       isStart,
       urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
       title: typeof args.title === 'string' ? args.title : '',
-      batchKey: batchKeyForMcp(tool.name, args),
+      batchKey,
+      batchScope,
       destructive: isDestructive(tool.name),
       prepare: isStart ? () => prepareMcpStartArgs(args, kanbanUrl, ctx?.signal) : undefined,
       execute: async () => {

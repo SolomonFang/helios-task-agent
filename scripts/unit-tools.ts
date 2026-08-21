@@ -3,7 +3,7 @@
  * 单会话创建上限跨工具闭包重建存活、clearHistory 显式重置；
  * hk_cli 脚本用户目录优先、包内兜底；MCP start_workspace 确认卡片 detail
  * 展示前置补全后的最终参数；SourceRegistry 按 mtime 缓存盘上解析结果；
- * hk_cli/lark_cli 批量免问 key 绑定操作对象 id；hk 创建标题跳过 flag 取值；
+ * hk_cli/lark_cli 批量免问 key 分级（启动类级、其余绑定操作对象 id）；hk 创建标题跳过 flag 取值；
  * MCP 非法工具名跳过注册；localToolSummary 按 memory 启用标志拼接。
  * 运行：tsx scripts/unit-tools.ts
  */
@@ -217,45 +217,49 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- hk_cli batchKey：start/stop/approve/deny/follow-up 绑定 argv[1] 对象 id ----------
-  await checkAsync('hk_cli 批量免问 key：start/stop/approve/deny/follow-up 均绑定操作对象 id', async () => {
+  // ---------- hk_cli batchKey：start/create-and-start 类级免问；stop/approve/deny/follow-up 对象级 ----------
+  await checkAsync('hk_cli 批量免问 key：start 类级（不同任务同 key），stop/approve/deny/follow-up 绑定操作对象 id', async () => {
     const tmp = tmpHome('hkkey');
     try {
-      const keys: Array<string | undefined> = [];
+      const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
       const { handlers } = buildTools({
         mcp: null,
         kanbanUrl: KANBAN_URL,
         registry: new SourceRegistry(tmp),
         auditHome: tmp,
         confirm: async (req) => {
-          keys.push(req.batchKey);
+          seen.push({ batchKey: req.batchKey, batchScope: req.batchScope });
           return false; // 闸门即拒，不真正执行子进程
         },
       });
       const hk = handlers.get('hk_cli')!;
       const taskA = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      const taskB = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
       const repoB = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
       const wsA = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
       const apA = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
       // --branch 已带：start 前置补全直接放行（无需 HTTP），确认闸门先于执行
       await hk({ args: ['start', taskA, '--repo', repoB, '--branch', 'dev'] });
+      await hk({ args: ['start', taskB, '--branch', 'dev'] });
       await hk({ args: ['stop', wsA] });
       await hk({ args: ['approve', apA] });
       await hk({ args: ['deny', apA] });
       await hk({ args: ['follow-up', taskA, '继续'] });
-      // sub 本身含 argv[1]（既有格式），对象 id 再经 extractUuid(argv[1]) 绑定一次
       assert.deepEqual(
-        keys,
+        seen,
         [
-          `hk:start ${taskA}:${taskA}`, // 绑定任务 id，不得被 --repo 的 repo id 抢占
-          `hk:stop ${wsA}:${wsA}`,
-          `hk:approve ${apA}:${apA}`,
-          `hk:deny ${apA}:${apA}`,
-          `hk:follow-up ${taskA}:${taskA}`,
+          // 启动类级免问：不同任务同 key，批量启动工作区不再逐次弹确认；key 不含 --repo 的 repo id
+          { batchKey: 'hk:start', batchScope: 'kind' },
+          { batchKey: 'hk:start', batchScope: 'kind' },
+          // sub 本身含 argv[1]（既有格式），对象 id 再经 extractUuid(argv[1]) 绑定一次
+          { batchKey: `hk:stop ${wsA}:${wsA}`, batchScope: 'object' },
+          { batchKey: `hk:approve ${apA}:${apA}`, batchScope: 'object' },
+          { batchKey: `hk:deny ${apA}:${apA}`, batchScope: 'object' },
+          { batchKey: `hk:follow-up ${taskA}:${taskA}`, batchScope: 'object' },
         ],
-        `实际 keys=${JSON.stringify(keys)}`,
+        `实际 seen=${JSON.stringify(seen)}`,
       );
-      assert.ok(!keys[0]!.includes(repoB), `start 的 key 不得绑到 --repo id: ${keys[0]}`);
+      assert.ok(!seen[0]!.batchKey!.includes(repoB), `start 的 key 不得绑到 --repo id: ${seen[0]!.batchKey}`);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

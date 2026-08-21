@@ -16,8 +16,16 @@ export interface ConfirmRequest {
    * Batch approval key: all write ops carry one（所有确认卡片都提供「同类免问」）;
    * an approval is remembered for the rest of the session and subsequent
    * requests with the same key skip re-asking.
+   * key 粒度分两档（见 batchScope）：类级（工具名成类）与对象级（工具名 + 对象 id 成类）。
    */
   batchKey?: string;
+  /**
+   * 「同类免问」粒度：'kind' = 同类操作本会话内都免问（启动/创建类——不改写既有对象，
+   * 批量操作是高频用法）；'object' = 仅同一对象的同类操作免问（删除/取消/停止/审批/更新等，
+   * 防止「批准删 A」被借授权删任意对象）。缺省按 'kind' 处理——仅影响卡片/回执文案，
+   * 免问匹配完全由 batchKey 决定。
+   */
+  batchScope?: 'kind' | 'object';
   /**
    * 破坏性/高影响操作（删除/取消/停止/审批/启动/归档/合并/推送/执行、飞书写、
    * 记忆写、技能脚本）：确认超时放宽到 300s（决策成本高）。与 batchKey 解耦——
@@ -46,6 +54,16 @@ export function kindLabel(kind: string): string {
   if (kind === 'memory') return '记忆';
   if (kind === 'skill') return '技能脚本';
   return kind;
+}
+
+/** 免问粒度措辞：'object' → 「同对象」；其余（含缺省）→ 「同类」。卡片按钮/提示与文本应答词共用。 */
+export function batchScopeWord(scope: ConfirmRequest['batchScope']): string {
+  return scope === 'object' ? '同对象' : '同类';
+}
+
+/** 「同类免问」批准回执正文：对象级须明说「该对象的同类」，避免用户误以为整个类都免问。 */
+export function batchAckText(scope: ConfirmRequest['batchScope']): string {
+  return scope === 'object' ? '该对象的同类写操作本会话内免问' : '同类写操作本会话内免问';
 }
 
 /** ConfirmFn 附带「同类免问」查询/撤销能力（「恢复确认」/ `/confirm on` 用）。 */

@@ -7,7 +7,7 @@
  * 与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发。
  */
 
-import { kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
+import { batchScopeWord, kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
 import { WATCH_HINT_DONE, WATCH_HINT_FAILED, type WatchEvent, type WatchEventKind } from '../kanban/watcher';
 import { statusLabel } from '../kanban/summary';
 import { isLoopbackUrl } from '../infra/url-utils';
@@ -49,7 +49,8 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   if (req.batchKey) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '🔁 同类免问（本会话）' },
+      // 粒度如实标注：对象级免问（删除/审批等）只说「同对象」，避免用户误以为整个类都放行
+      text: { tag: 'plain_text', content: `🔁 ${batchScopeWord(req.batchScope)}免问（本会话）` },
       value: { hta_confirm: id, decision: 'batch' },
     });
   }
@@ -61,7 +62,7 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   });
   // 精简版注脚：有效期与文本回复方式合并为一行（操作类型已在标题体现，不再单列 fields）
   const replyHint = req.batchKey
-    ? `${timeoutSec} 秒内有效 · 回复「确认」/「同类免问」/「取消」`
+    ? `${timeoutSec} 秒内有效 · 回复「确认」/「${batchScopeWord(req.batchScope)}免问」/「取消」`
     : `${timeoutSec} 秒内有效 · 回复「确认」/「取消」`;
   return {
     config: baseCardConfig(),
@@ -90,7 +91,7 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     },
     batch: {
       template: 'green',
-      title: `🔁 ${kindText} · 写操作已批准（同类免问 · 本会话）`,
+      title: `🔁 ${kindText} · 写操作已批准（${batchScopeWord(req.batchScope)}免问 · 本会话）`,
       note: '回复「恢复确认」可随时撤销免问；重启后自动失效。',
     },
     denied: {

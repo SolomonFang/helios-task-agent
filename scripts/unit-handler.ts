@@ -466,6 +466,13 @@ async function main(): Promise<void> {
       assert.equal(await v2, 'batch');
       assert.ok(f.channel.replies.at(-1)!.text.includes('同类写操作本会话内免问'));
 
+      // 对象级免问的回执须如实说「该对象的同类」，不得让用户误以为整个类都放行
+      const objReq: ConfirmRequest = { kind: 'kanban', summary: '删除任务', detail: 'delete_task x', batchKey: 'del:x', batchScope: 'object' };
+      const v2b = f.confirmations.request('u1', objReq);
+      await f.handlers.handle(mkMsg('u1', '同对象免问'));
+      assert.equal(await v2b, 'batch');
+      assert.ok(f.channel.replies.at(-1)!.text.includes('该对象的同类写操作本会话内免问'), `实际：${f.channel.replies.at(-1)!.text}`);
+
       const v3 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '取消'));
       assert.equal(await v3, false);

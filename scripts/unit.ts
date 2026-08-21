@@ -396,6 +396,32 @@ async function run(): Promise<void> {
     );
   })());
 
+  check('确认卡片：免问按钮与终态标题按粒度广告（类级「同类」/ 对象级「同对象」）', (() => {
+    const btnText = (scope?: 'kind' | 'object'): string => {
+      const card = buildConfirmCard(
+        { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope },
+        'id1',
+        120000,
+      ) as { elements: Array<{ tag: string; actions?: Array<{ text?: { content?: string } }> }> };
+      const action = card.elements.find((e) => e.tag === 'action');
+      return String(action?.actions?.[1]?.text?.content ?? '');
+    };
+    const resolvedTitle = (scope?: 'kind' | 'object'): string => {
+      const card = buildResolvedCard(
+        { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope },
+        'batch',
+      ) as { header: { title: { content: string } } };
+      return card.header.title.content;
+    };
+    return (
+      btnText('kind').includes('同类免问') &&
+      btnText(undefined).includes('同类免问') && // 缺省按类级文案（与既有行为一致）
+      btnText('object').includes('同对象免问') &&
+      resolvedTitle('object').includes('同对象免问') &&
+      resolvedTitle('kind').includes('同类免问')
+    );
+  })());
+
   // ---------- llm：history 修剪与修复 ----------
   check('trimHistory 保留 system、边界无孤儿 tool', (() => {
     const messages: ChatMessage[] = [{ role: 'system', content: 'sys' }];
@@ -2000,7 +2026,7 @@ async function run(): Promise<void> {
   });
 
   // ---------- 闸门 batchKey：所有写操作都可同类免问；破坏性操作仍标记 destructive ----------
-  await checkAsync('闸门 batchKey：create/start/approve/delete 均带 batchKey，破坏性操作带 destructive 标记', async () => {
+  await checkAsync('闸门 batchKey：create/start 类级免问，approve/delete/stop 对象级免问；破坏性操作带 destructive 标记', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-batchkey-'));
     const fakeMcp = {
       connected: true,
@@ -2013,12 +2039,12 @@ async function run(): Promise<void> {
       ],
       callTool: async () => '{"success":true}',
     } as unknown as KanbanMcp;
-    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
+    const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
       mcp: fakeMcp,
       kanbanUrl: 'http://localhost:1',
       confirm: async (req) => {
-        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
+        seen.push({ batchKey: req.batchKey, batchScope: req.batchScope, destructive: req.destructive });
         return 'once';
       },
       registry: new SourceRegistry(tmp),
@@ -2026,17 +2052,20 @@ async function run(): Promise<void> {
     });
     await handlers.get('kanban_create_task')!({ title: 't' });
     await handlers.get('kanban_start_workspace')!({ task_id: 'x' });
+    await handlers.get('kanban_start_workspace')!({ task_id: 'y' });
     await handlers.get('kanban_approve')!({ approval_id: 'a' });
     await handlers.get('kanban_delete_task')!({ task_id: 'x' });
     await handlers.get('kanban_stop_workspace')!({ workspace_id: 'w' });
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.deepEqual(seen, [
-      { batchKey: 'kanban:create_task', destructive: false },
-      { batchKey: 'kanban:start_workspace:x', destructive: true },
-      // approval_id / workspace_id 必须进 key：否则免问退化成类级放行（批准任意审批/停任意工作区）
-      { batchKey: 'kanban:approve:a', destructive: true },
-      { batchKey: 'kanban:delete_task:x', destructive: true },
-      { batchKey: 'kanban:stop_workspace:w', destructive: true },
+      { batchKey: 'kanban:create_task', batchScope: 'kind', destructive: false },
+      // 启动类级免问：不同 task_id 同 key——「同类免问」后批量启动工作区不再逐次弹确认
+      { batchKey: 'kanban:start_workspace', batchScope: 'kind', destructive: true },
+      { batchKey: 'kanban:start_workspace', batchScope: 'kind', destructive: true },
+      // approval_id / workspace_id / task_id 必须进 key：否则免问退化成类级放行（批准任意审批/删任意任务）
+      { batchKey: 'kanban:approve:a', batchScope: 'object', destructive: true },
+      { batchKey: 'kanban:delete_task:x', batchScope: 'object', destructive: true },
+      { batchKey: 'kanban:stop_workspace:w', batchScope: 'object', destructive: true },
     ]);
   });
 
@@ -3060,12 +3089,12 @@ async function run(): Promise<void> {
       ],
       callTool: async () => '{"success":true}',
     } as unknown as KanbanMcp;
-    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
+    const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
       mcp: fakeMcp,
       kanbanUrl: 'http://localhost:1',
       confirm: async (req) => {
-        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
+        seen.push({ batchKey: req.batchKey, batchScope: req.batchScope, destructive: req.destructive });
         return 'once';
       },
       registry: new SourceRegistry(tmp),
@@ -3075,19 +3104,19 @@ async function run(): Promise<void> {
     await handlers.get('kanban_create_task')!({ title: 't' });
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.deepEqual(seen, [
-      { batchKey: 'kanban:archive_task:x', destructive: true },
-      { batchKey: 'kanban:create_task', destructive: false },
+      { batchKey: 'kanban:archive_task:x', batchScope: 'object', destructive: true },
+      { batchKey: 'kanban:create_task', batchScope: 'kind', destructive: false },
     ]);
   });
 
   await checkAsync('闸门 batchKey：lark 写操作按命令路径 + 对象归类（可同类免问）并标记破坏性', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-larkbatch-'));
-    const seen: Array<{ batchKey: string | undefined; destructive: boolean | undefined }> = [];
+    const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
       mcp: null,
       kanbanUrl: 'http://localhost:1',
       confirm: async (req) => {
-        seen.push({ batchKey: req.batchKey, destructive: req.destructive });
+        seen.push({ batchKey: req.batchKey, batchScope: req.batchScope, destructive: req.destructive });
         return false; // 闸门即拒，不真正执行 lark-cli 子进程
       },
       registry: new SourceRegistry(tmp),
@@ -3097,8 +3126,8 @@ async function run(): Promise<void> {
     await handlers.get('lark_cli')!({ args: ['task', 'create', 't'] });
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.deepEqual(seen, [
-      { batchKey: 'lark:im send:ou_x', destructive: true },
-      { batchKey: 'lark:task create:t', destructive: true },
+      { batchKey: 'lark:im send:ou_x', batchScope: 'object', destructive: true },
+      { batchKey: 'lark:task create:t', batchScope: 'object', destructive: true },
     ]);
   });
 
@@ -3110,6 +3139,7 @@ async function run(): Promise<void> {
       CONFIRM_YES_RE.test('执行') &&
       CONFIRM_YES_RE.test('y') &&
       CONFIRM_BATCH_RE.test('同类免问') &&
+      CONFIRM_BATCH_RE.test('同对象免问') && // 对象级免问的应答词（卡片按粒度广告）
       CONFIRM_BATCH_RE.test('批量允许') &&
       CONFIRM_BATCH_RE.test('都允许') &&
       CONFIRM_BATCH_RE.test('以后都') &&

@@ -30,7 +30,7 @@ export function makeMemoryHandlers({
     const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
     const detail = summarizeBothEnds(`memory_set(key=${key.trim()}, value=${value})`);
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:set', destructive: true },
+      { kind: 'memory', summary, detail, batchKey: 'memory:set', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {
@@ -70,7 +70,7 @@ export function makeMemoryHandlers({
     const summary = `删除记忆「${key}」`;
     const detail = `memory_delete(key=${key})`;
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:delete', destructive: true },
+      { kind: 'memory', summary, detail, batchKey: 'memory:delete', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {
@@ -95,7 +95,7 @@ export function makeMemoryHandlers({
     const summary = `追加记忆备注：${text.slice(0, 100)}`;
     const detail = summarizeBothEnds(`memory_note(text=${text})`);
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:note', destructive: true },
+      { kind: 'memory', summary, detail, batchKey: 'memory:note', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {

@@ -29,7 +29,8 @@ export function makeLarkCliHandler({
       const target = argv.slice(sub ? 2 : 1).find((a) => !a.startsWith('-'));
       const batchKey = target ? `lark:${argv[0]}${sub}:${target}` : `lark:${argv[0]}${sub}`;
       const gate = await passGate(
-        { kind: 'lark', summary, detail, batchKey, destructive: true },
+        // 对象级免问：key 绑接收对象/资源 id，批准发给 ou_x 不授权发给 ou_y
+        { kind: 'lark', summary, detail, batchKey, batchScope: 'object', destructive: true },
         confirm,
       );
       if (!gate.allowed) {

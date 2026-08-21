@@ -23,7 +23,7 @@ import {
   TRY_EXAMPLES,
 } from './commands';
 import { CONFIRM_BATCH_RE, CONFIRM_YES_RE } from './agent/confirm';
-import { kindLabel, type ConfirmFn } from './agent/guard';
+import { batchAckText, batchScopeWord, kindLabel, type ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
 
@@ -323,7 +323,9 @@ export async function main(): Promise<void> {
     console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.destructive ? 300000 : 120000;
-    const options = req.batchKey ? 'y=仅此次 / 免问=同类免问（本会话） / N=取消' : 'y=仅此次 / N=取消';
+    const options = req.batchKey
+      ? `y=仅此次 / 免问=${batchScopeWord(req.batchScope)}免问（本会话） / N=取消`
+      : 'y=仅此次 / N=取消';
     for (;;) {
       const ans = await askWithAbort(
         c.warn(`允许执行？【${options}】（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
@@ -343,7 +345,7 @@ export async function main(): Promise<void> {
       const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
       const once = !batch && CONFIRM_YES_RE.test(t);
       if (batch) {
-        console.log(c.ok('已批准；同类写操作本会话内免问（/confirm revoke 撤销）。'));
+        console.log(c.ok(`已批准；${batchAckText(req.batchScope)}（/confirm revoke 撤销）。`));
         return 'batch';
       }
       if (once) {

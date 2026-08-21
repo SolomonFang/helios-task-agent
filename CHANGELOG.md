@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 「同类免问」粒度分级：启动/创建类看板操作（`start_workspace*`、`hk start`/`create-and-start`）从「绑定任务标识」改为按工具成类——此前点「同类免问」后批量启动多个任务的工作区仍逐个弹确认（每个 task_id 各成一个 key），与按钮文案的「同类」预期不符；现启动类点一次免问，本会话内同类操作都放行。删除/取消/停止/审批/更新等保持对象级绑定（防止借一次授权改任意对象）；确认卡片按钮、终态标题与批准回执按粒度如实区分文案（类级「同类免问」/ 对象级「同对象免问」），文本应答词表同步新增「同对象免问」（`src/agent/tools/kanban-mcp.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/guard.ts`、`src/agent/confirm.ts`、`src/channels/feishu-cards.ts`）
+
 ### Security
 
 - lark-cli 写闸门补齐本地落盘 flag：`classifyLark` 此前只看命令动词，携带 `--output`/`-o`/`--output-dir` 的读动词命令（`api GET …/download --output <路径>`、`drive +version-get --output …`、`markdown +fetch --output …`）被误判为 read、不经确认直接执行，可被提示注入诱导覆盖任意本地文件；现命中落盘 flag 一律判写（`src/agent/guard.ts`）
