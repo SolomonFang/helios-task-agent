@@ -357,7 +357,7 @@ async function main() {
     check(
       'repoFsGrep ReDoS 防护：嵌套量词与超长 pattern 拒绝',
       (await repoFsGrep(root, '(\\w+)+$')).includes('参数错误') &&
-        (await repoFsGrep(root, 'a'.repeat(201))).includes('pattern 过长') &&
+        (await repoFsGrep(root, 'a'.repeat(201))).includes('搜索表达式过长') &&
         (await repoFsGrep(root, 'token')).includes('app.ts'),
     );
     check(
@@ -368,8 +368,8 @@ async function main() {
     );
     check(
       'repoFsGrep ReDoS 防护不误伤：字符类内 .* 字面量与非相邻量词段放行',
-      (await repoFsGrep(root, '[.*]')).includes('pattern: [.*]') && // 未被拒即放行（输出头含原 pattern）
-        (await repoFsGrep(root, 'a.*b.*c')).includes('pattern: a.*b.*c'),
+      (await repoFsGrep(root, '[.*]')).includes('搜索表达式：[.*]') && // 未被拒即放行（输出头含原 pattern）
+        (await repoFsGrep(root, 'a.*b.*c')).includes('搜索表达式：a.*b.*c'),
     );
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -569,7 +569,7 @@ async function main() {
       looksLikeStrongFailure('命令执行失败: exit 1') && // 真失败：串首（run() 子进程失败）
       looksLikeStrongFailure('已创建 1 个任务\nHTTP 502 Bad Gateway') && // 真失败：多行输出某行行首
       looksLikeStrongFailure('看板工具 create_task 调用失败: boom') && // 带前缀的真实失败（unit.ts 同形态）
-      looksLikeStrongFailure('工具 hk_cli 执行异常: spawn fail'), // 带前缀的真实失败（llm.ts 同形态）
+      looksLikeStrongFailure('工具调用失败: spawn fail'), // llm.ts 工具异常的行首形态（正则同步维护）
   );
 
   // ---------- 闸门文案：被新写操作顶掉的确认返回「被替代」而非「用户拒绝」 ----------

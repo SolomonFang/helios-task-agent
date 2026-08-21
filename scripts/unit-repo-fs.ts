@@ -194,8 +194,8 @@ async function main(): Promise<void> {
       fs.writeFileSync(path.join(root, 'a.txt'), 'abc\n');
       assert.ok((await repoFsGrep(root, '(\\w+)+$')).includes('嵌套量词'));
       assert.ok((await repoFsGrep(root, '.*.*.*b')).includes('连续相邻的量词段'));
-      assert.ok((await repoFsGrep(root, 'a'.repeat(201))).includes('pattern 过长'));
-      assert.ok((await repoFsGrep(root, '[')).includes('无效正则'));
+      assert.ok((await repoFsGrep(root, 'a'.repeat(201))).includes('搜索表达式过长'));
+      assert.ok((await repoFsGrep(root, '[')).includes('不是有效的正则表达式'));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

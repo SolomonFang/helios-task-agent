@@ -54,8 +54,8 @@ function groupByStatus(tasks: WorkSummaryTask[]): Array<{ status: string; meta: 
 function diffStatsLine(t: WorkSummaryTask): string {
   const parts: string[] = [];
   if (t.filesChanged !== undefined) parts.push(`${t.filesChanged} 个文件`);
-  if (t.additions !== undefined) parts.push(`+${t.additions}`);
-  if (t.deletions !== undefined) parts.push(`-${t.deletions}`);
+  if (t.additions !== undefined) parts.push(`+${t.additions} 行`);
+  if (t.deletions !== undefined) parts.push(`-${t.deletions} 行`);
   return parts.join('，');
 }
 
@@ -79,6 +79,14 @@ function truncationNote(data: WorkSummaryData): string | null {
   return full > data.tasks.length ? `仅展示最近 ${data.tasks.length} 条，共 ${full} 条` : null;
 }
 
+/**
+ * 概览统计口径标注：状态计数覆盖全量任务，而改动文件/增删行只统计了清单样本
+ * （见 kanban/summary.ts 截断逻辑）；截断发生时口径不一，必须在概览注明。
+ */
+function sampleStatsNote(data: WorkSummaryData): string | null {
+  return truncationNote(data) ? `改动文件与增删行仅统计最近 ${data.tasks.length} 条` : null;
+}
+
 export function renderMarkdown(data: WorkSummaryData): string {
   const { totals } = data;
   const lines: string[] = [
@@ -91,8 +99,10 @@ export function renderMarkdown(data: WorkSummaryData): string {
     '| 完成 | 待审阅 | 进行中 | 待办 | 已取消 | 改动文件 | 新增行 | 删除行 |',
     '| --- | --- | --- | --- | --- | --- | --- | --- |',
     `| ${totals.done} | ${totals.inreview} | ${totals.inprogress} | ${totals.todo} | ${totals.cancelled} | ${totals.filesChanged} | +${totals.additions} | -${totals.deletions} |`,
-    '',
   ];
+  const sampleNote = sampleStatsNote(data);
+  if (sampleNote) lines.push('', `> ${sampleNote}`);
+  lines.push('');
   for (const group of groupByStatus(data.tasks)) {
     lines.push(`## ${group.meta.emoji} ${group.meta.label}（${group.tasks.length}）`, '');
     for (const t of group.tasks) {
@@ -133,8 +143,8 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   }
   const stats: string[] = [];
   if (t.filesChanged !== undefined) stats.push(`改动 ${t.filesChanged} 个文件`);
-  if (t.additions !== undefined) stats.push(`<span class="plus">+${t.additions}</span>`);
-  if (t.deletions !== undefined) stats.push(`<span class="minus">-${t.deletions}</span>`);
+  if (t.additions !== undefined) stats.push(`<span class="plus">+${t.additions} 行</span>`);
+  if (t.deletions !== undefined) stats.push(`<span class="minus">-${t.deletions} 行</span>`);
   if (stats.length) parts.push(`<p class="changes">${stats.join(' · ')}</p>`);
   if (t.changedFiles?.length) {
     const chips = t.changedFiles
@@ -242,16 +252,17 @@ export function renderHtml(data: WorkSummaryData): string {
     ? sections.join('\n')
     : '<p class="empty">该范围内没有匹配的任务。</p>';
   const note = truncationNote(data);
+  const sampleNote = sampleStatsNote(data);
   return renderReportPage({
     title: `工作总结 · ${escapeHtml(data.sinceLabel)}`,
     css: SUMMARY_PAGE_CSS,
     body: `  <header class="hero">
     <h1>工作总结</h1>
     <p class="subtitle">${escapeHtml(data.sinceLabel)}</p>
-    <p class="gen">生成时间 ${escapeHtml(formatGeneratedAt(data.generatedAt))}</p>
+    <p class="gen">生成时间：${escapeHtml(formatGeneratedAt(data.generatedAt))}</p>
   </header>
   <section class="stats">
-    ${htmlStatCard(String(totals.done), '完成任务')}
+    ${htmlStatCard(String(totals.done), '完成')}
     ${htmlStatCard(String(totals.inreview), '待审阅')}
     ${htmlStatCard(String(totals.inprogress), '进行中')}
     ${htmlStatCard(String(totals.todo), '待办')}
@@ -259,7 +270,7 @@ export function renderHtml(data: WorkSummaryData): string {
     ${htmlStatCard(String(totals.filesChanged), '改动文件')}
     ${htmlStatCard(`+${totals.additions}`, '新增行', 'add')}
     ${htmlStatCard(`-${totals.deletions}`, '删除行', 'del')}
-  </section>
+  </section>${sampleNote ? `\n  <p class="trunc-note">${escapeHtml(sampleNote)}</p>` : ''}
   ${body}${note ? `\n  <p class="trunc-note">${escapeHtml(note)}</p>` : ''}`,
   });
 }
@@ -327,18 +338,21 @@ export function summarizeForChat(
       // 可达性与飞书卡片同一口径：仅 loopback 才是「仅本机可达」，否则按所在网络可达表述
       lines.push(
         isLoopbackUrl(url)
-          ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，重启后链接失效）'
-          : '（链接仅本机所在网络可达；报告保留 30 天，重启后链接失效）',
+          ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，机器人重启后链接失效）'
+          : '（链接仅本机所在网络可达；报告保留 30 天，机器人重启后链接失效）',
       );
     } else {
       lines.push(`- HTML：${paths.htmlPath}`);
     }
   }
-  if (paths.mdPath) lines.push(`- Markdown：${paths.mdPath}`);
+  // bot 场景用户够不到部署机文件系统，md 本机路径不推给飞书用户；CLI 场景保留
+  if (paths.mdPath && !opts.linkBaseUrl) lines.push(`- Markdown：${paths.mdPath}`);
+  const sampleNote = sampleStatsNote(data);
   lines.push(
     '',
     `概览：完成 ${totals.done} · 待审阅 ${totals.inreview} · 进行中 ${totals.inprogress} · 待办 ${totals.todo} · 已取消 ${totals.cancelled}` +
-      ` · 改动文件 ${totals.filesChanged} · +${totals.additions} 行 / -${totals.deletions} 行`,
+      ` · 改动文件 ${totals.filesChanged} · +${totals.additions} 行 / -${totals.deletions} 行` +
+      (sampleNote ? `（${sampleNote}）` : ''),
   );
   for (const t of data.tasks.slice(0, 5)) {
     lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '（无标题）'}`);

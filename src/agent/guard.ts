@@ -61,8 +61,15 @@ export function batchScopeWord(scope: ConfirmRequest['batchScope']): string {
   return scope === 'object' ? '同对象' : '同类';
 }
 
-/** 「同类免问」批准回执正文：对象级须明说「该对象的同类」，避免用户误以为整个类都免问。 */
-export function batchAckText(scope: ConfirmRequest['batchScope']): string {
+/**
+ * 「同类免问」批准回执正文：按操作类别（kind）细化「对象」指代——lark 的对象是接收人、
+ * 看板是任务/审批、技能是脚本+参数，跨场景通稿会让用户误解免问范围。未传 kind 时回退
+ * 通用措辞；对象级须明说「该对象的同类」，避免用户误以为整个类都免问。
+ */
+export function batchAckText(scope: ConfirmRequest['batchScope'], kind?: ConfirmKind): string {
+  if (kind === 'lark') return '发往同一接收人的同类操作本会话内免问';
+  if (kind === 'kanban' || kind === 'hk') return '对同一任务/审批的同类操作本会话内免问';
+  if (kind === 'skill') return '同一脚本同一参数本会话内免问';
   return scope === 'object' ? '该对象的同类写操作本会话内免问' : '同类写操作本会话内免问';
 }
 
@@ -297,10 +304,10 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
  */
 const STRONG_FAILURE_RE = /^错误|⏹ 已中断|permission denied/i;
 // 行首锚定的中文失败形态（m 标志：任一行的行首）——真实失败输出均以这些形态起行：
-// run() 子进程失败「命令执行失败：…」（tools/shared.ts）、看板写失败「看板工具 xxx 调用失败：…」
-// （tools/kanban-mcp.ts）、handler 异常「工具 xxx 执行异常：…」（llm.ts）。与串首锚定的
+// run() 子进程失败「命令执行失败：…」（tools/shared.ts）、看板写失败「…调用失败：…」
+// （tools/kanban-mcp.ts）、handler 异常「工具调用失败：…」（llm.ts）。与串首锚定的
 // ^错误 分开：m 标志会把 ^错误 放宽成行首匹配（成功输出的正文行可能以「错误」开头）。
-const STRONG_FAILURE_LINE_ZH_RE = /^(?:命令执行失败|调用失败|执行异常|HTTP \d{3}\b|(?:看板)?工具 \S+ (?:调用失败|执行异常))/im;
+const STRONG_FAILURE_LINE_ZH_RE = /^(?:命令执行失败|工具调用失败|调用失败|执行异常|HTTP \d{3}\b|(?:看板)?工具 \S+ (?:调用失败|执行异常))/im;
 // 行首锚定的英文失败形态（m 标志：任一行的行首，可带 error: 前缀）。
 const STRONG_FAILURE_LINE_RE = /^(?:error[:：]\s*)?(?:api error|denied|not found)\b/im;
 

@@ -10,6 +10,22 @@
 
 - 「同类免问」粒度分级：启动/创建类看板操作（`start_workspace*`、`hk start`/`create-and-start`）从「绑定任务标识」改为按工具成类——此前点「同类免问」后批量启动多个任务的工作区仍逐个弹确认（每个 task_id 各成一个 key），与按钮文案的「同类」预期不符；现启动类点一次免问，本会话内同类操作都放行。删除/取消/停止/审批/更新等保持对象级绑定（防止借一次授权改任意对象）；确认卡片按钮、终态标题与批准回执按粒度如实区分文案（类级「同类免问」/ 对象级「同对象免问」），文本应答词表同步新增「同对象免问」（`src/agent/tools/kanban-mcp.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/guard.ts`、`src/agent/confirm.ts`、`src/channels/feishu-cards.ts`）
 
+## [1.0.29] - 2026-08-19
+
+### Changed
+
+- helios-kanban 默认包规格改回 `helios-kanban@latest` 跟随最新版（不再默认钉版本）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖为指定版本（`src/infra/deps.ts`）
+
+## [1.0.28] - 2026-08-19
+
+仅版本号发布（附单测断言修正），无行为变更。
+
+## [1.0.27] - 2026-08-19
+
+### Changed
+
+- 单会话创建上限由 10 个提升至 50 个（`src/agent/tools/gated-write.ts`）
+
 ### Security
 
 - lark-cli 写闸门补齐本地落盘 flag：`classifyLark` 此前只看命令动词，携带 `--output`/`-o`/`--output-dir` 的读动词命令（`api GET …/download --output <路径>`、`drive +version-get --output …`、`markdown +fetch --output …`）被误判为 read、不经确认直接执行，可被提示注入诱导覆盖任意本地文件；现命中落盘 flag 一律判写（`src/agent/guard.ts`）
@@ -35,9 +51,28 @@
 - 杂项：群 @ 回执冷却写入前移至发送前（并发同群 @ 不再重复发指引，失败回补不耗额度）；AI 审查卡片注脚按报告地址是否回环区分「仅本机」/「本机所在网络」（与 watch 卡片同口径）；晨报底部引导语在未配置迭代时明确「全部迭代」范围（与 agent 默认 today 的口径对齐）；e2e-mock 的 lark-cli 断言与 smoke 同口径（不绑死外部 CLI 输出格式）（`src/channels/feishu.ts`、`src/channels/feishu-cards.ts`、`src/bot/daily-brief.ts`、`scripts/e2e-mock.ts`）
 - 测试与发布链路：`verify` 的 smoke/e2e 启用 `HTA_REQUIRE_E2E=1` 严格模式（发布机器缺 lark-cli 时 e2e 不再静默 SKIP 假绿）；unit-coverage 信号用例的 `healthSeen` 加 30s 超时与子进程提前退出监听（cli 启动回归时 npm test 不再永久挂死）；deps 三态用例的「已授权」模拟从 NODE_OPTIONS 注入改为 shebang 脚本（适配探测最小环境）（`package.json`、`scripts/unit-coverage.ts`、`scripts/unit.ts`）
 
+## [1.0.26] - 2026-08-12
+
+### Fixed
+
+- agent 全面审查的一批修复（确认状态机、记忆、会话存储、`repo_fs`、技能契约等模块的边界与稳健性）与飞书卡片过大问题
+
+## [1.0.25] - 2026-08-11
+
 ### Changed
 
-- helios-kanban 默认包规格改回 `helios-kanban@latest` 跟随最新版（不再默认钉版本）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖为指定版本（`src/infra/deps.ts`）
+- AI 审查的 `--background` 需求上下文并入所属任务描述（上限 2000 字符，取不到时静默兜底为空）（`src/kanban/ai-review.ts`）
+
+## [1.0.24] - 2026-08-11
+
+### Fixed
+
+- 来源查重注册表（SourceRegistry）解析修正与测试补强（`src/agent/source-registry.ts`）
+
+## [1.0.23] - 2026-08-11
+
+### Changed
+
 - 「同类免问」覆盖全部写操作：此前破坏性看板操作（删除/取消/停止/审批/启动/归档/合并/推送/执行）、飞书写、记忆写、技能脚本一律逐次确认，确认卡片无「同类免问」按钮；现所有写操作都带 batchKey（看板/hk 绑定工具名+对象 id，lark 按命令路径如 `lark:im send`，技能脚本按 `skill:<名>/<脚本>`，记忆按 set/delete/note 分动作），所有确认卡片均可「同类免问」；破坏性判定改由 `ConfirmRequest.destructive` 承载（`guard.isBatchable` 更名 `isDestructive`），仅用于确认超时分级（300s vs 120s），不再影响免问资格
 - 轮次内插入独立消息时的最终回复时序（bot）：确认卡片/超时提示等独立消息插在进度占位之后时，最终回复不再原地编辑占位（飞书编辑不改变消息位置，完成消息会停在卡片上方、时序颠倒），占位收尾为「✅ 已完成，结果见下方 ⬇️」，正文改发新消息落在时间线末尾；无插入消息时仍原地替换占位（见 `src/bot/handler.ts` 的 `RoundNoticeTracker` 与 `deliverReply` interleaved 分支）
 - SourceRegistry 按文件 mtime 缓存解析结果，来源去重检查不再每次全量读盘；会话历史落盘改异步（串行队列，原子写/0600 语义不变），目录清理按 60s 节流；watcher 快照每 tick 只序列化一次，比较与写盘复用
@@ -52,7 +87,7 @@
 
 - CLI 启动窗口的信号处理：SIGINT/SIGTERM/异常处理与资源登记移到看板拉起与 MCP 连接之前（此前窗口内 SIGTERM 直接终止并遗留 MCP 孤儿子进程、Ctrl+C 不退出），并补齐此前缺失的 SIGTERM 处理
 - `repo_fs` grep/list/read 异步化：大仓库的同步全树扫描不再阻塞 bot 事件循环（每 100 个文件让出一次），并新增扫描总量上限（5000 文件 / 50MB，截断时输出注明）
-- 单会话创建上限（10 个）不再随 MCP 掉线重连被静默重置：创建计数提升为会话级状态，仅 `/clear` 重置（与「同类免问」授权的生命周期对齐）
+- 单会话创建上限不再随 MCP 掉线重连被静默重置：创建计数提升为会话级状态，仅 `/clear` 重置（与「同类免问」授权的生命周期对齐）
 - MCP start_workspace 的确认卡片/审计按分支补全后的最终参数展示（此前显示补全前旧值，与 hk 路径的惰性求值口径不一致）
 - `hk_cli` 脚本定位与技能系统同口径：用户数据目录的 helios-kanban-remote 覆盖版优先，找不到回退包内脚本（此前 skill_doc 读用户版、hk_cli 却永远执行包内版）
 - CLI 闸门确认因超时/Ctrl+C 中断后，不再吞掉用户在下一个提示符出现前输入的一行

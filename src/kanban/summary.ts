@@ -43,6 +43,8 @@ export interface WorkSummaryTotals {
   inprogress: number;
   todo: number;
   cancelled: number;
+  /** 最近一次 attempt 失败的任务数（与状态计数正交：失败任务可停在任意状态）。 */
+  failed: number;
   filesChanged: number;
   additions: number;
   deletions: number;
@@ -282,6 +284,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     inprogress: 0,
     todo: 0,
     cancelled: 0,
+    failed: 0,
     filesChanged: 0,
     additions: 0,
     deletions: 0,
@@ -293,6 +296,8 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     // totals 还含 filesChanged 等数值键，计数时必须用显式状态键集合判定，不能用 in
     const statusKey = TASK_STATUS_KEYS.find((s) => s === String(row.status || ''));
     if (statusKey) totals[statusKey]++;
+    // 失败标记与状态正交，同循环一并按截断前全量计数
+    if (row.last_attempt_failed) totals.failed++;
   }
   for (const t of tasks) {
     if (t.filesChanged !== undefined) totals.filesChanged += t.filesChanged;

@@ -16,6 +16,11 @@ export interface FeishuVerifyResult {
 
 const OPEN_BASE = 'https://open.feishu.cn';
 
+/** 飞书原始错误 msg/code 是英文，不落用户面；仅 HTA_DEBUG=1 时追加到消息尾部便于排查。 */
+function debugSuffix(json: { code?: number; msg?: string }): string {
+  return process.env.HTA_DEBUG ? `（原始错误：${json.msg || `code=${json.code}`}）` : '';
+}
+
 export async function verifyFeishuApp(appId: string, appSecret: string, timeoutMs = 8000): Promise<FeishuVerifyResult> {
   let token: string;
   try {
@@ -29,7 +34,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0 || !json.tenant_access_token) {
       return {
         ok: false,
-        message: `App ID / App Secret 无效，请到开发者后台 → 凭证与基础信息重新复制。（${json.msg || `code=${json.code}`}）`,
+        message: `App ID / App Secret 无效，请到开发者后台 → 凭证与基础信息重新复制。${debugSuffix(json)}`,
       };
     }
     token = json.tenant_access_token;
@@ -49,7 +54,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0) {
       return {
         ok: false,
-        message: `凭证有效，但「机器人」能力未启用，请到开发者后台 → 应用能力 → 添加「机器人」并发布版本。（${json.msg || `code=${json.code}`}）`,
+        message: `凭证有效，但「机器人」能力未启用，请到开发者后台 → 应用能力 → 添加「机器人」并发布版本。${debugSuffix(json)}`,
       };
     }
     return { ok: true, botName: json.bot?.app_name, message: 'ok' };

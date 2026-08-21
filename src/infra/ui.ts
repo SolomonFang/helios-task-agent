@@ -126,9 +126,16 @@ export function printBanner(status: BannerStatus): void {
     : larkAuthed
       ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
       : c.warn('●') + ' lark-cli         未授权，飞书能力不可用（运行 lark-cli auth login 完成授权）';
+  // 备用通道缺依赖的警示按主通道状态分时态：主通道正常时是「将来没有兜底」，已中断时是「当前不可用」
   const hkLine =
     hkMissing.length > 0
-      ? ['  ' + c.warn('●') + ` 备用通道         缺少 ${hkMissing.join('、')}，MCP 掉线时无法降级（${HK_CLI_INSTALL_HINT}）`]
+      ? [
+          '  ' +
+            c.warn('●') +
+            (status.mcp === 'fail'
+              ? ` 备用通道         缺少 ${hkMissing.join('、')}，看板读写当前不可用，安装后可恢复（${HK_CLI_INSTALL_HINT}）`
+              : ` 备用通道         缺少 ${hkMissing.join('、')}，看板主通道中断时将没有备用通道可用（安装：${HK_CLI_INSTALL_HINT}）`),
+        ]
       : [];
   const lines = [
     '',

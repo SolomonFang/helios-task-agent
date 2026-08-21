@@ -99,7 +99,7 @@ export class KanbanMcp {
 
   /** Liveness probe used by the supervisor (listTools is known to be supported). */
   async ping(): Promise<void> {
-    if (!this.client) throw new Error('MCP 未连接');
+    if (!this.client) throw new Error('看板连接已断开，正在自动重连，请稍后再试');
     // 显式 30s 超时，不依赖 SDK 隐式默认值
     await this.client.listTools(undefined, { timeout: 30000 });
   }
@@ -111,7 +111,7 @@ export class KanbanMcp {
   }
 
   async callTool(name: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
-    if (!this.client) throw new Error('MCP 未连接');
+    if (!this.client) throw new Error('看板连接已断开，正在自动重连，请稍后再试');
     // 显式 60s 超时（与 SDK 默认值一致，但不依赖隐式默认）；调用方 signal 仍可提前中断
     const result = await this.client.callTool(
       { name, arguments: args || {} },
@@ -123,7 +123,7 @@ export class KanbanMcp {
       if (block.type === 'text') return block.text ?? '';
       return JSON.stringify(block);
     });
-    return parts.join('\n') || '(空结果)';
+    return parts.join('\n') || '（空结果）';
   }
 
   async close(): Promise<void> {
@@ -225,14 +225,21 @@ async function sweepOrphanedTree(snapshot: Map<number, string> | null): Promise<
  * MCP 启动失败的已知模式诊断：命中返回给用户看的排查提示，未命中返回 null。
  * 典型场景：本机看板进程运行时间过长，其端口文件（vibe-kanban.port）被系统
  * 清理，MCP 服务启动即退出（Error: No such file or directory），重启看板即恢复。
+ *
+ * opts.fallbackAvailable === false 时（调用方已知 hk_cli 降级链缺 jq/curl）不得
+ * 再宣称「已自动切换为备用通道」——此时备用通道同样不可用，如实告知。
  */
-export function diagnoseMcpFailure(stderrTail: string): string | null {
+export function diagnoseMcpFailure(stderrTail: string, opts?: { fallbackAvailable?: boolean }): string | null {
   if (!stderrTail) return null;
   if (/vibe-kanban\.port|Reading port from/i.test(stderrTail) && /No such file|not found|error/i.test(stderrTail)) {
+    const fallback =
+      opts?.fallbackAvailable === false
+        ? '看板读写暂不可用（备用通道缺少 jq、curl）。'
+        : `当前${MCP_FALLBACK_TEXT}。`;
     return (
       '看板连接失败：看板运行时间过久，其端口记录文件可能已被系统清理。' +
-      '退出并重新运行本程序即可恢复（会同时重启看板）' +
-      `（当前${MCP_FALLBACK_TEXT}）。`
+      '退出并重新运行本程序即可恢复（会同时重启看板）。' +
+      fallback
     );
   }
   return null;
@@ -253,10 +260,17 @@ export interface McpBootResult {
  * onCreate：实例一创建（connect 发起前）即同步回调。连接窗口最长 45s，期间收到退出
  * 信号时调用方若等 resolve 才登记清理，in-flight 的 stdio 子进程会成孤儿——参照
  * kanban 的 onSpawn 模式，创建即登记（配合 KanbanMcp 的 closePending 兜底关闭）。
+ *
+ * fallbackAvailable：调用方已知 hk_cli 备用通道缺依赖（jq/curl）时传 false，
+ * 诊断提示不再宣称「已自动切换为备用通道」。
  */
 export async function connectMcp(
   cfg: { mcpCommand: string; mcpArgs: string[] },
-  opts: { onCreate?: (mcp: KanbanMcp) => void; onLog?: (msg: string) => void } = {},
+  opts: {
+    onCreate?: (mcp: KanbanMcp) => void;
+    onLog?: (msg: string) => void;
+    fallbackAvailable?: boolean;
+  } = {},
 ): Promise<McpBootResult> {
   const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
   opts.onCreate?.(mcp);
@@ -264,7 +278,7 @@ export async function connectMcp(
   const connectStartedAt = Date.now();
   const beat = opts.onLog
     ? setInterval(() => {
-        opts.onLog!(`仍在等待看板 MCP 连接（已等待 ${Math.round((Date.now() - connectStartedAt) / 1000)} 秒）…`);
+        opts.onLog!(`仍在等待看板连接（已等待 ${Math.round((Date.now() - connectStartedAt) / 1000)} 秒）…`);
       }, 10000)
     : null;
   beat?.unref();
@@ -274,7 +288,7 @@ export async function connectMcp(
   } catch (err) {
     const e = err instanceof Error ? err : new Error(String(err));
     if (process.env.HTA_DEBUG) console.error(`\n[mcp] ${e.stack || e.message}`);
-    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail()) };
+    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail(), { fallbackAvailable: opts.fallbackAvailable }) };
   } finally {
     if (beat) clearInterval(beat);
   }

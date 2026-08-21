@@ -36,7 +36,7 @@ export async function verifyLlmConfig(
     return {
       ok: false,
       uncertain: true,
-      message: `端点未实现 /models 预检（HTTP ${res.status}）。部分兼容网关如此，不代表配置有误。`,
+      message: `端点未实现 /models 接口（HTTP ${res.status}）。部分兼容网关如此，不代表配置有误。`,
     };
   } catch (err) {
     return {

@@ -10,6 +10,26 @@ import {
 import { extractUuid, resolveHkScript, run, summarizeBothEnds } from './shared';
 import type { GatedWrite } from './gated-write';
 
+/** 确认摘要的高频子命令中文动作（与 MCP 通道 summarizeMcp 口径对齐）；对象标识留在 detail 区。 */
+const HK_ACTION_LABELS: Record<string, string> = {
+  'tasks create': '创建看板任务',
+  'tasks update': '更新看板任务',
+  'tasks delete': '删除看板任务',
+  'tasks cancel': '取消看板任务',
+  'projects create': '创建看板项目',
+  'projects update': '更新看板项目',
+  start: '启动任务的工作区',
+  'create-and-start': '创建看板任务并启动工作区',
+  stop: '停止工作区',
+  'follow-up': '向任务发送跟进消息',
+  approve: '批准审批',
+  deny: '拒绝审批',
+};
+
+function hkActionLabel(argv: string[]): string | undefined {
+  return HK_ACTION_LABELS[`${argv[0] ?? ''} ${argv[1] ?? ''}`.trim()] ?? HK_ACTION_LABELS[argv[0] ?? ''];
+}
+
 /** hk tasks create [project_id] <title> — title = first non-flag arg that is not a UUID. */
 function hkCreateTitle(args: string[]): string {
   const rest = args[0] === 'create-and-start' ? args.slice(1) : args.slice(2);
@@ -75,9 +95,10 @@ export function makeHkCliHandler({
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
+    // 高频子命令摘要用中文动作（对象标识在 detail）；未覆盖的子命令回退原命令行形态
     const summary = isCreate
       ? `创建看板任务${title ? `「${title}」` : ''}`
-      : `看板写操作：${argv.slice(0, 3).join(' ')}`;
+      : hkActionLabel(argv) ?? `看板写操作：${argv.slice(0, 3).join(' ')}`;
     // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
     const { key: batchKey, scope: batchScope } = batchKeyForHk(argv);
     return runGatedWrite({

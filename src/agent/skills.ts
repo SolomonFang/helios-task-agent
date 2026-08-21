@@ -304,8 +304,8 @@ export function readSkillDoc(name: string): string {
   const trimmed = name.trim();
   if (!trimmed) {
     const digests = loadSkillDigests();
-    if (!digests.length) return '（skills/ 下没有已安装技能）';
-    return digests.map((s) => `- ${s.name}：${s.description || '（无 description）'}`).join('\n');
+    if (!digests.length) return '（当前没有已安装的技能）';
+    return digests.map((s) => `- ${s.name}：${s.description || '（无描述）'}`).join('\n');
   }
   if (!SKILL_NAME_RE.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
   const dir = resolveSkillDir(trimmed);

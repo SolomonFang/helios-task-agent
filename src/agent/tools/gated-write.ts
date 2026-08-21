@@ -95,8 +95,8 @@ export function makeGatedWriter({
       }
       const exists = await kanbanTaskExists(kanbanUrl, hit.taskId);
       if (exists) {
-        // 时间戳截断到分钟：ISO 毫秒精度对用户无核对价值
-        const createdShort = hit.createdAt.replace('T', ' ').slice(0, 16);
+        // 存储层保持 ISO 不动（source-registry 持久化格式）；展示转本地时区（同 report 层做法）
+        const createdShort = new Date(hit.createdAt).toLocaleString('zh-CN', { hour12: false });
         return (
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
           `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +

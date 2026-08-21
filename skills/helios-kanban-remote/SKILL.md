@@ -112,10 +112,10 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **项目**: {name}
 **任务**: {title} (`{id}`)
 **迭代**: {iteration or —}
-**优先级**: {priority}
-**状态**: {中文状态} | running: {yes/no} | failed: {yes/no}
+**优先级**: {紧急/高/中/低}
+**状态**: {中文状态} | 运行状态： {运行中/未运行}{，执行失败}
 **分支**: {target_branch}
-**Executor**: {executor}
+**执行器**: {用户指定的名字，如 Claude}
 **URL**: {url}
 **下一步**: {suggestion}
 ```
@@ -150,7 +150,14 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 ## Task priorities
 
-`urgent` | `high` | `medium` | `low` — default `medium` when omitted. Cards show a colored badge (red/orange/blue/gray).
+给用户展示时用中文优先级；英文键仅用于 `--priority` 参数（省略默认 `medium`）。卡片带颜色徽标（红/橙/蓝/灰）：
+
+| 英文键（`--priority` 参数） | 中文优先级 |
+|---|---|
+| `urgent` | 紧急 |
+| `high` | 高 |
+| `medium` | 中 |
+| `low` | 低 |
 
 ## Safety rules
 

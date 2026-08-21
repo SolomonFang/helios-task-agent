@@ -3,7 +3,7 @@
 // 2. handler hta_review 按钮全链路（分发 → handleAiReview → runAiReview，PATH 桩伪造 ocr）
 // 3. cli askWithAbort 三路竞态（正常回答 / Ctrl+C abort / 超时自动拒绝；createAskWithAbort 已抽出可测）
 //    + abort/超时收尾取消挂起 waiter（fake reader 注入 waiter 语义，验证中断后输入不被吞）
-// 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径
+// 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径 + net-error 的 err.cause 解包映射
 // 5. cli 启动窗口信号处理（信号注册前移到 ensureKanbanOrExit 之前：探测在途时 SIGTERM/SIGINT 优雅退出）
 // 仅用 loopback mock 服务与 PATH 桩，离线可跑。Run: npx tsx scripts/unit-coverage.ts
 
@@ -27,6 +27,7 @@ import { resolveAllowedOpenIds } from '../src/config/config-wizard';
 import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
+import { friendlyNetError } from '../src/config/net-error';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { check, checkAsync, finish } from './testkit';
@@ -188,6 +189,7 @@ async function run(): Promise<void> {
         inprogress: 1,
         todo: 0,
         cancelled: 0,
+        failed: 0,
         filesChanged: 3,
         additions: 10,
         deletions: 4,
@@ -610,6 +612,25 @@ async function run(): Promise<void> {
     } finally {
       await stopServer(server);
     }
+  });
+
+  await checkAsync('net-error：解包 undici err.cause，ECONNREFUSED/ENOTFOUND/fetch failed 均命中映射', async () => {
+    // 真实 undici 错误：TypeError: fetch failed + cause.code（此前只看 message，映射永不命中）
+    try {
+      await fetch('http://127.0.0.1:59999/x', { signal: AbortSignal.timeout(2000) });
+      assert.fail('应抛连接错误');
+    } catch (err) {
+      assert.equal(friendlyNetError(err), '连接被拒（目标地址无服务在监听）', `实际：${friendlyNetError(err)}`);
+    }
+    // 手工构造：cause.code ENOTFOUND / AggregateError / 裸 fetch failed 兜底
+    const enotfound = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND x' } });
+    assert.equal(friendlyNetError(enotfound), '域名解析失败');
+    const aggregate = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new AggregateError([{ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED' }]), { message: '' }),
+    });
+    assert.equal(friendlyNetError(aggregate), '连接被拒（目标地址无服务在监听）');
+    assert.equal(friendlyNetError(new TypeError('fetch failed')), '网络请求失败（请检查网络 / 代理）');
+    assert.equal(friendlyNetError(new Error('something odd')), null);
   });
 
   await checkAsync('feishu-verify：无效凭证 / 未启用机器人 / 网络异常均返回失败而非抛异常', async () => {

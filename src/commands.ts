@@ -64,12 +64,13 @@ export async function buildStatusLines(
   const mcpText = opts.mcpOk
     ? p.ok(`正常（${opts.mcpToolCount} 个工具）`)
     : p.warn(
+        // 备用通道缺依赖时不再拼接 downNote 的「已切换」说法（自相矛盾），直接给完整降级口径
         hkMissing.length
-          ? `${opts.mcpDownNote}；备用通道缺少 ${hkMissing.join('、')}，不可用（${HK_CLI_INSTALL_HINT}）`
+          ? `连接失败，备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
           : opts.mcpDownNote,
       );
   const larkText = !opts.larkOk
-    ? p.warn('未安装（飞书读取不可用）')
+    ? p.warn('未安装（运行 npm i -g @larksuite/cli 安装，然后 lark-cli auth login 完成授权）')
     : larkAuthed
       ? p.ok('正常')
       : p.warn(LARK_CLI_AUTH_HINT);
@@ -87,7 +88,8 @@ export async function buildStatusLines(
     `看板：${healthText}（${opts.kanbanUrl}）`,
     `看板连接：${mcpText}`,
     `lark-cli：${larkText}`,
-    `备用通道：${hkMissing.length ? p.warn(`缺少 ${hkMissing.join('、')}（${HK_CLI_INSTALL_HINT}）`) : p.ok('正常')}`,
+    // 缺依赖明细已在「看板连接」行给出，这里不再重复
+    `备用通道：${hkMissing.length ? p.warn('不可用') : p.ok('正常')}`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }
@@ -124,6 +126,17 @@ export function buildToolsLines(
   return lines;
 }
 
+/** 进度展示的工具动作文案：内部工具名不直接暴露给用户，常见工具映射为中文动作，未知名称回落「调用工具」（CLI spinner 与 bot 进度占位共用，实现与 bot handler 一致）。 */
+export function toolActionLabel(name: string): string {
+  if (name === 'repo_fs') return '读文件';
+  if (name === 'hk_cli' || name.startsWith('kanban_')) return '看板操作';
+  if (name === 'lark_cli') return '飞书操作';
+  if (name === 'work_summary') return '生成报告';
+  if (name.startsWith('memory_')) return '读写记忆';
+  if (name.startsWith('skill_')) return '运行技能';
+  return '调用工具';
+}
+
 /** /skills 内容行；空目录时 CLI 只给提示、bot 保留标题（headerWhenEmpty）。 */
 export function buildSkillsLines(
   opts: { header: string; bullet: string; footer?: string; headerWhenEmpty?: boolean },
@@ -131,7 +144,7 @@ export function buildSkillsLines(
 ): string[] {
   const skills = loadSkillDigests();
   if (!skills.length) {
-    const note = p.gray('（skills/ 下没有已安装技能）');
+    const note = p.gray('（当前没有已安装的技能）');
     return opts.headerWhenEmpty ? [opts.header, note] : [note];
   }
   const lines = [opts.header];
@@ -144,7 +157,7 @@ export function buildSkillsLines(
 }
 
 /** /skills 用法说明（子命令错误时提示；两端一致）。 */
-const SKILLS_USAGE = '用法：/skills 列表 · /skills install <技能目录路径> 安装 · /skills uninstall <技能名> 卸载';
+const SKILLS_USAGE = '用法：/skills（列出）· /skills install <技能目录路径>（安装）· /skills uninstall <技能名>（卸载）';
 
 /**
  * /skills 命令统一处理（CLI 与 bot 共用）：无参数=列表；install/uninstall 管理技能。

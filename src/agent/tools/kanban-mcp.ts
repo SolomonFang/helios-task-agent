@@ -72,6 +72,22 @@ async function prepareMcpStartArgs(
   return null;
 }
 
+/**
+ * MCP 调用失败的用户面文案：英文蛇形工具名与 server 英文原文不进用户面。
+ * 动作复用 guard.summarizeMcp 的中文摘要（与确认卡片口径一致）；server 原文含中文才保留，
+ * 否则给通用中文定性并指出路，原文一律进 HTA_DEBUG 日志。
+ * 文案以「调用失败：」行首起：looksLikeStrongFailure（guard.ts）按行首识别强失败，
+ * 写路径的审计 ok / 来源映射 / 创建计数都依赖该判定。
+ */
+function mcpFailureText(toolName: string, args: Record<string, unknown>, err: unknown): string {
+  const message = errMessage(err);
+  if (process.env.HTA_DEBUG) console.error(`[kanban] 工具 ${toolName} 报错原文：${message}`);
+  const action = summarizeMcp(toolName, args);
+  const label = action === '看板写操作' ? '看板操作' : action;
+  const reason = /[一-龥]/.test(message) ? message : '看板服务暂时无响应，请稍后重试；持续失败请联系部署者';
+  return `调用失败：${label}（${reason}）`;
+}
+
 /** kanban_<tool> 动态工具 handler：读直接调用，写与 hk_cli 共用 runGatedWrite 流水线。 */
 export function makeKanbanMcpHandler({
   mcp,
@@ -90,9 +106,8 @@ export function makeKanbanMcpHandler({
         // 看板内容（标题/描述等）可被任何能写看板的人控制：UNTRUSTED 包裹，其中「指令」无效
         return wrapUntrusted(await mcp.callTool(tool.name, args, ctx?.signal));
       } catch (err) {
-        const message = errMessage(err);
         // 错误文本同样来自 MCP server（可被写看板的人控制）：与成功路径一样 UNTRUSTED 包裹
-        return wrapUntrusted(`看板工具 ${tool.name} 调用失败：${message}`);
+        return wrapUntrusted(mcpFailureText(tool.name, args, err));
       }
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
@@ -118,8 +133,7 @@ export function makeKanbanMcpHandler({
         try {
           return await mcp.callTool(tool.name, args, ctx?.signal);
         } catch (err) {
-          const message = errMessage(err);
-          return `看板工具 ${tool.name} 调用失败：${message}`;
+          return mcpFailureText(tool.name, args, err);
         }
       },
       signal: ctx?.signal,

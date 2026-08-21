@@ -47,6 +47,19 @@ export function truncate(s: unknown): string {
   return str.length > MAX_OUTPUT ? str.slice(0, MAX_OUTPUT) + `\n…（输出过长，已截断，共 ${str.length} 字符）` : str;
 }
 
+/** stderr 用户面只带尾部几行（完整内容与英文原文进 HTA_DEBUG 日志，不落用户面）。 */
+function tailLines(s: string, n: number): string {
+  const lines = s.trim().split('\n').filter(Boolean);
+  return lines.slice(-n).join('\n');
+}
+
+/** 子进程失败原文（error.message 含完整命令与本机绝对路径、stderr 全文）进 HTA_DEBUG 日志。 */
+function logExecFailure(command: string, args: string[], error: Error, stderr: string): void {
+  if (!process.env.HTA_DEBUG) return;
+  console.error(`[exec] ${command} ${args.join(' ')} 失败原文：${error.message}`);
+  if (stderr.trim()) console.error(`[exec] stderr 完整内容：\n${stderr}`);
+}
+
 export function run(
   command: string,
   args: string[],
@@ -69,15 +82,38 @@ export function run(
         }
         if (error && !stdout) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-            const hint = command === 'lark-cli' ? `\n${LARK_CLI_INSTALL_HINT}` : '';
-            resolve(`未找到可执行命令「${command}」。${hint}`.trim());
+            const hint =
+              command === 'lark-cli'
+                ? LARK_CLI_INSTALL_HINT
+                : `请先在部署机器上安装 ${command} 后重试；如不会操作，请联系部署者。`;
+            resolve(`未找到可执行命令「${command}」。\n${hint}`);
             return;
           }
-          resolve(`命令执行失败：${error.message}\n${truncate(stderr || '')}`.trim());
+          logExecFailure(command, args, error, stderr || '');
+          // 超时中止：signal 中断已在上方拦截，此处的 killed/SIGTERM 即 EXEC_TIMEOUT 触发
+          if (error.killed === true || /timed?\s*out/i.test(error.message)) {
+            // 保留「命令执行失败」行首：looksLikeStrongFailure 依行首识别强失败（审计/来源映射/创建计数）
+            resolve(
+              `命令执行失败：执行超时（超过 ${EXEC_TIMEOUT / 1000} 秒已自动中止）。` +
+                '请稍后重试；若持续超时，可能是看板服务响应慢。',
+            );
+            return;
+          }
+          // 英文 error.message（含完整命令与本机绝对路径）不进用户面；stderr 只带尾部 3 行
+          const code = (error as NodeJS.ErrnoException).code;
+          const codeText = typeof code === 'number' ? `（退出码 ${code}）` : '';
+          const tail = tailLines(stderr || '', 3);
+          resolve(`命令执行失败${codeText}${tail ? `：\n${tail}` : '。'}`);
         } else if (error) {
+          logExecFailure(command, args, error, stderr || '');
           // 非零退出但有 stdout：不能只回 stdout 让模型误判成功；失败信号放在开头
           // （looksLikeStrongFailure 只扫前 300 字符，放末尾会漏判）
-          resolve(`命令执行失败（非零退出）：${error.message}\n${truncate(stderr || '')}\n--- stdout ---\n${truncate(stdout || '')}`.trim());
+          const code = (error as NodeJS.ErrnoException).code;
+          const codeText = typeof code === 'number' ? `（退出码 ${code}）` : '';
+          const tail = tailLines(stderr || '', 3);
+          resolve(
+            `命令执行失败（非零退出）${codeText}${tail ? `\n${tail}` : ''}\n--- stdout ---\n${truncate(stdout || '')}`,
+          );
         } else {
           const out = truncate(stdout || '');
           if (out && stderr) {

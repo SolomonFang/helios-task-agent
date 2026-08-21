@@ -310,7 +310,8 @@ export class KanbanWatcher {
           title: '',
           items: newApprovals.slice(0, 5).map((a) => a.label),
           total: newApprovals.length,
-          text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}\n回复「待审批」处理`,
+          // 文本版只列前 5 条：超出的补剩余计数，与卡片版口径一致
+          text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}${newApprovals.length > 5 ? `\n· …还有 ${newApprovals.length - 5} 个` : ''}\n回复「待审批」处理`,
         },
       });
     }

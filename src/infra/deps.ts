@@ -135,8 +135,9 @@ export function checkHkDeps(): string[] {
   return missing;
 }
 
-/** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器）。 */
-export const HK_CLI_INSTALL_HINT = 'macOS：brew install jq curl；Linux：用包管理器安装 jq curl';
+/** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器；无 brew 时给出 brew 安装入口）。 */
+export const HK_CLI_INSTALL_HINT =
+  'macOS：brew install jq curl（无 brew 先按 https://brew.sh 安装）；Linux：如 Ubuntu 用 sudo apt install jq curl';
 
 /** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
 export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';

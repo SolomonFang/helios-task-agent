@@ -29,7 +29,7 @@ import { reportsDir } from './report/report';
 import { startReportServer, type ReportServer } from './report/report-server';
 import { checkLarkCliStatus, checkHkDeps, checkHkDepsAsync, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
-import { wrapUntrusted } from './agent/guard';
+import { batchAckText, batchScopeWord, wrapUntrusted, type ConfirmKind } from './agent/guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
 import { connectMcp } from './kanban/mcp';
 import { TRY_EXAMPLES } from './commands';
@@ -57,7 +57,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 
 写操作安全闸门
 · 建/改/删任务、启动任务的工作区、发飞书消息等写操作会收到确认卡片
-· 「确认执行」仅此次有效；「同类免问（本会话）」适合批量建任务；文本回复「确认 / 同类免问 / 取消」
+· 「确认执行」仅此次有效；「同类免问（本会话）」适合批量建任务；删除/审批等只放行同一对象（卡片标注「同对象免问」）；文本回复「确认 / 同类免问 / 同对象免问 / 取消」
 · 免问期间回复「恢复确认」立即撤销，恢复逐次确认
 · 普通写操作 120 秒、破坏性操作（删除/停止/审批等）300 秒未操作自动拒绝
 
@@ -65,7 +65,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 ${TRY_EXAMPLES.map((e) => `· ${e}`).join('\n')}`;
 
 /** bot 子命令用法文案（--help 与未知参数报错共用；两个入口同一份，第二行覆盖独立入口）。 */
-const BOT_CLI_USAGE = `用法: helios-task-agent bot [选项]
+const BOT_CLI_USAGE = `用法：helios-task-agent bot [选项]
       helios-task-agent-bot [选项]（独立入口，等同上一行）
 
 选项
@@ -94,7 +94,7 @@ export function parseBotArgs(argv: string[]): { rebind: boolean; reconfig: boole
   }
   const unknown = args.filter((a) => a !== 'rebind' && a !== '--rebind' && a !== 'reconfig' && a !== '--reconfig');
   if (unknown.length) {
-    console.error(`未知参数: ${unknown.join(' ')}\n\n${BOT_CLI_USAGE}`);
+    console.error(`未知参数：${unknown.join(' ')}\n\n${BOT_CLI_USAGE}`);
     process.exit(1);
   }
   return {
@@ -168,7 +168,7 @@ async function main(): Promise<void> {
 
   const version = readPkgVersion();
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
-  console.log(c.gray(`配置目录: ${userEnvPath()}`));
+  console.log(c.gray(`配置目录：${userEnvPath()}`));
 
   // 信号处理尽早注册：向导/更新检查/看板拉起（最长 90s）/MCP 连接期间收到 SIGTERM
   // 走默认终止会让自动拉起的看板子进程成孤儿；这里保证已建立的资源都被清理。
@@ -242,7 +242,7 @@ async function main(): Promise<void> {
       const rb = await rebindFeishuBot(ask, { askSecret });
       agentCfg = currentConfig();
       feishuCfg = rb.feishu;
-      console.log(c.gray(`已加载配置: ${rb.envPath}`));
+      console.log(c.gray(`已加载配置：${rb.envPath}`));
     } else if (reconfig && isConfigured() && isFeishuBotConfigured()) {
       // 只重跑模型向导：writeEnv 合并写保留飞书凭证；看板默认值在向导中回显当前值
       agentCfg = await ensureConfig(ask, { force: true, choose, askSecret });
@@ -252,12 +252,12 @@ async function main(): Promise<void> {
       const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
       agentCfg = ready.agent;
       feishuCfg = ready.feishu;
-      console.log(c.gray(`已加载配置: ${ready.envPath}`));
+      console.log(c.gray(`已加载配置：${ready.envPath}`));
     }
   } catch (err) {
     close();
     const message = errMessage(err);
-    console.error(c.err(`配置失败: ${message}`));
+    console.error(c.err(`配置失败：${message}`));
     process.exit(1);
   }
   close();
@@ -284,22 +284,22 @@ async function main(): Promise<void> {
     }
   }
 
-  console.log(c.gray(`模型: ${agentCfg.llmModel}  kanban: ${agentCfg.kanbanUrl}`));
+  console.log(c.gray(`模型：${agentCfg.llmModel}  看板：${agentCfg.kanbanUrl}`));
   if (isLoopbackUrl(agentCfg.kanbanUrl)) {
     console.log(
       c.warn(
-        `kanban 地址为本机回环地址（${agentCfg.kanbanUrl}）：推送卡片里的看板/报告链接在手机上不可达，` +
+        `看板地址为本机回环地址（${agentCfg.kanbanUrl}）：推送卡片里的看板/报告链接在手机上不可达，` +
           `如需手机查看请在 ${userEnvPath()} 中把 HELIOS_KANBAN_URL 配置为局域网 IP 或 Tailscale 地址。`,
       ),
     );
   }
   if (feishuCfg.allowedOpenIds.length) {
-    console.log(c.gray(`允许 open_id: ${feishuCfg.allowedOpenIds.join(', ')}`));
+    console.log(c.gray(`允许 open_id：${feishuCfg.allowedOpenIds.join(', ')}`));
   } else {
     console.log(
       c.warn(
         '⚠️ 安全警告：未设置 FEISHU_ALLOWED_OPEN_IDS，首个私聊本机器人的用户将自动成为唯一 owner 并写入白名单' +
-          '（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定 owner，请先在 .env 中配置该白名单。',
+          `（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定 owner，请先在 ${userEnvPath()} 中配置该白名单。`,
       ),
     );
   }
@@ -332,13 +332,13 @@ async function main(): Promise<void> {
   try {
     reportServer = await startReportServer([reviewsDir(), reportsDir()], agentCfg.kanbanUrl);
     cleanup.reportServer = reportServer;
-    console.log(c.gray(`报告服务: ${reportServer.baseUrl}`));
+    console.log(c.gray(`报告服务：${reportServer.baseUrl}`));
   } catch (err) {
     const message = errMessage(err);
-    console.warn(c.warn(`报告服务启动失败，报告将回退为文本/本机路径推送: ${message}`));
+    console.warn(c.warn(`报告服务启动失败，报告将回退为文本/本机路径推送：${message}`));
   }
 
-  const bootLabel = '正在连接 helios-kanban MCP…';
+  const bootLabel = '正在连接看板…';
   process.stdout.write(c.gray(bootLabel));
   const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg, {
     // 实例一创建即登记：45s 连接窗口内收到退出信号时，shutdown 能拿到 mcp 做 close
@@ -348,13 +348,15 @@ async function main(): Promise<void> {
     },
     // 连接等待期每 ~10 秒覆写当前行补进度（bot 无 spinner，否则最长 45s 无反馈像卡死）
     onLog: (msg) => process.stdout.write(c.gray(`\r${msg}`)),
+    // hk_cli 降级链缺依赖（jq/curl）时，诊断提示不得宣称「已自动切换为备用通道」
+    fallbackAvailable: hkMissing.length === 0,
   });
   if (mcpOk) {
-    process.stdout.write(c.ok(`\rMCP 已连接（${mcp.tools.length} 个工具）          \n`));
+    process.stdout.write(c.ok(`\r看板已连接（${mcp.tools.length} 个工具）          \n`));
   } else {
     // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
     if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
-    process.stdout.write(c.warn(`\rMCP 连接失败，${MCP_FALLBACK_TEXT}          \n`));
+    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}          \n`));
     if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
@@ -366,11 +368,17 @@ async function main(): Promise<void> {
   // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
   // roundNotices：确认卡片/回执插在「处理中」占位之后时标记，最终回复改发新消息保持时间线顺序
   const roundNotices = createRoundNoticeTracker();
+  /** 每用户最近一次写操作确认请求的 kind（bot 批准回执按 kind 细化免问措辞；confirm.ts 未暴露该状态，这里随发送记录）。 */
+  const lastWriteKind = new Map<string, ConfirmKind>();
   const confirmations = new ConfirmationManager(
     async (openId, chatId, req, id, timeoutMs) => {
       roundNotices.mark(openId);
+      lastWriteKind.set(openId, req.kind);
       const sendText = () => {
-        const batchHint = req.batchKey ? '，「同类免问」本会话内同类操作免问' : '';
+        // 免问提示与卡片口径一致：粒度词（同类/同对象）与后果说明都复用 guard 的统一文案
+        const batchHint = req.batchKey
+          ? `，「${batchScopeWord(req.batchScope)}免问」${batchAckText(req.batchScope, req.kind)}`
+          : '';
         // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
         const detailBlock = req.detail
           .split('\n')
@@ -405,7 +413,7 @@ async function main(): Promise<void> {
       onSuperseded: (openId, req) => {
         roundNotices.mark(openId);
         void channel
-          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}`)
+          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}。新操作会另发确认，请留意处理。`)
           .catch(() => {});
       },
       onSettled: (_openId, req, settle, cardMessageId) => {
@@ -419,8 +427,10 @@ async function main(): Promise<void> {
       // 避免"操作默默没执行"（仍失败只能落日志，等待方已拿到明确拒绝、不会干等）
       onSendFailed: (openId, req, error) => {
         roundNotices.mark(openId);
+        // 原始错误（可能是 axios 英文原文）只进日志，不落用户面
+        console.error(`[confirm] 确认发送最终失败(${openId.slice(0, 4)}…): ${error}`);
         void channel
-          .notifyOpenId(openId, `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n原因：${error}\n请稍后重试或检查机器人网络。`)
+          .notifyOpenId(openId, `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n请稍后重试；若反复出现，请检查部署机器的网络。`)
           .catch((err) => {
             const message = errMessage(err);
             console.error(`[confirm] 发送失败通知也未送达(${openId}): ${message}`);
@@ -434,7 +444,7 @@ async function main(): Promise<void> {
   channel.onOwnerClaim = (openId) => {
     try {
       writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
-      console.log(c.ok(`首个私聊用户已成为 owner 并写入白名单: ${openId}`));
+      console.log(c.ok(`首个私聊用户已成为 owner 并写入白名单：${openId}`));
     } catch (err) {
       const message = errMessage(err);
       console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）: ${message}`);
@@ -489,16 +499,16 @@ async function main(): Promise<void> {
         // hk_cli 降级链依赖（jq/curl）缺失时「已切换备用通道」是谎言：按探测结果条件化
         const hkMissing = await checkHkDepsAsync();
         const fallback = hkMissing.length
-          ? `看板读写暂不可用，缺少 ${hkMissing.join('/')}（${HK_CLI_INSTALL_HINT}）`
+          ? `看板读写暂不可用（缺少 ${hkMissing.join('/')}，${HK_CLI_INSTALL_HINT}）`
           : MCP_FALLBACK_TEXT;
-        console.log(c.warn(`MCP 连接丢失，${fallback}，将自动重连…`));
-        notifyOwners(`⚠️ 看板 MCP 连接丢失，${fallback}（恢复后自动切回）`);
+        console.log(c.warn(`看板连接已中断，${fallback}，将自动重连…`));
+        notifyOwners(`⚠️ 看板连接已中断：${fallback}，恢复后自动切回。`);
       })();
     },
     onRecovered: () => {
       router.setMcpOk(true);
-      console.log(c.ok('MCP 已恢复'));
-      notifyOwners('✅ 看板 MCP 连接已恢复');
+      console.log(c.ok('看板连接已恢复'));
+      notifyOwners('✅ 看板连接已恢复');
     },
   });
   supervisor.start();
@@ -514,6 +524,7 @@ async function main(): Promise<void> {
     reportServer,
     helpText: BOT_HELP,
     roundNotices,
+    lastBatchKind: (openId) => lastWriteKind.get(openId),
   });
   channel.onCardAction = handlers.onCardAction;
 
@@ -522,7 +533,7 @@ async function main(): Promise<void> {
     await channel.start(handlers.handle);
   } catch (err) {
     const message = errMessage(err);
-    console.error(c.err(`\n长连接失败: ${message}`));
+    console.error(c.err(`\n长连接失败：${message}`));
     console.error(c.gray('请确认：开放平台事件订阅已选「长连接」、已添加 im.message.receive_v1、App 已发布/可用。'));
     console.error(
       c.gray(`改凭证请直接编辑 ${userEnvPath()}；或清空其中 FEISHU_APP_ID / FEISHU_APP_SECRET 后重新运行（会重新进入配置向导）。`),
@@ -592,7 +603,7 @@ async function main(): Promise<void> {
     });
     cleanup.watcher = watcher;
     watcher.start();
-    console.log(c.gray(`看板状态推送已开启（每 ${intervalSec}s 轮询）`));
+    console.log(c.gray(`看板状态推送已开启（每 ${intervalSec} 秒轮询）`));
   }
 
   // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭

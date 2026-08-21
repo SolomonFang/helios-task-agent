@@ -18,7 +18,7 @@ import { buildAiReviewCard } from '../channels/feishu-cards';
 import { isAllPass, writeReviewReport } from '../report/review-report';
 import type { ReportServer } from '../report/report-server';
 import { checkLarkCliAsync, checkOcrCliAsync, checkHkDepsAsync, HK_CLI_INSTALL_HINT } from '../infra/deps';
-import { batchAckText, wrapUntrusted } from '../agent/guard';
+import { batchAckText, wrapUntrusted, type ConfirmKind } from '../agent/guard';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -30,11 +30,11 @@ import {
   llmFailureParts,
   parseCommand,
   plainPaint,
+  toolActionLabel,
 } from '../commands';
 import type { AgentConfig, InboundMessage, InlineImage, ProgressInfo } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { McpSupervisor } from './supervisor';
-import { MCP_FALLBACK_TEXT } from '../infra/deps';
 import { errMessage } from '../infra/err';
 
 /** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */
@@ -87,17 +87,6 @@ const WS_STATE_LABEL: Record<string, string> = {
   idle: '空闲',
 };
 
-/** 进度占位的工具动作文案：内部工具名不直接暴露给用户，常见工具映射为中文动作，未知名称回落「调用工具」。 */
-function toolActionLabel(name: string): string {
-  if (name === 'repo_fs') return '读文件';
-  if (name === 'hk_cli' || name.startsWith('kanban_')) return '看板操作';
-  if (name === 'lark_cli') return '飞书操作';
-  if (name === 'work_summary') return '生成报告';
-  if (name.startsWith('memory_')) return '读写记忆';
-  if (name.startsWith('skill_')) return '运行技能';
-  return '调用工具';
-}
-
 export interface BotHandlerDeps {
   channel: FeishuChannel;
   router: SessionRouter;
@@ -115,6 +104,8 @@ export interface BotHandlerDeps {
   imageFetcher?: ImageFetcher;
   /** 轮次内插消息追踪（bot-main 在确认卡片/回执发送时 mark）；缺省时最终回复一律原地替换占位。 */
   roundNotices?: RoundNoticeTracker;
+  /** 每用户最近一次写操作确认请求的 kind（bot-main 随确认发送记录）；用于免问回执按 kind 细化措辞。 */
+  lastBatchKind?: (openId: string) => ConfirmKind | undefined;
 }
 
 export interface BotHandlers {
@@ -161,18 +152,18 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const ctl = new AbortController();
     aiReviewRunning.set(attemptId, { openId, ctl });
     try {
-      // 首次触发时告知：AI 审查由第三方 open-code-review 执行，且将复用机器人主 LLM 配置
+      // 首次触发时告知：AI 审查由第三方工具执行，会用到模型 API key（只提示一次，不刷屏）
       // （仅在实际会派生主 key 时提示；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
       let llmNotice = '';
       if (!aiReviewLlmNoticed && ocrWillDeriveBotLlm()) {
         aiReviewLlmNoticed = true;
         llmNotice =
-          '\n⚠️ 安全提示：AI 审查由第三方工具 open-code-review 执行，将把机器人 LLM 配置（含 API key）以 OCR_LLM_* 环境变量交给它；' +
-          '如需隔离，请配置 AI 审查专用 key（OCR_LLM_TOKEN）或用 ocr config provider 单独配置。';
+          '\n⚠️ 安全提示：AI 审查由第三方工具执行，会使用你的模型 API key。' +
+          '如需隔离，可以为它单独配置一个专用 key（在配置文件中设置 OCR_LLM_TOKEN，详见 README）。';
       }
       await channel.notifyOpenId(
         openId,
-        `🤖 AI 审查已开始：《${title}》\n正在调用 open-code-review 分析 diff，完成后推送结果（首次使用需自动下载代码审查工具，耗时稍长）。${llmNotice}`,
+        `🤖 AI 审查已开始：《${title}》\n正在调用代码审查工具（open-code-review）分析改动，完成后推送结果（首次使用需自动下载，耗时稍长）。${llmNotice}`,
       );
       // /stop 可中断：竞速胜出后立即向用户收尾返回；signal 同时透传给 runAiReview，
       // 底层 ocr 子进程随 abort 被 execFile 立即 kill，不必等自身 15 分钟超时。
@@ -207,12 +198,13 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         }
       } catch (deliverErr) {
         const dmsg = errMessage(deliverErr);
+        // 原始错误（英文 fs/网络原文 + 宿主机绝对路径）只进日志，不落用户面
         console.error(`[review] 报告写盘/卡片推送失败，降级文本推送: ${dmsg}`);
         const excerpt = result.length > 3000 ? `${result.slice(0, 3000)}\n…（结果过长已截断）` : result;
         await channel
           .notifyOpenId(
             openId,
-            `🤖 AI 审查结果：《${title}》\n⚠️ 报告写盘/卡片推送失败（${dmsg}），改为文本推送：\n${excerpt}`,
+            `🤖 AI 审查结果：《${title}》\n⚠️ 审查报告生成或推送失败，改为文本推送：\n${excerpt}`,
           )
           .catch((e) => {
             // 降级文本也失败：结果无法送达，只能落日志（不再往外抛，避免误报「AI 审查失败」）
@@ -258,8 +250,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
     else if (result === 'approved_batch')
       void channel
-        // 粒度如实告知：对象级免问只说「该对象的同类」（scope 由 finish 记录在 manager 上）
-        .notifyOpenId(openId, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId))}，正在执行…（回复「恢复确认」可随时撤销）`)
+        // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
+        .notifyOpenId(openId, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`)
         .catch(() => {});
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
     else void channel.notifyOpenId(openId, '该确认已处理或已过期，无需重复操作。').catch(() => {});
@@ -329,7 +321,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         kanbanUrl: cfg.kanbanUrl,
         mcpOk: supervisor.isAlive,
         mcpToolCount: mcp.tools.length,
-        mcpDownNote: `${MCP_FALLBACK_TEXT}，自动重连中`,
+        mcpDownNote: '已切换为备用通道，自动重连中',
         larkOk,
         extra: [
           `代码审查工具：${ocrOk ? '正常' : '未安装（首次点「AI 审查」时自动下载，耗时稍长）'}`,
@@ -355,8 +347,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         memoryEnabled: true,
         kanbanHeader: `看板工具（${mcp.tools.length} 个）`,
         downNote: hkMissing.length
-          ? `看板工具：MCP 未连接，且备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
-          : `看板工具：MCP 未连接，${MCP_FALLBACK_TEXT}，功能不受影响`,
+          ? `看板工具：看板连接已断开，且备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
+          : '看板工具：看板连接已断开，已切换为备用通道，大部分功能可用，如遇操作失败请稍后再试',
         localHeader: '本地工具',
         bullet: '· ',
       },
@@ -403,7 +395,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return true;
     }
     if (answer === 'approved_batch') {
-      await channel.reply(msg, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(msg.senderId))}，正在执行…（回复「恢复确认」可随时撤销）`);
+      await channel.reply(msg, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(msg.senderId), deps.lastBatchKind?.(msg.senderId))}，正在执行…（回复「恢复确认」可随时撤销）`);
       return true;
     }
     if (answer === 'denied') {

@@ -46,16 +46,29 @@ function isWildcard(host: string): boolean {
   return host === '0.0.0.0' || host === '::';
 }
 
+/** 说明页模板：卡片式中文提示（404/405/400 共用结构，只换标题与正文）。 */
+function noticePage(title: string, lines: string[]): string {
+  return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' + title + '</title>' +
+    '<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;' +
+    'color:#1f2937;background:#f3f4f8;padding:48px 20px;line-height:1.8}' +
+    '.card{max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:32px 24px;text-align:center;' +
+    'box-shadow:0 2px 8px rgba(15,23,42,.06)}h1{font-size:18px;margin-bottom:12px}p{font-size:14px;color:#4b5563}</style></head>' +
+    '<body><div class="card"><h1>' + title + '</h1>' +
+    lines.map((l) => '<p>' + l + '</p>').join('') +
+    '</div></body></html>';
+}
+
 /** 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效），并给出找回报告的出路。 */
-const NOT_FOUND_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
-  '<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>报告不存在</title>' +
-  '<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;' +
-  'color:#1f2937;background:#f3f4f8;padding:48px 20px;line-height:1.8}' +
-  '.card{max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:32px 24px;text-align:center;' +
-  'box-shadow:0 2px 8px rgba(15,23,42,.06)}h1{font-size:18px;margin-bottom:12px}p{font-size:14px;color:#4b5563}</style></head>' +
-  '<body><div class="card"><h1>报告不存在或已过期</h1>' +
-  '<p>报告保留 30 天，进程重启后旧链接也会失效。</p>' +
-  '<p>请回到飞书重新发送指令生成新报告。</p></div></body></html>';
+const NOT_FOUND_HTML = noticePage('报告不存在或已过期', [
+  '报告保留 30 天，进程重启后旧链接也会失效。',
+  '请回到飞书重新发送指令，或重新点击卡片上的「AI 审查」，生成新报告。',
+]);
+
+/** 400/405 统一中文说明：请求本身没法处理时，告诉用户回飞书重新拿链接。 */
+const BAD_REQUEST_HTML = noticePage('链接无法处理', [
+  '链接格式不正确，请回到飞书重新获取报告链接。',
+]);
 
 /** dirs：允许服务的报告目录（可多个，如 reviews/ 与 reports/）。 */
 export function startReportServer(dirs: string | string[], kanbanUrl: string): Promise<ReportServer> {
@@ -63,7 +76,7 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
   const server = http.createServer((req, res) => {
     try {
       if (req.method !== 'GET') {
-        res.writeHead(405).end();
+        res.writeHead(405, { 'Content-Type': 'text/html; charset=utf-8' }).end(BAD_REQUEST_HTML);
         return;
       }
       const pathname = decodeURIComponent(new URL(req.url || '/', 'http://x').pathname);
@@ -92,7 +105,7 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
         res.end();
       });
     } catch {
-      res.writeHead(400).end('bad request');
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' }).end(BAD_REQUEST_HTML);
     }
   });
   return new Promise((resolve, reject) => {

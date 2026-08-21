@@ -26,7 +26,7 @@ export function parseDailyBriefTime(raw: string | undefined): DailyBriefTime | n
   const m = /^(\d{1,2}):([0-5]\d)$/.exec(v);
   const hour = m ? Number(m[1]) : NaN;
   if (!m || hour > 23) {
-    throw new Error(`HTA_DAILY_BRIEF 值非法: ${JSON.stringify(raw)}（应为 HH:MM，如 09:30）`);
+    throw new Error(`HTA_DAILY_BRIEF 值非法：${JSON.stringify(raw)}（应为 HH:MM，如 09:30）`);
   }
   return { hour, minute: Number(m![2]) };
 }
@@ -57,20 +57,24 @@ function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatu
 /** 晨报文本（纯函数便于单测）：数量概览 + 各状态标题清单；空迭代给一句兜底。 */
 export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
   const inprogress = data.tasks.filter((t) => t.status === 'inprogress');
+  const todo = data.tasks.filter((t) => t.status === 'todo');
   const inreview = data.tasks.filter((t) => t.status === 'inreview');
   const done = data.tasks.filter((t) => t.status === 'done');
   // 失败按 last_attempt_failed 标记独立分组（与状态正交：失败任务可能停在 inprogress 等任意状态）
   const failed = data.tasks.filter((t) => t.failed);
+  // 头部计数全部用 totals（截断前全量）；列表仍取截断后的 data.tasks 抽样。失败与状态计数正交，
+  // 非零时注明口径（零值不挂括注，减少噪音）
+  const failedNote = data.totals.failed ? '（含于上方状态）' : '';
   const lines = [
     `☀️ 看板晨报 · ${data.sinceLabel}（${localDateStr(now)}）`,
-    // 头部计数用 totals（截断前全量）；列表仍取截断后的 data.tasks 抽样。失败与状态计数正交，注明口径
-    `进行中 ${data.totals.inprogress} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done} · 失败 ${failed.length}（含于上方状态）`,
+    `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done} · 失败 ${data.totals.failed}${failedNote}`,
   ];
   if (!data.tasks.length) {
-    lines.push('', '当前范围内还没有任务。');
+    lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
   } else {
     for (const section of [
       listSection('进行中', inprogress),
+      listSection('待办', todo),
       listSection('待审阅', inreview),
       listSection('已完成', done),
       listSection('失败', failed, { showStatus: true }),

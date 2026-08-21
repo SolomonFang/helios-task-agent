@@ -213,10 +213,13 @@ function setup(
   if (extra.visionEnabled) cfg.visionEnabled = true;
   const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
   const confirmPrompts: Fixture['confirmPrompts'] = [];
+  // 与 bot-main 同款：随确认发送记录每用户最近写操作 kind，供免问回执按 kind 细化措辞
+  const lastWriteKind = new Map<string, ConfirmRequest['kind']>();
   // 短超时：用例失败时挂起的确认定时器不拖住进程
   const confirmations = new ConfirmationManager(
     async (openId, _chatId, req, id) => {
       confirmPrompts.push({ openId, req, id });
+      lastWriteKind.set(openId, req.kind);
       return undefined;
     },
     { timeoutMs: 5000 },
@@ -240,6 +243,7 @@ function setup(
     supervisor,
     reportServer: extra.reportServer ?? null,
     helpText: 'HELP-TEXT',
+    lastBatchKind: (openId) => lastWriteKind.get(openId),
     ...(extra.aiReviewRunner ? { aiReviewRunner: extra.aiReviewRunner } : {}),
     ...(extra.progressHeartbeatMs ? { progressHeartbeatMs: extra.progressHeartbeatMs } : {}),
     ...(extra.imageFetcher ? { imageFetcher: extra.imageFetcher } : {}),
@@ -464,14 +468,15 @@ async function main(): Promise<void> {
       const v2 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '同类免问'));
       assert.equal(await v2, 'batch');
-      assert.ok(f.channel.replies.at(-1)!.text.includes('同类写操作本会话内免问'));
+      // kanban 类免问回执按 kind 细化措辞（guard.batchAckText 第二参）
+      assert.ok(f.channel.replies.at(-1)!.text.includes('对同一任务/审批的同类操作本会话内免问'));
 
-      // 对象级免问的回执须如实说「该对象的同类」，不得让用户误以为整个类都放行
+      // 对象级免问的回执须如实限定「同一任务/审批」，不得让用户误以为整个类都放行
       const objReq: ConfirmRequest = { kind: 'kanban', summary: '删除任务', detail: 'delete_task x', batchKey: 'del:x', batchScope: 'object' };
       const v2b = f.confirmations.request('u1', objReq);
       await f.handlers.handle(mkMsg('u1', '同对象免问'));
       assert.equal(await v2b, 'batch');
-      assert.ok(f.channel.replies.at(-1)!.text.includes('该对象的同类写操作本会话内免问'), `实际：${f.channel.replies.at(-1)!.text}`);
+      assert.ok(f.channel.replies.at(-1)!.text.includes('对同一任务/审批的同类操作本会话内免问'), `实际：${f.channel.replies.at(-1)!.text}`);
 
       const v3 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '取消'));
@@ -946,12 +951,13 @@ async function main(): Promise<void> {
         const degraded = f.channel.notifies.find((n) => n.text.includes('改为文本推送'))!;
         assert.ok(degraded.text.includes('AI 审查结果'), '降级推送应带审查结果');
         assert.ok(degraded.text.includes('审查结论：无问题'), '审查结果本身不得丢失');
-        assert.ok(degraded.text.includes('card mock failure'), '应注明卡片失败原因');
+        assert.ok(!degraded.text.includes('card mock failure'), '原始英文错误不得落用户面（只进日志）');
         assert.ok(
           !f.channel.notifies.some((n) => n.text.includes('AI 审查失败')),
           '投递失败不得误报为「AI 审查失败」',
         );
         assert.ok(errLogs.some((m) => m.includes('报告写盘/卡片推送失败')), '投递失败应记日志');
+        assert.ok(errLogs.some((m) => m.includes('card mock failure')), '原始错误应落日志');
         cleanup(f);
       } finally {
         console.error = origErr;

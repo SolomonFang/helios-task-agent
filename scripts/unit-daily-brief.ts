@@ -39,9 +39,10 @@ function fakeTask(over: Partial<WorkSummaryTask>): WorkSummaryTask {
 
 function fakeSummary(tasks: WorkSummaryTask[]): WorkSummaryData {
   // totals 是截断前全量计数（晨报头部用）：按任务状态推导，保持与 tasks 一致
-  const totals = { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, filesChanged: 0, additions: 0, deletions: 0 };
+  const totals = { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, failed: 0, filesChanged: 0, additions: 0, deletions: 0 };
   for (const t of tasks) {
     if (t.status in totals) (totals as Record<string, number>)[t.status]!++;
+    if (t.failed) totals.failed++; // 失败标记与状态正交
   }
   return {
     scope: 'iteration',
@@ -88,7 +89,7 @@ async function main(): Promise<void> {
     ]);
     const text = buildDailyBriefText(data, at(9, 30));
     assert.ok(text.includes('☀️ 看板晨报 · 迭代 260717'), '头部含范围');
-    assert.ok(text.includes('进行中 2 · 待审阅 1 · 已完成 1 · 失败 1（含于上方状态）'), `计数行: ${text.split('\n')[1]}`);
+    assert.ok(text.includes('进行中 2 · 待办 0 · 待审阅 1 · 已完成 1 · 失败 1（含于上方状态）'), `计数行: ${text.split('\n')[1]}`);
     assert.ok(text.includes('【进行中】2 个') && text.includes('· 《修复登录页》'));
     assert.ok(text.includes('【待审阅】1 个') && text.includes('【已完成】1 个') && text.includes('【失败】1 个'));
     // 纯文本消息不做 markdown 解析：含 markdown 字符的标题原样保留
@@ -109,9 +110,24 @@ async function main(): Promise<void> {
     assert.ok(!text.includes('总结一下这个迭代做了什么'));
   });
 
-  await checkAsync('buildDailyBriefText：空范围给兜底文案', () => {
-    const text = buildDailyBriefText(fakeSummary([]), at(9, 30));
-    assert.ok(text.includes('当前范围内还没有任务。'));
+  await checkAsync('buildDailyBriefText：空范围按口径给兜底文案（迭代 / 全量）', () => {
+    // 配置了迭代：按迭代口径
+    assert.ok(buildDailyBriefText(fakeSummary([]), at(9, 30)).includes('这个迭代还没有任务。'));
+    // 未配置迭代（范围为全部迭代）：按看板整体口径
+    const all = fakeSummary([]);
+    delete all.iteration;
+    assert.ok(buildDailyBriefText(all, at(9, 30)).includes('看板上还没有任务。'));
+  });
+
+  await checkAsync('buildDailyBriefText：头部含待办计数且失败为 0 时不挂括注', () => {
+    const data = fakeSummary([
+      fakeTask({ id: 'a', title: '排队中的活', status: 'todo' }),
+      fakeTask({ id: 'b', title: '进行中的活', status: 'inprogress' }),
+    ]);
+    const text = buildDailyBriefText(data, at(9, 30));
+    assert.ok(text.includes('进行中 1 · 待办 1 · 待审阅 0 · 已完成 0 · 失败 0'), `计数行: ${text.split('\n')[1]}`);
+    assert.ok(!text.includes('（含于上方状态）'), '失败为 0 不应挂括注');
+    assert.ok(text.includes('【待办】1 个') && text.includes('· 《排队中的活》'), `待办分组: ${text}`);
   });
 
   await checkAsync('buildDailyBriefText：单组超 10 个任务时截断并提示剩余数量', () => {

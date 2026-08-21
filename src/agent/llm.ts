@@ -294,21 +294,24 @@ export async function runAgentTurn({
         let result: string | undefined;
         if (onProgress) onProgress({ type: 'tool', name });
         if (!handler) {
-          result = `错误：未知工具 ${name}`;
+          // 内部工具名不落用户面（黑话），只提示改用已有工具
+          result = '错误：没有这个工具，请改用已有工具重试';
         } else {
           let args: Record<string, unknown> = {};
           try {
             args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
           } catch (err) {
-            const message = errMessage(err);
-            result = `错误：工具参数 JSON 解析失败：${message}`;
+            // 原始解析错误（英文）进日志，用户面只给可执行的修正方向
+            console.error(`[llm] 工具参数解析失败: ${errMessage(err)}`);
+            result = '错误：工具参数格式有误，请修正后重新调用';
           }
           if (result === undefined) {
             try {
               result = String(await handler(args, { signal: turnSignal }));
             } catch (err) {
               const message = errMessage(err);
-              result = `工具 ${name} 执行异常：${message}`;
+              // 行首文案被 guard.ts STRONG_FAILURE_LINE_ZH_RE 匹配，改动须同步该正则
+              result = `工具调用失败：${message}`;
             }
           }
         }

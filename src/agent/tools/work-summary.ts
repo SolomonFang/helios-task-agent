@@ -39,10 +39,9 @@ export function makeWorkSummaryHandler({
       // 报告内容源自看板数据（任务标题/摘要等），UNTRUSTED 包裹
       return wrapUntrusted(empty + summarizeForChat(data, paths, { linkBaseUrl: reportLinkBaseUrl }));
     } catch (err) {
-      return (
-        `生成工作总结失败：${errMessage(err)}\n` +
-        `请确认看板服务可访问（${kanbanUrl}）后重试。`
-      );
+      // 看板地址（本机 localhost，bot 用户打不开）与英文报错原文不落用户面；原文进 HTA_DEBUG 日志
+      if (process.env.HTA_DEBUG) console.error(`[work_summary] 报错原文：${errMessage(err)}`);
+      return '生成工作总结失败：看板服务暂时无响应，请稍后重试；持续失败请联系部署者检查看板服务。';
     }
   };
 }

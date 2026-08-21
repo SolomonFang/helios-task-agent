@@ -295,7 +295,7 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
       // 重试指引由 handler 统一追加，这里不再自带，避免两句重复
       throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
     }
-    throw new Error('代码审查工具执行失败，请稍后重试；若持续失败请检查代码审查工具配置。');
+    throw new Error('代码审查工具执行失败，请稍后重试；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。');
   }
   const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
   return text || '（代码审查工具未产生输出：可能没有可审查的变更）';

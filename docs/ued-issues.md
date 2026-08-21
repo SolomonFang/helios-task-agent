@@ -256,3 +256,67 @@
 - 确认卡片 detailCodeBlock 把命令里的 ``` 静默替换为 `'''`，所见非所得：lark_md 是否支持四连反引号长围栏未验证，贸然改用可能破坏渲染，暂保持。
 - 报告「仅展示最近 50 条，共 N 条」的 N 由五状态计数之和推算（summary 未导出独立全量字段），未知状态任务不计入，极端情况 N 偏小。
 - unit-kanban.ts:162 测试 fixture 仍是旧「无法启动 workspace」措辞：仅透传入参，不断言用户文案，不影响产品面。
+
+## 第八轮复查（2026-08-21，免问粒度优化后全表面复审）
+
+> 背景：第七轮后唯一变更「feat：免问逻辑优化」（免问分级为类级/对象级两档）。本轮 12 路并行审查 = 增量 diff 专项 + 11 个用户可见表面（CLI、bot、卡片、向导、看板链路、agent 核心、工具层、报告、infra、文档、晨报），共修复 50 余项。验证：typecheck 0 错误，单测 12 个脚本全过，smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为修复时点快照。
+
+### P1 误导与高风险
+
+- [x] **G1 lark-cli 无目标参数时「同对象免问」失实承诺**：target 取不到时 batchKey 已退化为整命令路径（按类放行），batchScope 却硬编码 `'object'`，卡片渲染「同对象免问」。改 `batchScope: target ? 'object' : 'kind'`（`tools/lark-cli.ts`）。
+- [x] **G2 /status 降级文案自相矛盾（S3 漏网链路）**：mcpDownNote「已自动切换为备用通道」与 hkMissing 追加的「备用通道缺少 jq、curl，不可用」同句矛盾，且「备用通道」行重复报缺依赖。缺依赖时改「连接失败，备用通道缺少 jq、curl，看板读写暂不可用」（`commands.ts`、`cli.ts`）。
+- [x] **G3 /tools downNote 谎称「功能不受影响」（S1 漏网）**：bot 与 CLI 两端统一改「已切换为备用通道，大部分功能可用，如遇操作失败请稍后再试」（`handler.ts`、`cli.ts`）。
+- [x] **G4 启动期诊断提示无条件宣称「已自动切换」（S2/S3 漏网路径）**：`diagnoseMcpFailure` 增加 `opts.fallbackAvailable`，缺 jq/curl 时改口「看板读写暂不可用（备用通道缺少 jq、curl）」；重启说明独立成句消除相邻双括号。CLI 与 bot-main 调用点按已探测的 hkMissing 传参（`mcp.ts`、`cli.ts`、`bot-main.ts`）。
+- [x] **G5 文档创建上限漂移**：README×2 与 CHANGELOG 仍写「单会话最多创建 10 个」，代码已是 50。README 同步；CHANGELOG 不篡改历史（1.0.23 条目去数字、1.0.27 补 10→50 提升记录）。
+
+### P2 文案可理解性与死胡同
+
+- [x] **G6 免问粒度优化的漏改面**：bot 文本降级确认仍静态写「同类免问」（对象级授权被夸大，改复用 `batchScopeWord`/`batchAckText`）；bot /help 与 README 闸门行补「同对象免问」应答词与两档说明（`bot-main.ts`、README×2）。
+- [x] **G7 MCP 黑话集中清理**：掉线/恢复推送、/tools 与 /status downNote、`mcp.ts` 两处 `throw 'MCP 未连接'`、启动控制台「正在连接 helios-kanban MCP…/MCP 已连接/MCP 连接失败」、连接等待心跳，统一「看板连接」；hkMissing 推送双括号改逗号串联（`bot-main.ts`、`handler.ts`、`mcp.ts`）。
+- [x] **G8 原始英文错误内联用户消息两处**：确认发送失败「原因：${error}」、AI 审查降级「（${dmsg}）」均可能含 axios/fs 英文原文与宿主机绝对路径，用户面只留中文结论+出路，原文进日志（`bot-main.ts`、`handler.ts`）。
+- [x] **G9 首次 AI 审查安全提示黑话堆叠**：LLM/OCR_LLM_*/OCR_LLM_TOKEN/`ocr config provider` 四术语收敛为一条可执行出路（`handler.ts`）。
+- [x] **G10 网络错误映射形同虚设**：Node fetch 连接失败抛 `TypeError: fetch failed`，真实原因挂在 `err.cause`，「连接被拒/域名解析失败」映射永不命中。`friendlyNetError` 解包 cause（含 AggregateError）并补 fetch failed 兜底映射（`net-error.ts`，新增单测覆盖）。
+- [x] **G11 向导三处**：k/b/m 缩写补含义说明；飞书校验失败英文 json.msg 收 HTA_DEBUG；「http:// 仅限本机调试，会有明文警告」与实际行为两处不符，改如实描述（`config-wizard.ts`、`feishu-verify.ts`）。
+- [x] **G12 /config 改看板地址警示三连黑话**：MCP/kanban_*/hk_cli 同句直达用户，改「当前连接仍指向旧看板，看板工具操作的是旧看板；备用通道已指向新地址」；/status 持续警示同口径（`cli.ts`）。
+- [x] **G13 CLI spinner 暴露内部工具名**：`toolActionLabel` 上移到 `commands.ts` 共用，CLI 与 bot 进度统一中文动作（`commands.ts`、`cli.ts`、`handler.ts`）。
+- [x] **G14 /skills 用法教了不存在的子命令**「/skills 列表」：改「/skills（列出）· install · uninstall」（`commands.ts`）。
+- [x] **G15 确认闸未识别回答静默按取消**：「好的/ok」等明确批准意图落到「已取消」零解释。非空未命中词表时提示「无法识别的回答，请回复 y 确认或 N 取消」并重问（S4 先例扩展）（`cli.ts`）。
+- [x] **G16 /status lark-cli 未安装无出路**：补安装+授权指引，与未授权分支对称（`commands.ts`）。
+- [x] **G17 repo-fs 错误链路（S12/S20 漏网重灾区）**：裸 HTTP 码+响应体倾倒、英文原文、误诊「看板不可达」、无效正则英文原文、key=value 调试串、pattern 中英混排、截断缺单位——统一中文定性+出路，原文进日志（`repo-fs.ts`）。
+- [x] **G18 prompt 教模型的英文话术**：PR/push/merge/rebase/桌面 Web UI/attempt/URL/kanban 中文化，禁用英文术语清单补 web ui/attempt/url（`prompt.ts`）。
+- [x] **G19 shared.run 错误通道**：超时单独成文（保留「命令执行失败」行首，guard 强失败判定依赖）；英文 error.message 与含本机绝对路径的完整命令不进用户面，stderr 收敛尾部 3 行进日志；ENOENT 对 python3/node/bash 补安装出路（`tools/shared.ts`）。
+- [x] **G20 看板工具报错英文蛇形名**：`看板工具 start_workspace 调用失败：<英文原文>` 改复用 `summarizeMcp` 中文动作摘要，英文原文收 HTA_DEBUG（`tools/kanban-mcp.ts`）。
+- [x] **G21 hk/lark 确认摘要英文子命令**：「tasks delete 9f2e4c…」「im send ou_xxx…」映射中文动作（删除看板任务/发送飞书消息等），与 MCP 通道口径对齐（`tools/hk-cli.ts`、`tools/lark-cli.ts`）。
+- [x] **G22 去重拦截时间戳是 UTC**：展示处改 `toLocaleString('zh-CN')`，存储层保持 ISO（S23 同款）（`tools/gated-write.ts`）。
+- [x] **G23 work_summary 失败裸给 localhost 地址**：bot 用户打不开，改「看板服务暂时无响应…请联系部署者检查看板服务」（`tools/work-summary.ts`）。
+- [x] **G24 待审批纯文本版截断无提示**：列 5 条报 8 个，补「· …还有 N 个」（F3 只修了卡片版）（`watcher.ts`）。
+- [x] **G25 缺默认分支报错裸 UUID+内部参数名**：列表改「仓库名（ID：…）/仓库 ID：…」（best-effort 拉取仓库名），「base_branch / --branch」改「直接告诉我使用哪个分支」（`workspace-ready.ts`）。
+- [x] **G26 晨报头部失败计数仍是截断样本 + 待办不可见**：`WorkSummaryTotals` 增加 `failed`（截断前全量计数）；头部补「待办 N」，正文增加待办分组；范围内全待办时不再输出全零空晨报（`summary.ts`、`daily-brief.ts`）。
+- [x] **G27 报告 MD 本机路径裸推 bot 场景**：有 linkBaseUrl 时省略 Markdown 行（F28 漏网分支）（`report.ts`）。
+- [x] **G28 概览改动统计全量/样本口径混排**：截断发生时三形态统一补「改动文件与增删行仅统计最近 N 条」（`report.ts`）。
+- [x] **G29 报告服务 400/405 英文裸响应**：改中文说明页；404 出路补「或重新点击卡片上的「AI 审查」」（`report-server.ts`）。
+- [x] **G30 确认卡片注脚丢「超时自动拒绝」（F39 口径回归）**：batch 与非 batch 两分支补回，与文本降级版对齐（`feishu-cards.ts`）。
+- [x] **G31 bootstrap 兜底两处**：非本机地址错误仍被追加本机 npx 指引（S19 修复不完整，排除条件补「非本机」）；手动启动指引硬编码 PORT=7964，改从 kanbanUrl 解析端口与 autoStart 上下文（`bootstrap.ts`）。
+- [x] **G32 banner hkLine 黑话+时态矛盾**：「MCP 掉线时无法降级」改按 MCP 状态分时态（正常「看板主通道中断时将没有备用通道可用」/已 fail「看板读写当前不可用，安装后可恢复」）（`ui.ts`）。
+- [x] **G33 文档三处**：README 补「--reconfig/--rebind 前先停当前进程」警告（与 llm-error 口径一致）；CHANGELOG 按 tag 时点收编 [1.0.23]–[1.0.29] 版本节（F29 同类复发，免问粒度条目保留在 Unreleased）；SKILL.md 回复模板英文残留（{priority}/running/failed/Executor 中文化+优先级中文对照表）。
+
+### P3 细节打磨
+
+- [x] **G34 batchAckText「该对象」指代不明**：按 kind 细化——lark「发往同一接收人」、kanban/hk「对同一任务/审批」、skill「同一脚本同一参数」；`batchAckText(scope, kind?)` 签名扩展，handler/CLI 经 `lastWriteKind` 接线传入（`guard.ts`、`bot-main.ts`、`handler.ts`、`cli.ts`）。
+- [x] **G35 bot 侧**：作废确认通知补「新操作会另发确认，请留意处理」；「open-code-review」裸称统一为「代码审查工具（open-code-review）」；bot-main 控制台半角冒号 10 处全角化、「kanban 地址」中文化、`.env` 补 `userEnvPath()`、「每 60s 轮询」改「秒」。
+- [x] **G36 卡片**：「重启后失效」三处补主语「机器人重启后」；AI 审查按钮标题截断 50 字符补省略号（`feishu-cards.ts`）。
+- [x] **G37 向导**：「当前绑定 App ID:」半角冒号、「无法预检：…预检」重复、「bot --rebind」缩写到全称、「helios-kanban 地址」改「看板地址」（`config/`）。
+- [x] **G38 agent 核心**：memory「key/value 不能为空」中文化+写盘失败补「请再试一次」；llm 工具异常三条（未知工具/参数解析/执行异常）中文化，`STRONG_FAILURE_LINE_ZH_RE` 与注释同步；skills「（无 description）」等英文残留（`memory.ts`、`llm.ts`、`guard.ts`、`skills.ts`、`commands.ts`）。
+- [x] **G39 工具层**：/tools 本地摘要去「HTTP REST/MCP 降级/SKILL.md/HTML/MD」技术记号（`defs.ts`）。
+- [x] **G40 看板链路**：进程退出报错「退出码 N+最后一行 stderr」收 HTA_DEBUG，用户面保留中文出路；AI 审查失败指引补「请联系部署者」落点；「（空结果）」全角；工作区初始化失败去裸 UUID、分支列表 `join('、')`（`kanban-ensure.ts`、`ai-review.ts`、`mcp.ts`、`workspace-ready.ts`）。
+- [x] **G41 晨报**：「失败 0（含于上方状态）」零值不挂括注；`值非法:` 半角冒号；空范围兜底与头部范围口径统一（`daily-brief.ts`）。
+- [x] **G42 报告**：chips「Token 消耗」改「模型用量（Token）」、ocr 耗时「1m23s」中文化「1 分 23 秒」；hero「AI 代码审查」统一「AI 审查」；任务级增删补「行」单位；HTML「生成时间」补全角冒号；「完成任务」统一「完成」（`report.ts`、`review-report.ts`）。
+- [x] **G43 CLI**：帮助两端对齐（/skills 分隔符、/tools「看板 + 本地」、/status 与实际行标签、/memory「你的记忆」）；未知命令改首词匹配与 bot 对齐；闸口破坏性操作标题加「· 高危」（`cli.ts`）。
+- [x] **G44 infra/文档**：HK_CLI_INSTALL_HINT 补无 brew 兜底与 Ubuntu 示例；技能迁移提示「包内目录/数据目录」改「个人数据目录」；.env.example 去 `sk-...` 前缀（U10 复发）、半角冒号 5 处、「先 list」中文化、ocr 表述顺序与 README 对齐（`deps.ts`、`bootstrap.ts`、`.env.example`）。
+- [x] **G45 收尾一致性**：guard 强失败注释形态示例更新；unit-bot 断言随启动文案同步；mcp.ts/bot-main 启动控制台 MCP 字样清尾。
+
+### 本轮暂不修（记录在案）
+
+- 代码注释与文件头中的 MCP/hk_cli 字样（非用户可见面，改注释收益低且易与代码标识符脱节）。
+- bot 场景 Markdown 报告仍无 HTTP 访问路径（报告服务只托管 HTML）：本轮选择 bot 场景省略 MD 行，MD 在线化留待后续。
+- `lastWriteKind` 按 openId 记录最近一次写操作 kind：同用户并发两个不同 kind 确认时回执措辞可能张冠李戴（授权行为本身按 batchKey 正确，仅措辞），边缘场景暂缓。

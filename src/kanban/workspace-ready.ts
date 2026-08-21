@@ -43,11 +43,20 @@ export function applyRepoBaseBranches(
   return { repos: out, unresolved };
 }
 
-export function formatMissingBaseBranchError(repoIds: string[]): string {
+export function formatMissingBaseBranchError(
+  repoIds: string[],
+  repoNames?: Record<string, string | null | undefined>,
+): string {
   return (
     `无法启动工作区：以下仓库未在看板配置默认目标分支，且本次未指定分支：\n` +
-    repoIds.map((id) => `- ${id}`).join('\n') +
-    `\n请在看板的仓库设置里填写默认目标分支（如 develop），或在创建任务时显式指定分支（base_branch / --branch）。` +
+    // 有仓库名时带名字便于辨认；拿不到名字时只给「仓库 ID」，不落裸 UUID 列表
+    repoIds
+      .map((id) => {
+        const name = repoNames?.[id]?.trim();
+        return `- ${name ? `${name}（ID：${id}）` : `仓库 ID：${id}`}`;
+      })
+      .join('\n') +
+    `\n请在看板的仓库设置里填写默认目标分支（如 develop），或在创建任务时直接告诉我使用哪个分支。` +
     `\n（若不指定，看板会回退到 main 分支；仓库没有 main 时会创建出空工作区，看板详情页会一直转圈加载。）`
   );
 }
@@ -88,7 +97,11 @@ export async function fillHkStartBranches(
     signal,
   );
   const { repos: filled, unresolved } = applyRepoBaseBranches(repos, defaults);
-  if (unresolved.length) return formatMissingBaseBranchError(unresolved);
+  // 报错前再按 unresolved 拉一次仓库名（仅错误路径的额外请求），让用户面能显示「名字（ID：…）」
+  if (unresolved.length) {
+    const names = await fetchRepoNames(kanbanUrl, unresolved, signal);
+    return formatMissingBaseBranchError(unresolved, names);
+  }
   if (isArgv) {
     const argv = target as string[];
     for (const i of repoArgs) argv[i] = `${argv[i]}:${defaults[argv[i]!]}`;
@@ -131,12 +144,13 @@ export function formatWorkspaceSetupFailure(opts: {
   elapsedMs: number;
 }): string {
   const secs = Math.round(opts.elapsedMs / 1000);
-  const branches = opts.targetBranches.length ? opts.targetBranches.join(', ') : '（未知）';
+  // 分支列表用中文顿号；工作区 ID（UUID）不落用户面，调用方日志里可溯
+  const branches = opts.targetBranches.length ? opts.targetBranches.join('、') : '（未知）';
   const mainHint = opts.targetBranches.some((b) => b === 'main')
     ? `\n检测到目标分支为 main。若仓库实际没有 main 分支（例如主分支叫 develop），工作区会创建失败：任务状态不会变成「进行中」，看板详情页会一直转圈加载。`
     : '';
   return (
-    `工作区 ${opts.workspaceId} 初始化超过 ${secs} 秒仍未就绪（看板分配的执行目录一直为空）。\n` +
+    `该任务的工作区初始化超过 ${secs} 秒仍未就绪（看板分配的执行目录一直为空）。\n` +
     `当前目标分支：${branches}` +
     mainHint +
     `\n请检查：仓库在看板里的默认分支设置、以及创建任务时指定的分支是否存在；必要时归档该工作区后用正确分支重试。`
@@ -159,6 +173,28 @@ export async function fetchRepoDefaultBranches(
             ? (json as { default_target_branch?: unknown }).default_target_branch
             : null;
         out[id] = typeof branch === 'string' && branch.trim() ? branch.trim() : null;
+      } catch {
+        out[id] = null;
+      }
+    }),
+  );
+  return out;
+}
+
+/** Load repo display name for each repo_id (best-effort; missing → null)。仅报错文案用。 */
+export async function fetchRepoNames(
+  kanbanUrl: string,
+  repoIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, string | null>> {
+  const out: Record<string, string | null> = {};
+  await Promise.all(
+    repoIds.map(async (id) => {
+      try {
+        const json: unknown = await apiGet(kanbanUrl, `/repos/${id}`, { timeoutMs: 8000, signal });
+        const name =
+          json && typeof json === 'object' ? (json as { name?: unknown }).name : null;
+        out[id] = typeof name === 'string' && name.trim() ? name.trim() : null;
       } catch {
         out[id] = null;
       }

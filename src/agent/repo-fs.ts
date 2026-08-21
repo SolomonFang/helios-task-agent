@@ -20,6 +20,11 @@ export function truncateOutput(s: string, max = MAX_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
 }
 
+/** 原始错误（英文堆栈/响应体）进日志：用户面只给可执行出路，不落原文（同 confirm.ts/session.ts 的 [tag] 惯例）。 */
+function logRepoFsError(context: string, detail: unknown): void {
+  console.error(`[repo-fs] ${context}: ${typeof detail === 'string' ? detail : errMessage(detail)}`);
+}
+
 /** Resolve relPath under root; reject escapes outside root (including via symlinks). */
 export function resolveUnderRoot(
   root: string,
@@ -37,7 +42,7 @@ export function resolveUnderRoot(
     const realTarget = fs.realpathSync(target);
     const relReal = path.relative(realRoot, realTarget);
     if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
-      return { ok: false, error: `路径越界：符号链接指向仓库根目录之外（path=${relPath}）` };
+      return { ok: false, error: `路径越界：符号链接指向仓库根目录之外（目标路径：${relPath}）` };
     }
     return { ok: true, abs: realTarget };
   }
@@ -83,18 +88,18 @@ export async function fetchRepoPath(  kanbanUrl: string,
     try {
       json = JSON.parse(text) as typeof json;
     } catch {
-      return { ok: false, error: `解析仓库信息失败 HTTP ${res.status}：${text.slice(0, 200)}` };
+      logRepoFsError(`解析仓库信息响应失败（HTTP ${res.status}）`, text.slice(0, 200));
+      return { ok: false, error: `看板接口异常（HTTP ${res.status}），无法获取仓库路径，请确认看板服务正常后重试` };
     }
     const repoPath = json.data?.path;
     if (!res.ok || !repoPath) {
-      return {
-        ok: false,
-        error: `无法解析仓库 ${repoId} 的本机路径：${json.message || text.slice(0, 300)}`,
-      };
+      logRepoFsError(`获取仓库 ${repoId} 的本机路径失败（HTTP ${res.status}）`, json.message || text.slice(0, 300));
+      return { ok: false, error: '未找到该仓库或仓库路径未配置，请在看板中确认仓库已注册后重试' };
     }
     return { ok: true, path: repoPath };
   } catch (err) {
-    return { ok: false, error: `请求 ${url} 失败：${errMessage(err)}` };
+    logRepoFsError(`请求看板服务失败（${url}）`, err);
+    return { ok: false, error: '无法连接看板服务，请确认看板正在运行后重试' };
   }
 }
 
@@ -155,10 +160,16 @@ export async function resolveRepoRoot(opts: {
     try {
       repoPaths = await fetchRegisteredRepoPaths(opts.kanbanUrl);
     } catch (err) {
+      logRepoFsError('校验仓库白名单失败', err);
+      // 区分网络异常与 HTTP 异常，给用户不同的可执行出路；不再裸挂原始错误（如「: HTTP 500」）
+      const httpStatus = /^HTTP (\d{3})\b/.exec(errMessage(err))?.[1];
+      const cause = httpStatus
+        ? `看板接口异常（HTTP ${httpStatus}），请稍后再试或重启看板服务`
+        : '看板不可达，请确认看板服务正在运行后重试';
       return {
         ok: false,
         denied: true,
-        error: `无法校验仓库白名单（看板不可达），已拒绝访问本机路径：${errMessage(err)}`,
+        error: `无法校验仓库白名单（${cause}），已拒绝访问本机路径；看板恢复后再让我读取即可`,
       };
     }
     if (!isUnderRegisteredRepo(rootAbs, repoPaths)) {
@@ -186,7 +197,7 @@ export async function repoFsList(root: string, relPath = '.'): Promise<string> {
     .sort((a, b) => a.localeCompare(b))
     .slice(0, MAX_LIST_ENTRIES);
   const extra = entries.length > MAX_LIST_ENTRIES ? `\n…（共 ${entries.length} 项，已截断）` : '';
-  return truncateOutput(`root: ${root}\npath: ${relPath || '.'}\n\n${lines.join('\n')}${extra}`);
+  return truncateOutput(`仓库根目录：${root}\n相对路径：${relPath || '.'}\n\n${lines.join('\n')}${extra}`);
 }
 
 export async function repoFsRead(root: string, relPath: string): Promise<string> {
@@ -205,7 +216,7 @@ export async function repoFsRead(root: string, relPath: string): Promise<string>
     const { bytesRead } = await fh.read(buf, 0, size, 0);
     let text = buf.subarray(0, bytesRead).toString('utf8');
     if (st.size > MAX_READ_BYTES) {
-      text += `\n…（文件共 ${st.size} 字节，仅读取前 ${MAX_READ_BYTES}）`;
+      text += `\n…（文件共 ${st.size} 字节，仅读取前 ${MAX_READ_BYTES / 10_000} 万字节）`;
     }
     return truncateOutput(`# ${relPath}\n\n${text}`);
   } finally {
@@ -222,7 +233,7 @@ function matchesGlob(fileName: string, relFile: string, globHint?: string): bool
 export async function repoFsGrep(root: string, pattern: string, relPath = '.', globHint?: string): Promise<string> {
   if (!pattern) return '参数错误：grep 需要 pattern';
   // pattern 来自模型生成：限制长度缓解 ReDoS，编译异常友好报错
-  if (pattern.length > MAX_PATTERN_LEN) return `参数错误：pattern 过长（>${MAX_PATTERN_LEN} 字符），请缩短后重试`;
+  if (pattern.length > MAX_PATTERN_LEN) return `参数错误：搜索表达式过长（超过 ${MAX_PATTERN_LEN} 字符），请缩短后重试`;
   // 简单启发式拒绝嵌套量词（如 (\w+)+ 一类灾难性回溯），不过度工程
   if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
     return '参数错误：搜索表达式含嵌套量词（如 (\\w+)+），可能导致匹配卡死，请简化后重试';
@@ -238,7 +249,8 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   try {
     re = new RegExp(pattern, 'i');
   } catch (err) {
-    return `无效正则：${errMessage(err)}`;
+    logRepoFsError(`无效正则「${pattern}」`, err);
+    return '搜索表达式不是有效的正则表达式，请检查括号/符号是否配对后重试';
   }
   const resolved = resolveUnderRoot(root, relPath);
   if (!resolved.ok) return resolved.error;
@@ -313,9 +325,9 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   } else await walk(resolved.abs);
 
   const truncNote = scanTruncated ? `\n…（${scanTruncated}，已达扫描总量上限，结果可能不全）` : '';
-  if (!hits.length) return truncateOutput(`root: ${root}\npattern: ${pattern}\n（无命中）${truncNote}`);
+  if (!hits.length) return truncateOutput(`仓库根目录：${root}\n搜索表达式：${pattern}\n（无命中）${truncNote}`);
   const more = hits.length >= MAX_GREP_HITS ? `\n…（已达 ${MAX_GREP_HITS} 条上限）` : '';
-  return truncateOutput(`root: ${root}\npattern: ${pattern}\n\n${hits.join('\n')}${more}${truncNote}`);
+  return truncateOutput(`仓库根目录：${root}\n搜索表达式：${pattern}\n\n${hits.join('\n')}${more}${truncNote}`);
 }
 
 export async function runRepoFs(

@@ -332,19 +332,30 @@ function fmtNum(v: string): string {
   return v.replace(/\d+/g, (d) => d.replace(/\B(?=(\d{3})+(?!\d))/g, ','));
 }
 
+/** ocr 耗时原文（如 1m23s / 45s / 2h3m）→ 中文「1 分 23 秒」；解析失败回退原文。 */
+function zhElapsed(raw: string): string {
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$/.exec(raw.trim());
+  if (!m || (!m[1] && !m[2] && !m[3])) return raw;
+  const parts: string[] = [];
+  if (m[1]) parts.push(`${m[1]} 小时`);
+  if (m[2]) parts.push(`${m[2]} 分`);
+  if (m[3]) parts.push(`${m[3]} 秒`);
+  return parts.join(' ');
+}
+
 /** [ocr] Summary 原文 → 统计 chips；解析不到时原样展示。 */
 function summaryChips(summary: string | undefined): string {
   if (!summary) return '';
-  const defs: Array<[RegExp, string]> = [
-    [/(\d+)\s*file\(s\)\s*reviewed/i, '审查文件'],
-    [/(\d+)\s*comment\(s\)/i, '意见数'],
-    [/(~?[\d,]+)\s*token\(s\)/i, 'Token 消耗'],
-    [/([\d.hms]+)\s*elapsed/i, '耗时'],
+  const defs: Array<[RegExp, string, (v: string) => string]> = [
+    [/(\d+)\s*file\(s\)\s*reviewed/i, '审查文件', fmtNum],
+    [/(\d+)\s*comment\(s\)/i, '意见数', fmtNum],
+    [/(~?[\d,]+)\s*token\(s\)/i, '模型用量（Token）', fmtNum],
+    [/([\d.hms]+)\s*elapsed/i, '耗时', zhElapsed],
   ];
   const chips = defs
-    .map(([re, label]) => {
+    .map(([re, label, fmt]) => {
       const m = re.exec(summary);
-      return m ? `<span class="chip"><b>${escapeHtml(fmtNum(m[1]!))}</b> ${label}</span>` : '';
+      return m ? `<span class="chip"><b>${escapeHtml(fmt(m[1]!))}</b> ${label}</span>` : '';
     })
     .filter(Boolean);
   return chips.length ? chips.join('') : `<span class="chip">${escapeHtml(summary)}</span>`;
@@ -599,9 +610,9 @@ export function renderReviewHtml(data: ReviewReportData): string {
     title: `AI 审查 · ${escapeHtml(data.title || '（无标题）')}`,
     css: REVIEW_PAGE_CSS,
     body: `  <header class="hero${pass ? ' pass' : ''}">
-    <h1>${pass ? '✅' : '🤖'} AI 代码审查${pass ? ' · 全部通过' : ''}</h1>
+    <h1>${pass ? '✅' : '🤖'} AI 审查${pass ? ' · 全部通过' : ''}</h1>
     <p class="subtitle">${escapeHtml(data.title || '（无标题）')}</p>
-    <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间 ${escapeHtml(data.generatedAt)}</p>
+    <p class="gen">${range ? `范围 ${range} · ` : ''}生成时间：${escapeHtml(data.generatedAt)}</p>
   </header>
   ${content}`,
   });

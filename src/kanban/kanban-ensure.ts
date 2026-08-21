@@ -182,14 +182,15 @@ export async function ensureKanbanRunning(
       if (child.exitCode === -2) {
         throw new Error('未检测到 Node.js/npm（npx 命令不可用），请先安装 Node.js（https://nodejs.org）后重新运行。');
       }
-      // stderr 尾部（原始报错）收进 HTA_DEBUG 日志；用户面只带最后一行（截断）+ 常见原因与出路
-      if (process.env.HTA_DEBUG && stderrBuf.trim()) {
-        console.error(`[kanban] 进程退出前 stderr 尾部：\n${stderrBuf.slice(-800)}`);
+      // 退出码与 stderr 尾部（原始报错，常是英文 npm 输出）收进 HTA_DEBUG 日志；
+      // 用户面只给中文定性与出路，不落退出码/英文原文
+      if (process.env.HTA_DEBUG) {
+        console.error(
+          `[kanban] 进程退出（退出码 ${child.exitCode}）${stderrBuf.trim() ? `，stderr 尾部：\n${stderrBuf.slice(-800)}` : ''}`,
+        );
       }
-      const lastLine = (stderrBuf.trim().split('\n').filter(Boolean).pop() || '').slice(0, 120);
       throw new Error(
-        `helios-kanban 启动后退出（退出码 ${child.exitCode}），常见原因是端口被占用。` +
-          `可设 HTA_DEBUG=1 重新运行查看详细报错。${lastLine ? `\n最后一行报错：${lastLine}` : ''}`,
+        'helios-kanban 启动后退出，常见原因是端口被占用。可设 HTA_DEBUG=1 重新运行查看详细报错。',
       );
     }
     // 等待期间每 ~10 秒补一行进度，避免启动阶段长时间无反馈

@@ -71,7 +71,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       if (/^https:\/\//i.test(u)) return u;
       // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
       if (!/^http:\/\//i.test(u)) {
-        console.log(c.err('请输入以 https:// 开头的地址（http:// 仅限本机调试，会有明文警告；如 https://api.deepseek.com/v1）。'));
+        console.log(c.err('请输入以 https:// 开头的地址。http:// 明文端点会要求显式确认（本机地址除外），建议用 https://，如 https://api.deepseek.com/v1。'));
         u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
         if (!u) throw new Error('Base URL 不能为空');
         continue;
@@ -140,7 +140,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     } else {
       console.log(c.err(`模型配置校验失败：${check.message}`));
     }
-    const act = (await need('回车 = 直接重试；输入 k/b/m 修改某项；输入 s = 仍然保存: ')).toLowerCase();
+    const act = (await need('回车 = 直接重试；输入 k 改 API Key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
     if (act === 's' || act === 'save' || act === '保存') break;
     if (act === 'b' || act === 'base' || act === 'url') {
       baseUrl = await need(`Base URL（当前 ${baseUrl}）: `);
@@ -156,7 +156,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     // 其余输入（含回车）= 不修改，用当前配置直接重试
   }
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
-  const kanbanUrl = (await need(`helios-kanban 地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
+  const kanbanUrl = (await need(`看板地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
   const kanbanProjectId =
     (await need(`默认项目 ID（可选，回车跳过${old.kanbanProjectId ? `，当前 ${old.kanbanProjectId}` : ''}）: `)) ||
     old.kanbanProjectId;
@@ -228,7 +228,7 @@ async function promptFeishuConfig(
   }
   const allowedPrompt = existing.allowedOpenIds.length
     ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再用 bot --rebind 回填）: ';
+    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再运行 helios-task-agent bot --rebind 回填）: ';
   const allowedRaw = await need(allowedPrompt);
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };
@@ -244,7 +244,7 @@ export async function rebindFeishuBot(
 ): Promise<{ feishu: FeishuBotConfig; envPath: string }> {
   const existing = feishuBotConfig();
   if (existing.appId) {
-    console.log(c.gray(`当前绑定 App ID: ${existing.appId}，输入新机器人的凭证即完成换绑。`));
+    console.log(c.gray(`当前绑定 App ID：${existing.appId}，输入新机器人的凭证即完成换绑。`));
   }
   const feishu = await promptFeishuConfig(makeNeed(ask, askSecret), existing, { allowClear: true });
   const envPath = writeEnv(currentConfig(), feishu);

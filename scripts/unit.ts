@@ -965,14 +965,14 @@ async function run(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  await checkAsync('MemoryStore.persist：目录不可写时写操作显式报未持久化（不再假装已记住），内存态仍可用', async () => {
+  await checkAsync('MemoryStore.persist：目录不可写时写操作显式报保存失败（不再假装已记住），内存态仍可用', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memro-'));
     fs.writeFileSync(path.join(tmp, 'blocker'), 'x'); // 占住路径，使 mkdir 必然 ENOTDIR
     const mem = new MemoryStore(path.join(tmp, 'blocker', 'sub'));
-    assert.throws(() => mem.setFact('u1', 'k', 'v'), /未持久化/); // 写盘失败必须报错
-    assert.throws(() => mem.addNote('u1', 'n1'), /未持久化/);
+    assert.throws(() => mem.setFact('u1', 'k', 'v'), /记忆保存失败/); // 保存失败必须报错
+    assert.throws(() => mem.addNote('u1', 'n1'), /记忆保存失败/);
     assert.equal(mem.getFact('u1', 'k'), 'v'); // 内存态仍可用
-    assert.throws(() => mem.deleteFact('u1', 'k'), /未持久化/); // 删除同样不得假装已忘记
+    assert.throws(() => mem.deleteFact('u1', 'k'), /记忆保存失败/); // 删除同样不得假装已忘记
     assert.equal(mem.getFact('u1', 'k'), undefined); // 与写路径一致：删除失败也只影响内存态
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -1048,7 +1048,7 @@ async function run(): Promise<void> {
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memempty-'));
     const mem = new MemoryStore(tmp);
-    assert.throws(() => mem.setFact('u1', 'k', ''), /value 不能为空/);
+    assert.throws(() => mem.setFact('u1', 'k', ''), /记忆内容不能为空/);
     mem.setFact('u1', ' k<<<USER_MEMORY ', 'v'); // 存储键为归一化后的「k<<<USER_MEMORY」中和形态
     check(
       'MemoryStore deleteFact 与 setFact 键归一化对称（trim + 标记中和）',
@@ -1313,10 +1313,10 @@ async function run(): Promise<void> {
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
       const okRes = await runRepoFs(base, { action: 'list', root: registered, path: '.' });
-      assert.ok(okRes.out.includes('root:'), `已注册仓库应放行，实际：${okRes.out.slice(0, 120)}`);
+      assert.ok(okRes.out.includes('仓库根目录：'), `已注册仓库应放行，实际：${okRes.out.slice(0, 120)}`);
       assert.equal(okRes.denied, false, '放行不应标记 denied');
       const subRes = await runRepoFs(base, { action: 'list', root: path.join(registered, '..', 'repo-a'), path: '.' });
-      assert.ok(subRes.out.includes('root:'), '等价路径应放行');
+      assert.ok(subRes.out.includes('仓库根目录：'), '等价路径应放行');
       const badRes = await runRepoFs(base, { action: 'list', root: stranger, path: '.' });
       assert.ok(badRes.out.includes('不在看板注册仓库内'), `未注册仓库应拒绝，实际：${badRes.out.slice(0, 120)}`);
       assert.equal(badRes.denied, true, '白名单拒绝应标记 denied');
@@ -1511,6 +1511,10 @@ async function run(): Promise<void> {
     const hint = diagnoseMcpFailure(portFileStderr);
     assert.ok(hint!.includes('端口记录文件'), '诊断应点明端口文件');
     assert.ok(hint!.includes('重新运行本程序'), '诊断应给出可操作的恢复动作');
+    assert.ok(hint!.includes('（会同时重启看板）。'), '重启说明应独立成句（不与备用通道说明叠成双括号）');
+    const noFallback = diagnoseMcpFailure(portFileStderr, { fallbackAvailable: false });
+    assert.ok(noFallback!.includes('备用通道缺少 jq、curl'), '备用通道不可用时应如实告知');
+    assert.ok(!noFallback!.includes('已自动切换'), '备用通道不可用时不得宣称已自动切换');
     assert.equal(diagnoseMcpFailure('Error: spawn npx ENOENT'), null, '其他启动错误不误诊');
     assert.equal(diagnoseMcpFailure(''), null, '空 stderr 返回 null');
   });
@@ -1879,7 +1883,7 @@ async function run(): Promise<void> {
     });
     return (
       page.includes('<header class="hero pass">') &&
-      page.includes('AI 代码审查 · 全部通过') &&
+      page.includes('AI 审查 · 全部通过') &&
       page.includes('class="pass-banner"') &&
       page.includes('审查全部通过') &&
       page.includes('<b>0</b> 意见数') &&
@@ -2947,8 +2951,8 @@ async function run(): Promise<void> {
       process.env.PATH = bin;
       const unauth = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
       assert.ok(unauth.includes(`lark-cli：${LARK_CLI_AUTH_HINT}`));
-      assert.ok(unauth.includes('备用通道：缺少 jq、curl'));
-      assert.ok(unauth.includes('备用通道缺少 jq、curl，不可用')); // 看板连接掉线且备用通道缺依赖时必须警示
+      assert.ok(unauth.includes('备用通道：不可用')); // 缺依赖明细在「看板连接」行，本行不重复
+      assert.ok(unauth.includes('备用通道缺少 jq、curl，看板读写暂不可用')); // 看板连接掉线且备用通道缺依赖时必须警示（不得再说「已切换」）
       const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
       assert.ok(missing.includes('lark-cli：未安装'));
       // 已授权：shebang 直指 node 的假 lark-cli 输出 available=true（探测走 minimalChildEnv，NODE_OPTIONS 注入不可达）
@@ -3124,10 +3128,13 @@ async function run(): Promise<void> {
     });
     await handlers.get('lark_cli')!({ args: ['im', 'send', 'ou_x', 'hi'] });
     await handlers.get('lark_cli')!({ args: ['task', 'create', 't'] });
+    await handlers.get('lark_cli')!({ args: ['im', 'send'] });
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.deepEqual(seen, [
       { batchKey: 'lark:im send:ou_x', batchScope: 'object', destructive: true },
       { batchKey: 'lark:task create:t', batchScope: 'object', destructive: true },
+      // 无对象实参时 key 退化为命令路径，粒度同步降为类级——卡片不再广告「同对象免问」
+      { batchKey: 'lark:im send', batchScope: 'kind', destructive: true },
     ]);
   });
 

@@ -319,7 +319,7 @@ async function main(): Promise<void> {
     await checkAsync('退出码：bot 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
       const { child, tmp, out } = spawnAgent('bot-main.ts', kanban.url, feishuEnv);
       try {
-        await waitOutput(out, '正在连接 helios-kanban MCP'); // 连接在途（慢命令）时发信号
+        await waitOutput(out, '正在连接看板'); // 连接在途（慢命令）时发信号
         child.kill('SIGINT');
         const code = await waitExit(child);
         assert.ok(out().includes('正在退出'), `应走优雅退出路径，输出：${out()}`);

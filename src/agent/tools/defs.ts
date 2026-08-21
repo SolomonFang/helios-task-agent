@@ -152,10 +152,10 @@ export const LOCAL_TOOLS: OpenAiTool[] = [
 /** /tools 展示的本地工具一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
 export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
   { name: 'lark_cli', summary: '飞书读写：任务 / 文档 / 群消息等' },
-  { name: 'hk_cli', summary: '看板 HTTP REST 命令（MCP 降级与补充）' },
+  { name: 'hk_cli', summary: '看板备用通道（看板连接异常时兜底与补充）' },
   { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
-  { name: 'work_summary', summary: '生成工作总结报告（HTML/MD）' },
-  { name: 'skill_doc', summary: '按需读取已安装技能完整文档（SKILL.md）' },
+  { name: 'work_summary', summary: '生成工作总结报告（网页/文档）' },
+  { name: 'skill_doc', summary: '按需读取已安装技能的完整使用文档' },
   { name: 'skill_exec', summary: '运行技能目录内脚本（每次需用户确认）' },
 ];
 

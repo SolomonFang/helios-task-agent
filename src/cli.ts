@@ -5,7 +5,7 @@ import { ensureEnvLoaded } from './config/config';
 import { ensureConfig } from './config/config-wizard';
 import { AgentSession } from './agent/session';
 import { SessionHistoryStore } from './agent/session-store';
-import { connectMcp } from './kanban/mcp';
+import { connectMcp, diagnoseMcpFailure } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
 import { checkHkDeps, checkLarkCliStatus, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
@@ -20,9 +20,10 @@ import {
   confirmStateText,
   handleSkillsCommand,
   llmFailureParts,
+  toolActionLabel,
   TRY_EXAMPLES,
 } from './commands';
-import { CONFIRM_BATCH_RE, CONFIRM_YES_RE } from './agent/confirm';
+import { CONFIRM_BATCH_RE, CONFIRM_NO_RE, CONFIRM_YES_RE } from './agent/confirm';
 import { batchAckText, batchScopeWord, kindLabel, type ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
@@ -87,10 +88,10 @@ const HELP = `
   ${c.strong('命令')}
   ${c.info('/help')}     显示帮助
   ${c.info('/config')}   重新配置模型 / 看板地址
-  ${c.info('/tools')}    列出当前可用的看板工具
-  ${c.info('/skills')}   列出技能；install <技能目录路径> 安装（npm 升级不丢失）/ uninstall <技能名> 卸载
+  ${c.info('/tools')}    列出当前可用工具（看板 + 本地）
+  ${c.info('/skills')}   列出技能；install <技能目录路径> 安装（升级不丢失）；uninstall <技能名> 卸载
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
-  ${c.info('/status')}   健康检查（模型 / 看板 / 看板连接 / lark-cli）
+  ${c.info('/status')}   查看状态（模型 / 看板 / 看板连接 / 备用通道 / lark-cli）
   ${c.info('/clear')}    清空对话历史（不清记忆）
   ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（/quit 同效；任务运行中按 Ctrl+C 只中断不退出）
@@ -291,7 +292,9 @@ export async function main(): Promise<void> {
         c.warn(`看板连接失败，备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）。`),
       );
     }
-    if (mcpHint) console.log(c.warn(mcpHint));
+    // 诊断提示在 connectMcp 内生成时尚未知降级链状态：缺 jq/curl 时按「无备用通道」重算，避免谎称已切换备用通道
+    const hint = hkMissing.length ? diagnoseMcpFailure(mcp.getStderrTail(), { fallbackAvailable: false }) : mcpHint;
+    if (hint) console.log(c.warn(hint));
   }
 
   const larkStatus = checkLarkCliStatus();
@@ -320,7 +323,7 @@ export async function main(): Promise<void> {
   const confirmWrite: ConfirmFn = async (req) => {
     spinner.stop();
     console.log('');
-    console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}）：${req.summary}`));
+    console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}${req.destructive ? ' · 高危' : ''}）：${req.summary}`));
     console.log(c.gray(req.detail));
     const timeoutMs = req.destructive ? 300000 : 120000;
     const options = req.batchKey
@@ -345,12 +348,17 @@ export async function main(): Promise<void> {
       const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
       const once = !batch && CONFIRM_YES_RE.test(t);
       if (batch) {
-        console.log(c.ok(`已批准；${batchAckText(req.batchScope)}（/confirm revoke 撤销）。`));
+        console.log(c.ok(`已批准；${batchAckText(req.batchScope, req.kind)}（/confirm revoke 撤销）。`));
         return 'batch';
       }
       if (once) {
         console.log(c.ok('已批准（仅此次），继续执行。'));
         return 'once';
+      }
+      // 非空但未命中任何词表（「好的/ok/可以」等随口应答）不是取消意图：提示后重问；空回车与取消词才取消
+      if (t && !CONFIRM_NO_RE.test(t)) {
+        console.log(c.warn('无法识别的回答，请回复 y 确认或 N 取消。'));
+        continue;
       }
       console.log(c.gray('已取消，操作未执行。'));
       return false;
@@ -389,7 +397,10 @@ export async function main(): Promise<void> {
     if (!line) continue;
 
     if (line.startsWith('/')) {
-      const cmd = line.toLowerCase();
+      // 按首词判定命令（与 bot 的 parseCommand 一致）：/status foo 不再整行被当成未知命令；
+      // 带子命令的 /confirm 仍按整行词表匹配（fullCmd）
+      const cmd = line.toLowerCase().split(/\s+/)[0]!;
+      const fullCmd = line.toLowerCase();
       if (cmd === '/exit' || cmd === '/quit') {
         console.log(c.gray('再见 👋'));
         await cleanup();
@@ -398,9 +409,9 @@ export async function main(): Promise<void> {
       } else if (cmd === '/clear') {
         session.clearHistory();
         console.log(c.gray(clearedText(session.activeBatchApprovals(), '/confirm revoke 可恢复逐次确认')));
-      } else if (cmd === '/confirm' || cmd === '/confirm revoke' || cmd === '/confirm on') {
+      } else if (cmd === '/confirm' && (fullCmd === '/confirm' || fullCmd === '/confirm revoke' || fullCmd === '/confirm on')) {
         // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）
-        if (cmd !== '/confirm') {
+        if (fullCmd !== '/confirm') {
           const n = session.revokeBatchApprovals();
           console.log(
             n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, '当前没有生效中的「同类免问」。')),
@@ -416,7 +427,7 @@ export async function main(): Promise<void> {
       } else if (cmd === '/memory') {
         // CLI 端记忆归属恒为 local：仅在非 local（未来多用户）时展示 user= 后缀，避免无信息量的内部细节
         const userSuffix = session.memoryUserId === 'local' ? '' : c.gray(`  user=${session.memoryUserId}`);
-        for (const l of buildMemoryLines(session, c.strong('用户记忆') + userSuffix)) {
+        for (const l of buildMemoryLines(session, c.strong('你的记忆') + userSuffix)) {
           console.log(l);
         }
         console.log('');
@@ -431,7 +442,7 @@ export async function main(): Promise<void> {
             downNote: c.warn(
               hkMissing.length
                 ? `看板连接失败，备用通道因缺少 ${hkMissing.join('、')} 不可用（${HK_CLI_INSTALL_HINT}）。`
-                : `看板连接失败，${MCP_FALLBACK_TEXT}，看板功能不受影响。`,
+                : `看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`,
             ),
             localHeader: c.strong('本地工具：'),
             bullet: '  ',
@@ -440,7 +451,7 @@ export async function main(): Promise<void> {
         )) {
           console.log(l);
         }
-      } else if (cmd === '/skills' || cmd.startsWith('/skills ')) {
+      } else if (cmd === '/skills') {
         // 子命令参数（install 路径等）区分大小写，用原始 line 而非小写化后的 cmd
         for (const l of handleSkillsCommand(
           line,
@@ -460,14 +471,14 @@ export async function main(): Promise<void> {
             kanbanUrl: cfg.kanbanUrl,
             mcpOk,
             mcpToolCount: mcp.tools.length,
-            mcpDownNote: `连接失败，${MCP_FALLBACK_TEXT}`,
+            mcpDownNote: '连接失败，已切换为备用通道',
             larkOk: larkStatus !== 'missing',
             // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启
             extra:
               cfg.kanbanUrl !== mcpBoundKanbanUrl
                 ? [
                     c.warn(
-                      `注意：MCP 仍连接旧看板 ${mcpBoundKanbanUrl}，kanban_* 工具操作的是旧实例；/exit 重启后才会连接新地址。`,
+                      `注意：看板连接仍指向旧地址 ${mcpBoundKanbanUrl}，看板工具操作的是旧看板；/exit 重启后才会连接新地址。`,
                     ),
                   ]
                 : undefined,
@@ -491,8 +502,8 @@ export async function main(): Promise<void> {
           if (cfg.kanbanUrl !== prevKanbanUrl) {
             console.log(
               c.warn(
-                `看板地址已改为 ${cfg.kanbanUrl}，但 MCP 连接仍是启动时的旧实例（kanban_* 工具将操作旧看板）；` +
-                  'hk_cli 已指向新地址。建议 /exit 后重启以重连 MCP。',
+                `看板地址已改为 ${cfg.kanbanUrl}，但当前连接仍指向启动时的旧看板，看板工具操作的仍是旧看板；` +
+                  '备用通道已指向新地址。建议 /exit 后重启以连接新地址。',
               ),
             );
           }
@@ -503,7 +514,7 @@ export async function main(): Promise<void> {
           else console.error(c.err(`配置失败：${message}`));
         }
       } else {
-        console.log(c.warn(`未知命令 ${line}，输入 /help 查看帮助。`));
+        console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));
       }
       continue;
     }
@@ -515,7 +526,7 @@ export async function main(): Promise<void> {
       const reply = await session.handleUserMessage(
         line,
         (info) => {
-          if (info.type === 'tool') spinner.setText(`调用工具 ${info.name} …（Ctrl+C 中断）`);
+          if (info.type === 'tool') spinner.setText(`${toolActionLabel(info.name)} …（Ctrl+C 中断）`);
           else spinner.setText('思考中…（Ctrl+C 中断）');
         },
         ctl.signal,

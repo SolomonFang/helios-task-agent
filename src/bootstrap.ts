@@ -46,7 +46,7 @@ export function warnStartupDeps(larkStatus: LarkCliStatus, opts: StartupDepsWarn
 /** 历史误放进 npm 包内 skills/ 的技能升级即丢失：启动时先迁到数据目录持久保存，再校验最终生效的技能集。 */
 export function migrateAndValidateSkills(): void {
   for (const name of migratePackageSkills()) {
-    console.log(c.info(`已将技能「${name}」从包内目录迁移到数据目录（以后升级不再丢失）`));
+    console.log(c.info(`已将技能「${name}」迁移到个人数据目录，今后升级不会丢失`));
   }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   // problem 自带「技能「x」配置问题：…」前缀（见 agent/skills.ts），直接打印即可
@@ -72,9 +72,19 @@ export async function ensureKanbanOrExit(opts: KanbanBootOptions): Promise<Kanba
     const message = errMessage(err);
     opts.onFail?.();
     console.error(c.err(`${opts.failLabel}：${message}`));
-    // kanban-ensure 的多数失败已内嵌指引；npx 缺失（提示安装 Node.js）时追加「手动执行 npx」是循环指引，跳过
-    if (!message.includes('可手动执行') && !message.includes('nodejs.org')) {
-      console.error(c.gray(kanbanManualStartHint()));
+    // kanban-ensure 的多数失败已内嵌指引；npx 缺失（提示安装 Node.js）与「非本机主机」分支
+    // 再追加本机 npx 手动指引是循环/矛盾指引（先让去别的主机启动、又教本机拉起），跳过
+    if (!message.includes('可手动执行') && !message.includes('nodejs.org') && !message.includes('非本机')) {
+      // 手动指引的端口跟随用户配置的看板地址，自定义端口时不导回默认 7964
+      let port: string | number = 7964;
+      try {
+        port = new URL(opts.kanbanUrl).port || 7964;
+      } catch {
+        /* 地址解析失败时保留默认 7964 */
+      }
+      console.error(
+        c.gray(kanbanManualStartHint({ port, autoStart: process.env.HELIOS_KANBAN_AUTO_START !== '0' })),
+      );
     }
     process.exit(1);
   }

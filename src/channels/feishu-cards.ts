@@ -17,6 +17,17 @@ function baseCardConfig(): Record<string, unknown> {
   return { wide_screen_mode: true, enable_forward: false };
 }
 
+/**
+ * 本机链接可达性注脚（看板事件卡片与 AI 审查卡片同口径）：
+ * loopback（localhost/127.x/::1）连同一局域网都不可达，需与「本机所在网络可达」区分；
+ * 失效主语写明是机器人重启，避免「重启后失效」不知所指。
+ */
+function linkReachNote(url: string): string {
+  return isLoopbackUrl(url)
+    ? '链接仅本机可达（手机/局域网打不开），机器人重启后链接失效。'
+    : '链接仅本机所在网络可达，机器人重启后链接失效。';
+}
+
 /** lark_md 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
 function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
@@ -60,10 +71,10 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
     // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
     value: { hta_confirm: id, decision: 'no' },
   });
-  // 精简版注脚：有效期与文本回复方式合并为一行（操作类型已在标题体现，不再单列 fields）
+  // 精简版注脚：有效期（含超时后果，与文本降级版口径一致）与文本回复方式合并为一行
   const replyHint = req.batchKey
-    ? `${timeoutSec} 秒内有效 · 回复「确认」/「${batchScopeWord(req.batchScope)}免问」/「取消」`
-    : `${timeoutSec} 秒内有效 · 回复「确认」/「取消」`;
+    ? `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「${batchScopeWord(req.batchScope)}免问」/「取消」`
+    : `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「取消」`;
   return {
     config: baseCardConfig(),
     header: {
@@ -92,7 +103,7 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
     batch: {
       template: 'green',
       title: `🔁 ${kindText} · 写操作已批准（${batchScopeWord(req.batchScope)}免问 · 本会话）`,
-      note: '回复「恢复确认」可随时撤销免问；重启后自动失效。',
+      note: '回复「恢复确认」可随时撤销免问；机器人重启后自动失效。',
     },
     denied: {
       template: 'red',
@@ -181,7 +192,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
         actions.push({
           tag: 'button',
           text: { tag: 'plain_text', content: '🤖 AI 审查' },
-          value: { hta_review: e.attemptId, title: e.title.slice(0, 50) },
+          // 标题超 50 字符截断时补省略号，下游《标题》展示不至于残缺得无声无息
+          value: { hta_review: e.attemptId, title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title },
         });
       }
       elements.push({ tag: 'action', actions });
@@ -191,12 +203,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       done: WATCH_HINT_DONE,
       failed: WATCH_HINT_FAILED,
     };
-    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错；
-    // loopback（localhost/127.x/::1）连同一局域网都不可达，注脚需区分
-    const linkNote =
-      e.url && isLoopbackUrl(e.url)
-        ? '链接仅本机可达（手机/局域网打不开），重启后失效。'
-        : '链接仅本机所在网络可达，重启后失效。';
+    // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错
+    const linkNote = e.url ? linkReachNote(e.url) : null;
     const notes = [hints[e.kind], e.url ? linkNote : null].filter(
       (t): t is string => Boolean(t),
     );
@@ -218,11 +226,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
  * 纯函数（不含流程与 IO），便于单测与复用。
  */
 export function buildAiReviewCard(title: string, url: string, pass: boolean): Record<string, unknown> {
-  // 链接可达性与 buildWatchEventCard 同口径：report-server 绑 0.0.0.0/局域网地址时手机/局域网可达，
-  // 仅 loopback（localhost/127.x/::1）才是「仅本机可达」
-  const linkNote = isLoopbackUrl(url)
-    ? '链接仅本机可达（手机/局域网打不开），重启后失效。'
-    : '链接仅本机所在网络可达，重启后失效。';
+  // 链接可达性与 buildWatchEventCard 同口径（见 linkReachNote）
+  const linkNote = linkReachNote(url);
   return {
     config: baseCardConfig(),
     header: {

@@ -173,9 +173,9 @@ export class MemoryStore {
 
   setFact(userId: string, key: string, value: string): UserMemory {
     const k = normalizeFactKey(key);
-    if (!k) throw new Error('key 不能为空');
+    if (!k) throw new Error('记忆名不能为空');
     const v = neutralizeMemoryMarkers(clampEntry(String(value)));
-    if (!v) throw new Error('value 不能为空');
+    if (!v) throw new Error('记忆内容不能为空');
     const user = this.touch(userId);
     // 键数上限：仅拦新增 key（更新已有 key 不受限）
     if (!(k in user.facts) && Object.keys(user.facts).length >= MAX_FACTS) {
@@ -184,7 +184,7 @@ export class MemoryStore {
     user.facts[k] = v;
     this.journalFact(userId, k, v);
     // 持久化失败必须显式报错：否则用户被告知「已记住」实际重启后丢失
-    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
+    if (!this.persist()) throw new Error('记忆保存失败，本次修改重启后会丢失，请再试一次');
     return this.getUser(userId);
   }
 
@@ -196,13 +196,13 @@ export class MemoryStore {
     user.updatedAt = new Date().toISOString();
     this.journalFact(userId, k, null);
     // 与 setFact/addNote 一致：持久化失败显式报错，不假装「已忘记」
-    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
+    if (!this.persist()) throw new Error('记忆保存失败，本次修改重启后会丢失，请再试一次');
     return true;
   }
 
   addNote(userId: string, text: string): UserMemory {
     const note = neutralizeMemoryMarkers(clampEntry(text.trim()));
-    if (!note) throw new Error('note 不能为空');
+    if (!note) throw new Error('备注内容不能为空');
     const user = this.touch(userId);
     user.notes.push(note);
     if (user.notes.length > MAX_NOTES) user.notes = user.notes.slice(-MAX_NOTES);
@@ -210,7 +210,7 @@ export class MemoryStore {
     if (pending) pending.push(note);
     else this.addedNotes.set(userId, [note]);
     // 与 setFact 一致：持久化失败显式报错，不假装「已记住」
-    if (!this.persist()) throw new Error('记忆写盘失败，本次修改未持久化（重启后丢失）');
+    if (!this.persist()) throw new Error('记忆保存失败，本次修改重启后会丢失，请再试一次');
     return this.getUser(userId);
   }
 
