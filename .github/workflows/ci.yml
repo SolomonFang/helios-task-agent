@@ -1,8 +1,13 @@
 name: CI
 
-# PR / push 级检查：typecheck + 单元测试 + 生产依赖 audit
+# PR / tag push 级检查：typecheck + 单元测试 + 生产依赖 audit
 # smoke / e2e 依赖本机 helios-kanban，不在 CI 跑
-on: [push, pull_request]
+# 普通分支 push 不跑 CI；只在 PR 和打 tag（git push --follow-tags）时构建
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
 
 permissions:
   contents: read
