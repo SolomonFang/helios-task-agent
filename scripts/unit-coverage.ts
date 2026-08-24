@@ -629,7 +629,7 @@ async function run(): Promise<void> {
       cause: Object.assign(new AggregateError([{ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED' }]), { message: '' }),
     });
     assert.equal(friendlyNetError(aggregate), '连接被拒（目标地址无服务在监听）');
-    assert.equal(friendlyNetError(new TypeError('fetch failed')), '网络请求失败（请检查网络 / 代理）');
+    assert.equal(friendlyNetError(new TypeError('fetch failed')), '网络请求失败（请检查网络/代理）');
     assert.equal(friendlyNetError(new Error('something odd')), null);
   });
 

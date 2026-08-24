@@ -34,7 +34,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0 || !json.tenant_access_token) {
       return {
         ok: false,
-        message: `App ID / App Secret 无效，请到开发者后台 → 凭证与基础信息重新复制。${debugSuffix(json)}`,
+        message: `App ID / App Secret 无效，请到飞书开放平台 → 凭证与基础信息重新复制。${debugSuffix(json)}`,
       };
     }
     token = json.tenant_access_token;
@@ -54,7 +54,7 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
     if (json.code !== 0) {
       return {
         ok: false,
-        message: `凭证有效，但「机器人」能力未启用，请到开发者后台 → 应用能力 → 添加「机器人」并发布版本。${debugSuffix(json)}`,
+        message: `凭证有效，但「机器人」能力未启用，请到飞书开放平台 → 应用能力 → 添加「机器人」并发布版本。${debugSuffix(json)}`,
       };
     }
     return { ok: true, botName: json.bot?.app_name, message: 'ok' };

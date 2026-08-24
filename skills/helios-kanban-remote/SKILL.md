@@ -109,15 +109,15 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 ## Response format for chat
 
 ```markdown
-**项目**: {name}
-**任务**: {title} (`{id}`)
-**迭代**: {iteration or —}
-**优先级**: {紧急/高/中/低}
-**状态**: {中文状态} | 运行状态： {运行中/未运行}{，执行失败}
-**分支**: {target_branch}
-**执行器**: {用户指定的名字，如 Claude}
-**URL**: {url}
-**下一步**: {suggestion}
+**项目**：{name}
+**任务**：{title}（`{id}`）
+**迭代**：{迭代，无则 —}
+**优先级**：{紧急/高/中/低}
+**状态**：{中文状态} | 运行状态：{运行中/未运行}{，执行失败}
+**分支**：{分支名}
+**执行器**：{用户指定的名字，如 Claude}
+**链接**：{url}
+**下一步**：{suggestion}
 ```
 
 ## Executor names (only when user names one)

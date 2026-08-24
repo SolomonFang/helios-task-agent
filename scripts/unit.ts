@@ -29,6 +29,7 @@ import {
   CONFIRM_BATCH_RE,
   CONFIRM_NO_RE,
   isConfirmWord,
+  hasPendingConfirmation,
 } from '../src/agent/confirm';
 import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from '../src/channels/feishu-cards';
 import { isLoopbackUrl } from '../src/infra/url-utils';
@@ -419,6 +420,22 @@ async function run(): Promise<void> {
       btnText('object').includes('同对象免问') &&
       resolvedTitle('object').includes('同对象免问') &&
       resolvedTitle('kind').includes('同类免问')
+    );
+  })());
+
+  check('确认卡片：summary 经 mdSafe 全角化中和 ~~、<font>、<at> 等 lark_md 语法', (() => {
+    const card = buildConfirmCard(
+      { kind: 'kanban', summary: '~~删~~ <font color="red">红</font> <at id=x>人</at>', detail: 'd' },
+      'id1',
+    ) as { elements: Array<{ tag: string; text?: { content?: string } }> };
+    const content = card.elements.find((e) => e.text?.content?.includes('删'))?.text?.content ?? '';
+    return (
+      content.includes('～～删～～') && // ~~ 删除线中和
+      content.includes('＜font color="red"＞红＜/font＞') && // <font> 标签中和
+      content.includes('＜at id=x＞人＜/at＞') && // <at> 标签中和
+      !content.includes('~~') &&
+      !content.includes('<font') &&
+      !content.includes('<at')
     );
   })());
 
@@ -2384,7 +2401,20 @@ async function run(): Promise<void> {
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
       assert.deepEqual(await apiGet(base, '/ok'), { v: 1 });
-      await assert.rejects(() => apiGet(base, '/fail'), /boom/);
+      // 信封失败：用户面统一中文定性，英文原文不落用户面
+      await assert.rejects(() => apiGet(base, '/fail'), /看板拒绝了请求/);
+      // HTA_DEBUG=1 时服务端原文进日志
+      const errLogs: string[] = [];
+      const origErr = console.error;
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      process.env.HTA_DEBUG = '1';
+      try {
+        await assert.rejects(() => apiGet(base, '/fail'), /看板拒绝了请求/);
+        assert.ok(errLogs.some((m) => m.includes('boom')), `HTA_DEBUG 下原文应进日志，实际：${errLogs.join(' | ')}`);
+      } finally {
+        console.error = origErr;
+        delete process.env.HTA_DEBUG;
+      }
       assert.deepEqual(await apiGet(base, '/envelope-less-data'), [1, 2]);
       assert.deepEqual(await apiGet(base, '/raw'), [3, 4]);
       await assert.rejects(() => apiGet(base, '/missing'), /HTTP 500/);
@@ -2677,7 +2707,7 @@ async function run(): Promise<void> {
     alerter.stop();
   });
 
-  // ---------- WsAlerter：失败锁存后又自行连上 → 补「已恢复」并解锁 ----------
+  // ---------- WsAlerter：失败锁存后又自行连上 → 补「已自行恢复」并解锁 ----------
   await checkAsync('WsAlerter：failed 后 reconnected 补恢复通知，新一轮失败可再告警', async () => {
     const sent: string[] = [];
     const alerter = new WsAlerter({ notify: (t) => sent.push(t) });
@@ -2686,12 +2716,57 @@ async function run(): Promise<void> {
     assert.equal(sent.length, 1);
     alerter.onState('reconnected'); // SDK 又自行连上：补恢复通知并清除锁存
     assert.equal(sent.length, 2);
-    assert.ok(sent[1]!.includes('已恢复'));
+    assert.ok(sent[1]!.includes('已自行恢复'));
+    assert.ok(sent[1]!.includes('无需重启'));
     alerter.onState('reconnected'); // 无锁存时的 reconnected：静默
     assert.equal(sent.length, 2);
     alerter.onState('failed'); // 解锁后新一轮失败可再次告警
     assert.equal(sent.length, 3);
     assert.ok(sent[2]!.includes('重连失败'));
+    alerter.stop();
+  });
+
+  // ---------- WsAlerter：持续断线超阈值才首提，之后按 repeatMs 至多一条 ----------
+  await checkAsync('WsAlerter：持续断线首提 + 重复提醒；提醒后恢复补「已恢复」', async () => {
+    const sent: string[] = [];
+    const alerter = new WsAlerter({ notify: (t) => sent.push(t), remindAfterMs: 40, repeatMs: 60 });
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    alerter.onState('reconnecting');
+    alerter.onState('reconnecting'); // 计时中重复触发忽略（不重置计时）
+    assert.equal(sent.length, 0); // 未到阈值：静默
+    await sleep(70);
+    assert.equal(sent.length, 1); // 持续断线超阈值：首提
+    assert.ok(sent[0]!.includes('已断开超过'));
+    assert.ok(sent[0]!.includes('自动重连'));
+    await sleep(90);
+    assert.equal(sent.length, 2); // 重复提醒按 repeatMs 节奏至多一条
+    assert.ok(sent[1]!.includes('仍未恢复'));
+    alerter.onState('reconnected'); // 提醒过：补「已恢复」
+    assert.equal(sent.length, 3);
+    assert.ok(sent[2]!.includes('已恢复'));
+    assert.ok(!sent[2]!.includes('自行恢复'));
+    alerter.stop();
+  });
+
+  // ---------- WsAlerter：failed 锁存期间 reconnecting 不起断线计时 ----------
+  await checkAsync('WsAlerter：failed 锁存期间 reconnecting 不起计时，解锁后才恢复计时', async () => {
+    const sent: string[] = [];
+    const alerter = new WsAlerter({ notify: (t) => sent.push(t), remindAfterMs: 40 });
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    alerter.onState('failed');
+    assert.equal(sent.length, 1);
+    alerter.onState('reconnecting'); // 锁存期间：不起断线计时
+    await sleep(70);
+    assert.equal(sent.length, 1); // 超阈值也不推断线提醒
+    alerter.onState('reconnected'); // 自行恢复：解锁
+    assert.equal(sent.length, 2);
+    assert.ok(sent[1]!.includes('已自行恢复'));
+    alerter.onState('reconnecting'); // 解锁后：断线计时恢复生效
+    await sleep(70);
+    assert.equal(sent.length, 3);
+    assert.ok(sent[2]!.includes('已断开超过'));
     alerter.stop();
   });
 
@@ -3153,13 +3228,20 @@ async function run(): Promise<void> {
     );
   })());
 
-  // ---------- isConfirmWord：无 pending 时的即时提示判定（排除单字母） ----------
-  check('isConfirmWord：确认词命中，单字母 y/n/b 与随口应答不命中', (() => {
+  // ---------- isConfirmWord：无 pending 时的即时提示判定（收窄为确认专属词） ----------
+  check('isConfirmWord：确认专属词命中，日常应答词与单字母不命中', (() => {
     return (
-      isConfirmWord('确认') &&
-      isConfirmWord(' 取消 ') &&
-      isConfirmWord('yes') &&
-      isConfirmWord('同类免问') &&
+      isConfirmWord('确认执行') &&
+      isConfirmWord(' 同类免问 ') &&
+      isConfirmWord('同对象免问') &&
+      isConfirmWord('批量允许') &&
+      isConfirmWord('以后都') &&
+      isConfirmWord('一直允许') &&
+      isConfirmWord('始终允许') &&
+      !isConfirmWord('确认') && // 日常应答词不再拦截，消息照常入队
+      !isConfirmWord('取消') &&
+      !isConfirmWord('yes') &&
+      !isConfirmWord('算了') &&
       !isConfirmWord('y') && // 单字母不排除会误伤正常对话
       !isConfirmWord('n') &&
       !isConfirmWord('b') &&
@@ -3177,6 +3259,18 @@ async function run(): Promise<void> {
     const p2 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
     assert.equal(mgr.resolveFromText('u1', '批量允许'), 'approved_batch');
     assert.equal(await p2, 'batch');
+  });
+
+  // ---------- hasPendingConfirmation：跨实例查询有无挂起确认 ----------
+  await checkAsync('hasPendingConfirmation：有/无 pending 两态', async () => {
+    const mgr = new ConfirmationManager(async () => undefined);
+    assert.equal(hasPendingConfirmation('u-pending'), false); // 无 pending
+    const p = mgr.request('u-pending', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(hasPendingConfirmation('u-pending'), true); // 有 pending
+    assert.equal(hasPendingConfirmation('u-other'), false); // 他人不受影响
+    mgr.resolveFromText('u-pending', '确认');
+    await p;
+    assert.equal(hasPendingConfirmation('u-pending'), false); // 裁决后清除
   });
 
   // ---------- kind 枚举 → 用户可见中文 ----------
@@ -3345,7 +3439,7 @@ async function run(): Promise<void> {
       uninstallSkill('src-skill');
       assert.ok(!fs.existsSync(path.join(tmp, 'skills', 'src-skill')), '卸载后目录应删除');
       assert.throws(() => uninstallSkill('src-skill'), /未找到技能/);
-      assert.throws(() => uninstallSkill('helios-kanban-remote'), /内置技能/);
+      assert.throws(() => uninstallSkill('helios-kanban-remote'), /随产品自带的技能，不能卸载/);
 
       // ~/ 前缀展开（POSIX 下 os.homedir() 读 $HOME）
       const fakeHome = path.join(tmp, 'fake-home');
@@ -3554,14 +3648,14 @@ async function run(): Promise<void> {
   check('confirmStateText / confirmRevokedText：通道差异经参数保留', (() => {
     return (
       confirmStateText(2, '输入 /confirm on 恢复逐次确认') ===
-        '当前有 2 类写操作处于「同类免问」中；输入 /confirm on 恢复逐次确认。' &&
-      confirmStateText(0, '') === '当前没有生效中的「同类免问」（写操作逐次确认）。' &&
-      confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 类「同类免问」授权）。' &&
+        '当前有 2 项写操作免问授权生效中；输入 /confirm on 恢复逐次确认。' &&
+      confirmStateText(0, '') === '当前没有生效中的免问授权（写操作逐次确认）。' &&
+      confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 项免问授权）。' &&
       confirmRevokedText(0, '无') === '无' &&
       CLEARED_TEXT === '对话历史已清空（记忆保留）。' &&
       clearedText(0, '') === CLEARED_TEXT &&
       clearedText(2, '/confirm revoke 可恢复逐次确认') ===
-        '对话历史已清空（记忆保留；仍有 2 类写操作处于「同类免问」，/confirm revoke 可恢复逐次确认）。'
+        '对话历史已清空（记忆保留；仍有 2 项写操作免问授权生效中，/confirm revoke 可恢复逐次确认）。'
     );
   })());
 

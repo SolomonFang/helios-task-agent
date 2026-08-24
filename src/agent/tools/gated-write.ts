@@ -1,5 +1,5 @@
 import { looksLikeStrongFailure, passGate, wrapUntrusted, type ConfirmFn } from '../guard';
-import { auditLog } from '../../infra/audit';
+import { auditLog, type AuditDecision } from '../../infra/audit';
 import { SourceRegistry, kanbanTaskExists } from '../source-registry';
 import { extractWorkspaceId, waitForWorkspaceReady } from '../../kanban/workspace-ready';
 import { extractUuid } from './shared';
@@ -142,7 +142,9 @@ export function makeGatedWriter({
       confirm,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason }, auditHome);
+      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容，
+      // 审计得以区分「用户拒绝」与「超时未处理/被替代」）
+      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason as AuditDecision }, auditHome);
       return gate.message;
     }
     let result = await p.execute();

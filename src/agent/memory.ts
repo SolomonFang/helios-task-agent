@@ -179,7 +179,7 @@ export class MemoryStore {
     const user = this.touch(userId);
     // 键数上限：仅拦新增 key（更新已有 key 不受限）
     if (!(k in user.facts) && Object.keys(user.facts).length >= MAX_FACTS) {
-      throw new Error(`记忆键数量已达上限（${MAX_FACTS}），请先删除不再需要的记忆`);
+      throw new Error(`记忆条目已达上限（${MAX_FACTS} 条），请先删除不再需要的记忆`);
     }
     user.facts[k] = v;
     this.journalFact(userId, k, v);

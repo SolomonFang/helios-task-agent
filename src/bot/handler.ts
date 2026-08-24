@@ -12,7 +12,7 @@ import {
 } from '../channels/feishu';
 import { SessionRouter } from '../agent/session-router';
 import type { AgentSession } from '../agent/session';
-import { ConfirmationManager, isConfirmWord } from '../agent/confirm';
+import { ConfirmationManager, hasPendingConfirmation, isConfirmWord } from '../agent/confirm';
 import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
 import { buildAiReviewCard } from '../channels/feishu-cards';
 import { isAllPass, writeReviewReport } from '../report/review-report';
@@ -132,6 +132,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const aiReviewRunning = new Map<string, { openId: string; ctl: AbortController }>();
   /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
   let aiReviewLlmNoticed = false;
+  /** 挂起确认期间已提醒过「请回复确认/取消」的用户（每份确认只提醒一次，避免刷屏）。 */
+  const confirmShortReplyReminded = new Set<string>();
 
   /** 执行 AI 审查（open-code-review）并把结果推回飞书；同时注入会话上下文便于追问/修复。 */
   const handleAiReview = async (openId: string, attemptId: string, title: string): Promise<void> => {
@@ -226,9 +228,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (ctl.signal.aborted) {
         await channel.notifyOpenId(openId, `⏹ AI 审查已中断：《${title}》`).catch(() => {});
       } else {
-        // 失败原因截断防超长推送；底层文案自带「重试」时不重复追加重试后缀
+        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/人工审查）时不重复追加重试后缀
         const message = errMessage(err).slice(0, 200);
-        const retryHint = message.includes('重试') ? '' : '\n可稍后重新点击卡片上的「AI 审查」重试。';
+        const hasOwnWayOut = ['重试', '重新发起', '人工审查'].some((w) => message.includes(w));
+        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击卡片上的「AI 审查」重试。';
         await channel.notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}${retryHint}`).catch(() => {});
       }
     } finally {
@@ -247,6 +250,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
     if (!value.hta_confirm) return;
     const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), String(value.decision || ''));
+    // 卡片裁决落地后同样复位短应答提醒：下一份确认可再提醒一次
+    if (result !== 'ignored') confirmShortReplyReminded.delete(openId);
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
     else if (result === 'approved_batch')
       void channel
@@ -282,11 +287,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
     const stopped: string[] = [];
     if (ctl) stopped.push('已中断当前任务');
-    if (reviewsAborted) stopped.push(`已中断 ${reviewsAborted} 个 AI 审查`);
+    // 被中断的 AI 审查各有带标题的逐条通知（见 handleAiReview 的中断收尾），这里不再计数组播
     if (gateCancelled) stopped.push('待确认的写操作已一并取消');
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
     if (stopped.length) {
       await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
+    } else if (reviewsAborted) {
+      // 仅 AI 审查被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
+      await channel.reply(msg, '⏹ 已中断进行中的 AI 审查。');
     } else {
       await channel.reply(msg, '当前没有正在执行的任务。');
     }
@@ -303,7 +311,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       const n = session.revokeBatchApprovals();
       await channel.reply(
         msg,
-        n ? `✅ ${confirmRevokedText(n, '')}` : confirmRevokedText(0, '当前没有生效中的「同类免问」，无需撤销。'),
+        n ? `✅ ${confirmRevokedText(n, '')}` : confirmRevokedText(0, confirmStateText(0, '')),
       );
     } else {
       await channel.reply(msg, confirmStateText(session.activeBatchApprovals(), '回复「恢复确认」撤销'));
@@ -386,10 +394,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     return true;
   };
 
-  /** 写操作确认的文字应答：已裁决/确认词兜底均终结消息（返回 true），不再进入队列。 */
+  /** 写操作确认的文字应答：已裁决/确认词兜底/挂起期短应答提醒均终结消息（返回 true），不再进入队列。 */
   const handleConfirmationReply = async (msg: InboundMessage, text: string): Promise<boolean> => {
     confirmations.noteChat(msg.senderId, msg.sessionId);
     const answer = confirmations.resolveFromText(msg.senderId, text);
+    // 文字裁决落地后复位短应答提醒：下一份确认可再提醒一次
+    if (answer !== 'ignored') confirmShortReplyReminded.delete(msg.senderId);
     if (answer === 'approved') {
       await channel.reply(msg, '✅ 已批准，正在执行…');
       return true;
@@ -406,6 +416,24 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (!confirmations.hasPending(msg.senderId) && isConfirmWord(text)) {
       await channel.reply(msg, '当前没有待确认的写操作（可能已超时自动拒绝、被取消或被新操作替代）。如仍需执行，请重新描述你的需求。');
       return true;
+    }
+    // 挂起确认期间的未命中短应答（「好的/可以」等，≤10 字符）：不当新对话发给模型让确认
+    // 静默挂起，提醒一次如何裁决（每份确认只提醒一次，再发短句照常入队，避免刷屏）。
+    // 斜杠命令与「恢复确认」除外——它们须放行给后面的即时命令分发。
+    if (hasPendingConfirmation(msg.senderId)) {
+      if (
+        text.length <= 10 &&
+        !text.startsWith('/') &&
+        text !== '恢复确认' &&
+        !confirmShortReplyReminded.has(msg.senderId)
+      ) {
+        confirmShortReplyReminded.add(msg.senderId);
+        await channel.reply(msg, '请回复「确认」或「取消」，或点卡片上的按钮。');
+        return true;
+      }
+    } else {
+      // pending 已消失（超时/被替代/卡片裁决）：复位，下一份确认可再提醒
+      confirmShortReplyReminded.delete(msg.senderId);
     }
     return false;
   };
@@ -601,8 +629,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (ctl.signal.aborted) {
         if (progressId) {
           await channel
-            .updateText(progressId, '⏹ 已中断。')
-            .catch(() => channel.reply(msg, '⏹ 已中断。').catch(() => {}));
+            .updateText(progressId, '⏹ 已中断（未完成的操作未执行，可继续对话）。')
+            .catch(() => channel.reply(msg, '⏹ 已中断（未完成的操作未执行，可继续对话）。').catch(() => {}));
         }
       } else {
         const message = errMessage(err);

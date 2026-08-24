@@ -95,10 +95,11 @@ export function makeHkCliHandler({
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
     const title = isCreate ? hkCreateTitle(argv) : '';
-    // 高频子命令摘要用中文动作（对象标识在 detail）；未覆盖的子命令回退原命令行形态
+    // 高频子命令摘要用中文动作（对象标识在 detail）；未覆盖的子命令回退固定定性（完整命令在 detail 区，
+    // 与 MCP 通道 summarizeMcp 的 fallback 口径一致，不透传英文子命令原文）
     const summary = isCreate
       ? `创建看板任务${title ? `「${title}」` : ''}`
-      : hkActionLabel(argv) ?? `看板写操作：${argv.slice(0, 3).join(' ')}`;
+      : hkActionLabel(argv) ?? '看板写操作';
     // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
     const { key: batchKey, scope: batchScope } = batchKeyForHk(argv);
     return runGatedWrite({

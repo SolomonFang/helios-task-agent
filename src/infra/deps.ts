@@ -83,8 +83,8 @@ export async function checkHkDepsAsync(): Promise<string[]> {
 export const LARK_CLI_INSTALL_HINT =
   '安装：npm i -g @larksuite/cli，然后 lark-cli auth login 完成授权（不装则飞书任务/文档读取不可用，看板功能不受影响）。';
 
-/** lark-cli 已安装但未授权时的引导文案。 */
-export const LARK_CLI_AUTH_HINT = '已安装但未授权（运行 lark-cli auth login 完成授权）';
+/** lark-cli 已安装但未授权时的引导文案（含影响说明，与未安装分支对称）。 */
+export const LARK_CLI_AUTH_HINT = '已安装但未授权（运行 lark-cli auth login 完成授权；未授权期间飞书任务/文档读取不可用）';
 
 /** lark-cli 三态：未安装 / 已安装但未授权 / 已授权可用。 */
 export type LarkCliStatus = 'missing' | 'unauthorized' | 'ok';
@@ -135,9 +135,9 @@ export function checkHkDeps(): string[] {
   return missing;
 }
 
-/** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器；无 brew 时给出 brew 安装入口）。 */
+/** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器；分句表述，拼接点不再出现嵌套括号）。 */
 export const HK_CLI_INSTALL_HINT =
-  'macOS：brew install jq curl（无 brew 先按 https://brew.sh 安装）；Linux：如 Ubuntu 用 sudo apt install jq curl';
+  'macOS：brew install jq curl，无 brew 请先到 https://brew.sh 安装；Linux：如 Ubuntu 用 sudo apt install jq curl';
 
 /** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
 export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';

@@ -111,7 +111,7 @@ export function printBanner(status: BannerStatus): void {
     status.mcp === 'fail'
       ? hkMissing.length
         ? '，备用通道不可用（详见下行）'
-        : `，${MCP_FALLBACK_TEXT}，功能不受影响`
+        : `，${MCP_FALLBACK_TEXT}，大部分功能可用`
       : '';
   const mcpLine =
     status.mcp === 'ok'
@@ -133,8 +133,8 @@ export function printBanner(status: BannerStatus): void {
           '  ' +
             c.warn('●') +
             (status.mcp === 'fail'
-              ? ` 备用通道         缺少 ${hkMissing.join('、')}，看板读写当前不可用，安装后可恢复（${HK_CLI_INSTALL_HINT}）`
-              : ` 备用通道         缺少 ${hkMissing.join('、')}，看板主通道中断时将没有备用通道可用（安装：${HK_CLI_INSTALL_HINT}）`),
+              ? ` 备用通道         缺少 ${hkMissing.join('、')}，看板读写当前不可用，安装后可恢复。${HK_CLI_INSTALL_HINT}`
+              : ` 备用通道         缺少 ${hkMissing.join('、')}，看板主通道中断时将没有备用通道可用。${HK_CLI_INSTALL_HINT}`),
         ]
       : [];
   const lines = [

@@ -25,7 +25,12 @@ function envelopeData(json: unknown): unknown {
   const env = json as KanbanEnvelope | null;
   if (env && typeof env === 'object' && 'success' in env) {
     if (env.success === true) return env.data;
-    throw new Error(env.message || '看板接口返回失败（未附原因）');
+    // 看板服务端 message 常是英文原文，会经 AI 审查等链路直达飞书用户：
+    // 用户面统一中文定性，原文收 HTA_DEBUG 日志（不落用户面）
+    if (env.message && process.env.HTA_DEBUG) {
+      console.error(`[kanban] 接口返回 success:false，服务端原文：${env.message}`);
+    }
+    throw new Error('看板拒绝了请求。可设 HTA_DEBUG=1 重新运行，查看服务端返回的详细原因。');
   }
   // 无信封宽松回退：直接返回 data 字段或原始 JSON
   if (env && typeof env === 'object' && 'data' in env) return env.data;

@@ -34,6 +34,8 @@ export interface WorkSummaryTask {
   deletions?: number;
   /** Top 10 changed file paths. */
   changedFiles?: string[];
+  /** 截断前的变更文件总数（changedFiles 仅保留前 10 条；报告层「等 +N 个」展示用）。 */
+  changedFilesTotal?: number;
   diffUrl: string;
 }
 
@@ -51,7 +53,7 @@ export interface WorkSummaryTotals {
 }
 
 // statusLabel 已收口到 ./status（状态键与中文 label 的唯一来源）；re-export 兼容既有调用方
-export { statusLabel } from './status';
+export { statusLabel, isKnownStatus } from './status';
 
 export interface WorkSummaryData {
   scope: WorkSummaryScope;
@@ -262,7 +264,10 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
           if (stats.filesChanged !== undefined) task.filesChanged = stats.filesChanged;
           if (stats.additions !== undefined) task.additions = stats.additions;
           if (stats.deletions !== undefined) task.deletions = stats.deletions;
-          if (stats.changedFiles?.length) task.changedFiles = stats.changedFiles.slice(0, 10);
+          if (stats.changedFiles?.length) {
+            task.changedFilesTotal = stats.changedFiles.length;
+            task.changedFiles = stats.changedFiles.slice(0, 10);
+          }
           break;
         }
       }
@@ -305,11 +310,12 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     if (t.deletions !== undefined) totals.deletions += t.deletions;
   }
 
+  // 未配置迭代/全量范围统一称「全部任务」（与报告标题、晨报引导语同一措辞）
   const sinceLabel =
     scope === 'iteration'
       ? iteration
         ? `迭代 ${iteration}`
-        : '全部迭代'
+        : '全部任务'
       : scope === 'today'
         ? `${localDate()} 今天`
         : '全部任务';

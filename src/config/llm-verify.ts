@@ -42,7 +42,7 @@ export async function verifyLlmConfig(
     return {
       ok: false,
       uncertain: true,
-      message: `无法连接 ${baseUrl}${netErrorDetail(err)}。检查网络 / 代理后可重试，或在下方提示输入 s 仍然保存。`,
+      message: `无法连接 ${baseUrl}${netErrorDetail(err)}。检查网络/代理后可重试，或在下方提示输入 s 仍然保存。`,
     };
   }
 }

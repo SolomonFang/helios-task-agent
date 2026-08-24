@@ -203,7 +203,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
-| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / in-review / done / failed; all iterations when `HELIOS_KANBAN_ITERATION` is unset) to the allowlisted users (owner) every day. Unset or invalid = off |
+| `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / todo / in-review / done / failed; all tasks when `HELIOS_KANBAN_ITERATION` is unset) to the allowlisted users (owner) every day. Unset or invalid = off |
 | `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
@@ -223,7 +223,15 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/help` `/stop` `/confirm` `/status` `/tools` `/skills`. Queued: `/memory` `/clear` and normal chat.
 
-**Examples**: sync/list Feishu tasks; write to helios-kanban; turn a group chat into tasks; start with a named executor; list projects; follow-up / status.
+**Examples**:
+
+- "Always sync tasks from this Feishu URL from now on: \<link\>"
+- "Sync / list my tasks" (Feishu links get expanded with details)
+- "Write to helios-kanban" (created after confirmation; not auto-started)
+- "Turn the recent chat of group xx into tasks"
+- "Run this task with Claude" / "start" (you decide when and with whom)
+- "What projects are there" / "create a task: …" / "how's it going" / "tell it one more thing…"
+- "Summarize what this iteration did / what was completed today" (generates a report)
 
 Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); with `LLM_VISION=1` you can also send image messages (analyzed by the model with that single request — never written to disk or history, 10MB cap); other types rejected. Replies split ~3000 chars; the progress placeholder updates on tool calls (throttled ~2s) and heartbeats every 10s during silent LLM thinking (with elapsed seconds). Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt. Conversation history is persisted per user (`sessions/`) and restored after restart; `/clear` wipes it from disk too.
 

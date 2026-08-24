@@ -294,7 +294,7 @@ async function main(): Promise<void> {
     );
   }
   if (feishuCfg.allowedOpenIds.length) {
-    console.log(c.gray(`允许 open_id：${feishuCfg.allowedOpenIds.join(', ')}`));
+    console.log(c.gray(`允许 open_id：${feishuCfg.allowedOpenIds.join('、')}`));
   } else {
     console.log(
       c.warn(
@@ -306,11 +306,11 @@ async function main(): Promise<void> {
   const larkStatus = checkLarkCliStatus();
   // bot 无 banner，lark-cli 需完整告警文案；OCR 检查为 bot 特有（AI 审查功能依赖）
   warnStartupDeps(larkStatus, { style: 'bot', checkOcr: true });
-  // hk_cli 降级链依赖（jq/curl）：缺失时 MCP 掉线后看板读写不可用，不能宣称「功能不受影响」
+  // 备用通道依赖（jq/curl）：缺失时看板主连接中断后看板读写不可用，不能宣称「功能不受影响」
   const hkMissing = checkHkDeps();
   if (hkMissing.length) {
     console.log(
-      c.warn(`hk_cli 降级链缺少 ${hkMissing.join('、')}：MCP 掉线时看板读写将不可用（${HK_CLI_INSTALL_HINT}）`),
+      c.warn(`备用通道缺少 ${hkMissing.join('、')}：看板主连接中断时看板读写将不可用（${HK_CLI_INSTALL_HINT}）`),
     );
   }
   migrateAndValidateSkills();
@@ -356,7 +356,11 @@ async function main(): Promise<void> {
   } else {
     // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
     if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
-    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}          \n`));
+    // 备用通道缺依赖（jq/curl）时「已自动切换为备用通道」是谎言：按探测结果条件化主文案
+    const firstFailText = hkMissing.length
+      ? `备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
+      : MCP_FALLBACK_TEXT;
+    process.stdout.write(c.warn(`\r看板连接失败，${firstFailText}          \n`));
     if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
@@ -433,7 +437,7 @@ async function main(): Promise<void> {
           .notifyOpenId(openId, `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n请稍后重试；若反复出现，请检查部署机器的网络。`)
           .catch((err) => {
             const message = errMessage(err);
-            console.error(`[confirm] 发送失败通知也未送达(${openId}): ${message}`);
+            console.error(`[confirm] 发送失败通知也未送达(${openId.slice(0, 4)}…): ${message}`);
           });
       },
     },
@@ -460,7 +464,7 @@ async function main(): Promise<void> {
     void channel
       .notifyOpenId(
         openId,
-        '👋 你已成为本机器人实例的 owner（已写入白名单），其他私聊用户将被拒绝。发送 /help 查看我能做什么。',
+        '👋 你已成为本机器人实例的部署者（已写入白名单），其他私聊用户将被拒绝。发送 /help 查看我能做什么。',
       )
       .catch(() => {});
     return true;
@@ -499,7 +503,7 @@ async function main(): Promise<void> {
         // hk_cli 降级链依赖（jq/curl）缺失时「已切换备用通道」是谎言：按探测结果条件化
         const hkMissing = await checkHkDepsAsync();
         const fallback = hkMissing.length
-          ? `看板读写暂不可用（缺少 ${hkMissing.join('/')}，${HK_CLI_INSTALL_HINT}）`
+          ? `看板读写暂不可用（缺少 ${hkMissing.join('、')}，${HK_CLI_INSTALL_HINT}）`
           : MCP_FALLBACK_TEXT;
         console.log(c.warn(`看板连接已中断，${fallback}，将自动重连…`));
         notifyOwners(`⚠️ 看板连接已中断：${fallback}，恢复后自动切回。`);
@@ -544,9 +548,10 @@ async function main(): Promise<void> {
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
-  // 长连接断线告警：重连交给 SDK，断线期间消息由飞书侧补投，用户对「断开/恢复」
-  // 无感——因此 reconnecting/reconnected 完全静默（待机/唤醒反复断连不会刷屏），
-  // 只有 SDK 放弃重试（需人工重启）才通知 owner（WsAlerter 负责只报一次）。
+  // 长连接断线告警（WsAlerter）：重连交给 SDK，断线期间消息由飞书侧补投。
+  // 短时抖动（待机/唤醒反复断连）静默不刷屏；断开持续超过 15 分钟推一条提醒，
+  // 之后仍处于断开时每小时至多重复一条，恢复后补「已恢复」；SDK 放弃重试
+  //（failed，需人工重启）立即告警且只报一次。
   const wsAlerter = new WsAlerter({ notify: notifyOwners });
   channel.onWsStateChange = (state) => wsAlerter.onState(state);
   cleanup.wsAlerter = wsAlerter;

@@ -74,22 +74,26 @@ export async function buildStatusLines(
     : larkAuthed
       ? p.ok('正常')
       : p.warn(LARK_CLI_AUTH_HINT);
-  // HTTP 状态码包一层可读说明（http.ts 侧只返回 'HTTP <code>' 裸文本）
+  // http.ts 的健康探测返回「响应异常（状态码 N）」裸文本：命中时补一句可操作的复查出路
   const healthText =
     health === 'ok'
       ? p.ok('正常')
-      : p.warn(
-          /^HTTP \d+$/.test(health)
-            ? `异常（${health}，看板服务可能正在重启，稍后可 /status 复查）`
-            : health,
-        );
+      : p.warn(/状态码 \d+/.test(health) ? `${health}，看板服务可能正在重启，稍后可 /status 复查` : health);
   const lines = [
     `模型：${p.info(opts.model)}`,
     `看板：${healthText}（${opts.kanbanUrl}）`,
     `看板连接：${mcpText}`,
     `lark-cli：${larkText}`,
-    // 缺依赖明细已在「看板连接」行给出，这里不再重复
-    `备用通道：${hkMissing.length ? p.warn('不可用') : p.ok('正常')}`,
+    // MCP 掉线时缺依赖明细已在「看板连接」行给出，这里不重复；MCP 正常时这里补原因与安装出路
+    `备用通道：${
+      hkMissing.length
+        ? p.warn(
+            opts.mcpOk
+              ? `不可用（缺少 ${hkMissing.join('、')}，主通道中断时将无备用；${HK_CLI_INSTALL_HINT}）`
+              : '不可用',
+          )
+        : p.ok('正常')
+    }`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }
@@ -149,7 +153,8 @@ export function buildSkillsLines(
   }
   const lines = [opts.header];
   for (const s of skills) {
-    const brief = s.description.replace(/\s+/g, ' ').slice(0, 100);
+    const flat = s.description.replace(/\s+/g, ' ');
+    const brief = flat.length > 100 ? flat.slice(0, 100) + '…' : flat;
     lines.push(`${opts.bullet}${p.info(s.name)}  ${p.gray(brief)}`);
   }
   if (opts.footer) lines.push(opts.footer);
@@ -201,26 +206,31 @@ export function buildMemoryLines(session: { formatMemory(): string }, header: st
 /** /clear 回复（两端一致）。 */
 export const CLEARED_TEXT = '对话历史已清空（记忆保留）。';
 
-/** /clear 回复：activeBatches > 0 时提醒「同类免问」不受清盘影响、仍生效；revokeHint 为通道自己的撤销方式说明。 */
+/** /clear 回复：activeBatches > 0 时提醒免问授权不受清盘影响、仍生效；revokeHint 为通道自己的撤销方式说明。 */
 export function clearedText(activeBatches = 0, revokeHint: string): string {
   return activeBatches
-    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 类写操作处于「同类免问」，${revokeHint}）。`
+    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 项写操作免问授权生效中，${revokeHint}）。`
     : CLEARED_TEXT;
 }
 
-/** 「同类免问」状态查询文案；revokeHint 为通道自己的撤销方式说明（active=0 时忽略）。 */
+/** 免问授权状态查询文案；revokeHint 为通道自己的撤销方式说明（active=0 时忽略）。 */
 export function confirmStateText(active: number, revokeHint: string): string {
   return active
-    ? `当前有 ${active} 类写操作处于「同类免问」中；${revokeHint}。`
-    : '当前没有生效中的「同类免问」（写操作逐次确认）。';
+    ? `当前有 ${active} 项写操作免问授权生效中；${revokeHint}。`
+    : '当前没有生效中的免问授权（写操作逐次确认）。';
 }
 
-/** 「同类免问」撤销结果文案；noneText 为「没有可撤销」的通道文案。 */
+/** 免问授权撤销结果文案；noneText 为「没有可撤销」的通道文案。 */
 export function confirmRevokedText(n: number, noneText: string): string {
-  return n ? `已恢复逐次确认（撤销 ${n} 类「同类免问」授权）。` : noneText;
+  return n ? `已恢复逐次确认（撤销 ${n} 项免问授权）。` : noneText;
 }
 
-/** LLM 请求失败的三段回复：错误头 / 友好提示（可空）/ 原消息截断复述（60 字符）。 */
+/**
+ * LLM 请求失败的三段回复：错误头 / 友好提示（可空）/ 原消息截断复述（60 字符）。
+ * 命中 friendlyLlmError 已知模式（401/429/上下文超限/网络等）时 head 保留原始 message 便于对照；
+ * 未命中时英文原始 message 不直达用户面——head 只给中性「请求失败」与通用出路，
+ * 原始 message 截断（200 字符）收 HTA_DEBUG 日志（CLI/bot 两端同口径）。
+ */
 export function llmFailureParts(
   message: string,
   input: string,
@@ -232,5 +242,14 @@ export function llmFailureParts(
     channel === 'bot'
       ? `你的上一条消息未处理：「${quoted}」，可修改后重发。`
       : `上一条内容「${quoted}」未被处理，可修改后重发；也可用 /config 检查模型配置。`;
-  return { head: `请求失败：${message}`, friendly, tail };
+  if (friendly) return { head: `请求失败：${message}`, friendly, tail };
+  // 未命中已知模式：原始 message 截断收 HTA_DEBUG 日志，用户面只给中性与通用出路
+  if (process.env.HTA_DEBUG) {
+    console.error(`[llm] 请求失败原文：${message.slice(0, 200)}${message.length > 200 ? '…' : ''}`);
+  }
+  return {
+    head: '请求失败。请稍后重试；仍失败请检查模型配置与网络（原始报错可设 HTA_DEBUG=1 重新运行查看）。',
+    friendly: null,
+    tail,
+  };
 }

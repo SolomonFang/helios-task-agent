@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type { ConfirmRequest, ConfirmSettle, ConfirmVerdict } from './guard';
-import { markSuperseded } from './guard';
+import { markSuperseded, markTimedOut } from './guard';
 import { errMessage } from '../infra/err';
 
 /**
@@ -46,13 +46,33 @@ export const CONFIRM_BATCH_RE = wordsToRe(CONFIRM_BATCH_WORDS);
 export const CONFIRM_NO_RE = wordsToRe(CONFIRM_NO_WORDS);
 
 /**
- * 是否「确认应答词」——用于无 pending 时的即时提示（bot：确认已超时/已处理后用户又回「确认」）。
- * 排除单字母 y/n/b：正常对话里随手一个字母不应被拦截。
+ * 确认专属词：只在确认场景出现、日常对话几乎不会说的词。无 pending 时只有这些词
+ * 仍被拦截并提示「没有待确认的写操作」；「确认/同意/执行/取消/算了/不用/yes/no」等
+ * 日常应答词不再拦截，消息照常入队交给模型处理（避免谎称「可能已超时/被取消」）。
+ * 注意：本词表只用于无 pending 的兜底提示；pending 期间的闸口内裁决（resolveFromText）
+ * 仍用上面的完整词表，两条路径互不影响。
+ */
+const CONFIRM_EXCLUSIVE_RE = /^(?:确认执行|同类免问|同对象免问|批量允许|以后都|一直允许|始终允许)$/i;
+
+/**
+ * 是否「确认专属词」——用于无 pending 时的即时提示（bot：确认已超时/已处理后用户又回确认专属词）。
+ * 日常应答词与单字母一律不拦截，避免吞掉正常对话。
  */
 export function isConfirmWord(text: string): boolean {
   const t = text.trim();
   if (t.length <= 1) return false;
-  return CONFIRM_YES_RE.test(t) || CONFIRM_BATCH_RE.test(t) || CONFIRM_NO_RE.test(t);
+  return CONFIRM_EXCLUSIVE_RE.test(t);
+}
+
+/** 全部确认管理器实例：hasPendingConfirmation 跨实例查询用。 */
+const managers = new Set<ConfirmationManager>();
+
+/** 查询该用户当前是否有挂起的写操作确认（bot handler 用）。 */
+export function hasPendingConfirmation(userKey: string): boolean {
+  for (const m of managers) {
+    if (m.hasPending(userKey)) return true;
+  }
+  return false;
 }
 
 export class ConfirmationManager {
@@ -83,7 +103,9 @@ export class ConfirmationManager {
       /** 确认卡片与文本降级都发送失败时回调（用户无法裁决）：bot 层借此走最后可达路径告知用户。 */
       onSendFailed?: (openId: string, req: ConfirmRequest, error: string) => void;
     } = {},
-  ) {}
+  ) {
+    managers.add(this); // hasPendingConfirmation 跨实例查询
+  }
 
   /** Remember the user's chat so the confirm card can be delivered later. */
   noteChat(openId: string, chatId: string): void {
@@ -107,6 +129,7 @@ export class ConfirmationManager {
       // 先标记再 resolve：闸门（passGate）据此把「被新写操作替代」与「用户拒绝」区分开。
       // resolve 值保持 false（终态经 onSettled 的 'superseded' 区分），不改 ConfirmVerdict 口径
       markSuperseded(prev.req);
+      this.logSettle(openId, prev.req, 'superseded');
       prev.resolve(false);
       this.pendings.delete(openId);
       try {
@@ -124,6 +147,9 @@ export class ConfirmationManager {
         const p = this.pendings.get(openId);
         if (p && p.id === id) {
           this.pendings.delete(openId);
+          // 先标记再 resolve：闸门据此把「超时未处理」与「用户拒绝」区分开（审计 decision 可区分）
+          markTimedOut(req);
+          this.logSettle(openId, req, 'timeout');
           // 回调在 setTimeout 里同步执行：回调抛异常不得让 resolve 漏执行
           //（否则闸门 promise 永久挂起），resolve 放 finally 保证必达
           try {
@@ -231,17 +257,23 @@ export class ConfirmationManager {
     return true;
   }
 
+  /**
+   * 裁决留痕（批准/拒绝/超时/被替代同型日志）：open_id 只记头尾摘要，不完整落日志；
+   * memory 写操作的 summary 含 value 摘要（memory_set 的 value 前 100 字符，
+   * 见 tools/memory-tools.ts）——裁决日志只记 key 部分（「：」前），不落 value
+   */
+  private logSettle(openId: string, req: ConfirmRequest, settle: ConfirmSettle): void {
+    const maskedUser = openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
+    const loggedSummary = req.kind === 'memory' ? req.summary.split('：')[0]! : req.summary.slice(0, 80);
+    console.log(`[confirm] user=${maskedUser} verdict=${settle} summary="${loggedSummary}"`);
+  }
+
   private finish(openId: string, p: Pending, verdict: ConfirmVerdict): void {
     clearTimeout(p.timer);
     this.pendings.delete(openId);
-    // 裁决留痕：open_id 只记头尾摘要，不完整落日志；
-    // memory 写操作的 summary 含 value 摘要（memory_set 的 value 前 100 字符，
-    // 见 tools/memory-tools.ts）——裁决日志只记 key 部分（「：」前），不落 value
-    const maskedUser = openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
-    const loggedSummary = p.req.kind === 'memory' ? p.req.summary.split('：')[0]! : p.req.summary.slice(0, 80);
     const settle: ConfirmSettle = verdict === false ? 'denied' : verdict;
     if (verdict === 'batch') this.lastBatchScopes.set(openId, p.req.batchScope ?? 'kind');
-    console.log(`[confirm] user=${maskedUser} verdict=${settle} summary="${loggedSummary}"`);
+    this.logSettle(openId, p.req, settle);
     p.resolve(verdict);
     try {
       this.opts.onSettled?.(openId, p.req, settle, p.cardMessageId);

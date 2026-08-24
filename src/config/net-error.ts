@@ -16,7 +16,7 @@ export function friendlyNetError(err: unknown): string | null {
   if (/timed?\s*out|etimedout|aborted/.test(s)) return '连接超时';
   if (s.includes('econnrefused')) return '连接被拒（目标地址无服务在监听）';
   if (s.includes('enotfound') || s.includes('eai_again')) return '域名解析失败';
-  if (s.includes('fetch failed')) return '网络请求失败（请检查网络 / 代理）';
+  if (s.includes('fetch failed')) return '网络请求失败（请检查网络/代理）';
   return null;
 }
 

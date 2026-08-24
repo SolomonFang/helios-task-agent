@@ -2,7 +2,7 @@ import type { ToolHandler } from '../../types';
 import type { MemoryStore } from '../memory';
 import { normalizeFactKey } from '../memory';
 import { passGate, type ConfirmFn } from '../guard';
-import { auditLog } from '../../infra/audit';
+import { auditLog, type AuditDecision } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 
@@ -28,13 +28,15 @@ export function makeMemoryHandlers({
     const value = raw.value;
     // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
     const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
-    const detail = summarizeBothEnds(`memory_set(key=${key.trim()}, value=${value})`);
+    // 确认卡片 detail 用中文两行（不拼 key=value 伪调用串——用户面不出现代码形态）
+    const detail = summarizeBothEnds(`键：${key.trim()}\n值：${value}`);
     const gate = await passGate(
       { kind: 'memory', summary, detail, batchKey: 'memory:set', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容）
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
       return gate.message;
     }
     try {
@@ -47,7 +49,7 @@ export function makeMemoryHandlers({
     } catch (err) {
       // setFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_set 失败：${errMessage(err)}`;
+      return `保存记忆失败：${errMessage(err)}`;
     }
   };
 
@@ -60,7 +62,8 @@ export function makeMemoryHandlers({
         : JSON.stringify({ key, value, found: true });
     }
     const user = memory.getUser(uid);
-    return JSON.stringify({ facts: user.facts, notes: user.notes, updatedAt: user.updatedAt });
+    // updatedAt 是 UTC ISO 串，模型会原样转告且无决策价值：不放进返回（避免误导用户）
+    return JSON.stringify({ facts: user.facts, notes: user.notes });
   };
 
   const memoryDelete: ToolHandler = async (raw) => {
@@ -68,13 +71,13 @@ export function makeMemoryHandlers({
     if (!key) return '参数错误：key 不能为空';
     // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门
     const summary = `删除记忆「${key}」`;
-    const detail = `memory_delete(key=${key})`;
+    const detail = `键：${key}`;
     const gate = await passGate(
       { kind: 'memory', summary, detail, batchKey: 'memory:delete', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
       return gate.message;
     }
     try {
@@ -85,7 +88,7 @@ export function makeMemoryHandlers({
     } catch (err) {
       // deleteFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_delete 失败：${errMessage(err)}`;
+      return `删除记忆失败：${errMessage(err)}`;
     }
   };
 
@@ -93,13 +96,13 @@ export function makeMemoryHandlers({
     const text = typeof raw.text === 'string' ? raw.text : '';
     // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门
     const summary = `追加记忆备注：${text.slice(0, 100)}`;
-    const detail = summarizeBothEnds(`memory_note(text=${text})`);
+    const detail = summarizeBothEnds(`备注：${text}`);
     const gate = await passGate(
       { kind: 'memory', summary, detail, batchKey: 'memory:note', batchScope: 'kind', destructive: true },
       confirm,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
       return gate.message;
     }
     try {
@@ -110,7 +113,7 @@ export function makeMemoryHandlers({
     } catch (err) {
       // addNote 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved', ok: false }, auditHome);
-      return `memory_note 失败：${errMessage(err)}`;
+      return `追加备注失败：${errMessage(err)}`;
     }
   };
 

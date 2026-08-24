@@ -8,8 +8,16 @@
 
 ### Changed
 
-- 长连接断线告警改为「用户无感」：可自动恢复的断开/恢复（reconnecting/reconnected）不再推送任何消息——SDK 会自动重连、断线期间的消息由飞书侧补投，此前电脑待机/唤醒时「断开超 3 分钟 + 已恢复」逐对刷屏；仅保留「重连彻底失败需人工重启」的一次性告警（`/status` 仍可查连接状态）（`src/bot/ws-alerter.ts`、`src/bot-main.ts`）
+- 长连接断线告警「用户无感」化：可自动恢复的短时抖动（reconnecting/reconnected）完全静默——SDK 会自动重连、断线期间的消息由飞书侧补投，此前电脑待机/唤醒时「断开超 3 分钟 + 已恢复」逐对刷屏；持续断线超过 15 分钟推一条提醒（之后每小时至多一条，告警经飞书 HTTPS API 发送，长连接断线期间也能送达）；重连彻底失败（failed）立即告警且只报一次；连接恢复时按此前是否提醒过补发「已恢复」（`src/bot/ws-alerter.ts`、`src/bot-main.ts`）
+- 第九轮 UED 审查修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md) 第九轮）：断线告警补持续断线低频提醒、晨报头部与分组补「待办」、未配置迭代时范围统一称「全部任务」、免问状态文案统一「免问授权」口径、文档与入口一致性修复等
+
+## [1.0.30] - 2026-08-21
+
+### Changed
+
 - 「同类免问」粒度分级：启动/创建类看板操作（`start_workspace*`、`hk start`/`create-and-start`）从「绑定任务标识」改为按工具成类——此前点「同类免问」后批量启动多个任务的工作区仍逐个弹确认（每个 task_id 各成一个 key），与按钮文案的「同类」预期不符；现启动类点一次免问，本会话内同类操作都放行。删除/取消/停止/审批/更新等保持对象级绑定（防止借一次授权改任意对象）；确认卡片按钮、终态标题与批准回执按粒度如实区分文案（类级「同类免问」/ 对象级「同对象免问」），文本应答词表同步新增「同对象免问」（`src/agent/tools/kanban-mcp.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/guard.ts`、`src/agent/confirm.ts`、`src/channels/feishu-cards.ts`）
+- 第七轮 UED 审查修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md) 第七轮，S 系列 36 项）：MCP 降级话术不再谎称「功能不受影响」，缺 jq/curl 时 banner / CLI / 掉线推送同口径如实提示备用通道不可用；banner 与告警自相矛盾文案统一；CLI 闸口输入「免问」明确提示该操作不支持而非静默按取消；`.env.example` 钉版本残留注释改为如实描述等
+- 第八轮 UED 审查修复（同上文档第八轮，G 系列 50 余项）：免问粒度两档（类级/对象级）文案全面落地（确认卡片按钮、文本降级、回执、/help、README）；「看板连接」术语统一替换 MCP 黑话；用户可见消息不再内联英文原始错误（原文进日志）；网络错误映射解包 `err.cause` 真正生效；配置向导缩写补含义说明等
 
 ## [1.0.29] - 2026-08-19
 

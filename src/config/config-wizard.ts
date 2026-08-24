@@ -92,12 +92,14 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   if (choose && process.stdin.isTTY) {
     idx = await choose(PRESETS);
   } else {
-    console.log(c.strong('\n配置模型（OpenAI 兼容协议）：\n'));
+    // 与 wizardChoose 的 selectList 同一口径：重配时标题给出当前模型
+    const current = currentConfig().llmModel;
+    console.log(c.strong(`\n配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：\n`));
     PRESETS.forEach((p, i) => {
       console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
     });
     for (;;) {
-      const pick = await need(`\n请选择 [1-${PRESETS.length}]（默认 1）: `);
+      const pick = await need(`\n请输入 1 到 ${PRESETS.length} 的数字（默认 1）: `);
       if (!pick) {
         idx = 0;
         break;
@@ -107,7 +109,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
         idx = n - 1;
         break;
       }
-      console.log(c.err(`无效选择，请输入 1-${PRESETS.length}`));
+      console.log(c.err(`无效输入，请输入 1 到 ${PRESETS.length} 的数字`));
     }
   }
   const preset = PRESETS[idx]!;
@@ -156,16 +158,33 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     // 其余输入（含回车）= 不修改，用当前配置直接重试
   }
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
-  const kanbanUrl = (await need(`看板地址（默认 ${old.kanbanUrl}）: `)) || old.kanbanUrl;
-  const kanbanProjectId =
-    (await need(`默认项目 ID（可选，回车跳过${old.kanbanProjectId ? `，当前 ${old.kanbanProjectId}` : ''}）: `)) ||
-    old.kanbanProjectId;
-  const kanbanRepoId =
-    (await need(`默认仓库 ID（可选，回车跳过${old.kanbanRepoId ? `，当前 ${old.kanbanRepoId}` : ''}）: `)) ||
-    old.kanbanRepoId;
-  const kanbanIteration =
-    (await need(`默认迭代（可选，与看板 Web UI 的迭代名一致，如 260717；回车跳过${old.kanbanIteration ? `，当前 ${old.kanbanIteration}` : ''}）: `)) ||
-    old.kanbanIteration;
+  // 看板地址必须是完整 URL：缺 http(s):// 协议头直接重问
+  let kanbanUrl = '';
+  for (;;) {
+    const raw = await need(`看板地址（默认 ${old.kanbanUrl}）: `);
+    if (!raw) {
+      kanbanUrl = old.kanbanUrl;
+      break;
+    }
+    if (/^https?:\/\//i.test(raw)) {
+      kanbanUrl = raw;
+      break;
+    }
+    console.log(c.err('看板地址需以 http:// 或 https:// 开头，请重新输入。'));
+  }
+  // 可选字段口径与白名单一致：有当前值时回车 = 保留当前值，输入 - = 清除；无当前值时回车 = 跳过
+  const kanbanProjectIdRaw = await need(
+    `默认项目 ID（可选${old.kanbanProjectId ? `，回车 = 保留当前 ${old.kanbanProjectId}，输入 - 清除` : '，直接回车跳过'}）: `,
+  );
+  const kanbanProjectId = kanbanProjectIdRaw === '-' ? '' : kanbanProjectIdRaw || old.kanbanProjectId;
+  const kanbanRepoIdRaw = await need(
+    `默认仓库 ID（可选${old.kanbanRepoId ? `，回车 = 保留当前 ${old.kanbanRepoId}，输入 - 清除` : '，直接回车跳过'}）: `,
+  );
+  const kanbanRepoId = kanbanRepoIdRaw === '-' ? '' : kanbanRepoIdRaw || old.kanbanRepoId;
+  const kanbanIterationRaw = await need(
+    `默认迭代（可选，与看板 Web UI 的迭代名一致，如 260717${old.kanbanIteration ? `；回车 = 保留当前 ${old.kanbanIteration}，输入 - 清除` : '；直接回车跳过'}）: `,
+  );
+  const kanbanIteration = kanbanIterationRaw === '-' ? '' : kanbanIterationRaw || old.kanbanIteration;
 
   const cfg: AgentConfig = {
     ...old,
@@ -228,7 +247,7 @@ async function promptFeishuConfig(
   }
   const allowedPrompt = existing.allowedOpenIds.length
     ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后再运行 helios-task-agent bot --rebind 回填）: ';
+    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突））: ';
   const allowedRaw = await need(allowedPrompt);
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };

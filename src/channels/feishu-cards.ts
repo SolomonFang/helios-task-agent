@@ -8,24 +8,20 @@
  */
 
 import { batchScopeWord, kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
-import { WATCH_HINT_DONE, WATCH_HINT_FAILED, type WatchEvent, type WatchEventKind } from '../kanban/watcher';
+import {
+  WATCH_HINT_DONE,
+  WATCH_HINT_FAILED,
+  WATCH_HINT_FAILED_LOG,
+  WATCH_HINT_REVIEW,
+  linkReachNote,
+  type WatchEvent,
+  type WatchEventKind,
+} from '../kanban/watcher';
 import { statusLabel } from '../kanban/summary';
-import { isLoopbackUrl } from '../infra/url-utils';
 
 /** 全部卡片的共同 config：宽屏 + 禁止转发（见文件头注释）。 */
 function baseCardConfig(): Record<string, unknown> {
   return { wide_screen_mode: true, enable_forward: false };
-}
-
-/**
- * 本机链接可达性注脚（看板事件卡片与 AI 审查卡片同口径）：
- * loopback（localhost/127.x/::1）连同一局域网都不可达，需与「本机所在网络可达」区分；
- * 失效主语写明是机器人重启，避免「重启后失效」不知所指。
- */
-function linkReachNote(url: string): string {
-  return isLoopbackUrl(url)
-    ? '链接仅本机可达（手机/局域网打不开），机器人重启后链接失效。'
-    : '链接仅本机所在网络可达，机器人重启后链接失效。';
 }
 
 /** lark_md 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
@@ -33,11 +29,18 @@ function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
 }
 
-/** 嵌入 lark_md 的用户数据（任务标题等）：星号/反引号全角化并中和 [ ]( ) 链接语法，避免误触加粗/代码/链接解析破坏排版。 */
+/**
+ * 嵌入 lark_md 的用户数据（任务标题等）：星号/反引号/括号全角化并中和 [ ] 链接语法，
+ * 同时中和 ~~（删除线）、<font color>/<at id> 等类 HTML 标签语法（< > 全角化），
+ * 避免误触加粗/代码/链接/删除线/标签解析破坏排版。
+ */
 function mdSafe(s: string): string {
   return s
     .replace(/\*/g, '＊')
     .replace(/`/g, '｀')
+    .replace(/~/g, '～')
+    .replace(/</g, '＜')
+    .replace(/>/g, '＞')
     .replace(/\[/g, '［')
     .replace(/\]/g, '］')
     .replace(/\(/g, '（')
@@ -78,9 +81,10 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
   return {
     config: baseCardConfig(),
     header: {
-      // 写操作确认一律橙色警示头（蓝色只用于纯信息场景，如待审批通知）
+      // 写操作确认一律橙色警示头（蓝色只用于纯信息场景，如待审批通知）；
+      // 破坏性操作标题补「· 高危」，与 CLI 闸口（cli.ts confirmWrite）口径一致
       template: 'orange',
-      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认` },
+      title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认${req.destructive ? ' · 高危' : ''}` },
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
@@ -177,7 +181,7 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${label}** \`${rendered}\`` } });
     }
     if (e.kind === 'failed') {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: '请到看板查看日志定位问题。' } });
+      elements.push({ tag: 'div', text: { tag: 'plain_text', content: WATCH_HINT_FAILED_LOG } });
     }
     if (e.extra) {
       elements.push({ tag: 'div', text: { tag: 'plain_text', content: `结果摘要：${e.extra}` } });
@@ -199,7 +203,7 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push({ tag: 'action', actions });
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
-      review: '没问题回复「标记完成」；要继续改直接说',
+      review: WATCH_HINT_REVIEW,
       done: WATCH_HINT_DONE,
       failed: WATCH_HINT_FAILED,
     };

@@ -91,7 +91,7 @@ const HELP = `
   ${c.info('/tools')}    列出当前可用工具（看板 + 本地）
   ${c.info('/skills')}   列出技能；install <技能目录路径> 安装（升级不丢失）；uninstall <技能名> 卸载
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
-  ${c.info('/status')}   查看状态（模型 / 看板 / 看板连接 / 备用通道 / lark-cli）
+  ${c.info('/status')}   查看状态（模型 / 看板 / 看板连接 / lark-cli / 备用通道）
   ${c.info('/clear')}    清空对话历史（不清记忆）
   ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（/quit 同效；任务运行中按 Ctrl+C 只中断不退出）
@@ -276,7 +276,7 @@ export async function main(): Promise<void> {
   bootKanban.stop();
   if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
 
-  const boot = new Spinner('正在连接 helios-kanban MCP…').start();
+  const boot = new Spinner('正在连接看板…').start();
   const { mcp, ok: mcpOk, hint: mcpHint } = await connectMcp(cfg, {
     // 实例一创建即登记清理（参照 kanban 的 onSpawn 模式），不等 connect resolve
     onCreate: (instance) => {
@@ -284,14 +284,10 @@ export async function main(): Promise<void> {
     },
   });
   boot.stop();
-  // 降级链探测先于告警：可用时 banner 已完整表达（不在 banner 外重复），缺依赖时改口告知看板读写暂不可用
+  // 降级链探测先于告警：banner 的 hkLine 已完整展示缺依赖信息（含安装命令），banner 外不再重复打印
+  // （同 lark-cli 的 U15 先例：banner 行内已表达的，不再 banner 外复述）
   const hkMissing = checkHkDeps();
   if (!mcpOk) {
-    if (hkMissing.length) {
-      console.log(
-        c.warn(`看板连接失败，备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）。`),
-      );
-    }
     // 诊断提示在 connectMcp 内生成时尚未知降级链状态：缺 jq/curl 时按「无备用通道」重算，避免谎称已切换备用通道
     const hint = hkMissing.length ? diagnoseMcpFailure(mcp.getStderrTail(), { fallbackAvailable: false }) : mcpHint;
     if (hint) console.log(c.warn(hint));
@@ -327,8 +323,8 @@ export async function main(): Promise<void> {
     console.log(c.gray(req.detail));
     const timeoutMs = req.destructive ? 300000 : 120000;
     const options = req.batchKey
-      ? `y=仅此次 / 免问=${batchScopeWord(req.batchScope)}免问（本会话） / N=取消`
-      : 'y=仅此次 / N=取消';
+      ? `y=仅此次 / 免问=${batchScopeWord(req.batchScope)}免问（本会话） / N=取消 / 回车=取消`
+      : 'y=仅此次 / N=取消 / 回车=取消';
     for (;;) {
       const ans = await askWithAbort(
         c.warn(`允许执行？【${options}】（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
@@ -336,7 +332,7 @@ export async function main(): Promise<void> {
       );
       spinner.start('思考中…（Ctrl+C 中断）');
       if (ans === ASK_TIMEOUT) {
-        console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。'));
+        console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。如仍需执行，再说一次即可。'));
         return false;
       }
       const t = (ans || '').trim().toLowerCase();
@@ -414,7 +410,7 @@ export async function main(): Promise<void> {
         if (fullCmd !== '/confirm') {
           const n = session.revokeBatchApprovals();
           console.log(
-            n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, '当前没有生效中的「同类免问」。')),
+            n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, confirmStateText(0, ''))),
           );
         } else {
           const active = session.activeBatchApprovals();

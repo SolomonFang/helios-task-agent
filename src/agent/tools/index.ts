@@ -72,8 +72,10 @@ export function buildTools({
     for (const tool of mcp.tools) {
       const name = `kanban_${tool.name}`;
       if (!OPENAI_FN_NAME.test(name)) {
-        // MCP server 返回非法名：注册会让整个 tools 数组被 API 400 拒绝（全工具不可用），跳过并告警
-        console.warn(`[tools] 跳过非法 MCP 工具名「${name}」（须匹配 ^[a-zA-Z0-9_-]{1,64}$）`);
+        // MCP server 返回非法名：注册会让整个 tools 数组被 API 400 拒绝（全工具不可用），跳过并告警；
+        // 正则细节收 HTA_DEBUG（用户面不出现正则原文）
+        console.warn(`[tools] 跳过非法 MCP 工具名「${name}」（名称含非法字符或过长）`);
+        if (process.env.HTA_DEBUG) console.error(`[tools] 非法工具名「${name}」：须匹配 ${OPENAI_FN_NAME.source}`);
         continue;
       }
       openAiTools.push({

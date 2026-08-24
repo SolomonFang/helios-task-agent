@@ -112,7 +112,9 @@ export function makeKanbanMcpHandler({
     }
     // write path: 与 hk_cli 共用 runGatedWrite（去重 → 上限 → 闸门 → 执行 → 审计 → 记录来源）
     const summary = summarizeMcp(tool.name, args);
-    const isCreate = /create/i.test(tool.name);
+    // 创建上限只计任务创建（撞线文案为「看板任务」，与 hk 通道只认 tasks create / create-and-start
+    // 口径对齐）：create_project 不计入，避免「项目创建」消耗任务配额且文案失实
+    const isCreate = /create/i.test(tool.name) && !/project/i.test(tool.name);
     const isStart = /start_workspace/i.test(tool.name);
     const { key: batchKey, scope: batchScope } = batchKeyForMcp(tool.name, args);
     return runGatedWrite({

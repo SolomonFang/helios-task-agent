@@ -444,15 +444,27 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
-    // ---------- 无 pending 时确认词兜底 ----------
-    await checkAsync('handler：无 pending 确认时回复确认词给出兜底提示', async () => {
+    // ---------- 无 pending 时：日常应答词照常入队，确认专属词仍给兜底提示 ----------
+    await checkAsync('handler：无 pending 确认时日常词照常入队，确认专属词给兜底提示', async () => {
       const f = setup(llm.baseUrl);
+      // 「确认/取消」属日常应答词：不再拦截，消息照常入队交给模型处理
       await f.handlers.handle(mkMsg('u1', '确认'));
       await f.handlers.handle(mkMsg('u1', '取消'));
-      assert.equal(f.channel.replies.length, 2);
-      for (const r of f.channel.replies) {
-        assert.ok(r.text.includes('当前没有待确认的写操作'), `应给兜底提示，实际：${r.text}`);
-      }
+      assert.ok(
+        !f.channel.replies.some((r) => r.text.includes('当前没有待确认的写操作')),
+        '日常应答词不应被兜底提示拦截',
+      );
+      assert.equal(
+        f.channel.updated.filter((t) => t === '好的，已收到').length,
+        2,
+        '日常应答词应照常入队并得到最终回复',
+      );
+      // 确认专属词（日常对话几乎不会说）：仍即时提示，不发给模型
+      await f.handlers.handle(mkMsg('u1', '确认执行'));
+      assert.ok(
+        f.channel.replies.at(-1)!.text.includes('当前没有待确认的写操作'),
+        `确认专属词应给兜底提示，实际：${f.channel.replies.at(-1)!.text}`,
+      );
       cleanup(f);
     });
 
@@ -468,8 +480,8 @@ async function main(): Promise<void> {
       const v2 = f.confirmations.request('u1', req);
       await f.handlers.handle(mkMsg('u1', '同类免问'));
       assert.equal(await v2, 'batch');
-      // kanban 类免问回执按 kind 细化措辞（guard.batchAckText 第二参）
-      assert.ok(f.channel.replies.at(-1)!.text.includes('对同一任务/审批的同类操作本会话内免问'));
+      // 类级免问（scope='kind'）回执如实说整类免问（guard.batchAckText 第二参）
+      assert.ok(f.channel.replies.at(-1)!.text.includes('同类看板操作本会话内免问'));
 
       // 对象级免问的回执须如实限定「同一任务/审批」，不得让用户误以为整个类都放行
       const objReq: ConfirmRequest = { kind: 'kanban', summary: '删除任务', detail: 'delete_task x', batchKey: 'del:x', batchScope: 'object' };
@@ -485,15 +497,31 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
-    // ---------- pending 期间普通消息：即时 ⚠️ 回执并排队照跑 ----------
-    await checkAsync('handler：pending 期间普通消息给出确认卡片提醒并排入队列', async () => {
+    // ---------- pending 期间短应答：即时引导一次且不入队；再次短应答照常排队 ----------
+    await checkAsync('handler：pending 期间短应答给一次裁决引导且不入队，再次短应答照常排队', async () => {
       const f = setup(llm.baseUrl);
       const req: ConfirmRequest = { kind: 'kanban', summary: '更新任务', detail: 'update_task x', batchKey: 'update' };
       const verdict = f.confirmations.request('u1', req);
-      const p = f.handlers.handle(mkMsg('u1', '顺便帮我看看进度'));
+      // 短应答（≤10 字符）：引导一次如何裁决，消息不入队（不发给模型让确认静默挂起）
+      await f.handlers.handle(mkMsg('u1', '好的'));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('请回复「确认」或「取消」')),
+        '短应答应给裁决引导',
+      );
+      assert.ok(
+        !f.channel.replies.some((r) => r.text.includes('已收到并排队')),
+        '短应答不应入队',
+      );
+      // 同一确认第二次短应答：不再重复引导（避免刷屏），消息照常入队
+      const p = f.handlers.handle(mkMsg('u1', '在吗'));
       await waitFor(
         () => f.channel.replies.some((r) => r.text.includes('有未处理的写操作确认卡片')),
         'pending 排队回执',
+      );
+      assert.equal(
+        f.channel.replies.filter((r) => r.text.includes('请回复「确认」或「取消」')).length,
+        1,
+        '第二次短应答不再重复引导',
       );
       // 确认应答不进队列，立即裁决
       await f.handlers.handle(mkMsg('u1', '确认'));
@@ -550,12 +578,12 @@ async function main(): Promise<void> {
       );
       await pA;
       assert.ok(
-        f.channel.updated.includes('⏹ 已中断。'),
+        f.channel.updated.includes('⏹ 已中断（未完成的操作未执行，可继续对话）。'),
         '被中断的消息应把占位消息收尾为中断终态',
       );
       assert.ok(
-        !f.channel.replies.some((r) => r.text === '⏹ 已中断。'),
-        '/stop 已回执过，不得再重复回复「已中断。」',
+        !f.channel.replies.some((r) => r.text === '⏹ 已中断（未完成的操作未执行，可继续对话）。'),
+        '/stop 已回执过，不得再重复回复中断终态',
       );
       assert.equal(llm.requestCount, base + 1, '中断后不得再发起 LLM 请求');
       llm.release();
@@ -786,12 +814,16 @@ async function main(): Promise<void> {
         );
         await f.handlers.handle(mkMsg('u1', '/stop'));
         assert.ok(
-          f.channel.replies.some((r) => r.text.includes('已中断 1 个 AI 审查')),
-          `/stop 应报告中断 AI 审查，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+          f.channel.replies.some((r) => r.text.includes('已中断进行中的 AI 审查')),
+          `/stop 应回执中断 AI 审查，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+        );
+        assert.ok(
+          !f.channel.replies.some((r) => r.text.includes('已中断 1 个 AI 审查')),
+          '中断计数行已移除（改为带标题逐条通知）',
         );
         await waitFor(
-          () => f.channel.notifies.some((n) => n.text.includes('AI 审查已中断')),
-          '审查中断回执',
+          () => f.channel.notifies.some((n) => n.text.includes('AI 审查已中断：《a1》')),
+          '审查中断回执（带标题逐条通知）',
         );
         assert.ok(
           !f.channel.notifies.some((n) => n.text.includes('AI 审查失败')),
@@ -842,7 +874,7 @@ async function main(): Promise<void> {
       assert.equal(session.activeBatchApprovals(), 1);
       await f.handlers.handle(mkMsg('u1', '/confirm revoke'));
       const reply = f.channel.replies.at(-1)!.text;
-      assert.ok(reply.includes('已恢复逐次确认') && reply.includes('撤销 1 类'), `应撤销 1 类免问，实际：${reply}`);
+      assert.ok(reply.includes('已恢复逐次确认') && reply.includes('撤销 1 项免问授权'), `应撤销 1 项免问授权，实际：${reply}`);
       assert.equal(session.activeBatchApprovals(), 0, '免问授权应已被撤销');
       cleanup(f);
     });
@@ -851,7 +883,7 @@ async function main(): Promise<void> {
       const f = setup(llm.baseUrl);
       await f.handlers.handle(mkMsg('u1', '/confirm revoke'));
       assert.ok(
-        f.channel.replies.at(-1)!.text.includes('无需撤销'),
+        f.channel.replies.at(-1)!.text.includes('当前没有生效中的免问授权'),
         `撤销分支应给兜底文案，实际：${f.channel.replies.at(-1)!.text}`,
       );
       await f.handlers.handle(mkMsg('u1', '/confirm'));

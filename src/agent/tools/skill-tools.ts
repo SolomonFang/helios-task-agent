@@ -2,7 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import type { ToolHandler } from '../../types';
 import { looksLikeStrongFailure, passGate, wrapUntrusted, type ConfirmFn } from '../guard';
-import { auditLog } from '../../infra/audit';
+import { auditLog, type AuditDecision } from '../../infra/audit';
 import { readSkillDoc, resolveSkillDir } from '../skills';
 import { ALLOWED_INTERPRETERS, run, SCRIPT_INTERPRETERS, summarizeBothEnds, truncate } from './shared';
 
@@ -65,7 +65,8 @@ export function makeSkillExecHandler({
     const batchKey = `skill:${skill}/${script}${argv.length ? `:${argv.join(' ')}` : ''}`;
     const gate = await passGate({ kind: 'skill', summary, detail, batchKey, batchScope: 'object', destructive: true }, confirm);
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
+      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容）
+      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
       return gate.message;
     }
     const out = await run(interpreter, [scriptReal, ...argv], { signal: ctx?.signal, cwd: rootReal });

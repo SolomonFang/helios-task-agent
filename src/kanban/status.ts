@@ -19,3 +19,8 @@ const STATUS_LABELS: Record<string, string> = {
 export function statusLabel(status: string): string {
   return STATUS_LABELS[status] ?? status;
 }
+
+/** 状态键是否为已知看板状态（报告层/晨报对未知状态兜底「其他」用，避免英文原键落用户面）。 */
+export function isKnownStatus(status: string): boolean {
+  return (TASK_STATUS_KEYS as readonly string[]).includes(status);
+}

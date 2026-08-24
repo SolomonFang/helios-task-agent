@@ -320,3 +320,74 @@
 - 代码注释与文件头中的 MCP/hk_cli 字样（非用户可见面，改注释收益低且易与代码标识符脱节）。
 - bot 场景 Markdown 报告仍无 HTTP 访问路径（报告服务只托管 HTML）：本轮选择 bot 场景省略 MD 行，MD 在线化留待后续。
 - `lastWriteKind` 按 openId 记录最近一次写操作 kind：同用户并发两个不同 kind 确认时回执措辞可能张冠李戴（授权行为本身按 batchKey 正确，仅措辞），边缘场景暂缓。
+
+
+## 第九轮复查（2026-08-24，断线告警「用户无感」改造后全表面复审）
+
+> 背景：第八轮后经历「feat：cicd检查」（工程面，无用户可见影响）与「feat: 消息优化」（ws-alerter 断线告警改完全静默）两个增量。本轮 13 路并行审查 = 增量专项 + 12 个用户可见表面，共修复 60 余项。验证：typecheck 0 错误，单测 12 个脚本 418 条全过（含 4 个新增用例），smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为修复时点快照。
+
+### P1 误导与高风险
+
+- [x] **N1 断线「完全静默」论证只在短时成立，长断线 owner 零感知**：96bc508 以「SDK 自动重连 + 飞书补投」论证 reconnecting/reconnected 全面静默，但 SDK 对网络类错误无限重试、onError 几乎只在鉴权/配置类不可重试错误触发——挂机过夜/断网数小时（全是 retryable）failed 永不到来，owner 无任何感知（僵尸态回潮）；补投只在重连成功时发生，断线 6 小时消息就延迟 6 小时。告警通道（notifyOwners 走飞书 HTTPS API）与 WS 长连接独立、断线期间可送达。修：恢复低频非对称提醒——持续断线超 15 分钟推一条（之后每小时至多一条），reconnected 按是否提醒过补「已恢复」，短时抖动依旧零打扰（保留改造初衷）（`src/bot/ws-alerter.ts` 重写、`src/bot-main.ts` 接线注释，新增 3 个单测用例）。
+- [x] **N2 「/status 仍可查连接状态」是循环自救**：bot 的 /status 经 WS 长连接投递，断线时根本到不了 bot。CHANGELOG 与文件头注释中的该表述已随 N1 删除。
+- [x] **N3 banner 仍宣称「功能不受影响」（S1/G3 最后一个存活实例）**：banner 的 MCP 失败行与同会话 /tools「大部分功能可用，如遇操作失败请稍后再试」自相矛盾。改「大部分功能可用」（`src/infra/ui.ts`）。
+- [x] **N4 免问批准回执把类级授权描述成对象级（G1 回执侧漏网）**：`batchAckText` 的 kind 分支不看 scope——lark target 缺失、kanban start 类/id 缺失时实际按类放行，回执却说「发往同一接收人」「对同一任务/审批」，用户以为只免问一个对象、实际整类静默放行。kind 分支先看 scope：类级给「飞书写操作/同类看板操作本会话内免问」，对象级才用原措辞（`src/agent/guard.ts`）。
+- [x] **N5 无待确认时日常词被吞 + 谎称提示**：「算了/不用/取消/确认/yes」等日常会话词被确认拦截器吞掉（消息永远不到 LLM），还收到谎称「可能已超时/被取消/被替代」的提示。无 pending 时仅确认专属词（确认执行/同类免问/同对象免问/批量允许/以后都/一直允许/始终允许）仍拦截，日常词照常入队（`src/agent/confirm.ts`）。
+- [x] **N6 AI 审查「记录已清理」同屏两个出路自相矛盾且重试必败**：错误文案给「重新发起该任务后再试」，handler 关键词机制又追加「重新点击卡片『AI 审查』重试」——旧卡片带旧 attemptId，重试必败。handler 抑制条件扩展：message 含「重新发起」/「人工审查」不再追加重试指引；执行失败分支「请稍后重试」改「请重新点击卡片上的『AI 审查』重试」（出路详略倒挂一并消除）（`src/bot/handler.ts`、`src/kanban/ai-review.ts`）。
+
+### P2 文案可理解性与死胡同
+
+- [x] **N7 CHANGELOG 缺 [1.0.30] 节（F29/G33 第三次复发）**：按 tag 时点收编——免问粒度条目移入 [1.0.30]，第七/八轮修复仿 [1.0.18] 先例各收编一条摘要；[Unreleased] 只留断线告警条目（按 N1 新行为改写）与本轮摘要。
+- [x] **N8 MCP 失败 + 缺 jq/curl 同屏重复 2-3 遍（U15/S31 同类）**：banner 外 warn 与 banner 内 hkLine 完全重复，banner 内已完整展示（含安装命令）时外部不再打印（`src/cli.ts`）。
+- [x] **N9 /status「备用通道：不可用」裸状态**：MCP 正常但缺 jq/curl 时无原因无出路，补「（缺少 jq、curl，主通道中断时将无备用；安装：…）」（`src/commands.ts`）。
+- [x] **N10 /status 健康包装正则永不命中**：`/^HTTP \d+$/` 匹配不上 http.ts 实际返回的「响应异常（状态码 N）」，「看板服务可能正在重启」出路成死代码。正则改匹配「状态码 \d+」（`src/commands.ts`）。
+- [x] **N11 向导看板可选字段「回车跳过」与实际行为相反**：回车实为保留当前值。改「回车 = 保留当前 <值>」并支持输入「-」清除（与白名单一致）；同屏 open_id 提示口径统一（`src/config/config-wizard.ts`）。
+- [x] **N12 向导认领回填指引 `--rebind` 未提示先停在跑 bot**（S22/G33 漏网）：补「先停止当前机器人进程」（--rebind 会启动完整实例，与在跑实例冲突）。
+- [x] **N13 看板地址零校验**：漏写协议头静默保存、运行时才暴露。向导增加 http(s):// scheme 校验重问（`config-wizard.ts`）。
+- [x] **N14 llm-error 指引口径不齐**：CLI 分支补「（改 .env 需重启生效）」；bot modelHint 补键名「的 LLM_MODEL」（`src/config/llm-error.ts`）。
+- [x] **N15 bot LLM 失败收尾英文原文未截断直达用户（F17/G8 漏网链路）**：`llmFailureParts` 未命中已知模式时 head 不再内联英文 message——只留「请求失败」+ 通用出路，原文截断 200 字符收 HTA_DEBUG；已知模式指引不变（`src/commands.ts`）。
+- [x] **N16 bot 启动链路黑话与谎称三连**：启动告警「hk_cli 降级链…MCP 掉线」改「备用通道缺少 jq、curl：看板主连接中断时…」（G7 漏网）；MCP 首连失败主文案按 hkMissing 条件化（缺依赖改口「看板读写暂不可用」，S2/S3/G4 漏网分支）；CLI spinner「正在连接 helios-kanban MCP…」改「正在连接看板…」（`src/bot-main.ts`、`src/cli.ts`）。
+- [x] **N17 mdSafe 漏 ~~、`<font>`、`<at>`（B3/W2/F38 同类漏网分支）**：确认卡片 summary 含外部可控的看板任务标题，可被注入删除线/彩色伪造警示/@ 提及。补 `~`→`～`、`<`→`＜`、`>`→`＞` 全角化（`src/channels/feishu-cards.ts`，新增单测）。
+- [x] **N18 owner 认领欢迎语「owner」中英混排**：与拒绝文案「本实例的部署者」（S36）统一为「部署者」（`src/bot-main.ts`）。
+- [x] **N19 看板信封英文 message 直达飞书用户**：envelopeData 失败抛服务端英文原文，经 AI 审查链路原样推送。用户面统一「看板拒绝了请求」，原文收 HTA_DEBUG（`src/kanban/http.ts`）。
+- [x] **N20 watcher 纯文本版裸发 localhost 链接无可达性注记**：卡片发送失败降级时用户必然踩死链。`linkReachNote` 上移 watcher 导出复用，文本版链接行补注记（`src/kanban/watcher.ts`、`src/channels/feishu-cards.ts`）。
+- [x] **N21 shared.run 超时归因张冠李戴**：lark-cli/技能脚本超时也被归因「看板服务响应慢」。改中性「可能是网络或服务响应慢」（`src/agent/tools/shared.ts`）。
+- [x] **N22 memory 失败文案蛇形工具名前缀**（G20 同型漏网）：「memory_set 失败：」→「保存记忆失败：」等（`src/agent/tools/memory-tools.ts`）。
+- [x] **N23 prompt 教的创建上限（10）与代码闸门（50）矛盾（G5 漏网）**：改 50（`src/agent/prompt.ts`）。
+- [x] **N24 SKILL.md 回复模板与 prompt 禁令同屏打架**：模板教模型输出 `**URL**:`/`{target_branch}`（prompt 禁用 url 英文术语）、残留英文 or、九行半角冒号与 prompt 模板两套排版。全角化并改「链接/分支名/迭代，无则 —」（`skills/helios-kanban-remote/SKILL.md`）。
+- [x] **N25 prompt 黑话残留**：「HTTP REST」括注、kanban→看板（4 处）、coding agent/base 分支/task id/URL 中文化（`src/agent/prompt.ts`）。
+- [x] **N26 HK_CLI_INSTALL_HINT 嵌套全角括号系统性复发（B2/F36 同类）**：hint 内层括号改分句，五个拼接点（含直推飞书用户的一处）全部解套；ui.ts 双冒号「（安装：macOS：…」消除（`src/infra/deps.ts`、`src/infra/ui.ts`）。
+- [x] **N27 确认挂起时「好的/可以」被当新对话发给模型**：确认静默挂起直到超时，行为与意图相反（CLI 侧 G15 已重问，bot 漏）。有挂起确认且文本 ≤10 字符时回复「请回复「确认」或「取消」，或点卡片上的按钮。」（每份确认只提醒一次）；长文本照常入队（`src/agent/confirm.ts` 导出 `hasPendingConfirmation`、`src/bot/handler.ts`，新增单测）。
+- [x] **N28 CLI 闸口两缺口**：超时分支无出路（补「如仍需执行，再说一次即可。」，与 bot 对齐）；「空回车 = 取消」未在选项串说明（补「回车=取消」）（`src/cli.ts`）。
+- [x] **N29 免问状态/撤销/cleared 文案统称「同类免问」且按「类」计数**：对象级授权被叫错名字、多个对象级 key 被数成「N 类」。统一中性「免问授权」口径（「N 项写操作免问授权生效中」），CLI/bot 两端空态同步（`src/commands.ts`、`src/cli.ts`、`src/bot/handler.ts`）。
+- [x] **N30 README 示例与晨报枚举漂移**：两版 README 补「总结迭代/生成报告」示例（英文版恢复为对齐条目列表）；README×2 与 .env.example 晨报枚举补「待办」；「全部迭代」统一「全部任务」。
+- [x] **N31 lark-cli 未授权告警缺影响说明**：与未安装分支不对称，补「未授权期间飞书任务/文档读取不可用」（`src/infra/deps.ts`）。
+- [x] **N32 技能迁移提示不给目标路径**：附 `userSkillsDir()` 绝对路径（F22 先例）（`src/bootstrap.ts`）。
+- [x] **N33 向导细节**：非 TTY 编号列表分支标题不带当前模型（R6 漏网分支）；「开发者后台」统一「飞书开放平台」；「网络 / 代理」排版统一；「请选择 [1-N]」改「请输入 1 到 N 的数字」（`src/config/`）。
+- [x] **N34 工作区 404 误诊「超时未就绪」**：记录已清理时出现「超过 1 秒仍未就绪」怪话且误导排查方向。404 分支单独文案「工作区记录已被看板清理，请重新发起任务」（`src/kanban/workspace-ready.ts`）。
+- [x] **N35 报告未知任务状态透传英文键（S33 同类漏网）**：`|| '其他'` 是死代码（statusLabel 对未知键返回键本身）。status.ts 新增 `isKnownStatus()`，报告未知状态归「其他」组；晨报失败分组同口径（`src/kanban/status.ts`、`src/report/report.ts`、`src/bot/daily-brief.ts`）。
+- [x] **N36 变更文件「等 +N 个」死代码**：上游 slice(0,10) 不保留总数，改动 25 个文件静默只显 10 个。summary 新增 `changedFilesTotal`，报告 MD/HTML 据实渲染（`src/kanban/summary.ts`、`src/report/report.ts`）。
+- [x] **N37 晨报分组计数样本与头部全量矛盾**：分组标题与「还有 N 个」改用 totals 全量；范围内仅已取消/未知状态时不再输出全零空晨报（兜底体现「已取消 N 个」）；「全部迭代」与报告「全部任务」统一（`src/bot/daily-brief.ts`）。
+
+### P3 细节打磨
+
+- [x] **N38** /help /status 枚举顺序与实际输出对齐（lark-cli 在备用通道前）；/skills 描述截断补省略号（`src/cli.ts`、`src/commands.ts`）。
+- [x] **N39** hk/lark 摘要 fallback 透传英文子命令 → 固定「看板写操作」「飞书写操作」（S8 口径对齐）；shared.run 的 `[stderr]`/`--- stdout ---` 英文标注中文化统一；tools/index.ts 非法工具名提示的正则原文改「名称含非法字符或过长」（`src/agent/tools/`）。
+- [x] **N40** 创建上限两通道口径：MCP `isCreate` 把 create_project 计入任务配额 → 限定任务创建（与 hk 对齐）（`src/agent/tools/kanban-mcp.ts`）。
+- [x] **N41** memory_get 返回省略 UTC ISO updatedAt；确认 detail 的 key=value 伪调用串改「键：…/值：…」中文两行（`src/agent/tools/memory-tools.ts`）。
+- [x] **N42** MCP 通道确认摘要去完整 UUID（对象标识 detail 区已有，与 hk/lark 口径一致）（`src/agent/guard.ts`）。
+- [x] **N43** 超时/作废两种终态落裁决日志（verdict=timeout/superseded，open_id 脱敏）；`GateResult.reason` 扩展透传真实终态，审计可区分「用户拒绝」与「超时未处理」（`src/agent/confirm.ts`、`src/agent/guard.ts`、`src/infra/audit.ts`、tools 层透传）。
+- [x] **N44** /stop 措辞统一：占位收尾改「⏹ 已中断（未完成的操作未执行，可继续对话）。」（与 llm.ts 一条）；AI 审查中断计数行与带标题通知双发收敛为带标题逐条（`src/bot/handler.ts`）。
+- [x] **N45** 确认卡片 destructive 操作标题补「· 高危」（与 CLI 闸口 G43 口径一致）（`src/channels/feishu-cards.ts`）。
+- [x] **N46** watcher 措辞收敛：review 分隔符统一「；」、failed 引导语抽 `WATCH_HINT_FAILED_LOG` 常量文本/卡片共用；待审批 label 兜底裸 UUID 改「未命名审批（ID：…）」（`src/kanban/watcher.ts`）。
+- [x] **N47** ws-alerter 恢复通知「恢复」三现精简：「✅ 飞书长连接已自行恢复（此前重连失败，无需重启）」（`src/bot/ws-alerter.ts`）。
+- [x] **N48** bot-main 细节：缺依赖列表 join('/') 与 open_id 列表 join(', ') 统一「、」；确认失败日志 open_id 一处漏脱敏补齐；认领欢迎语去 owner（`src/bot-main.ts`）。
+- [x] **N49** llm.ts「模型返回为空」与「模型未返回内容」措辞统一（throw message 会展示给用户）；memory 上限「记忆键（100）」改「记忆条目（100 条）」；skills 卸载「包内内置技能」改「随产品自带的技能」；source-registry/session 控制台半角冒号（`src/agent/`）。
+- [x] **N50** 审查报告类别兜底「提示」（严重度词汇、语义错位）改「其他」，CAT_LABELS 补中文类别键（与 SEV_MAP 对称）；404 页「进程重启后」改「机器人重启后」（G36 漏网）；「其余 N 条见报告文件」按 bot/CLI 分措辞；MD 报告 projectName/iteration 过 mdText；空态标点两形态统一（`src/report/`）。
+- [x] **N51** 文档：README「约每 60s」改「60 秒」（G35 漏网）；.env.example 同句全半角括号混用统一；SKILL.md 模板「运行状态：」后多余空格（批次 H）。
+
+### 本轮暂不修（记录在案）
+
+- CLI 闸口免问词表与授权粒度脱节：类级操作下输入「同对象免问」会被静默授予类级授权（比字面范围大），反之亦然。边缘场景（用户须输入提示里没展示的词），授权行为按 batchKey 正确、仅措辞与授权范围的映射问题，暂缓。
+- src/agent/llm.ts:305、src/agent/confirm.ts:195 两处 console 日志半角冒号（非用户可见面，随下轮顺手清理）。
+- 第八轮遗留项（代码注释黑话、bot 场景 MD 报告在线化、lastWriteKind 并发措辞）维持暂不修结论。

@@ -2,7 +2,7 @@ import fs from 'fs';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import { errMessage } from '../infra/err';
 import { fetchKanbanHealth } from '../kanban/http';
-import { collectWorkSummary, statusLabel, type WorkSummaryData, type WorkSummaryTask } from '../kanban/summary';
+import { collectWorkSummary, isKnownStatus, statusLabel, type WorkSummaryData, type WorkSummaryTask } from '../kanban/summary';
 
 /**
  * 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭。
@@ -42,15 +42,22 @@ function localDateStr(d: Date): string {
 /** 每个分组最多列出的任务标题数（晨报是概览，全量走「总结一下这个迭代做了什么」报告）。 */
 const MAX_LIST = 10;
 
-function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatus?: boolean }): string[] {
-  if (!tasks.length) return [];
-  const lines = [`【${label}】${tasks.length} 个`];
+/**
+ * 分组小节：标题计数用 total（totals 的截断前全量，与头部计数行同口径），
+ * 列表仍是 data.tasks 的截断样本；截断时用「…还有 N 个」按全量口径补剩余数。
+ */
+function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatus?: boolean; total?: number }): string[] {
+  const total = opts?.total ?? tasks.length;
+  if (!total) return [];
+  const lines = [`【${label}】${total} 个`];
   // 标题来自看板数据：文本消息无 markdown 解析，原样输出即可，不做转义
-  // 失败分组与状态分组正交（同一任务两边都出现）：标注原状态消除「重复计数」困惑
+  // 失败分组与状态分组正交（同一任务两边都出现）：标注原状态消除「重复计数」困惑；
+  // 未知状态 statusLabel 会回退英文原键，这里兜底「其他」
   for (const t of tasks.slice(0, MAX_LIST)) {
-    lines.push(`· 《${t.title}》${opts?.showStatus ? `（${statusLabel(t.status)}）` : ''}`);
+    lines.push(`· 《${t.title}》${opts?.showStatus ? `（${isKnownStatus(t.status) ? statusLabel(t.status) : '其他'}）` : ''}`);
   }
-  if (tasks.length > MAX_LIST) lines.push(`· …还有 ${tasks.length - MAX_LIST} 个`);
+  const listed = Math.min(tasks.length, MAX_LIST);
+  if (total > listed) lines.push(`· …还有 ${total - listed} 个`);
   return lines;
 }
 
@@ -72,21 +79,34 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
   if (!data.tasks.length) {
     lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
   } else {
+    let anySection = false;
     for (const section of [
-      listSection('进行中', inprogress),
-      listSection('待办', todo),
-      listSection('待审阅', inreview),
-      listSection('已完成', done),
-      listSection('失败', failed, { showStatus: true }),
+      listSection('进行中', inprogress, { total: data.totals.inprogress }),
+      listSection('待办', todo, { total: data.totals.todo }),
+      listSection('待审阅', inreview, { total: data.totals.inreview }),
+      listSection('已完成', done, { total: data.totals.done }),
+      listSection('失败', failed, { showStatus: true, total: data.totals.failed }),
     ]) {
-      if (section.length) lines.push('', ...section);
+      if (section.length) {
+        anySection = true;
+        lines.push('', ...section);
+      }
+    }
+    // 范围内任务全部是已取消/未知状态时各分组为空：兜底体现取消数（与报告侧「已取消」
+    // 统计卡同口径），不输出头部全零、正文空白的空晨报
+    if (!anySection) {
+      const parts: string[] = [];
+      if (data.totals.cancelled) parts.push(`已取消 ${data.totals.cancelled} 个`);
+      const unknown = data.tasks.filter((t) => !isKnownStatus(t.status)).length;
+      if (unknown) parts.push(`其它状态 ${unknown} 个`);
+      if (parts.length) lines.push('', parts.join(' · '));
     }
   }
-  // 底部引导语与晨报范围匹配：配置了迭代引导「总结这个迭代」；未配置时范围为全部迭代，
-  // 引导语须说清「全部迭代」——只说「看板进展」时 agent 默认按 today 范围总结，与晨报口径不符
+  // 底部引导语与晨报范围匹配：配置了迭代引导「总结这个迭代」；未配置时范围为全部任务，
+  // 引导语须说清「全部任务」——只说「看板进展」时 agent 默认按 today 范围总结，与晨报口径不符
   lines.push(
     '',
-    data.iteration ? '回复「总结一下这个迭代做了什么」看完整报告' : '回复「总结一下全部迭代的看板进展」看完整报告',
+    data.iteration ? '回复「总结一下这个迭代做了什么」看完整报告' : '回复「总结一下全部任务的看板进展」看完整报告',
   );
   return lines.join('\n');
 }
@@ -103,7 +123,7 @@ export interface DailyBriefOptions {
   statePath: string;
   kanbanUrl: string;
   projectId?: string;
-  /** 当前迭代名（HELIOS_KANBAN_ITERATION）；缺省时范围为全部迭代。 */
+  /** 当前迭代名（HELIOS_KANBAN_ITERATION）；缺省时范围为全部任务。 */
   iteration?: string;
   /** owner 列表取法（含运行时认领的 owner）；为空时不推。 */
   owners: () => string[];

@@ -13,7 +13,7 @@ import {
   type LarkCliStatus,
 } from './infra/deps';
 import { ensureKanbanRunning, type KanbanEnsureResult } from './kanban/kanban-ensure';
-import { migratePackageSkills, validateSkills } from './agent/skills';
+import { migratePackageSkills, userSkillsDir, validateSkills } from './agent/skills';
 import { c } from './infra/ui';
 import { errMessage } from './infra/err';
 
@@ -46,7 +46,7 @@ export function warnStartupDeps(larkStatus: LarkCliStatus, opts: StartupDepsWarn
 /** 历史误放进 npm 包内 skills/ 的技能升级即丢失：启动时先迁到数据目录持久保存，再校验最终生效的技能集。 */
 export function migrateAndValidateSkills(): void {
   for (const name of migratePackageSkills()) {
-    console.log(c.info(`已将技能「${name}」迁移到个人数据目录，今后升级不会丢失`));
+    console.log(c.info(`已将技能「${name}」迁移到个人数据目录（${userSkillsDir()}），今后升级不会丢失`));
   }
   // 技能契约问题启动即告警：用户自建技能写错 frontmatter 时会静默降级，不放行到对话期才暴露
   // problem 自带「技能「x」配置问题：…」前缀（见 agent/skills.ts），直接打印即可

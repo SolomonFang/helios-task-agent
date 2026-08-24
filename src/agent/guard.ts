@@ -62,15 +62,23 @@ export function batchScopeWord(scope: ConfirmRequest['batchScope']): string {
 }
 
 /**
- * 「同类免问」批准回执正文：按操作类别（kind）细化「对象」指代——lark 的对象是接收人、
- * 看板是任务/审批、技能是脚本+参数，跨场景通稿会让用户误解免问范围。未传 kind 时回退
- * 通用措辞；对象级须明说「该对象的同类」，避免用户误以为整个类都免问。
+ * 「同类免问」批准回执正文：按免问粒度（scope）与操作类别（kind）细化措辞——scope='kind'
+ * 是类级授权（放行整类），回执必须如实说「整类免问」，不得沿用对象级措辞让用户误以为
+ * 只放行了当前对象；scope='object' 才按对象指代细化（lark 的对象是接收人、看板是
+ * 任务/审批）。技能授权 key 本就绑定脚本+参数，两种粒度共用脚本粒度措辞。
+ * 未传 kind 时回退通用措辞。
  */
 export function batchAckText(scope: ConfirmRequest['batchScope'], kind?: ConfirmKind): string {
-  if (kind === 'lark') return '发往同一接收人的同类操作本会话内免问';
-  if (kind === 'kanban' || kind === 'hk') return '对同一任务/审批的同类操作本会话内免问';
   if (kind === 'skill') return '同一脚本同一参数本会话内免问';
-  return scope === 'object' ? '该对象的同类写操作本会话内免问' : '同类写操作本会话内免问';
+  if (scope === 'object') {
+    if (kind === 'lark') return '发往同一接收人的同类操作本会话内免问';
+    if (kind === 'kanban' || kind === 'hk') return '对同一任务/审批的同类操作本会话内免问';
+    return '该对象的同类写操作本会话内免问';
+  }
+  // 类级授权（scope='kind' 或缺省）：如实说整类免问
+  if (kind === 'lark') return '飞书写操作本会话内免问';
+  if (kind === 'kanban' || kind === 'hk') return '同类看板操作本会话内免问';
+  return '同类写操作本会话内免问';
 }
 
 /** ConfirmFn 附带「同类免问」查询/撤销能力（「恢复确认」/ `/confirm on` 用）。 */
@@ -105,7 +113,7 @@ export function withBatchApproval(confirm: ConfirmFn): BatchConfirmFn {
 
 export type GateResult =
   | { allowed: true }
-  | { allowed: false; reason: 'denied' | 'no_gate'; message: string };
+  | { allowed: false; reason: 'denied' | 'no_gate' | 'timeout' | 'superseded'; message: string };
 
 export const DENIED_MESSAGE = '用户拒绝了该写操作，未执行。请如实转告用户，不要换工具或换参数重试同一操作。';
 export const SUPERSEDED_MESSAGE =
@@ -125,6 +133,17 @@ export function markSuperseded(req: ConfirmRequest): void {
   supersededReqs.add(req);
 }
 
+/**
+ * 确认超时自动拒绝的请求（confirm.ts 在 resolve 前标记）。passGate 据此把「超时未处理」
+ * 与「用户拒绝」区分开，工具层审计 decision 可区分两种终态。
+ */
+const timedOutReqs = new WeakSet<ConfirmRequest>();
+
+/** 由确认管理器在超时自动拒绝时调用（必须先于 resolve，保证等待方读到标记）。 */
+export function markTimedOut(req: ConfirmRequest): void {
+  timedOutReqs.add(req);
+}
+
 /** Ask the confirmation channel; fail closed on missing channel or errors. */
 export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefined): Promise<GateResult> {
   if (!confirm) return { allowed: false, reason: 'no_gate', message: NO_GATE_MESSAGE };
@@ -135,7 +154,8 @@ export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefin
     ok = false;
   }
   if (ok) return { allowed: true };
-  return { allowed: false, reason: 'denied', message: supersededReqs.has(req) ? SUPERSEDED_MESSAGE : DENIED_MESSAGE };
+  const reason = supersededReqs.has(req) ? 'superseded' : timedOutReqs.has(req) ? 'timeout' : 'denied';
+  return { allowed: false, reason, message: reason === 'superseded' ? SUPERSEDED_MESSAGE : DENIED_MESSAGE };
 }
 
 // --- lark-cli classification ---
@@ -273,7 +293,7 @@ export function isDestructive(toolName: string): boolean {
 /** Short human summary for a kanban MCP write call. */
 export function summarizeMcp(toolName: string, args: Record<string, unknown>): string {
   const title = typeof args.title === 'string' ? args.title : '';
-  const id = String(args.task_id ?? args.taskId ?? args.id ?? args.workspace_id ?? args.approval_id ?? '');
+  // 摘要行不放对象 id（完整 UUID 可读性差；对象标识在确认卡片的 detail 区已有），与 hk/lark 通道口径一致
   if (/create/i.test(toolName)) {
     if (/project/i.test(toolName)) {
       const name = typeof args.name === 'string' ? args.name : title;
@@ -281,14 +301,14 @@ export function summarizeMcp(toolName: string, args: Record<string, unknown>): s
     }
     return `创建看板任务${title ? `「${title}」` : ''}`;
   }
-  if (/delete/i.test(toolName)) return `删除看板任务 ${id}`;
-  if (/cancel/i.test(toolName)) return `取消看板任务 ${id}`;
-  if (/update/i.test(toolName)) return `更新看板任务 ${id}${title ? `（新标题「${title}」）` : ''}`;
-  if (/start/i.test(toolName)) return `启动任务 ${id} 的工作区`;
-  if (/stop/i.test(toolName)) return `停止工作区 ${id}`;
-  if (/follow/i.test(toolName)) return `向任务 ${id} 发送跟进消息`;
-  if (/approve/i.test(toolName)) return `批准审批 ${id}`;
-  if (/deny/i.test(toolName)) return `拒绝审批 ${id}`;
+  if (/delete/i.test(toolName)) return '删除看板任务';
+  if (/cancel/i.test(toolName)) return '取消看板任务';
+  if (/update/i.test(toolName)) return `更新看板任务${title ? `（新标题「${title}」）` : ''}`;
+  if (/start/i.test(toolName)) return '启动任务的工作区';
+  if (/stop/i.test(toolName)) return '停止工作区';
+  if (/follow/i.test(toolName)) return '向任务发送跟进消息';
+  if (/approve/i.test(toolName)) return '批准审批';
+  if (/deny/i.test(toolName)) return '拒绝审批';
   return '看板写操作';
 }
 

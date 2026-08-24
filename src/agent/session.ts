@@ -78,7 +78,7 @@ export class AgentSession {
           trimHistory(this.messages);
         }
       } catch (err) {
-        console.error(`[session] 会话历史恢复失败，按空历史继续: ${errMessage(err)}`);
+        console.error(`[session] 会话历史恢复失败，按空历史继续：${errMessage(err)}`);
       }
     }
   }
@@ -217,7 +217,7 @@ export class AgentSession {
     // 清盘与 save 共用串行队列（防在途写把旧历史写回）；fire-and-forget：失败仅记日志（内存已清，下次落盘会覆盖）
     if (this.historyStore) {
       this.historyStore.clear(this.userId).catch((err) => {
-        console.error(`[session] 磁盘会话历史清理失败: ${errMessage(err)}`);
+        console.error(`[session] 磁盘会话历史清理失败：${errMessage(err)}`);
       });
     }
   }
@@ -226,7 +226,7 @@ export class AgentSession {
   private persistHistory(): void {
     if (!this.historyStore) return;
     this.historyStore.save(this.userId, this.messages).catch((err) => {
-      console.error(`[session] 会话历史落盘失败（不影响本次对话）: ${errMessage(err)}`);
+      console.error(`[session] 会话历史落盘失败（不影响本次对话）：${errMessage(err)}`);
     });
   }
 

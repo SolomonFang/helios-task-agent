@@ -100,13 +100,13 @@ async function main(): Promise<void> {
     assert.ok(text.includes('总结一下这个迭代做了什么'), `迭代范围引导语: ${text}`);
   });
 
-  await checkAsync('buildDailyBriefText：未配置迭代时引导语明确「全部迭代」（与晨报范围口径一致）', () => {
+  await checkAsync('buildDailyBriefText：未配置迭代时引导语明确「全部任务」（与晨报范围口径一致）', () => {
     const data = fakeSummary([fakeTask({ id: 'a', title: '任务A', status: 'inprogress' })]);
-    delete data.iteration; // 未配置 HELIOS_KANBAN_ITERATION：范围为全部迭代
-    data.sinceLabel = '全部迭代';
+    delete data.iteration; // 未配置 HELIOS_KANBAN_ITERATION：范围为全部任务
+    data.sinceLabel = '全部任务';
     const text = buildDailyBriefText(data, at(9, 30));
-    // 必须说清「全部迭代」：只说「看板进展」时 agent 未说明范围默认按 today 总结，与晨报口径不符
-    assert.ok(text.includes('总结一下全部迭代的看板进展'), `全量范围引导语: ${text}`);
+    // 必须说清「全部任务」：只说「看板进展」时 agent 未说明范围默认按 today 总结，与晨报口径不符
+    assert.ok(text.includes('总结一下全部任务的看板进展'), `全量范围引导语: ${text}`);
     assert.ok(!text.includes('总结一下这个迭代做了什么'));
   });
 

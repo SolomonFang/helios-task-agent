@@ -128,8 +128,9 @@ export function extractWorkspaceId(startResult: string): string | null {
 
 /**
  * 分类工作区初始化状态。'unknown' 表示快照因瞬时错误（5xx/连接拒绝/网络抖动）
- * 拉取失败、状态不明——与 'failed'（已确认初始化失败，仅 404 判定）区分，
- * 调用方据此继续轮询而不是立即报「请检查分支设置」的误导文案。
+ * 拉取失败、状态不明——与 'failed'（记录已不存在，仅 404 判定）区分，
+ * 调用方据此继续轮询而不是立即报错；'failed' 由 waitForWorkspaceReady 给专用的
+ * 「工作区记录已被看板清理」文案，与超时分支的「超过 N 秒仍未就绪」分开。
  */
 export function classifyWorkspaceSetup(ws: WorkspaceSnapshot | null | 'unknown'): WorkspaceSetupState {
   if (ws === 'unknown') return 'unknown';
@@ -272,15 +273,9 @@ export async function waitForWorkspaceReady(
     const state = classifyWorkspaceSetup(snap);
     if (state === 'ready') return { ok: true };
     if (state === 'failed') {
-      const branches = await fetchWorkspaceTargetBranches(kanbanUrl, workspaceId, signal);
-      return {
-        ok: false,
-        message: formatWorkspaceSetupFailure({
-          workspaceId,
-          targetBranches: branches,
-          elapsedMs: Date.now() - started,
-        }),
-      };
+      // failed 仅由 404 判定（见 fetchWorkspaceSnapshot）：工作区记录已被看板清理，
+      // 等多久都不会就绪——与下方「初始化超时」分支分开定性，不再误诊为「超过 N 秒仍未就绪」
+      return { ok: false, message: '工作区记录已被看板清理，请重新发起任务。' };
     }
     // pending / unknown（瞬时错误、状态不明）都继续轮询，由整体 timeoutMs 兜底
     await new Promise((r) => setTimeout(r, intervalMs));

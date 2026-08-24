@@ -231,13 +231,25 @@ const CAT_LABELS: Record<string, string> = {
   warning: '警告',
   suggestion: '建议',
   nit: '建议',
+  // 与 SEV_MAP 的中文严重度键对称：ocr 直接输出中文类别时同样命中
+  缺陷: '缺陷',
+  安全: '安全',
+  性能: '性能',
+  正确性: '正确性',
+  可维护性: '可维护性',
+  可读性: '可读性',
+  风格: '风格',
+  文档: '文档',
+  测试: '测试',
+  警告: '警告',
+  建议: '建议',
 };
 
 function catLabel(raw: string): string {
   const key = raw.trim().toLowerCase();
   if (!key) return ''; // 无类别不渲染徽章
-  // 未命中映射的英文原文不上徽章，统一归到「提示」
-  return CAT_LABELS[key] ?? '提示';
+  // 未命中映射的原文不上徽章，统一归「其他」（兜底词不得用严重度词汇）
+  return CAT_LABELS[key] ?? '其他';
 }
 
 /** diff 候选行：带 +/- 前缀，或缩进 ≥2 的代码上下文行。 */

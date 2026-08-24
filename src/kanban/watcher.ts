@@ -12,6 +12,7 @@ import {
   type KanbanProjectRow,
 } from './http';
 import { statusLabel } from './summary';
+import { isLoopbackUrl } from '../infra/url-utils';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -54,6 +55,24 @@ export const WATCH_HINT_DONE = '回复「帮我审一下」看结果，要继续
 
 /** failed 事件的统一后续指引。 */
 export const WATCH_HINT_FAILED = '回复「为什么失败」分析原因';
+
+/** review 事件的统一后续指引（文本版与卡片版同源；句内分隔统一「；」）。 */
+export const WATCH_HINT_REVIEW = '没问题回复「标记完成」；要继续改直接说';
+
+/** failed 事件的查看日志引导语（文本版与卡片版同源）。 */
+export const WATCH_HINT_FAILED_LOG = '请到看板查看日志定位问题。';
+
+/**
+ * 本机链接可达性注记（watcher 纯文本版事件与 feishu-cards 卡片注脚同源）：
+ * 卡片发送失败降级为纯文本时用户必然踩「localhost 打不开」的坑，链接行必须带同口径注记。
+ * loopback（localhost/127.x/::1）连同一局域网都不可达，需与「本机所在网络可达」区分；
+ * 失效主语写明是机器人重启，避免「重启后失效」不知所指。
+ */
+export function linkReachNote(url: string): string {
+  return isLoopbackUrl(url)
+    ? '链接仅本机可达（手机/局域网打不开），机器人重启后链接失效。'
+    : '链接仅本机所在网络可达，机器人重启后链接失效。';
+}
 
 /** 一条看板状态事件：结构化字段用于渲染飞书卡片，text 为纯文本版本（会话注入 + 卡片发送失败时降级）。 */
 export interface WatchEvent {
@@ -252,7 +271,7 @@ export class KanbanWatcher {
             transition,
             url: review.url,
             attemptId: review.attemptId,
-            text: `🔍 看板任务待审阅：《${cur.title}》（${transitionText}）\n${review.url}\n点开链接人工审查 diff；没问题回复「标记完成」，要继续改直接说`,
+            text: `🔍 看板任务待审阅：《${cur.title}》（${transitionText}）\n${review.url}\n点开链接人工审查 diff；${WATCH_HINT_REVIEW}\n${linkReachNote(review.url)}`,
           },
         });
         continue; // 待审阅已提示，同一 tick 不再重复其它状态通知
@@ -278,7 +297,7 @@ export class KanbanWatcher {
             transition: `${old.status} → ${cur.status}`,
             url: link,
             extra: extra || undefined,
-            text: `${label}：《${cur.title}》（${statusLabel(old.status)} → ${statusLabel(cur.status)}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}`,
+            text: `${label}：《${cur.title}》（${statusLabel(old.status)} → ${statusLabel(cur.status)}）\n${link}${extra ? `\n结果摘要：${extra}` : ''}${hint}\n${linkReachNote(link)}`,
           },
         });
       }
@@ -292,7 +311,7 @@ export class KanbanWatcher {
             kind: 'failed',
             title: cur.title,
             url,
-            text: `❌ 看板任务执行失败：《${cur.title}》，请到看板查看日志\n${url}\n${WATCH_HINT_FAILED}`,
+            text: `❌ 看板任务执行失败：《${cur.title}》，${WATCH_HINT_FAILED_LOG}\n${url}\n${WATCH_HINT_FAILED}\n${linkReachNote(url)}`,
           },
         });
       }
@@ -431,7 +450,9 @@ export class KanbanWatcher {
           .filter((a) => /pending/i.test(String(a.status ?? a.state ?? '')))
           .map((a) => {
             const id = String(a.id || '');
-            const label = String(a.title || a.task_title || a.name || a.summary || id);
+            // 标题类字段全缺时兜底「未命名审批（ID：…）」，不落裸 UUID（用户无从辨认）
+            const rawLabel = a.title || a.task_title || a.name || a.summary;
+            const label = rawLabel ? String(rawLabel) : `未命名审批（ID：${id}）`;
             return { id, label };
           })
           .filter((a) => a.id);

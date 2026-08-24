@@ -92,18 +92,19 @@ export function run(
           logExecFailure(command, args, error, stderr || '');
           // 超时中止：signal 中断已在上方拦截，此处的 killed/SIGTERM 即 EXEC_TIMEOUT 触发
           if (error.killed === true || /timed?\s*out/i.test(error.message)) {
-            // 保留「命令执行失败」行首：looksLikeStrongFailure 依行首识别强失败（审计/来源映射/创建计数）
+            // 保留「命令执行失败」行首：looksLikeStrongFailure 依行首识别强失败（审计/来源映射/创建计数）。
+            // run() 为 lark-cli / hk.sh / 技能解释器三方共用，超时归因用中性措辞（不按看板服务单点归因）
             resolve(
               `命令执行失败：执行超时（超过 ${EXEC_TIMEOUT / 1000} 秒已自动中止）。` +
-                '请稍后重试；若持续超时，可能是看板服务响应慢。',
+                '请稍后重试；若持续超时，可能是网络或服务响应慢。',
             );
             return;
           }
-          // 英文 error.message（含完整命令与本机绝对路径）不进用户面；stderr 只带尾部 3 行
+          // 英文 error.message（含完整命令与本机绝对路径）不进用户面；stderr 只带尾部 3 行（标注同下方口径）
           const code = (error as NodeJS.ErrnoException).code;
           const codeText = typeof code === 'number' ? `（退出码 ${code}）` : '';
           const tail = tailLines(stderr || '', 3);
-          resolve(`命令执行失败${codeText}${tail ? `：\n${tail}` : '。'}`);
+          resolve(`命令执行失败${codeText}${tail ? `：\n错误输出：\n${tail}` : '。'}`);
         } else if (error) {
           logExecFailure(command, args, error, stderr || '');
           // 非零退出但有 stdout：不能只回 stdout 让模型误判成功；失败信号放在开头
@@ -112,13 +113,13 @@ export function run(
           const codeText = typeof code === 'number' ? `（退出码 ${code}）` : '';
           const tail = tailLines(stderr || '', 3);
           resolve(
-            `命令执行失败（非零退出）${codeText}${tail ? `\n${tail}` : ''}\n--- stdout ---\n${truncate(stdout || '')}`,
+            `命令执行失败（非零退出）${codeText}${tail ? `\n错误输出：\n${tail}` : ''}\n附加输出：\n${truncate(stdout || '')}`,
           );
         } else {
           const out = truncate(stdout || '');
           if (out && stderr) {
             // 成功但 stderr 非空：警告不得静默丢弃，截断摘要附在输出后（同 summarizeBothEnds 风格）
-            resolve(`${out}\n[stderr] ${summarizeBothEnds(stderr.trim())}`);
+            resolve(`${out}\n警告输出：${summarizeBothEnds(stderr.trim())}`);
           } else {
             resolve(stderr && !out ? truncate(stderr) : out || '（无输出）');
           }

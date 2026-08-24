@@ -254,7 +254,7 @@ export async function runAgentTurn({
       }
       if (!resp) throw new Error('模型请求失败');
       const msg = resp.choices[0]?.message;
-      if (!msg) throw new Error('模型返回为空');
+      if (!msg) throw new Error('模型未返回内容');
 
       messages.push(msg);
 

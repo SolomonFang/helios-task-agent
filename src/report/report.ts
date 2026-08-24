@@ -10,7 +10,7 @@ import { escapeHtml, renderReportPage } from './report-page';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
 import { pruneOldReports, sanitizeName } from './report-utils';
-import { TASK_STATUS_KEYS, statusLabel } from '../kanban/status';
+import { TASK_STATUS_KEYS, isKnownStatus, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
 
 // escapeHtml 已移到 report-page.ts（两个报告渲染器共用）；re-export 兼容既有调用方
@@ -36,18 +36,23 @@ const STATUS_META: Record<string, { emoji: string; badge: string }> = {
 function statusMeta(status: string): StatusMeta {
   const meta = STATUS_META[status];
   if (meta) return { ...meta, label: statusLabel(status) };
-  return { emoji: '🗂', label: statusLabel(status) || '其他', badge: 'todo' };
+  // 未知状态统一归「其他」，不把英文原键（如 blocked）落到徽章/分组标题/聊天摘要
+  return { emoji: '🗂', label: isKnownStatus(status) ? statusLabel(status) : '其他', badge: 'todo' };
 }
 
-/** 分组：已知状态按固定顺序，未知状态排在最后。 */
+/** 未知状态统一归入的「其他」分组键（不可能与真实状态键冲突）。 */
+const OTHER_GROUP = '__other__';
+
+/** 分组：已知状态按固定顺序，未知状态合并进最后的「其他」组。 */
 function groupByStatus(tasks: WorkSummaryTask[]): Array<{ status: string; meta: StatusMeta; tasks: WorkSummaryTask[] }> {
   const groups = new Map<string, WorkSummaryTask[]>();
   for (const t of tasks) {
-    const list = groups.get(t.status) ?? [];
+    const key = isKnownStatus(t.status) ? t.status : OTHER_GROUP;
+    const list = groups.get(key) ?? [];
     list.push(t);
-    groups.set(t.status, list);
+    groups.set(key, list);
   }
-  const ordered = [...STATUS_ORDER.filter((s) => groups.has(s)), ...[...groups.keys()].filter((s) => !(STATUS_ORDER as readonly string[]).includes(s))];
+  const ordered = [...STATUS_ORDER.filter((s) => groups.has(s)), ...(groups.has(OTHER_GROUP) ? [OTHER_GROUP] : [])];
   return ordered.map((status) => ({ status, meta: statusMeta(status), tasks: groups.get(status)! }));
 }
 
@@ -107,14 +112,15 @@ export function renderMarkdown(data: WorkSummaryData): string {
     lines.push(`## ${group.meta.emoji} ${group.meta.label}（${group.tasks.length}）`, '');
     for (const t of group.tasks) {
       lines.push(`### ${mdText(t.title) || '（无标题）'}`);
-      lines.push(`- 项目：${t.projectName}${t.iteration ? `（迭代 ${t.iteration}）` : ''}`);
+      lines.push(`- 项目：${mdText(t.projectName)}${t.iteration ? `（迭代 ${mdText(t.iteration)}）` : ''}`);
       if (t.attemptSummary) lines.push(`- 摘要：${mdText(t.attemptSummary)}`);
       const stats = diffStatsLine(t);
       if (stats) lines.push(`- 改动：${stats}`);
       if (t.changedFiles?.length) {
-        const files = t.changedFiles.slice(0, 10).map((f) => `\`${f}\``).join('、');
-        const more = t.changedFiles.length > 10 ? ` 等 +${t.changedFiles.length - 10} 个` : '';
-        lines.push(`- 变更文件：${files}${more}`);
+        // changedFiles 上游只留前 10 条；超出的部分用截断前总数 changedFilesTotal 补「等 +N 个」
+        const extra = (t.changedFilesTotal ?? t.changedFiles.length) - t.changedFiles.length;
+        const files = t.changedFiles.map((f) => `\`${f}\``).join('、');
+        lines.push(`- 变更文件：${files}${extra > 0 ? ` 等 +${extra} 个` : ''}`);
       }
       lines.push(`- [查看 diff](<${t.diffUrl}>)`, '');
     }
@@ -147,11 +153,12 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   if (t.deletions !== undefined) stats.push(`<span class="minus">-${t.deletions} 行</span>`);
   if (stats.length) parts.push(`<p class="changes">${stats.join(' · ')}</p>`);
   if (t.changedFiles?.length) {
+    // 与 MD 同口径：changedFiles 仅前 10 条，超出部分按截断前总数补「+N 个」
+    const extra = (t.changedFilesTotal ?? t.changedFiles.length) - t.changedFiles.length;
     const chips = t.changedFiles
-      .slice(0, 10)
       .map((f) => `<code>${escapeHtml(f)}</code>`)
       .join('');
-    const more = t.changedFiles.length > 10 ? `<code>+${t.changedFiles.length - 10} 个</code>` : '';
+    const more = extra > 0 ? `<code>+${extra} 个</code>` : '';
     parts.push(`<div class="chips">${chips}${more}</div>`);
   }
   if (t.diffUrl) {
@@ -250,7 +257,7 @@ export function renderHtml(data: WorkSummaryData): string {
   }
   const body = sections.length
     ? sections.join('\n')
-    : '<p class="empty">该范围内没有匹配的任务。</p>';
+    : '<p class="empty">（该范围内没有匹配的任务）</p>';
   const note = truncationNote(data);
   const sampleNote = sampleStatsNote(data);
   return renderReportPage({
@@ -357,7 +364,10 @@ export function summarizeForChat(
   for (const t of data.tasks.slice(0, 5)) {
     lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '（无标题）'}`);
   }
-  if (data.tasks.length > 5) lines.push(`· … 其余 ${data.tasks.length - 5} 条见报告文件`);
+  // bot 场景用户够不到部署机文件系统，指向报告链接；CLI 场景指向本机报告文件
+  if (data.tasks.length > 5) {
+    lines.push(`· … 其余 ${data.tasks.length - 5} 条${opts.linkBaseUrl ? '见上方报告链接' : '见报告文件'}`);
+  }
   const note = truncationNote(data);
   if (note) lines.push(`（${note}）`);
   return lines.join('\n');

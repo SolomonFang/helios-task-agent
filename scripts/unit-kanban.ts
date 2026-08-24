@@ -280,13 +280,28 @@ async function main(): Promise<void> {
     }
   });
 
-  await runHkContract('契约：信封失败路径一致——success:false 时两侧都以 message 报错', async () => {
+  await runHkContract('契约：信封失败路径一致——success:false 时两侧都报错（TS 侧中文定性，原文收 HTA_DEBUG）', async () => {
     const mock = await contractMock(() => ({ body: { success: false, message: 'boom-msg-contract' } }));
     try {
       const hk = await runHk(['info'], mock.baseUrl);
       assert.notEqual(hk.code, 0, 'hk.sh 应非零退出');
       assert.ok(hk.stderr.includes('boom-msg-contract'), `hk.sh stderr 应含 message，实际：${hk.stderr}`);
-      await assert.rejects(apiGet(mock.baseUrl, '/info'), /boom-msg-contract/);
+      await assert.rejects(apiGet(mock.baseUrl, '/info'), /看板拒绝了请求/);
+      // HTA_DEBUG=1 时服务端原文进日志
+      const errLogs: string[] = [];
+      const origErr = console.error;
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      process.env.HTA_DEBUG = '1';
+      try {
+        await assert.rejects(apiGet(mock.baseUrl, '/info'), /看板拒绝了请求/);
+        assert.ok(
+          errLogs.some((m) => m.includes('boom-msg-contract')),
+          `HTA_DEBUG 下原文应进日志，实际：${errLogs.join(' | ')}`,
+        );
+      } finally {
+        console.error = origErr;
+        delete process.env.HTA_DEBUG;
+      }
     } finally {
       await mock.close();
     }
@@ -645,7 +660,7 @@ process.stdin.on('data', (c) => {
     try {
       const ret = await waitForWorkspaceReady(mock.baseUrl, 'w5', { timeoutMs: 5000, intervalMs: 20 });
       assert.equal(ret.ok, false);
-      assert.ok(ret.message!.includes('请检查'), `应返回分支排查文案，实际：${ret.message}`);
+      assert.ok(ret.message!.includes('工作区记录已被看板清理，请重新发起任务'), `应返回记录已清理文案，实际：${ret.message}`);
       assert.equal(attemptsHits, 1, '404 应立即返回，不应继续轮询');
     } finally {
       await mock.close();

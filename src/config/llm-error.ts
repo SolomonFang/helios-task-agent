@@ -16,10 +16,10 @@ export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } 
   const keyHint =
     opts.channel === 'bot'
       ? `${reconfigHint}；或编辑 ${envFile} 的 LLM_API_KEY 后重启。`
-      : `用 /config 重新配置，或检查 ${envFile} 的 LLM_API_KEY。`;
+      : `用 /config 重新配置，或检查 ${envFile} 的 LLM_API_KEY（改 .env 需重启生效）。`;
   const modelHint =
     opts.channel === 'bot'
-      ? `检查 LLM_MODEL：${reconfigHint}；或编辑 ${envFile} 后重启。`
+      ? `检查 LLM_MODEL：${reconfigHint}；或编辑 ${envFile} 的 LLM_MODEL 后重启。`
       : '用 /config 检查 LLM_MODEL。';
   if (/\b401\b|unauthorized|invalid[_ ]api[_ ]key|incorrect api key|authentication/.test(s)) {
     return `排查建议：API Key 无效或已过期。${keyHint}`;

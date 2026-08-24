@@ -114,7 +114,7 @@ export class SourceRegistry {
       this.diskCache = { fingerprint: this.statFingerprint(), data: this.data };
     } catch (err) {
       // best-effort，但必须可观测：静默失败会让跨进程去重无声失效
-      console.warn(`[source-registry] 查重映射落盘失败（跨进程去重可能失效）: ${errMessage(err)}`);
+      console.warn(`[source-registry] 查重映射落盘失败（跨进程去重可能失效）：${errMessage(err)}`);
     }
   }
 

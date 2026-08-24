@@ -246,7 +246,7 @@ export function uninstallSkill(name: string): void {
   const dir = path.join(userSkillsDir(), trimmed);
   if (!fs.existsSync(dir)) {
     if (fs.existsSync(path.join(SKILLS_DIR, trimmed))) {
-      throw new Error(`「${trimmed}」是包内内置技能，不能卸载（可放到 ${path.join(userSkillsDir(), trimmed)} 下覆盖它）`);
+      throw new Error(`「${trimmed}」是随产品自带的技能，不能卸载（可放到 ${path.join(userSkillsDir(), trimmed)} 下覆盖它）`);
     }
     throw new Error(`未找到技能「${trimmed}」（${userSkillsDir()} 下不存在）`);
   }
