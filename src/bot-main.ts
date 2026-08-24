@@ -544,9 +544,9 @@ async function main(): Promise<void> {
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
-  // 长连接断线告警：重连交给 SDK。WsAlerter 负责静默策略——短暂抖动（宽限期内
-  // 恢复，消息由飞书侧补投）不打扰用户；持续断线超时或重连彻底失败才通知 owner，
-  // 避免网络抖动时「断开/恢复」成对刷屏，也避免僵尸态无人察觉。
+  // 长连接断线告警：重连交给 SDK，断线期间消息由飞书侧补投，用户对「断开/恢复」
+  // 无感——因此 reconnecting/reconnected 完全静默（待机/唤醒反复断连不会刷屏），
+  // 只有 SDK 放弃重试（需人工重启）才通知 owner（WsAlerter 负责只报一次）。
   const wsAlerter = new WsAlerter({ notify: notifyOwners });
   channel.onWsStateChange = (state) => wsAlerter.onState(state);
   cleanup.wsAlerter = wsAlerter;

@@ -8,6 +8,7 @@
 
 ### Changed
 
+- 长连接断线告警改为「用户无感」：可自动恢复的断开/恢复（reconnecting/reconnected）不再推送任何消息——SDK 会自动重连、断线期间的消息由飞书侧补投，此前电脑待机/唤醒时「断开超 3 分钟 + 已恢复」逐对刷屏；仅保留「重连彻底失败需人工重启」的一次性告警（`/status` 仍可查连接状态）（`src/bot/ws-alerter.ts`、`src/bot-main.ts`）
 - 「同类免问」粒度分级：启动/创建类看板操作（`start_workspace*`、`hk start`/`create-and-start`）从「绑定任务标识」改为按工具成类——此前点「同类免问」后批量启动多个任务的工作区仍逐个弹确认（每个 task_id 各成一个 key），与按钮文案的「同类」预期不符；现启动类点一次免问，本会话内同类操作都放行。删除/取消/停止/审批/更新等保持对象级绑定（防止借一次授权改任意对象）；确认卡片按钮、终态标题与批准回执按粒度如实区分文案（类级「同类免问」/ 对象级「同对象免问」），文本应答词表同步新增「同对象免问」（`src/agent/tools/kanban-mcp.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/guard.ts`、`src/agent/confirm.ts`、`src/channels/feishu-cards.ts`）
 
 ## [1.0.29] - 2026-08-19

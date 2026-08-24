@@ -2644,48 +2644,35 @@ async function run(): Promise<void> {
     assert.equal(lost, 1); // 已降级：onLost 不重复
   });
 
-  // ---------- WsAlerter：宽限期内恢复静默，超时断线才告警 ----------
-  await checkAsync('WsAlerter：快速抖动不通知；持续断线超时告警一次，恢复时补「已恢复」', async () => {
+  // ---------- WsAlerter：可自动恢复的断连/恢复完全静默（让用户无感） ----------
+  await checkAsync('WsAlerter：reconnecting/reconnected 反复抖动不推任何消息', async () => {
     const sent: string[] = [];
-    const alerter = new WsAlerter({ graceMs: 30, notify: (t) => sent.push(t) });
+    const alerter = new WsAlerter({ notify: (t) => sent.push(t) });
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-    // 快速抖动：宽限期内恢复 → 完全静默（刷屏场景）
+    // 快速抖动：静默
     alerter.onState('reconnecting');
     alerter.onState('reconnected');
-    await sleep(60);
+    // 长时间断线（电脑待机）：同样静默——SDK 会自动重连，消息由飞书侧补投
+    alerter.onState('reconnecting');
+    await sleep(100);
+    alerter.onState('reconnecting'); // 断线期间 SDK 反复触发
+    alerter.onState('reconnected');
     assert.equal(sent.length, 0);
-
-    // 持续断线超过宽限期 → 告警一次
-    alerter.onState('reconnecting');
-    await sleep(60);
-    assert.equal(sent.length, 1);
-    assert.ok(sent[0]!.includes('断开超过'));
-    // 断线期间 SDK 反复触发 reconnecting：不重复告警
-    alerter.onState('reconnecting');
-    await sleep(60);
-    assert.equal(sent.length, 1);
-    // 恢复：因告警过，补一条「已恢复」
-    alerter.onState('reconnected');
-    assert.equal(sent.length, 2);
-    assert.ok(sent[1]!.includes('已恢复'));
     alerter.stop();
   });
 
-  // ---------- WsAlerter：重连失败立即告警且只报一次 ----------
-  await checkAsync('WsAlerter：failed 立即告警一次；failed 后的状态变化不再打扰', async () => {
+  // ---------- WsAlerter：重连失败（需人工重启）立即告警且只报一次 ----------
+  await checkAsync('WsAlerter：failed 立即告警一次；failed 后的 reconnecting 不再打扰', async () => {
     const sent: string[] = [];
-    const alerter = new WsAlerter({ graceMs: 30, notify: (t) => sent.push(t) });
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const alerter = new WsAlerter({ notify: (t) => sent.push(t) });
 
-    alerter.onState('reconnecting'); // 宽限期计时中
-    alerter.onState('failed'); // 取消宽限期，立即告警
+    alerter.onState('failed');
     assert.equal(sent.length, 1);
     assert.ok(sent[0]!.includes('重连失败'));
     alerter.onState('failed'); // 重复 failed 不再报
     assert.equal(sent.length, 1);
-    alerter.onState('reconnecting'); // 已判失败：不再起宽限期告警
-    await sleep(60);
+    alerter.onState('reconnecting'); // 已判失败：抖动仍静默
     assert.equal(sent.length, 1);
     alerter.stop();
   });
@@ -2693,13 +2680,15 @@ async function run(): Promise<void> {
   // ---------- WsAlerter：失败锁存后又自行连上 → 补「已恢复」并解锁 ----------
   await checkAsync('WsAlerter：failed 后 reconnected 补恢复通知，新一轮失败可再告警', async () => {
     const sent: string[] = [];
-    const alerter = new WsAlerter({ graceMs: 30, notify: (t) => sent.push(t) });
+    const alerter = new WsAlerter({ notify: (t) => sent.push(t) });
 
     alerter.onState('failed');
     assert.equal(sent.length, 1);
     alerter.onState('reconnected'); // SDK 又自行连上：补恢复通知并清除锁存
     assert.equal(sent.length, 2);
     assert.ok(sent[1]!.includes('已恢复'));
+    alerter.onState('reconnected'); // 无锁存时的 reconnected：静默
+    assert.equal(sent.length, 2);
     alerter.onState('failed'); // 解锁后新一轮失败可再次告警
     assert.equal(sent.length, 3);
     assert.ok(sent[2]!.includes('重连失败'));
