@@ -17,12 +17,15 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const desc = typeof args.description === 'string' ? args.description : '';
   const project = String(args.project_id ?? args.projectId ?? '');
   const priorityLabel = typeof args.priority === 'string' ? PRIORITY_LABELS[args.priority] : undefined;
+  const taskType = typeof args.task_type === 'string' ? args.task_type : '';
   const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
     `标题：${title}`,
     project ? `项目 ID：${project}` : '',
     // 未命中中文映射时省略该行，不把英文枚举透传到确认卡片
     priorityLabel ? `优先级：${priorityLabel}` : '',
+    // 类型是 conventional commit 前缀（feat/fix/…），保留英文原值
+    taskType ? `类型：${taskType}` : '',
     preview,
   ]
     .filter(Boolean)

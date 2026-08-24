@@ -8,12 +8,14 @@ description: >-
   agents, or check progress on a running instance. If the skill is not installed
   yet, read and follow INSTALL.md to self-install first.
 digest_sections:
+  # 摘要上限 3500 字符（skills.ts DIGEST_MAX_LEN）：Complete lifecycle 与 Quick workflow
+  # 高度重叠，不进摘要，需要时经 skill_doc 读全文
   - Quick workflow
-  - Complete lifecycle
   - Response format
   - Executor names
   - Task statuses
   - Task priorities
+  - Task types
   - Safety rules
   - Out of scope
 ---
@@ -48,6 +50,7 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "260717 迭代" | `hk tasks list --iteration 260717` |
 | "创建任务" | `hk tasks create "标题" --desc "用 @coding-standards"` |
 | "紧急任务" | `hk tasks create "标题" --priority urgent` |
+| "修个 bug" | `hk tasks create "标题" --type fix`（合并信息带 `fix:` 前缀） |
 | "看紧急/高优任务" | `hk tasks list --priority urgent` |
 | "有哪些分支" | `hk branches <repo_id> [--query develop]` |
 | "多仓启动" | `hk start <task_id> --repo <id1> --repo <id2>:develop` |
@@ -68,7 +71,7 @@ Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so comma
 
 ```text
 1. hk repos / hk branches <repo>
-2. hk tasks create "标题" [--iteration CODE] [--priority P]
+2. hk tasks create "标题" [--iteration CODE] [--priority P] [--type T]
 3. hk start <task_id> [--branch B] [--repo R]
      └─ or: hk create-and-start "标题" …
 4. hk status <task_id>                  # progress / diff summary
@@ -113,6 +116,7 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **任务**：{title}（`{id}`）
 **迭代**：{迭代，无则 —}
 **优先级**：{紧急/高/中/低}
+**类型**：{feat/fix/docs/style/refactor/perf/test/chore}
 **状态**：{中文状态} | 运行状态：{运行中/未运行}{，执行失败}
 **分支**：{分支名}
 **执行器**：{用户指定的名字，如 Claude}
@@ -158,6 +162,10 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 | `high` | 高 |
 | `medium` | 中 |
 | `low` | 低 |
+
+## Task types
+
+`feat` | `fix` | `docs` | `style` | `refactor` | `perf` | `test` | `chore` — 省略默认 `feat`。类型会作为合并（squash）提交信息前缀，如 `fix: 修复登录 500 (helios-kanban a1b2c3d4)`。`tasks create` / `tasks update` / `create-and-start` 用 `--type` 指定；MCP 工具 `create_task` / `update_task` / `create_task_and_start` 对应参数为 `task_type`。
 
 ## Safety rules
 
