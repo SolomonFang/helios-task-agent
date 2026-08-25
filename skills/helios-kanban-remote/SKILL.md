@@ -167,6 +167,8 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 `feat` | `fix` | `docs` | `style` | `refactor` | `perf` | `test` | `chore` — 省略默认 `feat`。类型会作为合并（squash）提交信息前缀，如 `fix: 修复登录 500 (helios-kanban a1b2c3d4)`。`tasks create` / `tasks update` / `create-and-start` 用 `--type` 指定；MCP 工具 `create_task` / `update_task` / `create_task_and_start` 对应参数为 `task_type`。
 
+**必须根据任务内容推断类型，不要等用户点名**：修缺陷/报错/崩溃 → `fix`，新功能/需求 → `feat`，文档 → `docs`，重构 → `refactor`，性能优化 → `perf`，补测试 → `test`，构建/依赖/杂务 → `chore`。例如「修复登录 500」即使用户没说类型也必须传 `--type fix`；只有内容性质不明时才省略（落到默认 `feat`）。
+
 ## Safety rules
 
 1. Confirm before `tasks delete` — prefer `cancel`.

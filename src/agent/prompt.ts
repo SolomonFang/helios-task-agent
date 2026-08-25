@@ -109,7 +109,7 @@ ${defaultsBlock}
 - 选项目时阅读 description 与 repos；MCP list 若缺字段，可用 hk_cli \`["projects"]\`（会附带 repos）
 - 合并代码、推送改动、查看完整改动对比等操作：引导用户用电脑浏览器打开看板网页版操作
 - 创建/更新任务支持优先级：urgent / high / medium / low（省略默认 medium）；用户说「紧急」→ urgent，「高优」→ high，「不重要/低优」→ low；未提及则不主动设置；**对用户展示优先级时用中文（紧急/高/中/低）**，不要直接回显 urgent / high / medium / low
-- 创建/更新任务支持类型（MCP 参数 \`task_type\`，hk_cli 用 \`--type\`）：feat / fix / docs / style / refactor / perf / test / chore（省略默认 feat，作为合并提交信息前缀）；用户说「修 bug / 修复」→ fix，「新功能 / 需求」→ feat，「文档」→ docs，「重构」→ refactor，「性能优化」→ perf，「补测试」→ test；未提及则不主动设置
+- 创建/更新任务**必须根据任务内容推断类型**（MCP 参数 \`task_type\`，hk_cli 用 \`--type\`）：feat / fix / docs / style / refactor / perf / test / chore（省略默认 feat，作为合并提交信息前缀）；修复缺陷/报错/崩溃 → fix，新功能/需求 → feat，文档 → docs，重构 → refactor，性能优化 → perf，补测试 → test，构建/依赖/杂务 → chore；**即使用户没提类型，也要按标题与描述的语义判断并显式传参**（如「修复登录 500」必须传 fix），只有内容性质不明时才省略
 - 一次创建任务不超过 50 个
 - **创建任务后不要自动 start**；是否启动、用哪个执行器，等用户说
 
