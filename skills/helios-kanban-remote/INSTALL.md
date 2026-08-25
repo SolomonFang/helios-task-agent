@@ -50,6 +50,7 @@ Determine agent type and `SKILLS_ROOT`:
 
 | Agent | `SKILLS_ROOT` |
 |-------|---------------|
+| Kimi Code | `$HOME/.agents/skills` |
 | Cursor (global) | `$HOME/.cursor/skills` |
 | Claude Code | `$HOME/.claude/skills` |
 | Cursor (project) | `<workspace>/.cursor/skills` |
@@ -144,7 +145,7 @@ export HELIOS_KANBAN_URL="<user-provided-url>"
 # export HELIOS_KANBAN_ITERATION="260717"
 ```
 
-Persist (skip if already in profile):
+Persist (skip if already in profile). **Ask the user first** before modifying their shell profile — if they decline, keep the vars session-only:
 
 ```bash
 PROFILE="$HOME/.zshrc"
@@ -229,6 +230,8 @@ npm i -g helios-task-agent@latest   # 升级 npm 包后重跑 Step 2 Option A + 
 ```bash
 rm -rf "$SKILL_DIR"
 ```
+
+Also remove any `HELIOS_KANBAN_*` exports previously appended to the shell profile (`~/.zshrc` / `~/.bashrc`).
 
 ---
 

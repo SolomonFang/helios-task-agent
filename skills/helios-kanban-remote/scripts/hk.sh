@@ -330,6 +330,7 @@ EOF
 }
 
 cmd_health() {
+  require_jq
   curl -sS "${BASE_URL}/api/health" | jq .
 }
 
