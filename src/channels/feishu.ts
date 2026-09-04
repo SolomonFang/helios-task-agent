@@ -29,7 +29,19 @@ export interface FeishuInboundMessage extends InboundMessage {
 /** Subset of the card.action.trigger callback payload we care about. */
 export interface FeishuCardAction {
   operator?: { open_id?: string };
-  action?: { value?: { hta_confirm?: string; decision?: string; hta_review?: string; title?: string } };
+  action?: {
+    value?: {
+      hta_confirm?: string;
+      decision?: string;
+      hta_review?: string;
+      /** 「AI 诊断」按钮：失败任务 id；attempt 为「同一 attempt 只诊断一次」的粒度（可无）。 */
+      hta_diagnose?: string;
+      /** 「按诊断结论重试」按钮：失败任务 id（诊断结论由 bot 侧按 taskId 查）。 */
+      hta_retry?: string;
+      attempt?: string;
+      title?: string;
+    };
+  };
 }
 
 export type AccessDecision = 'allow' | 'claim' | 'deny';
@@ -692,8 +704,8 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
-  /** Proactive interactive-card push to a user (watcher notifications). */
-  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
+  /** Proactive interactive-card push to a user (watcher notifications); 返回 message_id 供后续原地置终态。 */
+  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<string | undefined> {
     const res = await this.client.im.v1.message.create({
       params: { receive_id_type: 'open_id' },
       data: {
@@ -705,6 +717,7 @@ export class FeishuChannel implements AgentChannel {
     if (res.code !== 0) {
       throw this.apiError('发送', res);
     }
+    return res.data?.message_id;
   }
 
   async stop(): Promise<void> {

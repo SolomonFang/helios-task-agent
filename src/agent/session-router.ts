@@ -2,6 +2,7 @@ import type { AgentConfig } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { ConfirmFn } from './guard';
 import { MemoryStore } from './memory';
+import type { ReminderStore } from './reminder';
 import { AgentSession } from './session';
 import type { SessionHistoryStore } from './session-store';
 
@@ -26,6 +27,7 @@ export class SessionRouter {
   private readonly confirmFactory?: (openId: string) => ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
   private readonly historyStore?: SessionHistoryStore;
+  private readonly reminders?: ReminderStore;
 
   constructor(
     cfg: AgentConfig,
@@ -37,6 +39,8 @@ export class SessionRouter {
     reportLinkBaseUrl?: string,
     /** 会话历史持久化：新建会话时恢复磁盘历史，LRU 淘汰后文件保留（下次说话可恢复）。 */
     historyStore?: SessionHistoryStore,
+    /** 提醒存储：透传给每个会话（reminder_* 工具）；缺省由会话按默认路径自建。 */
+    reminders?: ReminderStore,
   ) {
     this.cfg = cfg;
     this.mcp = mcp;
@@ -45,6 +49,7 @@ export class SessionRouter {
     this.confirmFactory = confirmFactory;
     this.reportLinkBaseUrl = reportLinkBaseUrl;
     this.historyStore = historyStore;
+    this.reminders = reminders;
   }
 
   getOrCreate(openId: string): AgentSession {
@@ -76,6 +81,7 @@ export class SessionRouter {
       confirm: this.confirmFactory?.(openId),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
       historyStore: this.historyStore,
+      reminders: this.reminders,
     });
     this.sessions.set(openId, session);
     return session;

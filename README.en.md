@@ -23,7 +23,7 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 ## Two forms: CLI vs Feishu bot
 
 - **Terminal CLI** (`helios-task-agent`): quick trial and debugging. Chat, write confirmation (`y/batch/N`), and all kanban operations included.
-- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link), **daily brief** (`HTA_DAILY_BRIEF=HH:MM`, pushes a current-iteration kanban overview to the allowlisted users (owner) every day), and **image messages** (`LLM_VISION=1`, requires a vision-capable model).
+- **Feishu DM bot** (`helios-task-agent bot`): the full experience. Adds bot-only capabilities on top of the CLI — **kanban status push** (cards when tasks reach in-review/done), **confirm cards** (button-based approval), **AI review** (one-click open-code-review on the in-review diff, pushed as an HTML report link), **failure AI diagnosis** (one-click Chinese diagnosis on the failure card, with one-click retry per the diagnosis), **stale-task nudge** (`HTA_STALE_NUDGE_HOURS=N`, reminds when an in-progress task has no update for over N hours), **daily brief** (`HTA_DAILY_BRIEF=HH:MM`, pushes a current-iteration kanban overview to the allowlisted users (owner) every day), **weekly brief** (`HTA_WEEKLY_BRIEF=HH:MM` + `HTA_WEEKLY_BRIEF_DAY=1-7`, pushes the week's iteration progress on the configured weekday), and **image messages** (`LLM_VISION=1`, requires a vision-capable model).
 
 ## Install
 
@@ -91,6 +91,10 @@ Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failu
 
 In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the kanban diff view; "🤖 AI 审查" (AI review) calls [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) on that attempt's diff (same scope as the kanban diff view: merge-base(target)..attempt branch), requires Simplified-Chinese output, renders the full result as an HTML report (written to the data dir `reviews/`, hosted by the bot's built-in static server), and pushes only the report link to Feishu (long results are no longer truncated) — the result is also injected into the session, so you can reply "按审查意见修一下" (fix per the review).
 
+Failure cards carry a "🔍 AI 诊断" (AI diagnosis) button: the bot collects what the kanban actually returns for the failed attempt (task description / failure summary / diff stats) and asks the model for a Chinese diagnosis (failure-cause classification + key evidence + suggested fix), pushed as a result card and injected into the session; the diagnosis card carries a "↻ 按诊断结论重试" (retry per diagnosis) button — one click sends the diagnosis (cause + fix suggestions) to the executing agent as a follow-up prompt and restarts the task (the click itself is explicit authorization, no second confirmation; the button settles to a terminal state once the retry is launched). The diagnosis LLM config follows the same derivation as AI review (`OCR_LLM_*` per-item override, falling back to the bot's model config) with a 6-minute overall timeout; LLM outages/timeouts produce an explicit Chinese failure notice.
+
+Stale-task nudge (`HTA_STALE_NUDGE_HOURS=8`, off by default): pushes a reminder card (project name, task title, stale duration, task link) when an in-progress task has had no update for over N hours. The signal is the task row's `updated_at` — the kanban exposes no finer execution heartbeat, so the copy says "久未更新" (no updates) rather than claiming the task is stuck; a long but healthy run may not bump that field and can trigger a reminder, which the card copy notes can be ignored. Each stale stage is announced once, then at most once every 24 hours; any task update or status change resets the timer; nudge state is persisted (`stale-nudge-state.json`), so restarts don't re-spam.
+
 - First poll is baseline only (`watch-state.json`)  
 - Does **not** notify on brand-new tasks  
 - Failed pushes don't advance the snapshot — retried next poll (duplicates preferred over loss)  
@@ -109,10 +113,13 @@ In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the
 ```text
 ~/.helios-task-agent/.env
 ~/.helios-task-agent/memory.json
+~/.helios-task-agent/reminders.json         # scheduled reminders (missed ones re-delivered on restart; delivered ones never repeated)
 ~/.helios-task-agent/synced-sources.json   # Feishu source → kanban task (dedupe map)
 ~/.helios-task-agent/audit.log             # write-op audit (JSONL)
 ~/.helios-task-agent/watch-state.json      # kanban push snapshot
+~/.helios-task-agent/stale-nudge-state.json # stale-task nudge state (no duplicate nudge per stale stage)
 ~/.helios-task-agent/daily-brief-state.json # daily-brief last-push date (no duplicate push same day)
+~/.helios-task-agent/weekly-brief-state.json # weekly-brief last-push date (no duplicate push same day)
 ~/.helios-task-agent/sessions/             # per-user conversation history (restored on restart; /clear wipes it)
 ~/.helios-task-agent/skills/               # user skills (target of /skills install)
 ~/.helios-task-agent/reviews/              # AI-review reports (HTML, cleaned up after 30 days)
@@ -196,14 +203,17 @@ via the `skill_doc` tool (progressive disclosure).
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |
-| `OCR_LLM_TOKEN` | Dedicated LLM key for AI review; when set it wins over the derived bot key (keeps your main key away from the third-party ocr subprocess), URL/model still fall back to the bot config |
-| `OCR_LLM_URL` / `OCR_LLM_MODEL` | Explicit LLM endpoint/model for AI review; when set they win over the config derived from the bot |
+| `OCR_LLM_TOKEN` | Dedicated LLM key for AI review / failure diagnosis; when set it wins over the derived bot key (keeps your main key away from the third-party ocr subprocess), URL/model still fall back to the bot config |
+| `OCR_LLM_URL` / `OCR_LLM_MODEL` | Explicit LLM endpoint/model for AI review / failure diagnosis; when set they win over the config derived from the bot |
 | `HELIOS_KANBAN_PROJECT_ID` / `HELIOS_KANBAN_REPO_ID` / `HELIOS_KANBAN_ITERATION` | Optional defaults; `HELIOS_KANBAN_PROJECT_ID` scopes bot watch |
 | `HELIOS_TASK_AGENT_HOME` / `HELIOS_TASK_AGENT_ENV` | Data dir (default `~/.helios-task-agent`) / forced `.env` path |
 | `KANBAN_WATCH` / `KANBAN_WATCH_INTERVAL_SEC` | Status push |
+| `HTA_STALE_NUDGE_HOURS` | Stale-task nudge (bot only): pushes a reminder card when an in-progress task has had no update (by its last-updated time) for over N hours; each stale stage is announced once, then at most once every 24 hours, state persisted across restarts. Unset or invalid = off |
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
 | `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / todo / in-review / done / failed; all tasks when `HELIOS_KANBAN_ITERATION` is unset) to the allowlisted users (owner) every day. Unset or invalid = off |
+| `HTA_WEEKLY_BRIEF` | Weekly brief (bot only): local `HH:MM` (e.g. `18:00`) — pushes the week's iteration progress (iteration-wide counts + done-this-week / in-review backlog / failed sections; "done this week" is counted by each task's last-updated time falling within the current week) to the allowlisted users (owner) once a week. Unset or invalid = off |
+| `HTA_WEEKLY_BRIEF_DAY` | Weekday for the weekly brief: `1`-`7` (1=Mon … 7=Sun), default `5` (Fri); invalid values warn at startup and fall back to the default |
 | `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
 | `HTA_DEBUG` | `1` = kanban/MCP debug logs |
 
@@ -237,6 +247,8 @@ Bot accepts text and rich-text messages (links/@/images/files/code blocks are co
 
 Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the latest 50 entries). Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
 
+Reminders are bucketed per user too (tools: `reminder_set` / `list` / `cancel`, available in both forms): say "remind me about the standup in 30 minutes" or "remind me to watch the build at 9am tomorrow" — relative minutes and local-time forms like `HH:mm`, `today/tomorrow HH:mm`, `YYYY-MM-DD HH:mm` are all accepted (max 20 pending reminders per user, up to 30 days ahead). On time, the bot pushes a Feishu DM; the CLI prints after the running turn finishes (never interrupts it). Creating and cancelling both go through the write confirmation gate. Reminders persist in `reminders.json`: delivered state is durable, reminders past due while the process was down fire immediately on restart, delivered ones never repeat, and delivery failures retry with 1→2→4… minute exponential backoff (capped at 30 minutes).
+
 ## Tools
 
 | Tool | Role |
@@ -246,9 +258,12 @@ Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the l
 | `hk_cli` | Always on; bundled `hk.sh` REST fallback/supplement |
 | `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
 | `work_summary` | Generate work-summary reports (HTML/MD) |
+| `daily_report` | Generate a personal daily report (structured material + HTML; date selectable) |
+| `iteration_retro` | Generate an iteration retrospective (HTML: overview/throughput/rule-based failure classification/diff stats) |
 | `skill_doc` | Read an installed skill's full doc (SKILL.md) on demand |
 | `skill_exec` | Run scripts inside a skill directory (confirmation per run by default; "approve same kind" applies per specific script + arguments) |
 | `memory_*` | Persistent prefs & notes |
+| `reminder_*` | Natural-language scheduled reminders (pushed proactively on time; create/cancel needs confirmation) |
 
 Bundled skill: `skills/helios-kanban-remote/`.
 

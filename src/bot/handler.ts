@@ -14,7 +14,14 @@ import { SessionRouter } from '../agent/session-router';
 import type { AgentSession } from '../agent/session';
 import { ConfirmationManager, hasPendingConfirmation, isConfirmWord } from '../agent/confirm';
 import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
-import { buildAiReviewCard } from '../channels/feishu-cards';
+import {
+  runFailureDiagnosis,
+  sendDiagnosisFollowUp,
+  latestAttemptId,
+  buildRetryPrompt,
+  DIAGNOSIS_TIMEOUT_MS,
+} from '../kanban/failure-diagnosis';
+import { buildAiReviewCard, buildDiagnosisCard } from '../channels/feishu-cards';
 import { isAllPass, writeReviewReport } from '../report/review-report';
 import type { ReportServer } from '../report/report-server';
 import { checkLarkCliAsync, checkOcrCliAsync, checkHkDepsAsync, HK_CLI_INSTALL_HINT } from '../infra/deps';
@@ -42,6 +49,9 @@ type CardAction = FeishuCardAction;
 
 /** AI 审查全局并发上限：每个审查是最长 15 分钟的子进程，不同 attempt 叠加会拖垮机器。 */
 const AI_REVIEW_MAX_CONCURRENT = 2;
+
+/** 失败诊断全局并发上限：单次 LLM 调用（最长 6 分钟），与 AI 审查同量级控制。 */
+const DIAGNOSIS_MAX_CONCURRENT = 2;
 
 /** 单条用户消息长度上限：超长消息直接拒答，不送入 LLM（上下文爆炸 / 网关 400）。 */
 export const MAX_USER_MESSAGE_CHARS = 8000;
@@ -98,6 +108,10 @@ export interface BotHandlerDeps {
   helpText: string;
   /** 测试注入用：替换 AI 审查执行器（默认 runAiReview 会拉起 ocr 子进程，单测不可行）。 */
   aiReviewRunner?: typeof runAiReview;
+  /** 测试注入用：替换失败诊断执行器（默认 runFailureDiagnosis 调 LLM，单测不可行）。 */
+  diagnosisRunner?: typeof runFailureDiagnosis;
+  /** 测试注入用：替换重试 follow-up 发送（默认 sendDiagnosisFollowUp 走看板 REST）。 */
+  followUpSender?: typeof sendDiagnosisFollowUp;
   /** 测试注入用：静默期心跳间隔（默认 PROGRESS_HEARTBEAT_MS）。 */
   progressHeartbeatMs?: number;
   /** 测试注入用：图片下载器（默认 channel.downloadImage 走飞书 SDK）。 */
@@ -118,6 +132,8 @@ export interface BotHandlers {
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const { channel, router, confirmations, cfg, mcp, supervisor, reportServer } = deps;
   const runReview = deps.aiReviewRunner ?? runAiReview;
+  const runDiagnosis = deps.diagnosisRunner ?? runFailureDiagnosis;
+  const sendFollowUp = deps.followUpSender ?? sendDiagnosisFollowUp;
   const progressHeartbeatMs = deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS;
   const fetchImage: ImageFetcher =
     deps.imageFetcher ?? ((mid, key) => channel.downloadImage(mid, key, MAX_IMAGE_BYTES));
@@ -130,6 +146,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const pendingTyping = new Map<string, { messageId: string; reactionId: string }[]>();
   /** 进行中的 AI 审查（按 attempt 去重，防止连点按钮）；携带发起人与 AbortController，/stop 可中断。 */
   const aiReviewRunning = new Map<string, { openId: string; ctl: AbortController }>();
+  /** 进行中的失败诊断（按 task 去重，防止连点按钮）；携带发起人与 AbortController，/stop 可中断。 */
+  const diagnosisRunning = new Map<string, { openId: string; ctl: AbortController }>();
+  /** 已完成诊断的 (task, attempt) 键：同一 attempt 只诊断一次（进程内语义，与 AI 审查去重一致）。 */
+  const diagnosedKeys = new Set<string>();
+  /** 每个任务最近一次诊断结论（「↻ 重试」按钮的 follow-up 材料；键为 taskId）。 */
+  const diagnosisResults = new Map<string, { attemptId?: string; text: string; cardMessageId?: string }>();
+  /** 已发起过重试的 (task, attempt) 键：重试发起后按钮置终态，重复点击不再发起。 */
+  const retryLaunched = new Set<string>();
   /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
   let aiReviewLlmNoticed = false;
   /** 挂起确认期间已提醒过「请回复确认/取消」的用户（每份确认只提醒一次，避免刷屏）。 */
@@ -239,6 +263,131 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
   };
 
+  /** 执行失败诊断（采集失败信息 → LLM 中文诊断）并推结果卡片（带「↻ 重试」按钮）；同时注入会话上下文。 */
+  const handleDiagnosis = async (openId: string, taskId: string, attemptId: string, title: string): Promise<void> => {
+    const dedupeKey = `${taskId}:${attemptId || 'latest'}`;
+    if (diagnosedKeys.has(dedupeKey)) {
+      await channel
+        .notifyOpenId(openId, `🔍 《${title}》这次失败已诊断过，结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。`)
+        .catch(() => {});
+      return;
+    }
+    if (diagnosisRunning.has(taskId)) {
+      await channel.notifyOpenId(openId, `🔍 《${title}》的 AI 诊断正在进行中，请稍候…`).catch(() => {});
+      return;
+    }
+    // 全局并发上限：超出时拒收并提示稍后再试（按 task 去重挡不住不同任务的叠加）
+    if (diagnosisRunning.size >= DIAGNOSIS_MAX_CONCURRENT) {
+      await channel
+        .notifyOpenId(
+          openId,
+          `🔍 同时进行的 AI 诊断已达上限（${DIAGNOSIS_MAX_CONCURRENT} 个）：《${title}》本次未开始。请等现有诊断完成后，重新点击失败卡片上的「AI 诊断」。`,
+        )
+        .catch(() => {});
+      return;
+    }
+    const ctl = new AbortController();
+    diagnosisRunning.set(taskId, { openId, ctl });
+    try {
+      await channel.notifyOpenId(
+        openId,
+        `🔍 AI 诊断已开始：《${title}》\n正在采集失败信息并调用模型分析（约几分钟内完成），完成后推送诊断结果。`,
+      );
+      const { text, attemptId: diagnosedAttemptId } = await runDiagnosis({
+        kanbanUrl: cfg.kanbanUrl,
+        taskId,
+        title,
+        llm: { baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.llmModel },
+        timeoutMs: DIAGNOSIS_TIMEOUT_MS,
+        signal: ctl.signal,
+      });
+      // 同一 attempt 只诊断一次：按钮没带 attempt 时以诊断采集到的真实 attempt 为准，两个键都记
+      diagnosedKeys.add(dedupeKey);
+      diagnosedKeys.add(`${taskId}:${diagnosedAttemptId || attemptId || 'latest'}`);
+      const result: { attemptId?: string; text: string; cardMessageId?: string } = { text };
+      if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
+      diagnosisResults.set(taskId, result);
+      // 结果推送与诊断执行分开兜底：推送失败降级为文本（含重试指引），不谎报「诊断失败」
+      try {
+        const messageId = await channel.notifyCardOpenId(openId, buildDiagnosisCard(title, text, taskId));
+        if (messageId) result.cardMessageId = messageId;
+      } catch (deliverErr) {
+        console.error(`[diagnosis] 诊断卡片推送失败，降级文本推送: ${errMessage(deliverErr)}`);
+        const excerpt = text.length > 3000 ? `${text.slice(0, 3000)}\n…（结果过长已截断）` : text;
+        await channel
+          .notifyOpenId(openId, `🔍 AI 失败诊断：《${title}》\n${excerpt}\n\n要按诊断结论重试，回复「重试这个任务」。`)
+          .catch((e) => console.error(`[diagnosis] 降级文本推送也失败: ${errMessage(e)}`));
+      }
+      // 注入会话：用户追问「按诊断结论修一下」时 agent 有上下文
+      try {
+        router
+          .getOrCreate(openId)
+          .injectSystemNote(
+            `[AI 失败诊断完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${wrapUntrusted(text.slice(0, 1500))}`,
+          );
+      } catch {
+        /* ignore */
+      }
+    } catch (err) {
+      if (ctl.signal.aborted) {
+        await channel.notifyOpenId(openId, `⏹ AI 诊断已中断：《${title}》`).catch(() => {});
+      } else {
+        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起）时不重复追加重试后缀
+        const message = errMessage(err).slice(0, 200);
+        const hasOwnWayOut = ['重试', '重新发起'].some((w) => message.includes(w));
+        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击失败卡片上的「AI 诊断」重试。';
+        await channel.notifyOpenId(openId, `⚠️ AI 诊断失败：《${title}》\n${message}${retryHint}`).catch(() => {});
+      }
+    } finally {
+      diagnosisRunning.delete(taskId);
+    }
+  };
+
+  /** 「↻ 按诊断结论重试」：以诊断结论作为 follow-up 指令重启任务（点击即显式授权，不再二次确认）。 */
+  const handleDiagnosisRetry = async (openId: string, taskId: string, title: string): Promise<void> => {
+    const result = diagnosisResults.get(taskId);
+    if (!result) {
+      await channel
+        .notifyOpenId(openId, `⚠️ 找不到《${title}》的诊断结论（机器人可能已重启）。请重新点击失败卡片上的「AI 诊断」后再重试。`)
+        .catch(() => {});
+      return;
+    }
+    try {
+      // 诊断时没采到 attempt（attempts 端点异常）这里补拉一次；仍没有则无法定位会话
+      const attemptId = result.attemptId ?? (await latestAttemptId(cfg.kanbanUrl, taskId).catch(() => undefined));
+      if (!attemptId) {
+        await channel
+          .notifyOpenId(openId, `⚠️ 重试未发起：《${title}》找不到可重试的执行记录（可能已被看板清理），请到看板手动重新发起该任务。`)
+          .catch(() => {});
+        return;
+      }
+      const retryKey = `${taskId}:${attemptId}`;
+      if (retryLaunched.has(retryKey)) {
+        await channel
+          .notifyOpenId(openId, `↻ 《${title}》的重试已发起过，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。`)
+          .catch(() => {});
+        return;
+      }
+      await sendFollowUp(cfg.kanbanUrl, attemptId, buildRetryPrompt(title, result.text));
+      retryLaunched.add(retryKey);
+      // 按钮置终态：诊断卡片原地替换为无按钮终态（参照确认卡片终态更新模式），失败不阻断
+      if (result.cardMessageId) {
+        const settledAt = new Date().toLocaleString('zh-CN', { hour12: false });
+        await channel
+          .updateCard(result.cardMessageId, buildDiagnosisCard(title, result.text, taskId, { settledAt }))
+          .catch((e) => console.error(`[diagnosis] 诊断卡片终态更新失败: ${errMessage(e)}`));
+      }
+      await channel
+        .notifyOpenId(openId, `↻ 已按诊断结论发起重试：《${title}》\n已把失败原因与修复建议作为跟进指令发给执行 Agent，任务进展会继续推送。`)
+        .catch(() => {});
+    } catch (err) {
+      const message = errMessage(err).slice(0, 200);
+      const hasOwnWayOut = ['重试', '重新发起', '手动'].some((w) => message.includes(w));
+      const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击诊断卡片上的「↻ 按诊断结论重试」。';
+      await channel.notifyOpenId(openId, `⚠️ 重试发起失败：《${title}》\n${message}${retryHint}`).catch(() => {});
+    }
+  };
+
   const onCardAction = (action: CardAction): void => {
     const openId = action.operator?.open_id || '';
     const value = action.action?.value || {};
@@ -246,6 +395,15 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 「AI 审查」按钮：异步执行并立即返回（ocr 审查耗时可达数分钟，回调需快速 ACK）
     if (value.hta_review) {
       void handleAiReview(openId, String(value.hta_review), String(value.title || ''));
+      return;
+    }
+    // 「AI 诊断」/「按诊断结论重试」按钮：同为异步长耗时操作，立即返回
+    if (value.hta_diagnose) {
+      void handleDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), String(value.title || ''));
+      return;
+    }
+    if (value.hta_retry) {
+      void handleDiagnosisRetry(openId, String(value.hta_retry), String(value.title || ''));
       return;
     }
     if (!value.hta_confirm) return;
@@ -275,6 +433,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         reviewsAborted++;
       }
     }
+    // 失败诊断同样在队列外运行，一并中断（各有带标题的逐条收尾通知）
+    let diagnosisAborted = 0;
+    for (const r of diagnosisRunning.values()) {
+      if (r.openId === msg.senderId && !r.ctl.signal.aborted) {
+        r.ctl.abort();
+        diagnosisAborted++;
+      }
+    }
     // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
     const stray = pendingTyping.get(msg.senderId);
     if (stray?.length) {
@@ -292,9 +458,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
     if (stopped.length) {
       await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
-    } else if (reviewsAborted) {
-      // 仅 AI 审查被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
-      await channel.reply(msg, '⏹ 已中断进行中的 AI 审查。');
+    } else if (reviewsAborted || diagnosisAborted) {
+      // 仅 AI 审查/失败诊断被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
+      await channel.reply(msg, '⏹ 已中断进行中的 AI 审查/诊断。');
     } else {
       await channel.reply(msg, '当前没有正在执行的任务。');
     }
@@ -351,8 +517,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       {
         mcpOk: supervisor.isAlive && mcp.tools.length > 0,
         mcpTools: mcp.tools,
-        // bot 会话恒持有 MemoryStore，memory_* 工具始终注册
+        // bot 会话恒持有 MemoryStore，memory_* 工具始终注册；reminder_* 同理恒注册
         memoryEnabled: true,
+        reminderEnabled: true,
         kanbanHeader: `看板工具（${mcp.tools.length} 个）`,
         downNote: hkMissing.length
           ? `看板工具：看板连接已断开，且备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`

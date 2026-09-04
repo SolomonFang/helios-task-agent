@@ -147,6 +147,48 @@ export const LOCAL_TOOLS: OpenAiTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'daily_report',
+      description:
+        '生成个人工作日报素材（+ HTML 日报文件），用于「帮我写今天的日报」「昨天的日报」类请求。' +
+        '采集当日看板活动：今日完成（状态已完成且最后更新时间在当日，与周报「本周完成」同一口径）、进行中、今日失败、今日新待审阅、改动统计。' +
+        '只读，不写看板。返回结构化素材与报告链接；回复时按「今日完成 / 进行中 / 风险与阻塞 / 明日计划」组织日报——' +
+        '明日计划仅依据进行中任务推断，素材没有的维度如实说明无数据，不要编造。',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: {
+            type: 'string',
+            description: '目标日期：「今天」（默认）/「昨天」/ YYYY-MM-DD（如 2026-09-01）',
+          },
+          iteration: { type: 'string', description: '可选；覆盖默认迭代号（未配置默认迭代时范围为全部任务）' },
+          html: { type: 'boolean', description: '是否生成 HTML 日报文件，默认 true' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'iteration_retro',
+      description:
+        '生成迭代复盘报告（HTML 文件），用于「复盘一下这个迭代」类请求。' +
+        '指标：迭代概览（任务总数、五状态分布、完成率）、吞吐（本周完成、累计完成，按最后更新时间口径）、' +
+        '失败归因（对失败摘要做确定性规则归类：合并冲突/测试失败/构建错误/执行超时/环境或依赖/其他，非模型判读）、改动统计汇总。' +
+        '数据来自 helios-kanban，只读，不写看板。回复时给报告链接与概览要点，解读失败归因时注明是规则归类结果。',
+      parameters: {
+        type: 'object',
+        properties: {
+          iteration: {
+            type: 'string',
+            description: '可选；覆盖默认迭代号。均未提供时范围为全部任务，报告会注明口径',
+          },
+        },
+      },
+    },
+  },
 ];
 
 /** /tools 展示的本地工具一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
@@ -155,6 +197,8 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
   { name: 'hk_cli', summary: '看板备用通道（看板连接异常时兜底与补充）' },
   { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
   { name: 'work_summary', summary: '生成工作总结报告（网页/文档）' },
+  { name: 'daily_report', summary: '生成个人工作日报（素材 + 网页报告）' },
+  { name: 'iteration_retro', summary: '生成迭代复盘报告（网页）' },
   { name: 'skill_doc', summary: '按需读取已安装技能的完整使用文档' },
   { name: 'skill_exec', summary: '运行技能目录内脚本（每次需用户确认）' },
 ];
@@ -162,12 +206,67 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
 /**
  * 按 memory 启用标志拼接摘要：memory_* 工具仅在实际注册（buildTools 传入 memory）时列出，
  * 否则摘要会展示并不存在的工具（见 buildTools 的 memory 条件注册）。
+ * reminder_* 同理按 reminders 注册标志拼接（两形态会话恒启用，/tools 调用方传 true）。
  */
-export function localToolSummary(memoryEnabled: boolean): Array<{ name: string; summary: string }> {
-  return memoryEnabled
-    ? [...LOCAL_TOOL_SUMMARY, { name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' }]
-    : LOCAL_TOOL_SUMMARY;
+export function localToolSummary(memoryEnabled: boolean, reminderEnabled = false): Array<{ name: string; summary: string }> {
+  const extra: Array<{ name: string; summary: string }> = [];
+  if (memoryEnabled) extra.push({ name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' });
+  if (reminderEnabled) extra.push({ name: 'reminder_set/list/cancel', summary: '自然语言定时提醒（到点主动推送）' });
+  return [...LOCAL_TOOL_SUMMARY, ...extra];
 }
+
+export const REMINDER_TOOLS: OpenAiTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'reminder_set',
+      description:
+        '创建定时提醒：到点后主动推送消息给用户（bot 走飞书私聊，终端形态在终端输出）。' +
+        '用于「30 分钟后提醒我…」「明天早上 9 点提醒我…」等请求。' +
+        '触发时间二选一：in_minutes 传相对分钟数（如 30）；at 传本地时间字符串（「HH:mm」当天已过则顺延次日、' +
+        '「今天/明天/后天 HH:mm」、「YYYY-MM-DD HH:mm」）。' +
+        '单用户最多 20 条待触发提醒，最远 30 天。创建会触发用户确认闸门。',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '提醒内容（到点原样推送给用户）' },
+          in_minutes: { type: 'number', description: '多少分钟后触发（大于 0；与 at 二选一）' },
+          at: {
+            type: 'string',
+            description: '触发时刻（本地时间）：「HH:mm」「今天/明天/后天 HH:mm」或「YYYY-MM-DD HH:mm」；与 in_minutes 二选一',
+          },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reminder_list',
+      description: '列出当前用户全部待触发提醒（序号、触发时间、内容、剩余时间）。只读，不触发确认闸门。',
+      parameters: {
+        type: 'object',
+        properties: {},
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reminder_cancel',
+      description:
+        '取消一条待触发提醒。ref 传 reminder_list 返回的序号或 id。取消会触发用户确认闸门。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string', description: 'reminder_list 返回的序号（如 "1"）或提醒 id' },
+        },
+        required: ['ref'],
+      },
+    },
+  },
+];
 
 export const MEMORY_TOOLS: OpenAiTool[] = [
   {

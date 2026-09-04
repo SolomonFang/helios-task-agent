@@ -11,7 +11,12 @@ import { makeHkCliHandler } from './hk-cli';
 import { makeRepoFsHandler } from './repo-fs';
 import { makeSkillDocHandler, makeSkillExecHandler } from './skill-tools';
 import { makeWorkSummaryHandler } from './work-summary';
+import { makeDailyReportHandler } from './personal-daily';
+import { makeIterationRetroHandler } from './iteration-retro';
 import { makeMemoryHandlers } from './memory-tools';
+import { makeReminderHandlers } from './reminder-tools';
+import { REMINDER_TOOLS } from './defs';
+import type { ReminderStore } from '../reminder';
 
 export { summarizeBothEnds } from './shared';
 export { LOCAL_TOOL_SUMMARY, localToolSummary } from './defs';
@@ -27,6 +32,7 @@ export function buildTools({
   kanbanRepoId,
   kanbanIteration,
   memory,
+  reminders,
   userId,
   onMemoryChange,
   confirm,
@@ -41,6 +47,8 @@ export function buildTools({
   kanbanRepoId?: string;
   kanbanIteration?: string;
   memory?: MemoryStore | null;
+  /** 提醒存储：传入则注册 reminder_* 工具（两形态会话恒传）。 */
+  reminders?: ReminderStore | null;
   userId?: string;
   /** Called after any successful memory write so session can refresh system prompt. */
   onMemoryChange?: () => void;
@@ -105,12 +113,27 @@ export function buildTools({
     'work_summary',
     makeWorkSummaryHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
   );
+  handlers.set(
+    'daily_report',
+    makeDailyReportHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
+  );
+  handlers.set(
+    'iteration_retro',
+    makeIterationRetroHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
+  );
 
   if (memory) {
     for (const [name, handler] of makeMemoryHandlers({ uid, memory, confirm, auditHome, onMemoryChange })) {
       handlers.set(name, handler);
     }
     openAiTools.push(...MEMORY_TOOLS);
+  }
+
+  if (reminders) {
+    for (const [name, handler] of makeReminderHandlers({ uid, reminders, confirm, auditHome })) {
+      handlers.set(name, handler);
+    }
+    openAiTools.push(...REMINDER_TOOLS);
   }
 
   openAiTools.push(...LOCAL_TOOLS);

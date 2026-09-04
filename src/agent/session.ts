@@ -1,5 +1,6 @@
 import type { KanbanMcp } from '../kanban/mcp';
 import { MemoryStore } from './memory';
+import { ReminderStore } from './reminder';
 import { createClient, runAgentTurn, trimHistory } from './llm';
 import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
@@ -24,6 +25,8 @@ export interface AgentSessionOptions {
   /** CLI 默认 local；飞书通道传 open_id。 */
   userId?: string;
   memory?: MemoryStore;
+  /** 提醒存储（reminder_* 工具注册的前提）；缺省按数据目录默认路径自建。 */
+  reminders?: ReminderStore;
   /** 写操作确认通道（CLI y/n 或飞书卡片）；缺省时所有写操作被闸门阻止。 */
   confirm?: ConfirmFn;
   /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
@@ -42,6 +45,7 @@ export class AgentSession {
   private mcpOk: boolean;
   private readonly userId: string;
   private readonly memory: MemoryStore;
+  private readonly reminders: ReminderStore;
   private readonly confirm?: ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
   private readonly historyStore?: SessionHistoryStore;
@@ -61,6 +65,7 @@ export class AgentSession {
     this.mcpOk = mcpOk;
     this.userId = opts.userId || 'local';
     this.memory = opts.memory || new MemoryStore();
+    this.reminders = opts.reminders || new ReminderStore();
     this.confirm = opts.confirm;
     this.reportLinkBaseUrl = opts.reportLinkBaseUrl;
     this.historyStore = opts.historyStore;
@@ -144,6 +149,7 @@ export class AgentSession {
       kanbanRepoId: cfg.kanbanRepoId,
       kanbanIteration: cfg.kanbanIteration,
       memory: this.memory,
+      reminders: this.reminders,
       userId: this.userId,
       onMemoryChange: () => this.refreshSystemPrompt(),
       confirm: this.getConfirm(),

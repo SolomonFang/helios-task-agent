@@ -212,6 +212,8 @@ export interface KanbanTaskRow {
   status?: string;
   has_in_progress_attempt?: boolean;
   last_attempt_failed?: boolean;
+  /** 任务最近一次更新时间（停滞提醒的判定依据；看板无更细粒度心跳字段）。 */
+  updated_at?: string;
 }
 
 export function validateKanbanTaskRows(endpoint: string, data: unknown): KanbanTaskRow[] {
@@ -221,6 +223,7 @@ export function validateKanbanTaskRows(endpoint: string, data: unknown): KanbanT
     status: 'string',
     has_in_progress_attempt: 'boolean',
     last_attempt_failed: 'boolean',
+    updated_at: 'string',
   });
 }
 

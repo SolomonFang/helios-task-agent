@@ -13,6 +13,7 @@ import {
 } from './http';
 import { statusLabel } from './summary';
 import { isLoopbackUrl } from '../infra/url-utils';
+import { StaleNudgeTracker } from './stale-nudge';
 
 /**
  * Kanban watcher: polls the kanban REST API and pushes proactive Feishu
@@ -26,6 +27,8 @@ interface WatchTaskState {
   running: boolean;
   failed: boolean;
   projectId: string;
+  /** 任务行 updated_at 原文（停滞提醒判定依据；旧版 state 文件无此字段，容忍缺失）。 */
+  updatedAt?: string;
 }
 
 interface WatchApproval {
@@ -48,7 +51,7 @@ interface WatchState {
   pending?: Record<string, PendingWatchEvent>;
 }
 
-export type WatchEventKind = 'review' | 'done' | 'cancelled' | 'failed' | 'approvals';
+export type WatchEventKind = 'review' | 'done' | 'cancelled' | 'failed' | 'approvals' | 'stale';
 
 /** done 事件的统一后续指引（文本版与卡片版同源，改动只动一处）。 */
 export const WATCH_HINT_DONE = '回复「帮我审一下」看结果，要继续改直接说';
@@ -91,6 +94,10 @@ export interface WatchEvent {
   items?: string[];
   /** 待审批真实总数（kind === 'approvals'，截断前计数；卡片标题计数用它，不用 items.length）。 */
   total?: number;
+  /** 任务 id（failed/stale 事件：卡片「AI 诊断」等回传按钮用）。 */
+  taskId?: string;
+  /** 项目名（stale 事件卡片展示；取不到时为空）。 */
+  projectName?: string;
   /** 纯文本版本，与卡片内容等价。 */
   text: string;
 }
@@ -110,6 +117,18 @@ export interface KanbanWatcherOptions {
   pendingTtlMs?: number;
   /** stop() 等待在途 tick 的兜底超时（默认 5s）：超时后照常返回，避免拖累整体退出。 */
   stopTimeoutMs?: number;
+  /**
+   * 停滞任务提醒（HTA_STALE_NUDGE_HOURS 开启时由 bot-main 装配）：每轮 diff 之后
+   * 对「进行中」且 updated_at 超阈值的任务产出 stale 事件，走同一 (事件, owner) 推送管线。
+   */
+  staleNudge?: {
+    thresholdMs: number;
+    statePath: string;
+    /** 同一任务同一停滞阶段提醒后的再次提醒间隔（默认 24h）。 */
+    remindIntervalMs?: number;
+    /** 注入时钟（测试用）；默认真实时间。 */
+    now?: () => number;
+  };
   log?: (msg: string) => void;
 }
 
@@ -120,11 +139,22 @@ export class KanbanWatcher {
   private state: WatchState | null;
   /** 最近一次落盘快照的序列化结果（tasks/approvals）：tick 里比较与写盘复用它，不再每轮重复 stringify。 */
   private lastSnapshotJson: { tasks: string; approvals: string } | null;
+  /** 项目 id → 项目名（每轮 collect 刷新；stale 事件展示用，不进快照）。 */
+  private projectNames = new Map<string, string>();
+  /** 停滞提醒状态跟踪器（staleNudge 开启时构造；决策与落盘见 stale-nudge.ts）。 */
+  private readonly staleTracker: StaleNudgeTracker | null = null;
 
   constructor(opts: KanbanWatcherOptions) {
     this.opts = opts;
     this.state = this.load();
     this.lastSnapshotJson = this.state ? KanbanWatcher.serializeSnapshot(this.state) : null;
+    if (opts.staleNudge) {
+      this.staleTracker = new StaleNudgeTracker({
+        statePath: opts.staleNudge.statePath,
+        thresholdMs: opts.staleNudge.thresholdMs,
+        remindIntervalMs: opts.staleNudge.remindIntervalMs,
+      });
+    }
   }
 
   start(): void {
@@ -232,6 +262,7 @@ export class KanbanWatcher {
         return;
       }
       const events = await this.diffEvents(current, prev);
+      events.push(...this.staleEvents(current));
       const { pending, pendingTouched, failed } = await this.deliverPending(events, prev.pending);
       const next: WatchState = { ...current };
       if (Object.keys(pending).length) next.pending = pending;
@@ -305,12 +336,16 @@ export class KanbanWatcher {
       // 期间）启动并失败的任务 running 全程不可见，但 failed 会落进快照；已通知过的
       // 轮次 old.failed=true 不重推，重启后由首轮基线兜底不刷历史失败
       if (cur.failed && !old.failed && !cur.running) {
+        // 顺带拉最新 attempt id：失败卡片「AI 诊断」按钮按 attempt 粒度防重复诊断
+        const review = await this.reviewTarget(cur.projectId, id);
         events.push({
           id: `failed:${id}`,
           event: {
             kind: 'failed',
             title: cur.title,
             url,
+            taskId: id,
+            attemptId: review.attemptId,
             text: `❌ 看板任务执行失败：《${cur.title}》，${WATCH_HINT_FAILED_LOG}\n${url}\n${WATCH_HINT_FAILED}\n${linkReachNote(url)}`,
           },
         });
@@ -331,6 +366,48 @@ export class KanbanWatcher {
           total: newApprovals.length,
           // 文本版只列前 5 条：超出的补剩余计数，与卡片版口径一致
           text: `⏳ 看板有 ${newApprovals.length} 个新的待审批项：\n${lines}${newApprovals.length > 5 ? `\n· …还有 ${newApprovals.length - 5} 个` : ''}\n回复「待审批」处理`,
+        },
+      });
+    }
+    return events;
+  }
+
+  /**
+   * 停滞提醒事件：diff 之后对「进行中」且 updated_at 超阈值的任务各产出一条 stale 事件，
+   * 走同一 (事件, owner) 推送/重投管线。文案口径与数据一致：看板没有执行心跳字段，
+   * 只能说「超过 N 小时无更新」，不断言任务卡死。首轮基线轮不调用（tick 里 prev 缺失即返回），
+   * 重启不重复轰炸由 tracker 落盘的 nudgedAt 保证。
+   */
+  private staleEvents(current: WatchState): Array<{ id: string; event: WatchEvent }> {
+    if (!this.staleTracker) return [];
+    const nowMs = this.opts.staleNudge?.now?.() ?? Date.now();
+    const due = this.staleTracker.due(
+      Object.entries(current.tasks).map(([id, t]) => {
+        const parsed = t.updatedAt ? Date.parse(t.updatedAt) : NaN;
+        return { id, status: t.status, updatedAtMs: Number.isFinite(parsed) ? parsed : null };
+      }),
+      nowMs,
+    );
+    const events: Array<{ id: string; event: WatchEvent }> = [];
+    for (const item of due) {
+      const t = current.tasks[item.id];
+      if (!t) continue;
+      const url = this.taskUrl(t.projectId, item.id);
+      const projectName = this.projectNames.get(t.projectId) || '';
+      const hours = Math.max(1, Math.round((nowMs - item.updatedAtMs) / 3600000));
+      const lastAt = new Date(item.updatedAtMs).toLocaleString('zh-CN', { hour12: false });
+      const detail = `状态「进行中」，已超过 ${hours} 小时无更新（最后更新：${lastAt}）`;
+      const hint = '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可。';
+      events.push({
+        id: `stale:${item.id}`,
+        event: {
+          kind: 'stale',
+          title: t.title,
+          url,
+          taskId: item.id,
+          projectName: projectName || undefined,
+          extra: detail,
+          text: `⏰ 看板任务久未更新：《${t.title}》${projectName ? `（项目：${projectName}）` : ''}\n${detail}。\n${url}\n${hint}\n${linkReachNote(url)}`,
         },
       });
     }
@@ -417,6 +494,15 @@ export class KanbanWatcher {
   /** 拉取一轮快照；approvals 端点失败时 approvalsUnknown=true（调用方沿用旧快照，见 tick）。 */
   private async collect(): Promise<{ state: WatchState; approvalsUnknown: boolean }> {
     const projectIds = this.opts.projectId ? [this.opts.projectId] : await this.fetchProjectIds();
+    // 指定单项目时 fetchProjectIds 不会跑：停滞提醒卡片要展示项目名，这里补拉一次（best-effort）
+    if (this.staleTracker && this.opts.projectId && !this.projectNames.get(this.opts.projectId)) {
+      try {
+        const p = (await this.api(`/projects/${this.opts.projectId}`)) as Record<string, unknown> | null;
+        if (p && typeof p.name === 'string' && p.name) this.projectNames.set(this.opts.projectId, p.name);
+      } catch {
+        /* 项目名取不到不阻断轮询 */
+      }
+    }
     const tasks: Record<string, WatchTaskState> = {};
     for (const pid of projectIds) {
       const raw = await this.api(`/tasks?project_id=${pid}`); // 网络错误照常上抛（tick 统一记轮询失败）
@@ -436,6 +522,7 @@ export class KanbanWatcher {
           running: Boolean(t.has_in_progress_attempt),
           failed: Boolean(t.last_attempt_failed),
           projectId: pid,
+          updatedAt: t.updated_at || undefined,
         };
       }
     }
@@ -488,6 +575,7 @@ export class KanbanWatcher {
       this.opts.log?.(errMessage(err));
       return [];
     }
+    this.projectNames = new Map(list.filter((p) => p.id).map((p) => [p.id!, String(p.name || '')]));
     return list.map((p) => p.id || '').filter(Boolean);
   }
 

@@ -100,9 +100,10 @@ class FakeChannel implements ChannelUnderTest {
   async notifyOpenId(openId: string, text: string): Promise<void> {
     this.notifies.push({ openId, text });
   }
-  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
+  async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<string | undefined> {
     if (this.failCard) throw new Error('card mock failure');
     this.cards.push({ openId, card });
+    return `card-${++this.messageSeq}`;
   }
   lastEventAt(): number {
     return 0;

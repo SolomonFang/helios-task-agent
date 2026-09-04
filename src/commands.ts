@@ -32,6 +32,7 @@ export const TRY_EXAMPLES: string[] = [
   '用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）',
   '把 xx 群最近的聊天整理成任务',
   '总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）',
+  '30 分钟后提醒我站会 / 明天早上 9 点提醒我盯一下构建',
 ];
 
 /** 斜杠命令解析：返回小写命令词（如 '/status'），非命令返回 null。 */
@@ -105,6 +106,8 @@ export function buildToolsLines(
     mcpTools: Tool[];
     /** 本地侧是否启用持久化记忆：memory_* 工具仅在实际注册时列出，否则展示的是不存在的工具。 */
     memoryEnabled: boolean;
+    /** 本地侧是否启用定时提醒：reminder_* 工具仅在实际注册时列出（两形态会话恒注册，调用方传 true）。 */
+    reminderEnabled?: boolean;
     /** MCP 可用时的看板工具标题（通道文案，CLI 可上色）。 */
     kanbanHeader: string;
     /** MCP 不可用时的降级说明（整行替换看板工具段）。 */
@@ -126,7 +129,7 @@ export function buildToolsLines(
     lines.push(opts.downNote);
   }
   lines.push(opts.localHeader);
-  for (const t of localToolSummary(opts.memoryEnabled)) lines.push(`${opts.bullet}${p.info(t.name)}  ${p.gray(t.summary)}`);
+  for (const t of localToolSummary(opts.memoryEnabled, opts.reminderEnabled)) lines.push(`${opts.bullet}${p.info(t.name)}  ${p.gray(t.summary)}`);
   return lines;
 }
 
@@ -137,6 +140,7 @@ export function toolActionLabel(name: string): string {
   if (name === 'lark_cli') return '飞书操作';
   if (name === 'work_summary') return '生成报告';
   if (name.startsWith('memory_')) return '读写记忆';
+  if (name.startsWith('reminder_')) return '设置提醒';
   if (name.startsWith('skill_')) return '运行技能';
   return '调用工具';
 }

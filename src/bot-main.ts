@@ -23,6 +23,7 @@ import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
 import { ConfirmationManager } from './agent/confirm';
 import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from './channels/feishu-cards';
 import { KanbanWatcher, type WatchEvent } from './kanban/watcher';
+import { parseStaleNudgeHours } from './kanban/stale-nudge';
 import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
@@ -37,6 +38,8 @@ import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
 import { DailyBrief, parseDailyBriefTime, type DailyBriefTime } from './bot/daily-brief';
+import { WeeklyBrief, parseWeeklyBriefTime, parseWeeklyBriefDay, type WeeklyBriefTime } from './bot/weekly-brief';
+import { ReminderRunner, ReminderStore } from './agent/reminder';
 import { createBotHandlers, createRoundNoticeTracker } from './bot/handler';
 import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
@@ -52,7 +55,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /skills   列出技能；install <路径> 安装（升级不丢失）；uninstall <名称> 卸载
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
-/stop     中断当前任务与进行中的 AI 审查（排队消息与待确认写操作一并取消）
+/stop     中断当前任务与进行中的 AI 审查/诊断（排队消息与待确认写操作一并取消）
 /confirm  查看「同类免问」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
@@ -182,7 +185,9 @@ async function main(): Promise<void> {
     wsAlerter: WsAlerter | null;
     reportServer: ReportServer | null;
     dailyBrief: DailyBrief | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null };
+    weeklyBrief: WeeklyBrief | null;
+    reminderRunner: ReminderRunner | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null };
   let shuttingDown = false;
   /**
    * 优雅退出：exitCode 由触发路径决定——正常信号（SIGINT/SIGTERM）传 0；
@@ -206,6 +211,8 @@ async function main(): Promise<void> {
       cleanup.wsAlerter?.stop();
       await cleanup.watcher?.stop();
       await cleanup.dailyBrief?.stop();
+      await cleanup.weeklyBrief?.stop();
+      await cleanup.reminderRunner?.stop();
       cleanup.reportServer?.close();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
@@ -471,6 +478,7 @@ async function main(): Promise<void> {
   };
 
   // 注意：router 始终持有 mcp 对象（即使启动时降级），supervisor 重连后可热切换回来
+  const reminders = new ReminderStore();
   const router = new SessionRouter(
     agentCfg,
     mcp,
@@ -479,6 +487,7 @@ async function main(): Promise<void> {
     (openId) => (req) => confirmations.request(openId, req),
     reportServer?.baseUrl,
     new SessionHistoryStore(),
+    reminders,
   );
 
   const notifyOwners = (text: string): void => {
@@ -559,6 +568,13 @@ async function main(): Promise<void> {
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {
     const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
+    // 停滞任务提醒：HTA_STALE_NUDGE_HOURS=N（小时）开启，默认关闭；非法值告警并关闭
+    let staleNudgeHours: number | null = null;
+    try {
+      staleNudgeHours = parseStaleNudgeHours(process.env.HTA_STALE_NUDGE_HOURS);
+    } catch (err) {
+      console.warn(c.warn(`${errMessage(err)}，停滞任务提醒已关闭`));
+    }
     // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
     // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
     const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
@@ -605,10 +621,21 @@ async function main(): Promise<void> {
         if (firstErr) throw firstErr;
       },
       log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
+      ...(staleNudgeHours
+        ? {
+            staleNudge: {
+              thresholdMs: staleNudgeHours * 60 * 60 * 1000,
+              statePath: path.join(defaultDataHome(), 'stale-nudge-state.json'),
+            },
+          }
+        : {}),
     });
     cleanup.watcher = watcher;
     watcher.start();
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec} 秒轮询）`));
+    if (staleNudgeHours) {
+      console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${staleNudgeHours} 小时无更新时提醒）`));
+    }
   }
 
   // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭
@@ -635,6 +662,51 @@ async function main(): Promise<void> {
     const mm = String(dailyBriefTime.minute).padStart(2, '0');
     console.log(c.gray(`定时晨报已开启（每天 ${hh}:${mm} 推送）`));
   }
+
+  // 定时周报：HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭。
+  // HTA_WEEKLY_BRIEF_DAY=1-7 指定周几推送（默认 5 周五），非法值告警并按默认处理（不关闭功能）
+  let weeklyBriefTime: WeeklyBriefTime | null = null;
+  try {
+    weeklyBriefTime = parseWeeklyBriefTime(process.env.HTA_WEEKLY_BRIEF);
+  } catch (err) {
+    console.warn(c.warn(`${errMessage(err)}，定时周报已关闭`));
+  }
+  let weeklyBriefDay = parseWeeklyBriefDay(undefined);
+  try {
+    weeklyBriefDay = parseWeeklyBriefDay(process.env.HTA_WEEKLY_BRIEF_DAY);
+  } catch (err) {
+    console.warn(c.warn(`${errMessage(err)}，按默认周五推送`));
+  }
+  if (weeklyBriefTime) {
+    const brief = new WeeklyBrief({
+      time: weeklyBriefTime,
+      day: weeklyBriefDay,
+      statePath: path.join(defaultDataHome(), 'weekly-brief-state.json'),
+      kanbanUrl: agentCfg.kanbanUrl,
+      projectId: agentCfg.kanbanProjectId || undefined,
+      iteration: agentCfg.kanbanIteration || undefined,
+      owners: () => channel.allowedOpenIds(),
+      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
+      log: (msg) => console.log(c.gray(`[weekly-brief] ${msg}`)),
+    });
+    cleanup.weeklyBrief = brief;
+    brief.start();
+    const hh = String(weeklyBriefTime.hour).padStart(2, '0');
+    const mm = String(weeklyBriefTime.minute).padStart(2, '0');
+    const weekdayName = '周' + '一二三四五六日'[weeklyBriefDay - 1]!;
+    console.log(c.gray(`定时周报已开启（每${weekdayName} ${hh}:${mm} 推送）`));
+  }
+
+  // 定时提醒投递：tick 检查到期提醒，通过飞书私聊推送给设定人；已触发/已投递状态落盘，
+  // 重启后到点未投的立即补投、已投的不重复；投递失败按 1→2→4…分钟指数退避（封顶 30 分钟）
+  const reminderRunner = new ReminderRunner({
+    store: reminders,
+    deliver: (openId, text) => channel.notifyOpenId(openId, text),
+    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
+  });
+  cleanup.reminderRunner = reminderRunner;
+  reminderRunner.start();
+  console.log(c.gray('定时提醒投递已开启'));
 
   console.log(c.gray('Ctrl+C 退出'));
 }

@@ -4,6 +4,7 @@ import { c, printBanner, Spinner, renderReply } from './infra/ui';
 import { ensureEnvLoaded } from './config/config';
 import { ensureConfig } from './config/config-wizard';
 import { AgentSession } from './agent/session';
+import { ReminderRunner, ReminderStore } from './agent/reminder';
 import { SessionHistoryStore } from './agent/session-store';
 import { connectMcp, diagnoseMcpFailure } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
@@ -191,7 +192,10 @@ export async function main(): Promise<void> {
   let currentCtl: AbortController | null = null;
   const spinner = new Spinner('思考中…');
   /** MCP 实例登记处：onCreate 在实例创建时（connect 发起前）即登记，45s 连接窗口内收到信号也能 close。 */
-  const cleanupRes: { mcp: KanbanMcp | null } = { mcp: null };
+  const cleanupRes: { mcp: KanbanMcp | null; reminderRunner: ReminderRunner | null } = {
+    mcp: null,
+    reminderRunner: null,
+  };
 
   let cleaningUp = false;
   /**
@@ -210,6 +214,7 @@ export async function main(): Promise<void> {
     forceTimer.unref();
     spinner.stop();
     try {
+      await cleanupRes.reminderRunner?.stop();
       await cleanupRes.mcp?.close();
     } catch {
       /* 尽力清理，失败照常退出 */
@@ -361,11 +366,37 @@ export async function main(): Promise<void> {
     }
   };
 
+  const reminders = new ReminderStore();
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, {
     userId: 'local',
     confirm: confirmWrite,
     historyStore: new SessionHistoryStore(),
+    reminders,
   });
+
+  /**
+   * 到点提醒的终端投递：agent 轮次进行中不打断（排队到轮次结束后统一提示，
+   * 避免提醒文本插进 spinner/工具输出中间）；空闲时立即打印。
+   */
+  const pendingReminderTexts: string[] = [];
+  const printReminder = (text: string) => {
+    console.log(`\n${c.warn(text)}`);
+  };
+  const flushPendingReminders = () => {
+    if (!pendingReminderTexts.length) return;
+    for (const text of pendingReminderTexts.splice(0)) printReminder(text);
+    console.log('');
+  };
+  const reminderRunner = new ReminderRunner({
+    store: reminders,
+    deliver: async (_uid, text) => {
+      if (currentCtl) pendingReminderTexts.push(text);
+      else printReminder(text);
+    },
+    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
+  });
+  reminderRunner.start();
+  cleanupRes.reminderRunner = reminderRunner;
 
   /** MCP 实例绑定的看板地址：/config 改地址后 MCP 不会重连，/status 据此持续警示，直到重启。 */
   const mcpBoundKanbanUrl = cfg.kanbanUrl;
@@ -432,8 +463,9 @@ export async function main(): Promise<void> {
           {
             mcpOk,
             mcpTools: mcp.tools,
-            // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册
+            // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册；reminder_* 同理恒注册
             memoryEnabled: true,
+            reminderEnabled: true,
             kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
             downNote: c.warn(
               hkMissing.length
@@ -542,6 +574,8 @@ export async function main(): Promise<void> {
       }
     } finally {
       currentCtl = null;
+      // 轮次结束后补提示期间到点的提醒（不打断进行中的轮次）
+      flushPendingReminders();
     }
   }
 }

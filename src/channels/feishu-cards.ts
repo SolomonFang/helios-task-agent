@@ -1,8 +1,9 @@
 /**
  * 飞书交互卡片（legacy card schema）构建统一收口：
  * - 写操作确认卡片 / 确认终态卡片（buildConfirmCard / buildResolvedCard）
- * - 看板事件通知卡片（buildWatchEventCard）
+ * - 看板事件通知卡片（buildWatchEventCard，含停滞提醒与失败「AI 诊断」按钮）
  * - AI 审查结果卡片（buildAiReviewCard）
+ * - 失败诊断结果卡片（buildDiagnosisCard，含「按诊断结论重试」按钮与重试后终态）
  * 共同约定（baseCardConfig）：宽屏模式 + enable_forward:false——卡片内含本机链接
  * 与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发。
  */
@@ -18,6 +19,7 @@ import {
   type WatchEventKind,
 } from '../kanban/watcher';
 import { statusLabel } from '../kanban/summary';
+import { DIAGNOSIS_CARD_MAX_CHARS } from '../kanban/failure-diagnosis';
 
 /** 全部卡片的共同 config：宽屏 + 禁止转发（见文件头注释）。 */
 function baseCardConfig(): Record<string, unknown> {
@@ -150,6 +152,8 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     failed: { template: 'red', title: '❌ 看板任务执行失败' },
     // 计数用 total（watcher 推送前 items 已截断到 5 条，items.length 是截断后的数字）
     approvals: { template: 'blue', title: `⏳ 看板有 ${e.total ?? e.items?.length ?? 0} 个新的待审批项` },
+    // 口径诚实：数据只有 updated_at，措辞是「久未更新」而非「停滞/卡死」
+    stale: { template: 'orange', title: '⏰ 看板任务久未更新' },
   };
   const m = meta[e.kind];
   const elements: Array<Record<string, unknown>> = [];
@@ -167,6 +171,9 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
   } else {
     // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
     elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
+    if (e.projectName) {
+      elements.push({ tag: 'div', text: { tag: 'plain_text', content: `项目：${e.projectName}` } });
+    }
     if (e.transition) {
       // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文；原文过 mdSafe 再进 lark_md 内联代码
       const hasArrow = e.transition.includes('→');
@@ -184,7 +191,9 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push({ tag: 'div', text: { tag: 'plain_text', content: WATCH_HINT_FAILED_LOG } });
     }
     if (e.extra) {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: `结果摘要：${e.extra}` } });
+      // stale 的 extra 是停滞时长说明（自带完整语义），done 的 extra 是结果摘要
+      const content = e.kind === 'stale' ? e.extra : `结果摘要：${e.extra}`;
+      elements.push({ tag: 'div', text: { tag: 'plain_text', content } });
     }
     if (e.url) {
       const btn = e.kind === 'review' ? '🔍 人工审查' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
@@ -200,12 +209,25 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
           value: { hta_review: e.attemptId, title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title },
         });
       }
+      // AI 诊断：回传按钮，bot 侧采集失败信息调 LLM 生成中文诊断（按钮语义同 AI 审查，点击即授权）
+      if (e.kind === 'failed' && e.taskId) {
+        actions.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🔍 AI 诊断' },
+          value: {
+            hta_diagnose: e.taskId,
+            attempt: e.attemptId,
+            title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title,
+          },
+        });
+      }
       elements.push({ tag: 'action', actions });
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
       review: WATCH_HINT_REVIEW,
       done: WATCH_HINT_DONE,
       failed: WATCH_HINT_FAILED,
+      stale: '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可',
     };
     // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错
     const linkNote = e.url ? linkReachNote(e.url) : null;
@@ -273,5 +295,65 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
         ],
       },
     ],
+  };
+}
+
+/** 按钮 value 里的标题与 hta_review 同口径：超 50 字符截断补省略号。 */
+function buttonTitle(title: string): string {
+  return title.length > 50 ? `${title.slice(0, 50)}…` : title;
+}
+
+/**
+ * 失败诊断结果卡片：正文为 LLM 中文诊断（超长截断，完整结论已注入会话），
+ * 带「↻ 按诊断结论重试」按钮（点击即显式授权，bot 以诊断结论作 follow-up 重启任务）。
+ * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）。
+ */
+export function buildDiagnosisCard(
+  title: string,
+  diagnosis: string,
+  taskId: string,
+  opts?: { settledAt?: string },
+): Record<string, unknown> {
+  const text =
+    diagnosis.length > DIAGNOSIS_CARD_MAX_CHARS ? `${diagnosis.slice(0, DIAGNOSIS_CARD_MAX_CHARS)}\n…（过长已截断）` : diagnosis;
+  const elements: Array<Record<string, unknown>> = [
+    // 诊断结论是 LLM 输出（markdown 为预期格式），直接按 lark_md 渲染
+    { tag: 'div', text: { tag: 'lark_md', content: text } },
+  ];
+  if (opts?.settledAt) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'note',
+      elements: [{ tag: 'plain_text', content: `已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送。` }],
+    });
+  } else {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '↻ 按诊断结论重试' },
+          type: 'primary',
+          value: { hta_retry: taskId, title: buttonTitle(title) },
+        },
+      ],
+    });
+    elements.push({
+      tag: 'note',
+      elements: [
+        { tag: 'plain_text', content: '重试会把以上诊断结论作为跟进指令发给执行 Agent（点击即发起，不再二次确认）' },
+      ],
+    });
+  }
+  return {
+    config: baseCardConfig(),
+    header: {
+      template: opts?.settledAt ? 'grey' : 'blue',
+      title: {
+        tag: 'plain_text',
+        content: opts?.settledAt ? `↻ 已按诊断结论重试：《${title}》` : `🔍 AI 失败诊断：《${title}》`,
+      },
+    },
+    elements,
   };
 }

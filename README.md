@@ -23,7 +23,7 @@ npx helios-task-agent@latest
 ## 两种形态：CLI 与飞书 bot
 
 - **终端 CLI**（`helios-task-agent`）：快速试用与调试。对话、写操作确认（`y/batch/N`）、看板操作全部可用。
-- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出几项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）、**定时晨报**（`HTA_DAILY_BRIEF=HH:MM`，每天定时向白名单用户（owner）推送当前迭代看板概览）、**图片消息**（`LLM_VISION=1`，需模型支持图片输入）。
+- **飞书私聊 bot**（`helios-task-agent bot`）：完整体验。在 CLI 能力之上多出几项 bot 专属能力——**看板状态推送**（任务待审阅/完成主动推卡片）、**确认卡片**（按钮点选确认）、**AI 审查**（待审阅 diff 一键调用 open-code-review，推 HTML 报告链接）、**失败 AI 诊断**（失败卡片一键生成中文诊断，可按结论一键重试）、**停滞任务提醒**（`HTA_STALE_NUDGE_HOURS=N`，进行中任务超 N 小时无更新时提醒）、**定时晨报**（`HTA_DAILY_BRIEF=HH:MM`，每天定时向白名单用户（owner）推送当前迭代看板概览）、**定时周报**（`HTA_WEEKLY_BRIEF=HH:MM` + `HTA_WEEKLY_BRIEF_DAY=1-7`，每周定时推送本周迭代进展）、**图片消息**（`LLM_VISION=1`，需模型支持图片输入）。
 
 ## 安装
 
@@ -92,6 +92,10 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），结果要求简体中文输出，完整内容渲染为 HTML 报告（写入数据目录 `reviews/`，由 bot 内置静态服务托管），飞书只推报告链接（长结果不再截断），同时注入会话（可直接回「按审查意见修一下」）。
 
+失败卡片带「🔍 AI 诊断」按钮：采集该任务失败 attempt 的可用信息（任务描述/失败摘要/diff 统计，以看板实际能返回的为准）调模型生成中文诊断（失败原因归类 + 关键证据摘要 + 建议修复方向），推诊断结果卡片并注入会话；诊断卡片带「↻ 按诊断结论重试」按钮，点击即把诊断结论（失败原因 + 修复建议）作为跟进指令发给执行 Agent 重启任务（点击即显式授权，不再二次确认；重试发起后按钮原地置为终态）。诊断的模型配置与 AI 审查同一派生口径（`OCR_LLM_*` 逐项优先、缺项回退机器人模型配置），整体超时 6 分钟；模型不可用/超时会推送明确的中文失败提示。
+
+停滞任务提醒（`HTA_STALE_NUDGE_HOURS=8`，默认关）：「进行中」任务超过 N 小时无更新时推一条提醒卡片（项目名、任务标题、已停滞时长、任务链接）。判定依据是任务行的最后更新时间（`updated_at`——看板没有更细粒度的执行心跳字段，所以文案只说「久未更新」而不断言「卡死」；执行中的 attempt 不一定推动该字段，长时间正常推进的任务也可能触发，提醒文案已注明可忽略）。同一停滞阶段只提醒一次，之后每 24 小时至多再提醒一次；任务有更新或状态流转后重新计时；提醒状态落盘（`stale-nudge-state.json`），重启不重复提醒。
+
 - 首轮只建基线（`watch-state.json`），重启不重复打扰  
 - **不**推送「新创建的任务」  
 - 推送失败不推进状态快照，恢复后自动重投（可能重复，优于丢事件）  
@@ -110,10 +114,13 @@ npm i -g @larksuite/cli && lark-cli auth login
 ```text
 ~/.helios-task-agent/.env
 ~/.helios-task-agent/memory.json
+~/.helios-task-agent/reminders.json         # 定时提醒（到点未投的重启补投，已投不重复）
 ~/.helios-task-agent/synced-sources.json   # 飞书来源 → 看板任务（查重）
 ~/.helios-task-agent/audit.log             # 写操作审计（JSONL）
 ~/.helios-task-agent/watch-state.json      # 看板推送快照
+~/.helios-task-agent/stale-nudge-state.json # 停滞任务提醒状态（同一阶段不重复提醒）
 ~/.helios-task-agent/daily-brief-state.json # 定时晨报推送日期（当天不重复推）
+~/.helios-task-agent/weekly-brief-state.json # 定时周报推送日期（当周当天不重复推）
 ~/.helios-task-agent/sessions/             # 会话历史（每用户一个文件，重启后恢复上下文；/clear 同步清除）
 ~/.helios-task-agent/skills/               # 用户技能目录（/skills install 安装到这里）
 ~/.helios-task-agent/reviews/              # AI 审查报告（HTML，30 天自动清理）
@@ -198,17 +205,20 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HELIOS_KANBAN_HOST` | 自动拉起看板的监听地址，默认 `127.0.0.1`（看板 Web/API 无鉴权，谨慎改为 `0.0.0.0`） |
 | `HELIOS_REPORT_HOST` | AI 审查报告静态服务的监听地址，默认 `127.0.0.1`（**不跟随** `HELIOS_KANBAN_HOST`；报告含代码 diff，确需对外暴露才改） |
 | `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |
-| `OCR_LLM_TOKEN` | AI 审查专用 LLM key；设置后优先于机器人主 key 派生（避免把主 key 交给第三方 ocr 子进程），URL/模型仍回退机器人配置 |
-| `OCR_LLM_URL` / `OCR_LLM_MODEL` | 显式指定 AI 审查的 LLM 端点/模型；设置后优先于从机器人配置派生 |
+| `OCR_LLM_TOKEN` | AI 审查/失败诊断专用 LLM key；设置后优先于机器人主 key 派生（避免把主 key 交给第三方 ocr 子进程），URL/模型仍回退机器人配置 |
+| `OCR_LLM_URL` / `OCR_LLM_MODEL` | 显式指定 AI 审查/失败诊断的 LLM 端点/模型；设置后优先于从机器人配置派生 |
 | `HELIOS_KANBAN_PROJECT_ID` / `HELIOS_KANBAN_REPO_ID` / `HELIOS_KANBAN_ITERATION` | 可选默认；设了 `HELIOS_KANBAN_PROJECT_ID` 时 bot 推送只盯该项目 |
 | `HELIOS_TASK_AGENT_HOME` | 数据目录，默认 `~/.helios-task-agent` |
 | `HELIOS_TASK_AGENT_ENV` | 强制 `.env` 路径（写入目标；加载优先级最高） |
 | `KANBAN_WATCH` | bot 看板推送，默认开；`0` 关闭 |
 | `KANBAN_WATCH_INTERVAL_SEC` | 推送间隔秒（默认 60，最小 15） |
+| `HTA_STALE_NUDGE_HOURS` | 停滞任务提醒（仅 bot）：「进行中」任务超过 N 小时无更新（按任务最后更新时间判定）时推一条提醒卡片；同一停滞阶段只提醒一次，之后每 24 小时至多再提醒一次，状态落盘重启不重复。未设置或非法值 = 关闭 |
 | `HTA_UPDATE_CHECK` | 启动时检查 npm 新版本，默认开；`0` 关闭 |
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `LLM_VISION` | `1` 时 bot 支持图片消息：下载图片随当次请求发给模型（**需模型支持图片输入**；图片不进会话历史、不落盘，单张上限 10MB）。默认关，关闭时图片消息仍提示仅支持文字 |
 | `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向白名单用户（owner）推送当前迭代看板概览（进行中/待办/待审阅/已完成/失败；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部任务）。未设置或非法值 = 关闭 |
+| `HTA_WEEKLY_BRIEF` | 定时周报（仅 bot）：本地时间 `HH:MM`（如 `18:00`）每周向白名单用户（owner）推送本周迭代进展（迭代全量计数 + 本周完成/待审阅积压/失败分组；「本周完成」按任务最后更新时间落在本周统计）。未设置或非法值 = 关闭 |
+| `HTA_WEEKLY_BRIEF_DAY` | 定时周报的推送星期：`1`-`7`（1=周一…7=周日），默认 `5`（周五）；非法值启动时告警并按默认处理 |
 | `HTA_TURN_TIMEOUT_MIN` | 单轮对话的墙钟时间上限（分钟），默认 30；超时按「已中止」收尾并提示 |
 | `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
 
@@ -242,6 +252,8 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 
 记忆按飞书 `open_id`（bot）或 `local`（终端）分桶。工具：`memory_set` / `get` / `delete` / `note`（备注约保留最近 50 条）。常用键：`feishu_task_source`、`feishu_chat_id`、`preferred_project_id` / `repo_id` / `iteration`、`last_sync_at`。
 
+定时提醒同样按用户分桶（工具：`reminder_set` / `list` / `cancel`，两种形态都有）：说「30 分钟后提醒我站会」「明天早上 9 点提醒我盯一下构建」即可创建（相对分钟数与「HH:mm」「今天/明天/后天 HH:mm」「YYYY-MM-DD HH:mm」等本地时间写法均可，单用户最多 20 条待触发、最远 30 天）；到点后 bot 经飞书私聊主动推送，终端在轮次结束后输出（进行中不打断）。创建与取消都过确认闸门。提醒落盘 `reminders.json`：已投递状态持久化，进程重启后到点未投的立即补投、已投的不重复；投递失败按 1→2→4… 分钟指数退避（封顶 30 分钟）补投。
+
 ## 工具一览
 
 | 工具 | 作用 |
@@ -251,9 +263,12 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 | `hk_cli` | 始终可用；跑内置 `hk.sh`（HTTP REST），MCP 掉线或缺能力时补充 |
 | `repo_fs` | 可选：对看板关联仓库本机 path 做 `list` / `read` / `grep`（不可越界） |
 | `work_summary` | 生成工作总结报告（HTML/MD） |
+| `daily_report` | 生成个人工作日报（结构化素材 + HTML，支持指定日期） |
+| `iteration_retro` | 生成迭代复盘报告（HTML，含概览/吞吐/失败规则归类/改动统计） |
 | `skill_doc` | 按需读取已安装技能完整文档（SKILL.md） |
 | `skill_exec` | 运行技能目录内脚本（默认逐次确认，同类免问按具体脚本+参数生效） |
 | `memory_*` | 持久化偏好与备注 |
+| `reminder_*` | 自然语言定时提醒（到点主动推送；创建/取消需确认） |
 
 包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.sh`）。
 
