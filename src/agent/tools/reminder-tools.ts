@@ -6,7 +6,7 @@ import {
   type ReminderStore,
 } from '../reminder';
 import { passGate, type ConfirmFn } from '../guard';
-import { auditLog, type AuditDecision } from '../../infra/audit';
+import { auditLog } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 
@@ -26,7 +26,7 @@ export function makeReminderHandlers({
   confirm?: ConfirmFn;
   auditHome?: string;
 }): Array<[string, ToolHandler]> {
-  const reminderSet: ToolHandler = async (raw) => {
+  const reminderSet: ToolHandler = async (raw, ctx) => {
     const text = typeof raw.text === 'string' ? raw.text.trim() : '';
     if (!text) return '参数错误：text 不能为空';
     const at = typeof raw.at === 'string' ? raw.at : undefined;
@@ -44,9 +44,10 @@ export function makeReminderHandlers({
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: 'reminder:set', batchScope: 'kind' },
       confirm,
+      ctx?.signal,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'reminder', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'reminder', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     try {
@@ -83,7 +84,7 @@ export function makeReminderHandlers({
     });
   };
 
-  const reminderCancel: ToolHandler = async (raw) => {
+  const reminderCancel: ToolHandler = async (raw, ctx) => {
     const ref = typeof raw.ref === 'string' ? raw.ref.trim() : typeof raw.ref === 'number' ? String(raw.ref) : '';
     if (!ref) return '参数错误：ref 不能为空（传 reminder_list 返回的序号或 id）';
     const target = reminders.find(uid, ref);
@@ -94,9 +95,10 @@ export function makeReminderHandlers({
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: `reminder:cancel:${target.id}`, batchScope: 'object', destructive: true },
       confirm,
+      ctx?.signal,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'reminder', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'reminder', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     try {

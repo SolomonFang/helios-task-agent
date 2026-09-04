@@ -11,6 +11,7 @@ import { createClient, downgradeSystemNotes, runAgentTurn } from '../src/agent/l
 import { KanbanWatcher } from '../src/kanban/watcher';
 import { collectWorkSummary } from '../src/kanban/summary';
 import { McpSupervisor } from '../src/bot/supervisor';
+import { runFailureDiagnosis } from '../src/kanban/failure-diagnosis';
 import { KanbanMcp, connectMcp } from '../src/kanban/mcp';
 import { fetchHealth } from '../src/kanban/kanban-ensure';
 import { startReportServer } from '../src/report/report-server';
@@ -448,6 +449,54 @@ async function main(): Promise<void> {
     await sup.stop();
     clearInterval(keepAlive);
     assert.ok(Date.now() - t0 < 3000, `stop 应在竞速超时后返回，实际 ${Date.now() - t0}ms`);
+    assert.ok(logs.some((m) => m.includes('超时')), '超时应记日志');
+  });
+
+  // ---------- McpSupervisor：stop 等待 ping 阶段的在途 tick ----------
+  await checkAsync('McpSupervisor：stop 等待 ping 阶段（busy 但无重连占位）的在途 tick 结束才返回', async () => {
+    let releasePing!: () => void;
+    const fakeMcp = {
+      tools: [],
+      ping: () =>
+        new Promise<void>((resolve) => {
+          releasePing = resolve;
+        }),
+      reconnect: async () => {},
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({ mcp: fakeMcp, initiallyAlive: true, failThreshold: 1, stopTimeoutMs: 2000 });
+    const tickPromise = sup.tick(); // ping 挂起：busy=true、reconnecting=null（停等漏洞的原始形态）
+    await new Promise((r) => setTimeout(r, 20));
+    let stopped = false;
+    const stopPromise = sup.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(stopped, false, '在途 tick 未结束时 stop 不应返回');
+    releasePing();
+    await stopPromise;
+    await tickPromise;
+    assert.equal(stopped, true, '在途 tick 结束后 stop 应返回');
+  });
+
+  await checkAsync('McpSupervisor：ping 挂死的在途 tick 超 stopTimeoutMs 后 stop 照常返回并记日志', async () => {
+    const logs: string[] = [];
+    const fakeMcp = {
+      tools: [],
+      ping: () => new Promise<void>(() => {}), // ping 永不返回
+      reconnect: async () => {},
+    } as unknown as KanbanMcp;
+    const sup = new McpSupervisor({
+      mcp: fakeMcp,
+      initiallyAlive: true,
+      failThreshold: 1,
+      stopTimeoutMs: 120,
+      log: (m) => logs.push(m),
+    });
+    void sup.tick(); // busy=true 且永不自清（不 await；无定时器残留）
+    await new Promise((r) => setTimeout(r, 20));
+    const t0 = Date.now();
+    await sup.stop();
+    assert.ok(Date.now() - t0 < 3000, `stop 应在兜底超时后返回，实际 ${Date.now() - t0}ms`);
     assert.ok(logs.some((m) => m.includes('超时')), '超时应记日志');
   });
 
@@ -1089,6 +1138,50 @@ async function main(): Promise<void> {
       console.error = origErr;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // ---------- 失败诊断：整体时长兜底（timeoutMs 约束含重试的整段 complete） ----------
+  await checkAsync('runFailureDiagnosis：complete 挂起时按 timeoutMs 兜底超时收尾（不受单次尝试超时倍数影响）', async () => {
+    const t0 = Date.now();
+    let sawSignal = false;
+    await assert.rejects(
+      runFailureDiagnosis({
+        kanbanUrl: 'http://localhost:1',
+        taskId: 't1',
+        llm: { baseUrl: 'http://localhost:1', apiKey: 'k', model: 'm' },
+        timeoutMs: 80,
+        collectContext: async () => ({ taskId: 't1', title: 'T', description: '', attemptSummary: '' }),
+        complete: (_p, _l, signal) => {
+          sawSignal = signal instanceof AbortSignal;
+          return new Promise<string>((_, reject) => {
+            signal?.addEventListener('abort', () => reject(signal.reason as Error), { once: true });
+          });
+        },
+      }),
+      /AI 诊断超时/,
+    );
+    assert.ok(sawSignal, 'complete 应收到组合后的兜底 signal');
+    assert.ok(Date.now() - t0 < 3000, `应按 timeoutMs=80ms 收尾，实际 ${Date.now() - t0}ms`);
+  });
+
+  await checkAsync('runFailureDiagnosis：调用方 signal 中断时按「已中断」收尾（不混淆为超时）', async () => {
+    const ctl = new AbortController();
+    await assert.rejects(
+      runFailureDiagnosis({
+        kanbanUrl: 'http://localhost:1',
+        taskId: 't1',
+        llm: { baseUrl: 'http://localhost:1', apiKey: 'k', model: 'm' },
+        timeoutMs: 60000,
+        signal: ctl.signal,
+        collectContext: async () => ({ taskId: 't1', title: 'T', description: '', attemptSummary: '' }),
+        complete: (_p, _l, signal) =>
+          new Promise<string>((_, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            ctl.abort();
+          }),
+      }),
+      /已中断/,
+    );
   });
 
   finish();

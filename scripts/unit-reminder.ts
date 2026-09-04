@@ -382,6 +382,28 @@ async function main(): Promise<void> {
     assert.ok(text.includes('盯一下构建') && text.includes('2026-09-04 09:30') && text.includes('2026-09-04 10:00'));
   });
 
+  // ---------- 存储：写盘失败留痕 ----------
+  await checkAsync('ReminderStore：mutate 写盘失败时 console.error 留痕且不谎报成功', () => {
+    const tmp = tmpHome('writefail');
+    try {
+      // home 占位为常规文件：reminders.json 的所在目录创建必失败，走 mutate 的 catch 路径
+      const blocker = path.join(tmp, 'not-a-dir');
+      fs.writeFileSync(blocker, 'x');
+      const origErr = console.error;
+      const errLogs: string[] = [];
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      try {
+        const store = new ReminderStore(blocker);
+        assert.throws(() => store.add('u1', '写不进去', NOW_MS), /提醒保存失败/);
+        assert.ok(errLogs.some((m) => m.includes('[reminder] 提醒存储写入失败')), `应留痕，实际日志：${errLogs.join(' | ')}`);
+      } finally {
+        console.error = origErr;
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   finish();
 }
 

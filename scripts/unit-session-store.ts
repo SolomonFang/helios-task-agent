@@ -395,7 +395,7 @@ async function main(): Promise<void> {
         { role: 'user', content: '之前的对话' },
         { role: 'assistant', content: '之前的回复' },
       ]);
-      const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp), undefined, undefined, store);
+      const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp), historyStore: store });
       const msgs = historyOf(router.getOrCreate('ou_x'));
       assert.deepEqual(
         msgs.map((m) => m.role),
@@ -456,6 +456,41 @@ async function main(): Promise<void> {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   })());
+
+  // ---------- drain：等待串行写队列清空（shutdown 用） ----------
+  await checkAsync('SessionHistoryStore：drain 等待 fire-and-forget 的 save 落盘完成', async () => {
+    const tmp = tmpHome('drain');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      void store.save('u1', [{ role: 'user', content: '最后一轮' }]).catch(() => {}); // 模拟 fire-and-forget
+      await store.drain();
+      assert.equal(store.load('u1')[0]?.content, '最后一轮', 'drain 后最后一轮应已落盘');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('SessionHistoryStore：写队列挂死时 drain 按兜底超时返回并留痕', async () => {
+    const tmp = tmpHome('drain-timeout');
+    const origErr = console.error;
+    const errLogs: string[] = [];
+    console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+    try {
+      const store = new SessionHistoryStore(tmp);
+      (store as unknown as { queue: Promise<void> }).queue = new Promise<void>(() => {}); // 永不 settle 的在途写
+      // drain 的兜底定时器是 unref 的（生产侧不拖累退出）：测试进程此时无其他 ref 句柄，
+      // 事件循环清空会以 0 静默退出、后续用例整段丢失——持一个 ref 定时器保活
+      const keepAlive = setInterval(() => {}, 1000);
+      const t0 = Date.now();
+      await store.drain(80);
+      clearInterval(keepAlive);
+      assert.ok(Date.now() - t0 < 3000, `drain 应按兜底超时返回，实际 ${Date.now() - t0}ms`);
+      assert.ok(errLogs.some((m) => m.includes('[session-store] drain')), `超时应留痕，实际：${errLogs.join(' | ')}`);
+    } finally {
+      console.error = origErr;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   finish();
 }

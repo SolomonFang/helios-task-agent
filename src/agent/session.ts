@@ -1,6 +1,7 @@
 import type { KanbanMcp } from '../kanban/mcp';
 import { MemoryStore } from './memory';
 import { ReminderStore } from './reminder';
+import { SourceRegistry } from './source-registry';
 import { createClient, runAgentTurn, trimHistory } from './llm';
 import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
@@ -52,6 +53,8 @@ export class AgentSession {
   private batchedConfirm?: BatchConfirmFn;
   /** 「单会话创建上限」计数：会话级状态，跨 buildRuntime 重建（MCP 重连//config）存活，仅 clearHistory 重置。 */
   private readonly createCounter: CreateCounter = { count: 0 };
+  /** 查重注册表：会话级复用——buildRuntime 每次重建都 new 会同步读盘（构造即 load）。 */
+  private readonly registry = new SourceRegistry();
   private client: OpenAiClient;
   private openAiTools: OpenAiTool[];
   private handlers: ToolHandlers;
@@ -155,6 +158,7 @@ export class AgentSession {
       confirm: this.getConfirm(),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
       createCounter: this.createCounter,
+      registry: this.registry,
     });
     const systemPrompt = buildSystemPrompt(this.promptOpts());
     return {

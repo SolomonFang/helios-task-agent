@@ -1,6 +1,6 @@
 import type { ToolHandler } from '../../types';
 import { classifyLark, looksLikeStrongFailure, passGate, wrapUntrusted, type ConfirmFn } from '../guard';
-import { auditLog, type AuditDecision } from '../../infra/audit';
+import { auditLog } from '../../infra/audit';
 import { run, summarizeBothEnds } from './shared';
 
 /** 确认摘要的高频子命令中文动作（与看板通道 summarizeMcp 口径对齐）；对象标识留在 detail 区。 */
@@ -51,10 +51,10 @@ export function makeLarkCliHandler({
         // 对象级免问：key 绑接收对象/资源 id，批准发给 ou_x 不授权发给 ou_y；无对象则类级
         { kind: 'lark', summary, detail, batchKey, batchScope: target ? 'object' : 'kind', destructive: true },
         confirm,
+        ctx?.signal,
       );
       if (!gate.allowed) {
-        // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容）
-        auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+        auditLog({ user: uid, kind: 'lark', summary, detail, decision: gate.reason }, auditHome);
         return gate.message;
       }
       const out = await run('lark-cli', argv, { signal: ctx?.signal });

@@ -197,6 +197,21 @@ export async function main(): Promise<void> {
     reminderRunner: null,
   };
 
+  /**
+   * 到点提醒的终端投递缓冲：agent 轮次进行中不打断（排队到轮次结束后统一提示），
+   * 空闲时立即打印。声明先于 cleanup：启动早期收到退出信号时 cleanup 也要能 flush，
+   * 否则提醒已 markDelivered 落盘却永久丢失展示。
+   */
+  const pendingReminderTexts: string[] = [];
+  const printReminder = (text: string) => {
+    console.log(`\n${c.warn(text)}`);
+  };
+  const flushPendingReminders = () => {
+    if (!pendingReminderTexts.length) return;
+    for (const text of pendingReminderTexts.splice(0)) printReminder(text);
+    console.log('');
+  };
+
   let cleaningUp = false;
   /**
    * 退出清理：幂等（Ctrl+C 连按 / process+rl 双通道 SIGINT 不重入）+ 8s 强退兜底（对齐 bot 模式）。
@@ -219,6 +234,9 @@ export async function main(): Promise<void> {
     } catch {
       /* 尽力清理，失败照常退出 */
     }
+    // 轮次后直接 /exit（或退出信号）时缓冲提醒尚未 flush，但已 markDelivered 落盘：
+    // 退出前补一次展示，否则这批提醒永久丢失
+    flushPendingReminders();
     // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可。
     // 存活判定与 stopKanbanChild 一致用进程组（kanban-ensure.ts 的 treeAlive）：
     // detached 的 npx 壳可能先退、被 reparent 的看板孙进程仍在组里占端口，exitCode===null 会漏提示；
@@ -377,16 +395,8 @@ export async function main(): Promise<void> {
   /**
    * 到点提醒的终端投递：agent 轮次进行中不打断（排队到轮次结束后统一提示，
    * 避免提醒文本插进 spinner/工具输出中间）；空闲时立即打印。
+   * （缓冲本身在 cleanup 之前声明，退出路径也要 flush，见上。）
    */
-  const pendingReminderTexts: string[] = [];
-  const printReminder = (text: string) => {
-    console.log(`\n${c.warn(text)}`);
-  };
-  const flushPendingReminders = () => {
-    if (!pendingReminderTexts.length) return;
-    for (const text of pendingReminderTexts.splice(0)) printReminder(text);
-    console.log('');
-  };
   const reminderRunner = new ReminderRunner({
     store: reminders,
     deliver: async (_uid, text) => {

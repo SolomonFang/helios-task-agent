@@ -212,7 +212,7 @@ function setup(
     kanbanIteration: '',
   };
   if (extra.visionEnabled) cfg.visionEnabled = true;
-  const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+  const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
   const confirmPrompts: Fixture['confirmPrompts'] = [];
   // 与 bot-main 同款：随确认发送记录每用户最近写操作 kind，供免问回执按 kind 细化措辞
   const lastWriteKind = new Map<string, ConfirmRequest['kind']>();

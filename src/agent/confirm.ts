@@ -121,8 +121,12 @@ export class ConfirmationManager {
     return req.destructive ? Math.max(base, this.opts.destructiveTimeoutMs ?? 300000) : base;
   }
 
-  /** Called from the write gate; resolves the user's verdict ('once' / 'batch' / false). */
-  request(openId: string, req: ConfirmRequest): Promise<ConfirmVerdict> {
+  /**
+   * Called from the write gate; resolves the user's verdict ('once' / 'batch' / false).
+   * signal：轮次级中断（/stop 或墙钟看门狗）——abort 时走 cancel() 同一路径按拒绝收尾，
+   * 否则工具会卡在确认等待上直到确认超时（最长 300s），轮次墙钟形同虚设。
+   */
+  request(openId: string, req: ConfirmRequest, signal?: AbortSignal): Promise<ConfirmVerdict> {
     const prev = this.pendings.get(openId);
     if (prev) {
       clearTimeout(prev.timer);
@@ -158,7 +162,7 @@ export class ConfirmationManager {
           } catch {
             /* 通知回调失败不阻断收尾 */
           } finally {
-            resolve(false);
+            p.resolve(false);
           }
           if (!p.cardMessageId) p.settledWithoutCard = 'timeout';
         }
@@ -166,8 +170,32 @@ export class ConfirmationManager {
       // unref：确认超时（最长 300s）不应成为保活理由——进程若只剩这一个定时器
       //（如 shutdown 途中）应能直接退出，超时自动拒绝只是用户体验优化而非存活义务
       timer.unref();
-      const pending: Pending = { id, req, resolve, timer };
+      // 轮次中断监听：所有收尾路径（答复/超时/被替代/发送失败/abort）都经 pending.resolve，
+      // 在包装里统一摘除监听器，避免在 turn 级 signal 上滞留
+      let onAbort: (() => void) | undefined;
+      const pending: Pending = {
+        id,
+        req,
+        resolve: (v) => {
+          if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+          resolve(v);
+        },
+        timer,
+      };
       this.pendings.set(openId, pending);
+      if (signal) {
+        if (signal.aborted) {
+          // 轮次已中断：不发送确认请求，直接按拒绝收尾
+          clearTimeout(timer);
+          this.pendings.delete(openId);
+          resolve(false);
+          return;
+        }
+        onAbort = () => {
+          this.cancel(openId); // 与 /stop 一并取消同路径：按拒绝收尾并留痕
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
       void this.sendPrompt(openId, this.chatIds.get(openId), req, id, timeoutMs)
         .then((messageId) => {
           // 回填卡片 message id 前确认 pending 仍是这一条（可能已被答复/替代）
@@ -197,7 +225,7 @@ export class ConfirmationManager {
           if (p && p.id === id) {
             clearTimeout(p.timer);
             this.pendings.delete(openId);
-            resolve(false);
+            p.resolve(false);
             try {
               this.opts.onSendFailed?.(openId, req, message);
             } catch {

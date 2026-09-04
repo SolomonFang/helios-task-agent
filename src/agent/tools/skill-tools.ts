@@ -2,7 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import type { ToolHandler } from '../../types';
 import { looksLikeStrongFailure, passGate, wrapUntrusted, type ConfirmFn } from '../guard';
-import { auditLog, type AuditDecision } from '../../infra/audit';
+import { auditLog } from '../../infra/audit';
 import { readSkillDoc, resolveSkillDir } from '../skills';
 import { ALLOWED_INTERPRETERS, run, SCRIPT_INTERPRETERS, summarizeBothEnds, truncate } from './shared';
 
@@ -63,10 +63,13 @@ export function makeSkillExecHandler({
     // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定脚本与实际参数
     //（与 hk_cli 的 hk:tasks delete:<id> 同口径——授权 key 绑定操作对象，换参数需重新确认）
     const batchKey = `skill:${skill}/${script}${argv.length ? `:${argv.join(' ')}` : ''}`;
-    const gate = await passGate({ kind: 'skill', summary, detail, batchKey, batchScope: 'object', destructive: true }, confirm);
+    const gate = await passGate(
+      { kind: 'skill', summary, detail, batchKey, batchScope: 'object', destructive: true },
+      confirm,
+      ctx?.signal,
+    );
     if (!gate.allowed) {
-      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容）
-      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     const out = await run(interpreter, [scriptReal, ...argv], { signal: ctx?.signal, cwd: rootReal });

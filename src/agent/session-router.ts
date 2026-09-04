@@ -6,14 +6,26 @@ import type { ReminderStore } from './reminder';
 import { AgentSession } from './session';
 import type { SessionHistoryStore } from './session-store';
 
+/** SessionRouter 的可选装配项（options 对象形态，参照 AgentSessionOptions）。 */
+export interface SessionRouterOptions {
+  memory?: MemoryStore;
+  confirmFactory?: (openId: string) => ConfirmFn;
+  /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
+  reportLinkBaseUrl?: string;
+  /** 会话历史持久化：新建会话时恢复磁盘历史，LRU 淘汰后文件保留（下次说话可恢复）。 */
+  historyStore?: SessionHistoryStore;
+  /** 提醒存储：透传给每个会话（reminder_* 工具）；缺省由会话按默认路径自建。 */
+  reminders?: ReminderStore;
+}
+
 /**
  * One AgentSession per Feishu open_id; serializes messages per user.
  * 会话数设上限（LRU 淘汰最旧的空闲会话），防止长驻 bot 无界累积。
  */
 export class SessionRouter {
-  private static MAX_SESSIONS = 50;
+  private static readonly MAX_SESSIONS = 50;
   /** 每用户排队消息上限：超出拒收（handler 层据此回复「排队已满」），防止队列无界堆积。 */
-  private static MAX_QUEUED = 20;
+  private static readonly MAX_QUEUED = 20;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly queues = new Map<string, Promise<void>>();
   /** 每用户排队代际：/stop 时 +1，未开始的排队项据此自我丢弃。 */
@@ -33,23 +45,16 @@ export class SessionRouter {
     cfg: AgentConfig,
     mcp: KanbanMcp | null,
     mcpOk: boolean,
-    memory?: MemoryStore,
-    confirmFactory?: (openId: string) => ConfirmFn,
-    /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
-    reportLinkBaseUrl?: string,
-    /** 会话历史持久化：新建会话时恢复磁盘历史，LRU 淘汰后文件保留（下次说话可恢复）。 */
-    historyStore?: SessionHistoryStore,
-    /** 提醒存储：透传给每个会话（reminder_* 工具）；缺省由会话按默认路径自建。 */
-    reminders?: ReminderStore,
+    options: SessionRouterOptions = {},
   ) {
     this.cfg = cfg;
     this.mcp = mcp;
     this.mcpOk = mcpOk;
-    this.memory = memory || new MemoryStore();
-    this.confirmFactory = confirmFactory;
-    this.reportLinkBaseUrl = reportLinkBaseUrl;
-    this.historyStore = historyStore;
-    this.reminders = reminders;
+    this.memory = options.memory || new MemoryStore();
+    this.confirmFactory = options.confirmFactory;
+    this.reportLinkBaseUrl = options.reportLinkBaseUrl;
+    this.historyStore = options.historyStore;
+    this.reminders = options.reminders;
   }
 
   getOrCreate(openId: string): AgentSession {

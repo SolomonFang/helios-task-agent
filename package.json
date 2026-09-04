@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
-    "test": "tsx scripts/unit.ts && tsx scripts/unit-safety.ts && tsx scripts/unit-kanban.ts && tsx scripts/unit-resilience.ts && tsx scripts/unit-bot.ts && tsx scripts/unit-handler.ts && tsx scripts/unit-coverage.ts && tsx scripts/unit-feishu-filter.ts && tsx scripts/unit-daily-brief.ts && tsx scripts/unit-weekly-brief.ts && tsx scripts/unit-session-store.ts && tsx scripts/unit-repo-fs.ts && tsx scripts/unit-tools.ts && tsx scripts/unit-stale-diagnosis.ts && tsx scripts/unit-reports.ts && tsx scripts/unit-reminder.ts",
+    "test": "fail=''; for t in unit unit-safety unit-kanban unit-resilience unit-bot unit-handler unit-coverage unit-feishu-filter unit-daily-brief unit-weekly-brief unit-session-store unit-repo-fs unit-tools unit-stale-diagnosis unit-reports unit-reminder; do tsx \"scripts/$t.ts\" || fail=\"$fail $t\"; done; if [ -n \"$fail\" ]; then echo \"\"; echo \"失败的测试套件：$fail\"; exit 1; fi",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",

@@ -352,7 +352,7 @@ async function run(): Promise<void> {
           kanbanRepoId: '',
           kanbanIteration: '',
         };
-        const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+        const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
         const confirmations = new ConfirmationManager(async () => undefined, { timeoutMs: 1000 });
         const channel = new FakeChannel();
         const fakeMcp = { tools: [] } as unknown as KanbanMcp;

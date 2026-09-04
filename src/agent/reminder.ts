@@ -253,7 +253,9 @@ export class ReminderStore {
       }
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(file, null, 2) + '\n');
       return true;
-    } catch {
+    } catch (err) {
+      // fn 内部编程错误与写盘失败都落在这里：返回 false 让调用方显式报错，但至少留痕，不得静默吞掉
+      console.error(`[reminder] 提醒存储写入失败: ${errMessage(err)}`);
       return false;
     }
   }

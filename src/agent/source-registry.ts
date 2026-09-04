@@ -36,12 +36,31 @@ export function extractSourceUrls(text: string): string[] {
   return [...new Set(matches.map((u) => u.replace(/[/.]+$/, '')))];
 }
 
+/**
+ * 组合调用方 signal 与 8s 超时兜底：任一触发即中断（与 kanban/http.ts 同思路；
+ * AbortSignal.any 需 Node 20.3+，engines 只要求 >=20，故手写等价组合——ctl 触发时
+ * 摘掉调用方 signal 上的监听器，不随高频调用滞留）。
+ */
+function combinedFetchSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeout;
+  if (signal.aborted) return signal;
+  const ctl = new AbortController();
+  const onCallerAbort = (): void => ctl.abort();
+  signal.addEventListener('abort', onCallerAbort, { once: true });
+  timeout.addEventListener('abort', () => ctl.abort(), { once: true });
+  ctl.signal.addEventListener('abort', () => signal.removeEventListener('abort', onCallerAbort), { once: true });
+  return ctl.signal;
+}
+
 /** Existence check before honoring a recorded mapping (self-heals after manual deletes). */
-export async function kanbanTaskExists(kanbanUrl: string, taskId: string): Promise<boolean> {
+export async function kanbanTaskExists(kanbanUrl: string, taskId: string, signal?: AbortSignal): Promise<boolean> {
   try {
     const base = kanbanUrl.replace(/\/+$/, '');
     // taskId 来自盘上文件（可能被手改），编码后才拼进 URL，防止注入路径段
-    const res = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}`, { signal: AbortSignal.timeout(8000) });
+    const res = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}`, {
+      signal: combinedFetchSignal(signal, 8000),
+    });
     if (res.status === 404) return false;
     if (!res.ok) return true; // unknown → conservative: keep blocking
     const json: unknown = await res.json();

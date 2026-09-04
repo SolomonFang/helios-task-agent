@@ -140,6 +140,46 @@ function skillEntries(baseDirs: string[] = defaultSkillBaseDirs()): Array<{ dirN
   return out;
 }
 
+/** 技能块注入系统提示词的总字符预算：超出时技能条目降级为 name+description（完整文档始终可 skill_doc 按需读取）。 */
+const SKILLS_BLOCK_MAX_CHARS = 12_000;
+
+/**
+ * 技能摘要缓存：prompt 重建频繁（构造/applyConfig/setMcpOk/每次记忆写入），
+ * 每次全量 readdir + 读遍所有 SKILL.md 太贵。按目录内容指纹失效：技能目录清单 +
+ * 各 SKILL.md 的 mtimeNs:size（与 source-registry 的磁盘缓存同一思路——时间戳粒度
+ * 有限，叠加 size 识别同刻度改写）。install/uninstall 另做显式失效兜底。
+ */
+let digestCache: { fingerprint: string; digests: SkillDigest[] } | null = null;
+
+function skillsFingerprint(baseDirs: string[]): string {
+  const parts: string[] = [];
+  for (const base of baseDirs) {
+    parts.push(base);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true });
+    } catch {
+      parts.push('<missing>');
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      try {
+        const s = fs.statSync(path.join(base, e.name, 'SKILL.md'), { bigint: true });
+        parts.push(`${e.name}@${s.mtimeNs}:${s.size}`);
+      } catch {
+        parts.push(`${e.name}@<none>`);
+      }
+    }
+  }
+  return parts.join('|');
+}
+
+/** 显式失效技能摘要缓存（install/uninstall 后调用，兜底文件系统时间戳粒度）。 */
+export function invalidateSkillDigestCache(): void {
+  digestCache = null;
+}
+
 /**
  * 扫描 <用户数据目录>/skills 与包内 skills/ 下的 <name>/SKILL.md，为每个技能生成注入系统提示词的紧凑摘要。
  * 新增技能 = 在 <数据目录>/skills/ 下放一个含 SKILL.md（带 frontmatter）的目录，无需改代码：
@@ -148,12 +188,15 @@ function skillEntries(baseDirs: string[] = defaultSkillBaseDirs()): Array<{ dirN
  * - 完整文档留在磁盘，用 skill_doc 工具按需读取（渐进式披露）。
  */
 export function loadSkillDigests(): SkillDigest[] {
+  const fingerprint = skillsFingerprint(defaultSkillBaseDirs());
+  if (digestCache && digestCache.fingerprint === fingerprint) return [...digestCache.digests];
   const digests: SkillDigest[] = [];
   for (const { dirName, absDir } of skillEntries()) {
     const loaded = loadSkill(absDir, dirName);
     if (loaded) digests.push(loaded.digest);
   }
-  return digests;
+  digestCache = { fingerprint, digests };
+  return [...digests];
 }
 
 /** 启动期/测试期校验：返回所有技能的契约问题（空数组 = 全部健康）。baseDirs 缺省扫描用户目录 + 包内目录，测试可只传包内目录隔离用户环境。 */
@@ -174,17 +217,21 @@ export function renderSkillsBlock(): string {
     '# 已安装技能\n\n' +
     '以下技能已安装（用户目录 skills/ 优先，包内内置兜底）。此处只含 description 与关键章节摘要；需要完整细节时用 `skill_doc` 工具读取全文，不要臆造用法。' +
     '技能若自带脚本（node/shell/python 等），按文档说明用 `skill_exec` 工具运行（每次执行都会向用户弹确认）。';
-  const blocks = digests.map((s) =>
+  const renderEntry = (s: SkillDigest, withDigest: boolean): string =>
     [
       `## 技能：${s.name}`,
       s.description,
-      s.digest,
+      withDigest ? s.digest : '',
       `完整文档：\`${s.dir}/SKILL.md\`（用 skill_doc 读取）`,
     ]
       .filter(Boolean)
-      .join('\n\n'),
-  );
-  return [header, ...blocks].join('\n\n');
+      .join('\n\n');
+  let block = [header, ...digests.map((s) => renderEntry(s, true))].join('\n\n');
+  if (block.length > SKILLS_BLOCK_MAX_CHARS) {
+    // 总预算超出：条目降级为 name+description，保住路由依据，细节靠 skill_doc 按需读取
+    block = [header, ...digests.map((s) => renderEntry(s, false))].join('\n\n');
+  }
+  return block;
 }
 
 /** 随包发布的内置技能目录名：启动迁移时跳过；发布新内置技能时需加入此列表。 */
@@ -236,6 +283,7 @@ export function installSkill(srcPath: string): { name: string; dir: string; repl
   const replaced = fs.existsSync(dest);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.renameSync(tmpDest, dest);
+  invalidateSkillDigestCache();
   return { name, dir: dest, replaced };
 }
 
@@ -251,6 +299,7 @@ export function uninstallSkill(name: string): void {
     throw new Error(`未找到技能「${trimmed}」（${userSkillsDir()} 下不存在）`);
   }
   fs.rmSync(dir, { recursive: true, force: true });
+  invalidateSkillDigestCache();
 }
 
 /**

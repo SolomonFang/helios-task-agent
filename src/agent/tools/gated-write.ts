@@ -1,5 +1,5 @@
 import { looksLikeStrongFailure, passGate, wrapUntrusted, type ConfirmFn } from '../guard';
-import { auditLog, type AuditDecision } from '../../infra/audit';
+import { auditLog } from '../../infra/audit';
 import { SourceRegistry, kanbanTaskExists } from '../source-registry';
 import { extractWorkspaceId, waitForWorkspaceReady } from '../../kanban/workspace-ready';
 import { extractUuid } from './shared';
@@ -41,7 +41,8 @@ export interface GatedWriteParams {
   isStart: boolean;
   urls: string[];
   title: string;
-  batchKey: string;
+  /** 「同类免问」key；缺省（undefined）= 本次不提供免问（写工具缺可识别对象 id 时 fail-closed）。 */
+  batchKey?: string;
   /** 「同类免问」粒度（见 guard.ConfirmRequest.batchScope）：类级或对象级，由 key 生成处一并给出。 */
   batchScope: 'kind' | 'object';
   /** 破坏性/高影响操作：确认超时放宽（见 guard.isDestructive 与 ConfirmRequest.destructive）。 */
@@ -82,7 +83,7 @@ export function makeGatedWriter({
    * CLI 与 bot 两个进程并发同步同一来源时可双双通过查重、各建一个任务。
    * 单进程内串行（事件循环 + 同用户串行队列），风险仅限跨进程并发；当前以注释明示，不改行为。
    */
-  const checkDuplicates = async (urls: string[]): Promise<string | null> => {
+  const checkDuplicates = async (urls: string[], signal?: AbortSignal): Promise<string | null> => {
     for (const url of urls) {
       const hit = registry.lookup(uid, url);
       if (!hit) continue;
@@ -93,7 +94,7 @@ export function makeGatedWriter({
         registry.remove(uid, url);
         continue;
       }
-      const exists = await kanbanTaskExists(kanbanUrl, hit.taskId);
+      const exists = await kanbanTaskExists(kanbanUrl, hit.taskId, signal);
       if (exists) {
         // 存储层保持 ISO 不动（source-registry 持久化格式）；展示转本地时区（同 report 层做法）
         const createdShort = new Date(hit.createdAt).toLocaleString('zh-CN', { hour12: false });
@@ -120,7 +121,7 @@ export function makeGatedWriter({
 
   return async (p) => {
     if (p.urls.length) {
-      const dup = await checkDuplicates(p.urls);
+      const dup = await checkDuplicates(p.urls, p.signal);
       if (dup) {
         auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'blocked_dup' }, auditHome);
         return dup;
@@ -140,11 +141,10 @@ export function makeGatedWriter({
     const gate = await passGate(
       { kind: p.kind, summary: p.summary, detail: p.detail(), batchKey: p.batchKey, batchScope: p.batchScope, destructive: p.destructive },
       confirm,
+      p.signal, // 轮次中断（/stop/墙钟）时确认按拒绝收尾，不干等确认超时
     );
     if (!gate.allowed) {
-      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容，
-      // 审计得以区分「用户拒绝」与「超时未处理/被替代」）
-      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason }, auditHome);
       return gate.message;
     }
     let result = await p.execute();

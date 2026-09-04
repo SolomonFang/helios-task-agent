@@ -12,10 +12,12 @@ import { MemoryStore } from '../src/agent/memory';
 import { readSkillDoc } from '../src/agent/skills';
 import { isValidGitRef } from '../src/kanban/ai-review';
 import { buildTools, summarizeBothEnds } from '../src/agent/tools';
-import { classifyLark, looksLikeStrongFailure, passGate, DENIED_MESSAGE, SUPERSEDED_MESSAGE } from '../src/agent/guard';
+import { classifyLark, looksLikeStrongFailure, passGate, withBatchApproval, DENIED_MESSAGE, SUPERSEDED_MESSAGE } from '../src/agent/guard';
 import { ConfirmationManager } from '../src/agent/confirm';
 import { makeGatedWriter } from '../src/agent/tools/gated-write';
-import { SourceRegistry } from '../src/agent/source-registry';
+import { SourceRegistry, kanbanTaskExists } from '../src/agent/source-registry';
+import http from 'http';
+import type { AddressInfo } from 'net';
 import { kanbanPackageSpec, DEFAULT_KANBAN_PACKAGE } from '../src/infra/deps';
 import { check, checkAsync, finish } from './testkit';
 
@@ -548,6 +550,25 @@ async function main() {
       classifyLark(['im', 'send', '--help']) === 'write', // 写动词不豁免（回归）
   );
 
+  // ---------- classifyLark：skills/help/schema/doctor 只豁免已确认读形态（fail-closed） ----------
+  check(
+    'classifyLark：skills 命令组收窄豁免——裸/list/read 判 read，未知子命令判写',
+    classifyLark(['skills']) === 'read' &&
+      classifyLark(['skills', 'list']) === 'read' &&
+      classifyLark(['skills', 'read', 'lark-im']) === 'read' &&
+      classifyLark(['skills', 'install', 'evil-skill']) === 'write' && // 未来新增写子命令不得静默绕过闸门
+      classifyLark(['skills', 'frobnicate']) === 'write',
+  );
+  check(
+    'classifyLark：schema/doctor 仅裸形态豁免，help 路径含写动词不豁免',
+    classifyLark(['schema']) === 'read' &&
+      classifyLark(['doctor']) === 'read' &&
+      classifyLark(['schema', 'explode']) === 'write' && // 带子命令的未知形态 fail-closed
+      classifyLark(['help']) === 'read' &&
+      classifyLark(['help', 'task', 'list']) === 'read' && // help <读命令路径> 仍只读
+      classifyLark(['help', 'im', 'send']) === 'write', // 路径含写动词不豁免
+  );
+
   // ---------- classifyLark：本地落盘 flag（--output/-o/--output-dir）一律判写 ----------
   check(
     'classifyLark：读命令携带落盘 flag（含等号形态）判写，不经确认不得覆盖本地文件',
@@ -590,7 +611,143 @@ async function main() {
     mgr.cancel('u2'); // 清理 u2 的 pending，避免悬挂定时器
   });
 
-  // ---------- 强失败判定：正文不误判、行首/上下文形态命中、中断判失败 ----------
+  // ---------- 写确认闸门：轮次中断（AbortSignal）按拒绝收尾，不干等确认超时 ----------
+  await checkAsync('ConfirmationManager.request：abort 前已中断直接拒；pending 期间 abort 走 cancel 路径按拒绝收尾', async () => {
+    const settles: string[] = [];
+    const sent: string[] = [];
+    const mgr = new ConfirmationManager(async () => {
+      sent.push('prompt');
+      return undefined;
+    }, { onSettled: (_u, _r, settle) => settles.push(settle) });
+
+    // 轮次已中断：不发送确认请求，直接按拒绝收尾
+    const pre = new AbortController();
+    pre.abort();
+    assert.equal(await mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' }, pre.signal), false);
+    assert.equal(sent.length, 0, '已中断的轮次不得再发确认请求');
+
+    // pending 期间 abort：复用 cancel() 路径，按拒绝收尾（settle='denied'），promise 立即释放
+    const ctl = new AbortController();
+    const verdict = mgr.request('u2', { kind: 'kanban', summary: 's', detail: 'd' }, ctl.signal);
+    assert.equal(mgr.hasPending('u2'), true);
+    ctl.abort();
+    assert.equal(await verdict, false, 'abort 应按拒绝收尾');
+    assert.equal(mgr.hasPending('u2'), false, 'abort 后不得残留 pending');
+    assert.deepEqual(settles, ['denied'], `abort 终态应为 denied，实际 ${JSON.stringify(settles)}`);
+
+    // 正常答复路径不受影响（监听器随收尾摘除）
+    const ctl2 = new AbortController();
+    const v2 = mgr.request('u3', { kind: 'kanban', summary: 's', detail: 'd' }, ctl2.signal);
+    mgr.resolveFromText('u3', '确认');
+    assert.equal(await v2, 'once');
+  });
+
+  // ---------- passGate：signal 透传给 ConfirmFn ----------
+  await checkAsync('passGate：轮次 signal 透传至 ConfirmFn（工具卡在确认等待时墙钟可掐断）', async () => {
+    const ctl = new AbortController();
+    let got: AbortSignal | undefined;
+    const gate = await passGate(
+      { kind: 'kanban', summary: 's', detail: 'd' },
+      async (_req, signal) => {
+        got = signal;
+        return 'once';
+      },
+      ctl.signal,
+    );
+    assert.ok(gate.allowed);
+    assert.equal(got, ctl.signal, 'ConfirmFn 应收到透传的 signal');
+  });
+
+  // ---------- kanbanTaskExists：turn signal 与 8s 超时组合，abort 立即返回（保守拦截语义） ----------
+  await checkAsync('kanbanTaskExists：在途 fetch 随 turn signal 中断，不等 8s 超时', async () => {
+    const server = http.createServer(() => {
+      /* 永不响应：只能被 signal 掐断 */
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const ctl = new AbortController();
+      const started = Date.now();
+      const p = kanbanTaskExists(`http://127.0.0.1:${port}`, 'task-1', ctl.signal);
+      setTimeout(() => ctl.abort(), 50);
+      const exists = await p;
+      assert.ok(Date.now() - started < 3000, `abort 应立即结束 fetch，实际耗时 ${Date.now() - started}ms`);
+      assert.equal(exists, true, '中断按保守语义返回 true（保持拦截）');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // ---------- memory 写操作「同类免问」收窄：对象级 key，备注不提供免问 ----------
+  await checkAsync('memory 闸门：免问 key 绑定具体记忆 key（对象级），memory_note 不提供免问', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-memkey-'));
+    try {
+      const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        memory: new MemoryStore(tmp),
+        userId: 'u1',
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+        confirm: async (req) => {
+          seen.push({ batchKey: req.batchKey, batchScope: req.batchScope });
+          return false; // 闸门即拒，不落盘
+        },
+      });
+      await handlers.get('memory_set')!({ key: 'Alpha', value: 'v1' });
+      await handlers.get('memory_set')!({ key: 'beta', value: 'v2' });
+      await handlers.get('memory_delete')!({ key: 'Alpha' });
+      await handlers.get('memory_note')!({ text: 'n' });
+      assert.deepEqual(
+        seen,
+        [
+          // key 用归一化后的存储键（trim + 标记中和，同 setFact 落盘键），不同 key 各自确认
+          { batchKey: 'memory:set:Alpha', batchScope: 'object' },
+          { batchKey: 'memory:set:beta', batchScope: 'object' },
+          { batchKey: 'memory:delete:Alpha', batchScope: 'object' },
+          { batchKey: undefined, batchScope: undefined }, // 备注无 key 可绑，不提供免问
+        ],
+        `实际 seen=${JSON.stringify(seen)}`,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- memory 免问匹配：批准 key A 不免问 key B（对象级，guard.ts withBatchApproval 对齐） ----------
+  await checkAsync('withBatchApproval：memory 对象级 key 免问只放行同一 key，memory_note 永远确认', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-membatch-'));
+    try {
+      let asks = 0;
+      const confirm = withBatchApproval(async () => {
+        asks++;
+        return 'batch'; // 用户总是选「同类免问」
+      });
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        memory: new MemoryStore(tmp),
+        userId: 'u1',
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+        confirm,
+      });
+      const set = handlers.get('memory_set')!;
+      const note = handlers.get('memory_note')!;
+      await set({ key: 'k1', value: 'v' }); // 问（第 1 次）
+      await set({ key: 'k1', value: 'v2' }); // 免问：同 key
+      await set({ key: 'k2', value: 'v' }); // 问：换 key 不得借授权（第 2 次）
+      await note({ text: 'n1' }); // 问：无 batchKey（第 3 次）
+      await note({ text: 'n2' }); // 仍问：备注不提供免问（第 4 次）
+      assert.equal(asks, 4, `实际确认次数 ${asks}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+
   check(
     'looksLikeStrongFailure：正文提到 not found/denied/API error 不误判，行首/上下文形态仍命中，⏹ 已中断判失败',
     !looksLikeStrongFailure('已创建任务：补充 not found handling 与 denied 重试逻辑') && // 正文文本不误判

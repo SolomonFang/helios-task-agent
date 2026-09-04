@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { errMessage } from '../infra/err';
+import { truncate as truncateOutput } from './tools/shared';
 
-const MAX_OUTPUT = 8000;
 const MAX_GREP_HITS = 40;
 const MAX_LIST_ENTRIES = 200;
 const MAX_READ_BYTES = 200_000;
@@ -16,10 +16,7 @@ const GREP_YIELD_EVERY_FILES = 100;
 // V8 同步正则遇超长行会卡死 bot 主循环；命中展示本就截 200 字符，限长不影响可读性
 const MAX_GREP_LINE_CHARS = 2000;
 
-export function truncateOutput(s: string, max = MAX_OUTPUT): string {
-  return s.length > max ? s.slice(0, max) + `\n…（输出过长，已截断，共 ${s.length} 字符）` : s;
-}
-
+// 输出截断统一引用 tools/shared.ts 的 truncate（8000 字符上限 + 相同文案，单一来源）
 /** 原始错误（英文堆栈/响应体）进日志：用户面只给可执行出路，不落原文（同 confirm.ts/session.ts 的 [tag] 惯例）。 */
 function logRepoFsError(context: string, detail: unknown): void {
   console.error(`[repo-fs] ${context}: ${typeof detail === 'string' ? detail : errMessage(detail)}`);

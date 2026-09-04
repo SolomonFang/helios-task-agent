@@ -2,7 +2,7 @@ import type { ToolHandler } from '../../types';
 import type { MemoryStore } from '../memory';
 import { normalizeFactKey } from '../memory';
 import { passGate, type ConfirmFn } from '../guard';
-import { auditLog, type AuditDecision } from '../../infra/audit';
+import { auditLog } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 
@@ -20,23 +20,25 @@ export function makeMemoryHandlers({
   auditHome?: string;
   onMemoryChange?: () => void;
 }): Array<[string, ToolHandler]> {
-  const memorySet: ToolHandler = async (raw) => {
+  const memorySet: ToolHandler = async (raw, ctx) => {
     const key = typeof raw.key === 'string' ? raw.key : '';
     if (!key.trim()) return '参数错误：key 不能为空';
     // 与空 key 同口径：缺失/非字符串/空 value 直接报参数错误，不静默写空串
     if (typeof raw.value !== 'string' || !raw.value) return '参数错误：value 不能为空';
     const value = raw.value;
-    // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value
+    // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value。
+    // 「同类免问」绑定具体 key（对象级）：免问一次不得放行本会话任意 key 的记忆写
+    const storedKey = normalizeFactKey(key);
     const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
     // 确认卡片 detail 用中文两行（不拼 key=value 伪调用串——用户面不出现代码形态）
     const detail = summarizeBothEnds(`键：${key.trim()}\n值：${value}`);
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:set', batchScope: 'kind', destructive: true },
+      { kind: 'memory', summary, detail, batchKey: `memory:set:${storedKey}`, batchScope: 'object', destructive: true },
       confirm,
+      ctx?.signal,
     );
     if (!gate.allowed) {
-      // gate.reason 按字符串透传（guard.ts 并行扩展 'timeout'/'superseded' 后此处自动兼容）
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     try {
@@ -44,7 +46,6 @@ export function makeMemoryHandlers({
       onMemoryChange?.();
       auditLog({ user: uid, kind: 'memory', summary, detail, decision: 'approved' }, auditHome);
       // echo 实际存储值（经 clampEntry + 标记中和，可能与入参不同），key 用归一化后的存储键
-      const storedKey = normalizeFactKey(key);
       return JSON.stringify({ ok: true, key: storedKey, value: user.facts[storedKey], facts: user.facts });
     } catch (err) {
       // setFact 在 persist 失败时抛异常：失败落审计并如实回报，不谎报 ok:true
@@ -66,18 +67,20 @@ export function makeMemoryHandlers({
     return JSON.stringify({ facts: user.facts, notes: user.notes });
   };
 
-  const memoryDelete: ToolHandler = async (raw) => {
+  const memoryDelete: ToolHandler = async (raw, ctx) => {
     const key = typeof raw.key === 'string' ? raw.key.trim() : '';
     if (!key) return '参数错误：key 不能为空';
-    // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门
+    // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门；
+    // 免问绑定具体 key（对象级），防借一次授权删除任意记忆
     const summary = `删除记忆「${key}」`;
     const detail = `键：${key}`;
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:delete', batchScope: 'kind', destructive: true },
+      { kind: 'memory', summary, detail, batchKey: `memory:delete:${normalizeFactKey(key)}`, batchScope: 'object', destructive: true },
       confirm,
+      ctx?.signal,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     try {
@@ -92,17 +95,19 @@ export function makeMemoryHandlers({
     }
   };
 
-  const memoryNote: ToolHandler = async (raw) => {
+  const memoryNote: ToolHandler = async (raw, ctx) => {
     const text = typeof raw.text === 'string' ? raw.text : '';
-    // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门
+    // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门；
+    // 备注无 key 可绑定，不提供「同类免问」（无 batchKey 时卡片/词表裁决不出 batch 分支）
     const summary = `追加记忆备注：${text.slice(0, 100)}`;
     const detail = summarizeBothEnds(`备注：${text}`);
     const gate = await passGate(
-      { kind: 'memory', summary, detail, batchKey: 'memory:note', batchScope: 'kind', destructive: true },
+      { kind: 'memory', summary, detail, destructive: true },
       confirm,
+      ctx?.signal,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason as AuditDecision }, auditHome);
+      auditLog({ user: uid, kind: 'memory', summary, detail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     try {

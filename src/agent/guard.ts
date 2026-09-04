@@ -39,7 +39,11 @@ export interface ConfirmRequest {
  * 默认批准不再隐式开启批量免问——用户必须显式选择「同类免问」（知情权 + 发现性）。
  */
 export type ConfirmVerdict = 'once' | 'batch' | false;
-export type ConfirmFn = (req: ConfirmRequest) => Promise<ConfirmVerdict>;
+/**
+ * signal：轮次级中断（/stop 或墙钟看门狗）。实现方应在 abort 时按拒绝收尾，
+ * 不得让闸门 promise 继续挂到确认超时（最长 300s）。
+ */
+export type ConfirmFn = (req: ConfirmRequest, signal?: AbortSignal) => Promise<ConfirmVerdict>;
 
 /**
  * 确认请求的终态：once/batch = 批准；denied = 用户取消（含 /stop 一并取消）；
@@ -97,9 +101,9 @@ export interface BatchConfirmFn extends ConfirmFn {
  */
 export function withBatchApproval(confirm: ConfirmFn): BatchConfirmFn {
   const approved = new Set<string>();
-  const fn = (async (req) => {
+  const fn = (async (req, signal) => {
     if (req.batchKey && approved.has(req.batchKey)) return 'batch';
-    const verdict = await confirm(req);
+    const verdict = await confirm(req, signal);
     if (verdict === 'batch' && req.batchKey) approved.add(req.batchKey);
     return verdict;
   }) as BatchConfirmFn;
@@ -146,11 +150,11 @@ export function markTimedOut(req: ConfirmRequest): void {
 }
 
 /** Ask the confirmation channel; fail closed on missing channel or errors. */
-export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefined): Promise<GateResult> {
+export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefined, signal?: AbortSignal): Promise<GateResult> {
   if (!confirm) return { allowed: false, reason: 'no_gate', message: NO_GATE_MESSAGE };
   let ok = false;
   try {
-    ok = (await confirm(req)) !== false;
+    ok = (await confirm(req, signal)) !== false;
   } catch {
     ok = false;
   }
@@ -211,9 +215,24 @@ export function classifyLark(args: string[]): 'read' | 'write' {
     return 'write';
   }
   const first = args[0]!;
-  // 注意：`update`（lark-cli 自我更新 = 替换本机代码）不在此列，按写操作走闸门
-  if (['--help', '-h', '--version', '-v', 'help', 'schema', 'doctor', 'skills'].includes(first)) {
+  // --help/--version 类开关：纯本地输出，判 read。
+  // 注意：`update`（lark-cli 自我更新 = 替换本机代码）不在豁免之列，按写操作走闸门
+  if (['--help', '-h', '--version', '-v'].includes(first)) {
     return 'read';
+  }
+  // skills/help/schema/doctor 只豁免已确认的读形态：lark-cli 是独立升级的第三方 CLI，
+  // 未来若在这些命令组下新增有副作用的子命令，提前 return 会静默绕过闸门——未知形态
+  // 一律落入下方写动词判定（fail-closed，未命中读动词即判写）
+  if (first === 'skills') {
+    // 已确认读形态：裸 skills、skills list、skills read/show/info/get <name>
+    const sub = args[1];
+    if (sub === undefined || ['list', 'read', 'show', 'info', 'get'].includes(sub)) return 'read';
+  } else if (first === 'schema' || first === 'doctor') {
+    // 仅豁免裸形态（整体 dump/诊断）；带子命令/参数的形态 fail-closed
+    if (args.length === 1) return 'read';
+  } else if (first === 'help') {
+    // help <命令路径> 仍只读；路径含写动词时不豁免（防御未来语义变化），落入下方判定
+    if (!larkVerbs(args.slice(1)).some((v) => LARK_WRITE_VERBS.has(v))) return 'read';
   }
   // 帮助仅在「命令路径 + --help/-h 收尾」形态下判 read（如 ["task","list","--help"]）；
   // 携带其它实参时不得免确认——防止写命令夹带 --help 绕过闸门（如 ["im","send","ou_x","--help"]）

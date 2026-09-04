@@ -53,6 +53,9 @@ const AI_REVIEW_MAX_CONCURRENT = 2;
 /** 失败诊断全局并发上限：单次 LLM 调用（最长 6 分钟），与 AI 审查同量级控制。 */
 const DIAGNOSIS_MAX_CONCURRENT = 2;
 
+/** 进程级诊断状态表上限：只增不减会无界累积，超上限整体清空（代价只是同键可再诊断/重试一次）。 */
+const DIAGNOSIS_STATE_MAX_ENTRIES = 1000;
+
 /** 单条用户消息长度上限：超长消息直接拒答，不送入 LLM（上下文爆炸 / 网关 400）。 */
 export const MAX_USER_MESSAGE_CHARS = 8000;
 
@@ -302,10 +305,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         signal: ctl.signal,
       });
       // 同一 attempt 只诊断一次：按钮没带 attempt 时以诊断采集到的真实 attempt 为准，两个键都记
+      if (diagnosedKeys.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosedKeys.clear();
       diagnosedKeys.add(dedupeKey);
       diagnosedKeys.add(`${taskId}:${diagnosedAttemptId || attemptId || 'latest'}`);
       const result: { attemptId?: string; text: string; cardMessageId?: string } = { text };
       if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
+      if (diagnosisResults.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosisResults.clear();
       diagnosisResults.set(taskId, result);
       // 结果推送与诊断执行分开兜底：推送失败降级为文本（含重试指引），不谎报「诊断失败」
       try {
@@ -369,6 +374,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         return;
       }
       await sendFollowUp(cfg.kanbanUrl, attemptId, buildRetryPrompt(title, result.text));
+      if (retryLaunched.size >= DIAGNOSIS_STATE_MAX_ENTRIES) retryLaunched.clear();
       retryLaunched.add(retryKey);
       // 按钮置终态：诊断卡片原地替换为无按钮终态（参照确认卡片终态更新模式），失败不阻断
       if (result.cardMessageId) {

@@ -32,7 +32,7 @@ export interface McpSupervisorOptions {
   kanbanHealth?: () => Promise<void>;
   /** 看板健康探测的最小间隔（默认 5 分钟）：健康时不每 tick 打看板；上次失败时下轮立即复查。 */
   kanbanHealthIntervalMs?: number;
-  /** stop() 等待在途重连的竞速超时（默认 5s）：超时后继续关闭流程，避免拖累整体退出。 */
+  /** stop() 等待在途 tick/重连的兜底超时（默认 5s）：超时后继续关闭流程，避免拖累整体退出。 */
   stopTimeoutMs?: number;
   log?: (msg: string) => void;
 }
@@ -72,28 +72,23 @@ export class McpSupervisor {
     this.timer.unref();
   }
 
-  /** 停止周期探测；等待在途重连结束（调用方随后会 close MCP，避免 connect 中途完成残留无人持有的子进程）。 */
+  /**
+   * 停止周期探测；等待在途 tick 与在途重连结束（调用方随后会 close MCP：
+   * tick 的 ping 阶段 busy=true 但 reconnecting 尚未占位，不等它则 close 之后
+   * ping 失败会重新 connect，spawn 孤儿子进程；重连中途完成同理残留无人持有的子进程）。
+   */
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    if (!this.reconnecting) return;
-    // 在途重连最坏 45s 级别（mcp.reconnect 内部多次超时叠加），裸 await 会拖垮调用方的
-    // 退出超时兜底：竞速超时后照常返回继续关闭（重连 promise 不 reject，race 不会抛）
-    const ms = this.opts.stopTimeoutMs ?? 5000;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        this.reconnecting,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(() => {
-            this.opts.log?.(`stop 等待在途重连超时（${Math.round(ms / 1000)}s），继续关闭流程`);
-            resolve();
-          }, ms);
-          timer.unref();
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
+    // 先等在途 tick：busy 清零时重连占位必然已释放（tryReconnect 在 tick 内收尾），
+    // 在途重连最坏 45s 级别（mcp.reconnect 内部多次超时叠加），裸等会拖垮调用方的
+    // 退出超时兜底：带 deadline 轮询，超时后照常返回继续关闭（参照 ReminderRunner.stop）
+    const deadline = Date.now() + (this.opts.stopTimeoutMs ?? 5000);
+    while (this.busy && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (this.busy) {
+      this.opts.log?.(`stop 等待在途 tick/重连超时（${Math.round((this.opts.stopTimeoutMs ?? 5000) / 1000)}s），继续关闭流程`);
     }
   }
 

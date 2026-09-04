@@ -187,7 +187,8 @@ async function main(): Promise<void> {
     dailyBrief: DailyBrief | null;
     weeklyBrief: WeeklyBrief | null;
     reminderRunner: ReminderRunner | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null };
+    historyStore: SessionHistoryStore | null;
+  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null };
   let shuttingDown = false;
   /**
    * 优雅退出：exitCode 由触发路径决定——正常信号（SIGINT/SIGTERM）传 0；
@@ -213,6 +214,8 @@ async function main(): Promise<void> {
       await cleanup.dailyBrief?.stop();
       await cleanup.weeklyBrief?.stop();
       await cleanup.reminderRunner?.stop();
+      // 会话历史 save 是 fire-and-forget：drain 等在途写落盘后再退出，避免丢最后一轮
+      await cleanup.historyStore?.drain();
       cleanup.reportServer?.close();
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
@@ -384,6 +387,8 @@ async function main(): Promise<void> {
   const confirmations = new ConfirmationManager(
     async (openId, chatId, req, id, timeoutMs) => {
       roundNotices.mark(openId);
+      // Map 无清理会无界增长：超上限整体清空（代价只是免问回执措辞回退为泛化文案）
+      if (lastWriteKind.size >= 1000) lastWriteKind.clear();
       lastWriteKind.set(openId, req.kind);
       const sendText = () => {
         // 免问提示与卡片口径一致：粒度词（同类/同对象）与后果说明都复用 guard 的统一文案
@@ -479,16 +484,15 @@ async function main(): Promise<void> {
 
   // 注意：router 始终持有 mcp 对象（即使启动时降级），supervisor 重连后可热切换回来
   const reminders = new ReminderStore();
-  const router = new SessionRouter(
-    agentCfg,
-    mcp,
-    mcpOk,
+  const historyStore = new SessionHistoryStore();
+  cleanup.historyStore = historyStore; // shutdown 时 drain 在途写（session 的 save 是 fire-and-forget）
+  const router = new SessionRouter(agentCfg, mcp, mcpOk, {
     memory,
-    (openId) => (req) => confirmations.request(openId, req),
-    reportServer?.baseUrl,
-    new SessionHistoryStore(),
+    confirmFactory: (openId) => (req, signal) => confirmations.request(openId, req, signal),
+    reportLinkBaseUrl: reportServer?.baseUrl,
+    historyStore,
     reminders,
-  );
+  });
 
   const notifyOwners = (text: string): void => {
     for (const oid of channel.allowedOpenIds()) {
@@ -541,6 +545,16 @@ async function main(): Promise<void> {
   });
   channel.onCardAction = handlers.onCardAction;
 
+  // 长连接断线告警（WsAlerter）：重连交给 SDK，断线期间消息由飞书侧补投。
+  // 短时抖动（待机/唤醒反复断连）静默不刷屏；断开持续超过 15 分钟推一条提醒，
+  // 之后仍处于断开时每小时至多重复一条，恢复后补「已恢复」；SDK 放弃重试
+  //（failed，需人工重启）立即告警且只报一次。
+  // 钩子在 start() 之前挂接（onWsStateChange 是赋值即生效的字段）：首次连接就绪前
+  // 的断线/重连 alerter 也要有感知，挂在 start 之后会漏掉启动窗口内的状态变化。
+  const wsAlerter = new WsAlerter({ notify: notifyOwners });
+  channel.onWsStateChange = (state) => wsAlerter.onState(state);
+  cleanup.wsAlerter = wsAlerter;
+
   console.log(c.gray('正在建立飞书长连接…'));
   try {
     await channel.start(handlers.handle);
@@ -556,14 +570,6 @@ async function main(): Promise<void> {
     await shutdown(1);
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
-
-  // 长连接断线告警（WsAlerter）：重连交给 SDK，断线期间消息由飞书侧补投。
-  // 短时抖动（待机/唤醒反复断连）静默不刷屏；断开持续超过 15 分钟推一条提醒，
-  // 之后仍处于断开时每小时至多重复一条，恢复后补「已恢复」；SDK 放弃重试
-  //（failed，需人工重启）立即告警且只报一次。
-  const wsAlerter = new WsAlerter({ notify: notifyOwners });
-  channel.onWsStateChange = (state) => wsAlerter.onState(state);
-  cleanup.wsAlerter = wsAlerter;
 
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
   if (process.env.KANBAN_WATCH !== '0') {

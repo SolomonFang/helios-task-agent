@@ -385,6 +385,88 @@ async function main(): Promise<void> {
     assert.ok(withMem.some((t) => t.name === 'memory_set/get/delete/note'));
   });
 
+  // ---------- MCP 写工具免问 key：缺可识别对象 id fail-closed 不提供免问，创建类保留类级 ----------
+  await checkAsync('MCP 批量免问 key：未知 id 参数的写工具不提供免问（warn 留痕），创建类仍类级', async () => {
+    const tmp = tmpHome('mcpkey');
+    const origWarn = console.warn;
+    const warns: string[] = [];
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
+      const confirm: ConfirmFn = async (req) => {
+        seen.push({ batchKey: req.batchKey, batchScope: req.batchScope });
+        return false; // 闸门即拒，不真正调用 MCP
+      };
+      const mcp = {
+        connected: true,
+        tools: [
+          { name: 'update_task', description: 'x', inputSchema: { type: 'object', properties: {} } },
+          { name: 'create_task', description: 'x', inputSchema: { type: 'object', properties: {} } },
+          { name: 'mystery_write', description: 'x', inputSchema: { type: 'object', properties: {} } },
+        ],
+        callTool: async () => 'ok',
+      } as unknown as KanbanMcp;
+      const { handlers } = buildTools({ mcp, kanbanUrl: KANBAN_URL, confirm, registry: new SourceRegistry(tmp), auditHome: tmp });
+      await handlers.get('kanban_update_task')!({ task_id: 'task-1', title: 't' }); // 对象级
+      await handlers.get('kanban_update_task')!({ unknown_ref: 'x' }); // 无可识别 id → 无免问
+      await handlers.get('kanban_create_task')!({ title: 't' }); // 创建类：类级
+      await handlers.get('kanban_mystery_write')!({ foo: 'bar' }); // 未知写工具无 id → 无免问
+      assert.deepEqual(
+        seen,
+        [
+          { batchKey: 'kanban:update_task:task-1', batchScope: 'object' },
+          { batchKey: undefined, batchScope: 'kind' },
+          { batchKey: 'kanban:create_task', batchScope: 'kind' },
+          { batchKey: undefined, batchScope: 'kind' },
+        ],
+        `实际 seen=${JSON.stringify(seen)}`,
+      );
+      assert.ok(
+        warns.filter((w) => w.includes('不提供「同类免问」')).length === 2,
+        `两次缺 id 应各 warn 一次，实际 warns=${JSON.stringify(warns)}`,
+      );
+    } finally {
+      console.warn = origWarn;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- MCP inputSchema 运行时校验：畸形退化为空 schema 并 warn，合法原样保留 ----------
+  await checkAsync('MCP inputSchema：非 object 类型 / properties 畸形退化为空 schema（warn），合法 schema 透传', async () => {
+    const tmp = tmpHome('mcpschema');
+    const origWarn = console.warn;
+    const warns: string[] = [];
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      const goodSchema = { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] };
+      const mcp = {
+        connected: true,
+        tools: [
+          { name: 'good_schema', description: 'x', inputSchema: goodSchema },
+          { name: 'bad_type', description: 'x', inputSchema: { type: 'string' } },
+          { name: 'bad_props', description: 'x', inputSchema: { type: 'object', properties: ['not-an-object'] } },
+          { name: 'no_schema', description: 'x', inputSchema: undefined },
+        ],
+        callTool: async () => 'ok',
+      } as unknown as KanbanMcp;
+      const { openAiTools, handlers } = buildTools({ mcp, kanbanUrl: KANBAN_URL, auditHome: tmp });
+      const paramsOf = (n: string) => openAiTools.find((t) => t.function.name === `kanban_${n}`)?.function.parameters;
+      assert.deepEqual(paramsOf('good_schema'), goodSchema, '合法 schema 应原样透传');
+      for (const n of ['bad_type', 'bad_props', 'no_schema']) {
+        assert.deepEqual(paramsOf(n), { type: 'object', properties: {} }, `${n} 应退化为空 schema`);
+      }
+      assert.ok(handlers.has('kanban_bad_type'), '畸形 schema 的工具仍应注册（不拖垮工具列表）');
+      assert.equal(warns.filter((w) => w.includes('inputSchema 形态非法')).length, 2, `畸形两次应 warn 两次：${JSON.stringify(warns)}`);
+    } finally {
+      console.warn = origWarn;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   finish();
 }
 

@@ -38,12 +38,18 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
  *   多个任务的工作区」是高频用法，对象级绑定只剩打扰、没有安全收益；
  * - 其余写操作：对象级 key（task/工作区/审批 id 纳入 key，与 summarizeMcp 的对象标识
  *   口径对齐），免问仅对同一对象的同类操作生效——否则 approve、delete 这类会退化成
- *   类级免问（借一次授权放行任意对象）。
+ *   类级免问（借一次授权放行任意对象）；
+ * - 创建类（create_*）：类级 key——天然无既有对象可绑，与 hk 通道创建口径一致；
+ * - 其余写操作缺可识别对象 id：fail-closed 不提供免问（key 退化为类级等于静默放行整类）。
  */
-function batchKeyForMcp(name: string, args: Record<string, unknown>): { key: string; scope: 'kind' | 'object' } {
+function batchKeyForMcp(name: string, args: Record<string, unknown>): { key?: string; scope: 'kind' | 'object' } {
   if (/start/i.test(name)) return { key: `kanban:${name}`, scope: 'kind' };
   const id = String(args.task_id ?? args.taskId ?? args.id ?? args.workspace_id ?? args.approval_id ?? '');
-  return id ? { key: `kanban:${name}:${id}`, scope: 'object' } : { key: `kanban:${name}`, scope: 'kind' };
+  if (id) return { key: `kanban:${name}:${id}`, scope: 'object' };
+  // 创建类天然无既有对象可绑：类级 key（与 hk 通道 'hk:tasks create' 口径一致，批量建任务不逐次弹窗）
+  if (/create/i.test(name)) return { key: `kanban:${name}`, scope: 'kind' };
+  console.warn(`[kanban] 写工具 ${name} 缺少可识别对象 id 参数，本次不提供「同类免问」（每次均需确认）`);
+  return { key: undefined, scope: 'kind' };
 }
 
 function parseMcpStartRepos(args: Record<string, unknown>): RepoStartInput[] | null {

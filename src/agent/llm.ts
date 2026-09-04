@@ -68,25 +68,44 @@ function dropOldestTurn(messages: ChatMessage[]): boolean {
 }
 
 /**
+ * 历史被裁剪后的系统注记：丢轮是静默的，模型对缺失历史无感知会编造——
+ * 裁轮后向消息流注入一条说明。存储侧为 system 角色（紧跟 system prompt 的上下文注记），
+ * 发送时由 downgradeSystemNotes 降级为 user + UNTRUSTED 包裹（与后台事件注记同一机制）。
+ */
+export const HISTORY_TRUNCATED_NOTE = '（注：更早的对话内容因长度限制已移除；如需回顾其中的结论，请直接询问用户。）';
+
+/** 在 system 之后注入裁剪注记（已有则不重复）。 */
+function insertTruncationNote(messages: ChatMessage[]): void {
+  const first = messages[1];
+  if (first && first.role === 'system' && first.content === HISTORY_TRUNCATED_NOTE) return;
+  messages.splice(1, 0, { role: 'system', content: HISTORY_TRUNCATED_NOTE });
+}
+
+/**
  * Trim old turns from the front while preserving the system message and
  * not leaving orphaned `tool` messages without their assistant tool_calls.
  * 双重上限：条数（maxMessages）与总字符（maxChars）。Mutates in place.
+ * 丢轮后注入 HISTORY_TRUNCATED_NOTE，让模型知晓历史不完整。
  */
 export function trimHistory(
   messages: ChatMessage[],
   maxMessages = MAX_HISTORY_MESSAGES,
   maxChars = MAX_HISTORY_CHARS,
 ): ChatMessage[] {
+  let dropped = false;
   while (messages.length > maxMessages && messages.length > 3) {
     if (!dropOldestTurn(messages)) break;
+    dropped = true;
   }
   let chars = messages.reduce((n, m) => n + messageChars(m), 0);
   while (messages.length > 3 && chars > maxChars) {
     const before = messages.length;
     if (!dropOldestTurn(messages)) break;
+    dropped = true;
     chars = messages.reduce((n, m) => n + messageChars(m), 0);
     if (messages.length === before) break; // 防御：无进展即停
   }
+  if (dropped) insertTruncationNote(messages);
   return messages;
 }
 
@@ -250,6 +269,8 @@ export async function runAgentTurn({
           }
         }
         if (!recovered) throw err;
+        // 自愈丢轮同样要告知模型历史不完整（与 trimHistory 同一注记机制）
+        insertTruncationNote(messages);
         if (onProgress) onProgress({ type: 'continue' });
       }
       if (!resp) throw new Error('模型请求失败');

@@ -433,7 +433,7 @@ async function main(): Promise<void> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-diag-handler-'));
     try {
       const cfg = makeCfg('http://127.0.0.1:1');
-      const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+      const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
       const confirmations = new ConfirmationManager(async () => undefined, { timeoutMs: 1000 });
       const channel = new FakeChannel();
       const fakeMcp = { tools: [] } as unknown as KanbanMcp;
@@ -508,7 +508,7 @@ async function main(): Promise<void> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-diag-fail-'));
     try {
       const cfg = makeCfg('http://127.0.0.1:1');
-      const router = new SessionRouter(cfg, null, false, new MemoryStore(tmp));
+      const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
       const confirmations = new ConfirmationManager(async () => undefined, { timeoutMs: 1000 });
       const channel = new FakeChannel();
       const fakeMcp = { tools: [] } as unknown as KanbanMcp;

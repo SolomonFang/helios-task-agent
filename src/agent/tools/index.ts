@@ -25,6 +25,23 @@ export type { CreateCounter } from './gated-write';
 /** OpenAI function name 约束（长度含 kanban_ 前缀后计算）：非法名会让整个 tools 数组被 API 400 拒绝。 */
 const OPENAI_FN_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 
+const EMPTY_SCHEMA: OpenAiTool['function']['parameters'] = { type: 'object', properties: {} };
+
+/**
+ * 外部 MCP server 的 inputSchema 零信任：只接受 type==='object' 且 properties（如有）
+ * 为 plain object 的形态；畸形时退化为空 schema 并 warn（schema 原样透传给 LLM API，
+ * 畸形值可能让整个 tools 数组被 400 拒绝）。
+ */
+function sanitizeMcpInputSchema(toolName: string, schema: unknown): OpenAiTool['function']['parameters'] {
+  const isPlainObject = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+  const malformed = !isPlainObject(schema) || schema.type !== 'object' || (schema.properties !== undefined && !isPlainObject(schema.properties));
+  if (malformed) {
+    console.warn(`[tools] MCP 工具「${toolName}」的 inputSchema 形态非法（须为 type:object 的 JSON Schema），已按空 schema 注册`);
+    return EMPTY_SCHEMA;
+  }
+  return schema as OpenAiTool['function']['parameters'];
+}
+
 export function buildTools({
   mcp,
   kanbanUrl,
@@ -91,10 +108,7 @@ export function buildTools({
         function: {
           name,
           description: `[helios-kanban MCP] ${tool.description || tool.name}`,
-          parameters: (tool.inputSchema as OpenAiTool['function']['parameters']) || {
-            type: 'object',
-            properties: {},
-          },
+          parameters: sanitizeMcpInputSchema(name, tool.inputSchema ?? EMPTY_SCHEMA),
         },
       });
       handlers.set(name, makeKanbanMcpHandler({ mcp, tool, kanbanUrl, runGatedWrite }));

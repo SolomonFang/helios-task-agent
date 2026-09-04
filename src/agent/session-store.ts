@@ -179,6 +179,28 @@ export class SessionHistoryStore {
     return job;
   }
 
+  /**
+   * 等待串行写队列清空（进程退出前调用）：session 的 save 是 fire-and-forget，
+   * 不等的话退出瞬间最后一轮历史可能还在队列里丢失。兜底超时后照常返回，避免拖累退出。
+   */
+  async drain(timeoutMs = 3000): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.queue,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            console.error(`[session-store] drain 等待在途写超时（${Math.round(timeoutMs / 1000)}s），继续退出流程`);
+            resolve();
+          }, timeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** 文件总数超上限时按 mtime 删最老（mtime 读取失败的排最前优先删）；顺带清理过期的孤儿 tmp（rename 失败残留）。 */
   private async prune(): Promise<void> {
     let files: string[];

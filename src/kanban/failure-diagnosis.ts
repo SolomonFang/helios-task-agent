@@ -189,6 +189,11 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
   const prompt = buildDiagnosisPrompt(ctx, title);
   const llm = resolveDiagnosisLlm(opts.llm, opts.env);
   const timeoutMs = opts.timeoutMs ?? DIAGNOSIS_TIMEOUT_MS;
+  // 总时长兜底：OpenAI 客户端的 timeout 只是单次尝试（maxRetries:2 叠加最坏 3 倍），
+  // 用 AbortSignal.timeout 与调用方 signal 组合约束整段 complete（含全部重试）
+  const signals = [AbortSignal.timeout(timeoutMs)];
+  if (opts.signal) signals.push(opts.signal);
+  const turnSignal = AbortSignal.any(signals);
   const complete =
     opts.complete ??
     (async (p: string, l: DiagnosisLlmConfig, signal?: AbortSignal): Promise<string> => {
@@ -212,10 +217,14 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
       return text.trim();
     });
   try {
-    const text = await complete(prompt, llm, opts.signal);
+    const text = await complete(prompt, llm, turnSignal);
     return { text, attemptId: ctx.attemptId };
   } catch (err) {
     if (opts.signal?.aborted) throw new Error('已中断');
+    // 兜底信号到点（非调用方中断）：无论底层报什么错都按超时收尾（abort 原文不一定含 timeout 字样）
+    if (turnSignal.aborted) {
+      throw new Error(`AI 诊断超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
+    }
     const message = errMessage(err);
     if (process.env.HTA_DEBUG) console.error(`[diagnosis] 模型调用失败原文：${message.slice(0, 300)}`);
     if (/timed?\s*out|timeout/i.test(message)) {
