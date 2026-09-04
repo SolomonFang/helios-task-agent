@@ -182,11 +182,11 @@ If failed → check URL, kanban process, network (Tailscale). Do not claim insta
 ```markdown
 ## Helios Kanban Remote 技能已安装
 
-- **来源**: npm 包 `helios-task-agent` 内置副本
-- **安装路径**: `{SKILL_DIR}`
-- **CLI**: `{SKILL_DIR}/scripts/hk.sh`
-- **Kanban 地址**: `{HELIOS_KANBAN_URL}`
-- **连通性**: 正常
+- **来源**：npm 包 `helios-task-agent` 内置副本
+- **安装路径**：`{SKILL_DIR}`
+- **CLI**：`{SKILL_DIR}/scripts/hk.sh`
+- **Kanban 地址**：`{HELIOS_KANBAN_URL}`
+- **连通性**：正常
 
 你现在可以对我说：
 - 「有哪些项目」

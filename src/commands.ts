@@ -32,6 +32,8 @@ export const TRY_EXAMPLES: string[] = [
   '用 Claude 跑这个任务 / 再跟它说一句：先写测试（启用方式由你指定）',
   '把 xx 群最近的聊天整理成任务',
   '总结一下这个迭代做了什么 / 今天完成了什么（生成 HTML/MD 报告）',
+  '复盘一下这个迭代',
+  '帮我写今天的日报',
   '30 分钟后提醒我站会 / 明天早上 9 点提醒我盯一下构建',
 ];
 
@@ -138,8 +140,11 @@ export function toolActionLabel(name: string): string {
   if (name === 'repo_fs') return '读文件';
   if (name === 'hk_cli' || name.startsWith('kanban_')) return '看板操作';
   if (name === 'lark_cli') return '飞书操作';
-  if (name === 'work_summary') return '生成报告';
+  if (name === 'work_summary' || name === 'daily_report' || name === 'iteration_retro') return '生成报告';
   if (name.startsWith('memory_')) return '读写记忆';
+  if (name === 'reminder_set') return '设置提醒';
+  if (name === 'reminder_cancel') return '取消提醒';
+  if (name === 'reminder_list') return '查看提醒';
   if (name.startsWith('reminder_')) return '设置提醒';
   if (name.startsWith('skill_')) return '运行技能';
   return '调用工具';
@@ -210,10 +215,10 @@ export function buildMemoryLines(session: { formatMemory(): string }, header: st
 /** /clear 回复（两端一致）。 */
 export const CLEARED_TEXT = '对话历史已清空（记忆保留）。';
 
-/** /clear 回复：activeBatches > 0 时提醒免问授权不受清盘影响、仍生效；revokeHint 为通道自己的撤销方式说明。 */
-export function clearedText(activeBatches = 0, revokeHint: string): string {
-  return activeBatches
-    ? `对话历史已清空（记忆保留；仍有 ${activeBatches} 项写操作免问授权生效中，${revokeHint}）。`
+/** /clear 回复：清盘会一并撤销全部免问授权，revoked 为本次撤销数（>0 时如实告知已恢复逐次确认）。 */
+export function clearedText(revoked = 0): string {
+  return revoked
+    ? `对话历史已清空（记忆保留）；${revoked} 项免问授权已一并恢复逐次确认。`
     : CLEARED_TEXT;
 }
 
@@ -234,18 +239,21 @@ export function confirmRevokedText(n: number, noneText: string): string {
  * 命中 friendlyLlmError 已知模式（401/429/上下文超限/网络等）时 head 保留原始 message 便于对照；
  * 未命中时英文原始 message 不直达用户面——head 只给中性「请求失败」与通用出路，
  * 原始 message 截断（200 字符）收 HTA_DEBUG 日志（CLI/bot 两端同口径）。
+ * retryHint：尾注里的重发出路措辞，默认「可修改后重发」；图片轮次 input 为占位文本时
+ * 通道侧传「可重发图片」（bot handler 图片分支）。
  */
 export function llmFailureParts(
   message: string,
   input: string,
   channel: 'cli' | 'bot',
+  retryHint = '可修改后重发',
 ): { head: string; friendly: string | null; tail: string } {
   const friendly = channel === 'bot' ? friendlyLlmError(message, { channel: 'bot' }) : friendlyLlmError(message);
   const quoted = `${input.slice(0, 60)}${input.length > 60 ? '…' : ''}`;
   const tail =
     channel === 'bot'
-      ? `你的上一条消息未处理：「${quoted}」，可修改后重发。`
-      : `上一条内容「${quoted}」未被处理，可修改后重发；也可用 /config 检查模型配置。`;
+      ? `你的上一条消息未处理：「${quoted}」，${retryHint}。`
+      : `上一条内容「${quoted}」未被处理，${retryHint}；也可用 /config 检查模型配置。`;
   if (friendly) return { head: `请求失败：${message}`, friendly, tail };
   // 未命中已知模式：原始 message 截断收 HTA_DEBUG 日志，用户面只给中性与通用出路
   if (process.env.HTA_DEBUG) {

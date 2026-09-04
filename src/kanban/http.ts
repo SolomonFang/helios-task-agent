@@ -30,7 +30,7 @@ function envelopeData(json: unknown): unknown {
     if (env.message && process.env.HTA_DEBUG) {
       console.error(`[kanban] 接口返回 success:false，服务端原文：${env.message}`);
     }
-    throw new Error('看板拒绝了请求。可设 HTA_DEBUG=1 重新运行，查看服务端返回的详细原因。');
+    throw new Error('看板拒绝了请求，请稍后重试；持续失败请联系部署者。');
   }
   // 无信封宽松回退：直接返回 data 字段或原始 JSON
   if (env && typeof env === 'object' && 'data' in env) return env.data;

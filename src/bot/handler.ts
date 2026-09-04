@@ -268,11 +268,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
   /** 执行失败诊断（采集失败信息 → LLM 中文诊断）并推结果卡片（带「↻ 重试」按钮）；同时注入会话上下文。 */
   const handleDiagnosis = async (openId: string, taskId: string, attemptId: string, title: string): Promise<void> => {
+    title = title.trim() || '未命名任务';
     const dedupeKey = `${taskId}:${attemptId || 'latest'}`;
     if (diagnosedKeys.has(dedupeKey)) {
-      await channel
-        .notifyOpenId(openId, `🔍 《${title}》这次失败已诊断过，结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。`)
-        .catch(() => {});
+      // 指引按结果实际形态分支：诊断卡片推送失败走文本降级时没有卡片按钮可点
+      const tip = diagnosisResults.get(taskId)?.cardMessageId
+        ? '结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。'
+        : '结果见上方消息；回复「重试这个任务」可按结论重启。';
+      await channel.notifyOpenId(openId, `🔍 《${title}》这次失败已诊断过，${tip}`).catch(() => {});
       return;
     }
     if (diagnosisRunning.has(taskId)) {
@@ -304,10 +307,15 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         timeoutMs: DIAGNOSIS_TIMEOUT_MS,
         signal: ctl.signal,
       });
-      // 同一 attempt 只诊断一次：按钮没带 attempt 时以诊断采集到的真实 attempt 为准，两个键都记
-      if (diagnosedKeys.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosedKeys.clear();
-      diagnosedKeys.add(dedupeKey);
-      diagnosedKeys.add(`${taskId}:${diagnosedAttemptId || attemptId || 'latest'}`);
+      // 同一 attempt 只诊断一次：按钮与诊断采集到的真实 attempt 两个键都记（按钮 attempt 可能滞后）。
+      // 拿不到真实 attempt（attempts 端点异常）时不落键：否则 task:latest 永久占位，
+      // 之后的新失败会被谎称「已诊断过」并导向一张旧卡片
+      const realAttemptId = diagnosedAttemptId || attemptId;
+      if (realAttemptId) {
+        if (diagnosedKeys.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosedKeys.clear();
+        diagnosedKeys.add(`${taskId}:${realAttemptId}`);
+        if (attemptId) diagnosedKeys.add(dedupeKey);
+      }
       const result: { attemptId?: string; text: string; cardMessageId?: string } = { text };
       if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
       if (diagnosisResults.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosisResults.clear();
@@ -337,9 +345,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (ctl.signal.aborted) {
         await channel.notifyOpenId(openId, `⏹ AI 诊断已中断：《${title}》`).catch(() => {});
       } else {
-        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起）时不重复追加重试后缀
+        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/配置不完整联系部署者）时不重复追加重试后缀
         const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重试', '重新发起'].some((w) => message.includes(w));
+        const hasOwnWayOut = ['重试', '重新发起', '配置不完整'].some((w) => message.includes(w));
         const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击失败卡片上的「AI 诊断」重试。';
         await channel.notifyOpenId(openId, `⚠️ AI 诊断失败：《${title}》\n${message}${retryHint}`).catch(() => {});
       }
@@ -350,6 +358,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
   /** 「↻ 按诊断结论重试」：以诊断结论作为 follow-up 指令重启任务（点击即显式授权，不再二次确认）。 */
   const handleDiagnosisRetry = async (openId: string, taskId: string, title: string): Promise<void> => {
+    title = title.trim() || '未命名任务';
     const result = diagnosisResults.get(taskId);
     if (!result) {
       await channel
@@ -373,9 +382,15 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           .catch(() => {});
         return;
       }
-      await sendFollowUp(cfg.kanbanUrl, attemptId, buildRetryPrompt(title, result.text));
+      // 落键提到首个 await 前：连点竞态时第二次点击已在集合内被拦；发起失败摘键回补，允许再点
       if (retryLaunched.size >= DIAGNOSIS_STATE_MAX_ENTRIES) retryLaunched.clear();
       retryLaunched.add(retryKey);
+      try {
+        await sendFollowUp(cfg.kanbanUrl, attemptId, buildRetryPrompt(title, result.text));
+      } catch (err) {
+        retryLaunched.delete(retryKey);
+        throw err;
+      }
       // 按钮置终态：诊断卡片原地替换为无按钮终态（参照确认卡片终态更新模式），失败不阻断
       if (result.cardMessageId) {
         const settledAt = new Date().toLocaleString('zh-CN', { hour12: false });
@@ -384,11 +399,11 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           .catch((e) => console.error(`[diagnosis] 诊断卡片终态更新失败: ${errMessage(e)}`));
       }
       await channel
-        .notifyOpenId(openId, `↻ 已按诊断结论发起重试：《${title}》\n已把失败原因与修复建议作为跟进指令发给执行 Agent，任务进展会继续推送。`)
+        .notifyOpenId(openId, `↻ 已按诊断结论发起重试：《${title}》\n已把失败原因与修复建议作为跟进指令发给任务执行方，任务进展会继续推送。`)
         .catch(() => {});
     } catch (err) {
       const message = errMessage(err).slice(0, 200);
-      const hasOwnWayOut = ['重试', '重新发起', '手动'].some((w) => message.includes(w));
+      const hasOwnWayOut = ['重试', '重新发起', '手动', '已被看板清理'].some((w) => message.includes(w));
       const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击诊断卡片上的「↻ 按诊断结论重试」。';
       await channel.notifyOpenId(openId, `⚠️ 重试发起失败：《${title}》\n${message}${retryHint}`).catch(() => {});
     }
@@ -458,11 +473,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       running.delete(msg.senderId);
     }
     const stopped: string[] = [];
-    if (ctl) stopped.push('已中断当前任务');
     // 被中断的 AI 审查各有带标题的逐条通知（见 handleAiReview 的中断收尾），这里不再计数组播
     if (gateCancelled) stopped.push('待确认的写操作已一并取消');
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
-    if (stopped.length) {
+    if (ctl) {
+      // 回执与被中断轮次的占位终态同一文案：措辞不一会被读成两个事件
+      const extra = stopped.length ? `\n${stopped.join('，')}。` : '';
+      await channel.reply(msg, `⏹ 已中断（未完成的操作未执行，可继续对话）。${extra}`);
+    } else if (stopped.length) {
       await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
     } else if (reviewsAborted || diagnosisAborted) {
       // 仅 AI 审查/失败诊断被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
@@ -567,6 +585,18 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     return true;
   };
 
+  /**
+   * 挂起确认的展示形态（短应答提醒/排队回执分支用）：确认管理器未暴露只读查询，
+   * 这里做防御性只读窥视（与 unit-handler 的 pendings 窥视同款）；结构漂移时回退「无卡片、无免问」。
+   */
+  const pendingConfirmForm = (openId: string): { hasCard: boolean; batchKey: boolean } => {
+    const pendings = (confirmations as unknown as {
+      pendings?: Map<string, { req?: { batchKey?: string }; cardMessageId?: string }>;
+    }).pendings;
+    const p = pendings?.get(openId);
+    return { hasCard: Boolean(p?.cardMessageId), batchKey: Boolean(p?.req?.batchKey) };
+  };
+
   /** 写操作确认的文字应答：已裁决/确认词兜底/挂起期短应答提醒均终结消息（返回 true），不再进入队列。 */
   const handleConfirmationReply = async (msg: InboundMessage, text: string): Promise<boolean> => {
     confirmations.noteChat(msg.senderId, msg.sessionId);
@@ -601,7 +631,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         !confirmShortReplyReminded.has(msg.senderId)
       ) {
         confirmShortReplyReminded.add(msg.senderId);
-        await channel.reply(msg, '请回复「确认」或「取消」，或点卡片上的按钮。');
+        // 指引按本次确认的实际形态分支：文本降级（无卡片）不提按钮；支持免问的确认补「免问」应答词
+        const form = pendingConfirmForm(msg.senderId);
+        let tip = '请回复「确认」或「取消」';
+        if (form.hasCard) tip += '，或点卡片上的按钮';
+        if (form.batchKey) tip += '，或回复「免问」';
+        await channel.reply(msg, `${tip}。`);
         return true;
       }
     } else {
@@ -687,13 +722,20 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
    * 静默期心跳：LLM 长思考期间没有任何工具事件，占位消息原地不动，用户分不清「在想」还是「死了」。
    * 每 intervalMs 检查一次，静默超阈值则刷新占位并附已等待秒数；回复就绪即停（clearHeartbeat 在投递前调用）。
    */
-  const startProgressHeartbeat = (progressId: string | undefined, activity: { lastEventAt: number }): (() => void) => {
+  const startProgressHeartbeat = (
+    progressId: string | undefined,
+    activity: { lastEventAt: number },
+    openId: string,
+  ): (() => void) => {
     if (!progressId) return () => {};
     const startedAt = Date.now();
     const timer = setInterval(() => {
       if (Date.now() - activity.lastEventAt < progressHeartbeatMs) return;
-      const secs = Math.round((Date.now() - startedAt) / 1000);
-      void channel.updateText(progressId, `⏳ 仍在处理…（已等待 ${secs} 秒；/stop 可中断）`).catch(() => {});
+      // 确认挂起期间实际在等用户裁决，「仍在处理」是谎称
+      const text = confirmations.hasPending(openId)
+        ? '⏳ 等待你处理上方的写操作确认…'
+        : `⏳ 仍在处理…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒；/stop 可中断）`;
+      void channel.updateText(progressId, text).catch(() => {});
     }, progressHeartbeatMs);
     timer.unref();
     return () => clearInterval(timer);
@@ -709,9 +751,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const chunks = splitText(reply || '（无回复）');
     if (progressId && interleaved) {
       // 轮次中插入了确认卡片等独立消息：占位停在它们上方，原地改文案会时序颠倒。
-      // 占位收尾为短终态，正文另发新消息落在时间线末尾（分段各自兜底，同下方续发策略）。
+      // 占位收尾为短终态（中性措辞：正文可能是「已中止」等，不宜恒称「已完成」），正文另发新消息落在时间线末尾（分段各自兜底，同下方续发策略）。
       await channel
-        .updateText(progressId, '✅ 已完成，结果见下方 ⬇️')
+        .updateText(progressId, '处理结束，结果见下方 ⬇️')
         .catch((err) => console.error(`[feishu] 占位收尾更新失败: ${errMessage(err)}`));
       let chunkFailed = false;
       for (const chunk of chunks) {
@@ -788,7 +830,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const progressId = await sendPlaceholder(msg);
     const activity = { lastEventAt: Date.now() };
     const onProgress = createProgressReporter(progressId, activity);
-    const clearHeartbeat = startProgressHeartbeat(progressId, activity);
+    const clearHeartbeat = startProgressHeartbeat(progressId, activity, openId);
     // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）
     await supervisor.enterTurn();
     try {
@@ -798,7 +840,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     } catch (err) {
       clearHeartbeat();
       // 「占位即终态」：异常路径先把「处理中」占位收尾为终态文案，占位缺失/更新失败才回退 reply。
-      // /stop 的回执已由 handleStop 发出（「已中断当前任务…」），这里只收尾占位，不重复回复。
+      // /stop 的回执已由 handleStop 发出（「⏹ 已中断（未完成的操作未执行，可继续对话）。」），这里只收尾占位，不重复回复。
       if (ctl.signal.aborted) {
         if (progressId) {
           await channel
@@ -807,7 +849,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         }
       } else {
         const message = errMessage(err);
-        const parts = llmFailureParts(message, text, 'bot');
+        // 图片轮次：尾注引用原配文（无配文不引用内部占位「[图片]」），重试指引为「可重发图片」
+        const parts = image
+          ? llmFailureParts(message, text.startsWith('[图片] ') ? text.slice('[图片] '.length) : '图片', 'bot', '可重发图片')
+          : llmFailureParts(message, text, 'bot');
         const failText = [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n');
         if (progressId) {
           await channel
@@ -822,7 +867,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
   };
 
-  /** 串行队列内执行一条消息：队列内命令（/memory、/clear、未知命令）与普通对话。 */
+  /** 串行队列内执行一条消息：队列内命令（/memory、/clear）与普通对话（未知命令已在入队前即时答复）。 */
   const runQueuedMessage = async (
     msg: InboundMessage,
     text: string,
@@ -837,12 +882,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return;
     }
     if (cmd === '/clear') {
+      // clearHistory 会一并撤销免问授权：先取计数，按实际告知
+      const revoked = session.activeBatchApprovals();
       session.clearHistory();
-      await channel.reply(msg, clearedText(session.activeBatchApprovals(), '回复「恢复确认」撤销免问'));
-      return;
-    }
-    if (cmd) {
-      await channel.reply(msg, `未知命令 ${cmd}，发送 /help 查看帮助。`);
+      await channel.reply(msg, clearedText(revoked));
       return;
     }
 
@@ -860,14 +903,19 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const openId = msg.senderId;
     // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
     if (router.queueFull(openId)) {
-      await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或先 /stop 清空队列）。');
+      await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或 /stop 中断当前任务并清空排队）。');
       return;
     }
     // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
     if (confirmations.hasPending(openId)) {
+      // 指引按本次确认的实际形态分支：文本降级（无卡片）不提按钮；支持免问的确认补「免问」应答词
+      const form = pendingConfirmForm(openId);
+      const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
       await channel.reply(
         msg,
-        '⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复「确认」/「取消」，超时自动拒绝）。本条消息已排队，会按顺序处理。',
+        form.hasCard
+          ? `⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复${answers}，超时自动拒绝）。本条消息已排队，会按顺序处理。`
+          : `⚠️ 有未处理的写操作确认：请回复${answers}（超时自动拒绝）。本条消息已排队，会按顺序处理。`,
       );
     } else if (router.busy(openId)) {
       // 回执带排队位置：queuedCount 为已排在前面的条数（不含正在执行的那条，由后半句覆盖）
@@ -970,11 +1018,22 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return;
     }
 
+    // post 富文本里的配图只被展平为「[图片]」占位、并未读取（vision 开启时单独发图才可读）
+    if (cfg.visionEnabled && fmsg.messageType === 'post' && text.includes('[图片]')) {
+      await channel.reply(msg, '（消息中的图片未读取，请单独发送图片）');
+    }
+
     // 写操作确认应答优先处理：闸门在等答复，若进串行队列会死锁
     if (await handleConfirmationReply(msg, text)) return;
 
     const cmd = parseCommand(text);
     if (await dispatchInstantCommand(msg, text, cmd)) return;
+
+    // 未知斜杠命令即时答复：进串行队列会排在长任务（最长 30 分钟）之后，用户等太久才知道打错了
+    if (cmd && cmd !== '/memory' && cmd !== '/clear') {
+      await channel.reply(msg, `未知命令 ${cmd}，发送 /help 查看帮助。`);
+      return;
+    }
 
     await enqueueMessage(fmsg, text, cmd);
   };

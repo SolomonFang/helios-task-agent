@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { apiGet, apiPost, pickLatestAttempt } from './http';
+import { apiGet, apiPost, pickLatestAttempt, KanbanHttpError } from './http';
 import { errMessage } from '../infra/err';
 import type { OcrLlmConfig } from './ai-review';
 
@@ -134,8 +134,10 @@ export async function collectFailureContext(kanbanUrl: string, taskId: string): 
 
 /** 诊断 prompt（纯函数便于单测）：三段式中文输出契约 + 采集到的材料。 */
 export function buildDiagnosisPrompt(ctx: FailureContext, title: string): string {
+  // 标题取不到时用「该任务」指代：塞裸 UUID 会被 LLM 复述进卡片，用户无从辨认
+  const ref = title || ctx.title ? `看板任务「${title || ctx.title}」` : '该任务';
   const parts: string[] = [
-    `看板任务「${title || ctx.title || ctx.taskId}」的最近一次自动执行失败了。请根据以下材料给出诊断，严格按三段输出：`,
+    `${ref}的最近一次自动执行失败了。请根据以下材料给出诊断，严格按三段输出：`,
     '一、失败原因归类：从【测试失败 / 构建错误 / 代码冲突 / 执行超时 / 需求不清 / 环境或依赖问题 / 其他】中选一个最贴切的，并用一两句说明判断依据',
     '二、关键证据摘要：引用下方材料中最能说明问题的内容，保持简短',
     '三、建议修复方向：给出可操作的下一步，供再次执行该任务的 Agent 直接参考',
@@ -181,10 +183,37 @@ export interface RunFailureDiagnosisOptions {
 const SYSTEM_PROMPT =
   '你是资深研发工程师，擅长诊断自动化编码任务的失败原因。全程使用简体中文回答，结论务实、可直接执行，不要使用内部术语黑话。';
 
+/**
+ * 采集失败的错误中文化（网络映射与 net-error 同族；kanban 层无反向依赖 config 的先例，这里内联最小集）：
+ * 看板不可达/超时给中文定性，英文原文（fetch failed / The operation timed out…）由调用方收 HTA_DEBUG。
+ */
+function collectFailureMessage(err: unknown): string {
+  if (err instanceof KanbanHttpError) {
+    return err.status === 404 ? '该任务在看板上已不存在（可能已被清理）' : '看板接口暂时异常';
+  }
+  const cause = (err as { cause?: { code?: unknown; message?: unknown } } | null)?.cause;
+  const s = [errMessage(err), cause?.code, cause?.message]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (/timed?\s*out|etimedout|aborted/.test(s)) return '连接看板超时';
+  if (s.includes('econnrefused')) return '看板不可达（连接被拒）';
+  if (s.includes('enotfound') || s.includes('eai_again')) return '看板地址解析失败';
+  if (s.includes('fetch failed')) return '看板不可达（网络请求失败）';
+  return '看板响应异常';
+}
+
 /** 执行失败诊断：采集上下文 → 单次 LLM 调用；失败抛出中文错误（原文只进日志/HTA_DEBUG）。 */
 export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Promise<FailureDiagnosisResult> {
   const collect = opts.collectContext ?? collectFailureContext;
-  const ctx = await collect(opts.kanbanUrl, opts.taskId);
+  let ctx: FailureContext;
+  try {
+    ctx = await collect(opts.kanbanUrl, opts.taskId);
+  } catch (err) {
+    if (opts.signal?.aborted) throw new Error('已中断');
+    if (process.env.HTA_DEBUG) console.error(`[diagnosis] 失败上下文采集原文：${errMessage(err).slice(0, 300)}`);
+    throw new Error(`采集该任务的失败信息失败（${collectFailureMessage(err)}），请稍后重试。`);
+  }
   const title = ctx.title || opts.title || '';
   const prompt = buildDiagnosisPrompt(ctx, title);
   const llm = resolveDiagnosisLlm(opts.llm, opts.env);
@@ -198,7 +227,7 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
     opts.complete ??
     (async (p: string, l: DiagnosisLlmConfig, signal?: AbortSignal): Promise<string> => {
       if (!l.baseUrl || !l.apiKey || !l.model) {
-        throw new Error('模型配置不完整（LLM_BASE_URL / LLM_API_KEY / LLM_MODEL），无法进行 AI 诊断。');
+        throw new Error('模型配置不完整，请联系部署者检查模型配置。');
       }
       const client = new OpenAI({ baseURL: l.baseUrl, apiKey: l.apiKey, timeout: timeoutMs, maxRetries: 2 });
       const resp = await client.chat.completions.create(
@@ -241,11 +270,29 @@ export async function latestAttemptId(kanbanUrl: string, taskId: string): Promis
 }
 
 /**
+ * 重试请求的看板错误定性：404 = 执行记录已被看板清理（自动重试必败，单独指路）；
+ * 其余状态码统一中文定性，裸 HTTP 码不直达用户（收 HTA_DEBUG）。
+ */
+function followUpRequestError(err: unknown): Error {
+  if (err instanceof KanbanHttpError) {
+    if (process.env.HTA_DEBUG) console.error(`[diagnosis] 重试请求被看板拒绝：HTTP ${err.status}`);
+    if (err.status === 404) return new Error('执行记录已被看板清理，请到看板手动重新发起该任务。');
+    return new Error('看板接口暂时异常，请稍后重试；持续失败请联系部署者。');
+  }
+  return err instanceof Error ? err : new Error(errMessage(err));
+}
+
+/**
  * 以诊断结论作为 follow-up 指令重启任务：定位 attempt 的最新会话后 POST follow-up。
  * 按钮点击本身就是用户显式授权（与审批/AI 审查按钮同一语义），不再走二次确认。
  */
 export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string, prompt: string): Promise<void> {
-  const raw = await apiGet(kanbanUrl, `/sessions?workspace_id=${encodeURIComponent(attemptId)}`);
+  let raw: unknown;
+  try {
+    raw = await apiGet(kanbanUrl, `/sessions?workspace_id=${encodeURIComponent(attemptId)}`);
+  } catch (err) {
+    throw followUpRequestError(err);
+  }
   const list = Array.isArray(raw) ? raw : [];
   const sessionId = list
     .map((s) => (s && typeof s === 'object' ? String((s as Record<string, unknown>).id || '') : ''))
@@ -254,7 +301,11 @@ export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string
   if (!sessionId) {
     throw new Error('找不到该任务的执行会话（可能已被看板清理），无法自动重试。请到看板手动重新发起该任务。');
   }
-  await apiPost(kanbanUrl, `/sessions/${encodeURIComponent(sessionId)}/follow-up`, { prompt });
+  try {
+    await apiPost(kanbanUrl, `/sessions/${encodeURIComponent(sessionId)}/follow-up`, { prompt });
+  } catch (err) {
+    throw followUpRequestError(err);
+  }
 }
 
 /** 组装重试 follow-up 指令：上次失败原因 + 修复建议作为再次执行的背景。 */

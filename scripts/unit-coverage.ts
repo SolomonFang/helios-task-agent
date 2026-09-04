@@ -190,6 +190,7 @@ async function run(): Promise<void> {
         todo: 0,
         cancelled: 0,
         failed: 0,
+        doneThisWeek: 1, // t1 done 且 updated_at=now ≥ 本周一 00:00（截断前全量口径）
         filesChanged: 3,
         additions: 10,
         deletions: 4,

@@ -1,6 +1,6 @@
 /**
  * 向导联网校验的网络错误友好化：常见模式映射成中文短句；
- * 未命中返回 null，由调用方把原始错误弱化到括号内展示。
+ * 未命中返回 null，由调用方给通用定性，原始错误只进 HTA_DEBUG 日志（不落用户面）。
  */
 
 import { errMessage } from '../infra/err';
@@ -20,8 +20,10 @@ export function friendlyNetError(err: unknown): string | null {
   return null;
 }
 
-/** 错误细节片段：命中映射用「：中文短句」，未命中用「（原始错误）」。 */
+/** 错误细节片段：统一「：中文短句」；未命中映射时给通用定性，原文收 HTA_DEBUG 日志。 */
 export function netErrorDetail(err: unknown): string {
   const mapped = friendlyNetError(err);
-  return mapped ? `：${mapped}` : `（${errMessage(err)}）`;
+  if (mapped) return `：${mapped}`;
+  if (process.env.HTA_DEBUG) console.error(`[config] 网络错误原文：${errMessage(err)}`);
+  return '：网络请求失败';
 }

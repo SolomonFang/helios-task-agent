@@ -10,6 +10,17 @@ import type { GatedWrite } from './gated-write';
 /** 确认卡片展示的优先级中文映射（看板内部值为英文枚举）。 */
 const PRIORITY_LABELS: Record<string, string> = { urgent: '紧急', high: '高', medium: '中', low: '低' };
 
+/** 确认卡片展示的任务类型中文映射（看板内部值为 conventional commit 英文前缀）。 */
+const TASK_TYPE_LABELS: Record<string, string> = {
+  feat: '功能',
+  fix: '修复',
+  docs: '文档',
+  refactor: '重构',
+  perf: '性能',
+  test: '测试',
+  chore: '杂务',
+};
+
 /** 闸门卡片 detail：create 类结构化展示（标题/项目/描述预览），其余保持命令行原文。 */
 function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
   if (!/create/i.test(toolName)) return summarizeBothEnds(`kanban_${toolName}(${JSON.stringify(args)})`);
@@ -18,14 +29,14 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const project = String(args.project_id ?? args.projectId ?? '');
   const priorityLabel = typeof args.priority === 'string' ? PRIORITY_LABELS[args.priority] : undefined;
   const taskType = typeof args.task_type === 'string' ? args.task_type : '';
+  const taskTypeLabel = taskType ? TASK_TYPE_LABELS[taskType] : undefined;
   const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
     `标题：${title}`,
     project ? `项目 ID：${project}` : '',
     // 未命中中文映射时省略该行，不把英文枚举透传到确认卡片
     priorityLabel ? `优先级：${priorityLabel}` : '',
-    // 类型是 conventional commit 前缀（feat/fix/…），保留英文原值
-    taskType ? `类型：${taskType}` : '',
+    taskTypeLabel ? `类型：${taskTypeLabel}` : '',
     preview,
   ]
     .filter(Boolean)
@@ -93,7 +104,15 @@ function mcpFailureText(toolName: string, args: Record<string, unknown>, err: un
   if (process.env.HTA_DEBUG) console.error(`[kanban] 工具 ${toolName} 报错原文：${message}`);
   const action = summarizeMcp(toolName, args);
   const label = action === '看板写操作' ? '看板操作' : action;
-  const reason = /[一-龥]/.test(message) ? message : '看板服务暂时无响应，请稍后重试；持续失败请联系部署者';
+  let reason: string;
+  if (/[一-龥]/.test(message)) {
+    reason = message;
+  } else if (/not found|does not exist|invalid/i.test(message)) {
+    // 确定性失败（任务不存在/参数非法）重试必败，不带「稍后重试」
+    reason = '看板拒绝了该操作，请核对任务是否存在、参数是否正确后重新发起';
+  } else {
+    reason = '看板服务暂时无响应，请稍后重试；持续失败请联系部署者';
+  }
   return `调用失败：${label}（${reason}）`;
 }
 

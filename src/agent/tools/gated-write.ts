@@ -102,7 +102,7 @@ export function makeGatedWriter({
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
           `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
           '如确需重建，请先在「看板」中删除原任务（或告知用户该任务已存在）；\n' +
-          '如用户是想把最新内容合并进原任务，改用 update 更新该任务，不要重建。'
+          '如用户是想把最新内容合并进原任务，改用更新操作修改该任务，不要重复创建。'
         );
       }
       registry.remove(uid, url); // 原任务已被删除 → 清理映射后放行

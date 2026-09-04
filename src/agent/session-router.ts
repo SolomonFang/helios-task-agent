@@ -12,6 +12,8 @@ export interface SessionRouterOptions {
   confirmFactory?: (openId: string) => ConfirmFn;
   /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
   reportLinkBaseUrl?: string;
+  /** 会话形态：透传给每个会话；bot 场景报告服务不可用时省略本机路径行。 */
+  channel?: 'cli' | 'bot';
   /** 会话历史持久化：新建会话时恢复磁盘历史，LRU 淘汰后文件保留（下次说话可恢复）。 */
   historyStore?: SessionHistoryStore;
   /** 提醒存储：透传给每个会话（reminder_* 工具）；缺省由会话按默认路径自建。 */
@@ -38,6 +40,7 @@ export class SessionRouter {
   private readonly memory: MemoryStore;
   private readonly confirmFactory?: (openId: string) => ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
+  private readonly channel?: 'cli' | 'bot';
   private readonly historyStore?: SessionHistoryStore;
   private readonly reminders?: ReminderStore;
 
@@ -53,6 +56,7 @@ export class SessionRouter {
     this.memory = options.memory || new MemoryStore();
     this.confirmFactory = options.confirmFactory;
     this.reportLinkBaseUrl = options.reportLinkBaseUrl;
+    this.channel = options.channel;
     this.historyStore = options.historyStore;
     this.reminders = options.reminders;
   }
@@ -85,6 +89,7 @@ export class SessionRouter {
       memory: this.memory,
       confirm: this.confirmFactory?.(openId),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
+      channel: this.channel,
       historyStore: this.historyStore,
       reminders: this.reminders,
     });

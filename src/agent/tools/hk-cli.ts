@@ -4,6 +4,7 @@ import { extractSourceUrls } from '../source-registry';
 import {
   applyRepoBaseBranches,
   fetchRepoDefaultBranches,
+  fetchRepoNames,
   fillHkStartBranches,
   formatMissingBaseBranchError,
 } from '../../kanban/workspace-ready';
@@ -121,7 +122,11 @@ export function makeHkCliHandler({
               if (repoId) {
                 const defaults = await fetchRepoDefaultBranches(kanbanUrl, [repoId], ctx?.signal);
                 const { unresolved } = applyRepoBaseBranches([{ repo_id: repoId }], defaults);
-                if (unresolved.length) return formatMissingBaseBranchError(unresolved);
+                if (unresolved.length) {
+                  // 报错前先拉仓库名（同 fillHkStartBranches 的错误路径），不落裸 UUID 列表
+                  const names = await fetchRepoNames(kanbanUrl, unresolved, ctx?.signal);
+                  return formatMissingBaseBranchError(unresolved, names);
+                }
                 const branch = defaults[repoId];
                 if (branch) argv.push('--branch', branch);
               } else {
@@ -129,8 +134,8 @@ export function makeHkCliHandler({
                 return await fillHkStartBranches(argv, kanbanUrl, {
                   signal: ctx?.signal,
                   noRepoError:
-                    '无法启动工作区：未指定 --branch / --repo ID:branch，且未配置默认仓库。\n' +
-                    '请显式传入目标分支（如 --branch develop），避免静默回退到不存在的 main。',
+                    '无法启动工作区：本次未指定目标分支，且未配置默认仓库。\n' +
+                    '创建任务时直接告诉我使用哪个分支（如 develop），或联系部署者配置默认仓库。',
                 });
               }
             } else if (!argv.includes('--branch')) {

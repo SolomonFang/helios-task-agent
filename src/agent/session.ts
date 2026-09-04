@@ -5,6 +5,7 @@ import { SourceRegistry } from './source-registry';
 import { createClient, runAgentTurn, trimHistory } from './llm';
 import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
+import { checkHkDeps } from '../infra/deps';
 import { buildSystemPrompt } from './prompt';
 import { buildTools, type CreateCounter } from './tools';
 import { withBatchApproval, type BatchConfirmFn, type ConfirmFn } from './guard';
@@ -22,6 +23,13 @@ import type {
 /** 待注入后台事件的缓存上限：超出丢弃最旧，避免 watcher 风暴/积压撑爆上下文。 */
 const MAX_PENDING_NOTES = 20;
 
+// 备用通道（hk_cli 降级链）依赖探测：进程内只探一次并缓存（同步探测，jq/curl 缺失时即刻返回）。
+let hkDepsAvailable: boolean | undefined;
+function hkAvailable(): boolean {
+  if (hkDepsAvailable === undefined) hkDepsAvailable = checkHkDeps().length === 0;
+  return hkDepsAvailable;
+}
+
 export interface AgentSessionOptions {
   /** CLI 默认 local；飞书通道传 open_id。 */
   userId?: string;
@@ -32,6 +40,8 @@ export interface AgentSessionOptions {
   confirm?: ConfirmFn;
   /** bot 场景的报告静态服务基地址：work_summary 报告改推 HTTP 链接。 */
   reportLinkBaseUrl?: string;
+  /** 会话形态：bot 场景报告服务不可用时省略本机路径行；缺省按 CLI。 */
+  channel?: 'cli' | 'bot';
   /** 会话历史持久化（重启/LRU 淘汰后恢复上下文）；缺省则仅内存。 */
   historyStore?: SessionHistoryStore;
 }
@@ -49,6 +59,7 @@ export class AgentSession {
   private readonly reminders: ReminderStore;
   private readonly confirm?: ConfirmFn;
   private readonly reportLinkBaseUrl?: string;
+  private readonly channel?: 'cli' | 'bot';
   private readonly historyStore?: SessionHistoryStore;
   private batchedConfirm?: BatchConfirmFn;
   /** 「单会话创建上限」计数：会话级状态，跨 buildRuntime 重建（MCP 重连//config）存活，仅 clearHistory 重置。 */
@@ -71,6 +82,7 @@ export class AgentSession {
     this.reminders = opts.reminders || new ReminderStore();
     this.confirm = opts.confirm;
     this.reportLinkBaseUrl = opts.reportLinkBaseUrl;
+    this.channel = opts.channel;
     this.historyStore = opts.historyStore;
     const runtime = this.buildRuntime(cfg);
     this.client = runtime.client;
@@ -131,6 +143,7 @@ export class AgentSession {
       mcpOk: this.mcpOk,
       mcpToolNames: this.mcpOk && this.mcp ? this.mcp.tools.map((t) => t.name) : [],
       kanbanUrl: this.cfg.kanbanUrl,
+      hkAvailable: hkAvailable(),
       projectId: this.cfg.kanbanProjectId || undefined,
       repoId: this.cfg.kanbanRepoId || undefined,
       iteration: this.cfg.kanbanIteration || undefined,
@@ -157,6 +170,7 @@ export class AgentSession {
       onMemoryChange: () => this.refreshSystemPrompt(),
       confirm: this.getConfirm(),
       reportLinkBaseUrl: this.reportLinkBaseUrl,
+      channel: this.channel,
       createCounter: this.createCounter,
       registry: this.registry,
     });

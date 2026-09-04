@@ -9,7 +9,7 @@ import { isLoopbackUrl } from '../infra/url-utils';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { escapeHtml, renderReportPage } from './report-page';
 import { newReportToken } from './report-server';
-import { pruneOldReports, sanitizeName } from './report-utils';
+import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
@@ -247,8 +247,9 @@ function htmlFailureTask(t: WorkSummaryTask): string {
   const metaLine = [t.projectName, t.iteration ? `迭代 ${t.iteration}` : ''].filter(Boolean).join(' · ');
   if (metaLine) parts.push(`<p class="meta-line">${escapeHtml(metaLine)}</p>`);
   parts.push(`<p class="summary">${escapeHtml(t.attemptSummary || '（看板未提供失败摘要）')}</p>`);
-  if (t.diffUrl) {
-    parts.push(`<a class="diff-link" href="${escapeHtml(t.diffUrl)}" target="_blank" rel="noopener">查看改动 →</a>`);
+  const diffUrl = safeHttpUrl(t.diffUrl);
+  if (diffUrl) {
+    parts.push(`<a class="diff-link" href="${escapeHtml(diffUrl)}" target="_blank" rel="noopener">查看改动 →</a>`);
   }
   parts.push('</div>');
   return parts.join('\n');
@@ -327,7 +328,7 @@ export function writeRetroReport(model: RetroModel, opts: { dir?: string } = {})
 /** 给 LLM 解读的文本摘要：概览指标 + 失败归类计数 + 报告链接（明细在 HTML 里，不整份贴进对话）。 */
 export function buildRetroSummary(
   model: RetroModel,
-  opts: { htmlPath?: string; linkBaseUrl?: string } = {},
+  opts: { htmlPath?: string; linkBaseUrl?: string; channel?: 'cli' | 'bot' } = {},
 ): string {
   const { counts } = model;
   const rate = model.completionRate === null ? '—' : `${Math.round(model.completionRate * 100)}%`;
@@ -341,9 +342,10 @@ export function buildRetroSummary(
           ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，机器人重启后链接失效）'
           : '（链接仅本机所在网络可达；报告保留 30 天，机器人重启后链接失效）',
       );
-    } else {
+    } else if (opts.channel !== 'bot') {
       lines.push(`- HTML：${opts.htmlPath}`);
     }
+    // bot 场景报告服务不可用时无链接可给：本机路径对飞书用户是死链且泄露部署机目录，省略只给文本摘要
   }
   lines.push(
     '',

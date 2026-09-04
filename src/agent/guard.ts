@@ -78,11 +78,14 @@ export function batchAckText(scope: ConfirmRequest['batchScope'], kind?: Confirm
   if (scope === 'object') {
     if (kind === 'lark') return '发往同一接收人的同类操作本会话内免问';
     if (kind === 'kanban' || kind === 'hk') return '对同一任务/审批的同类操作本会话内免问';
+    if (kind === 'memory') return '对同一记忆键的写操作本会话内免问';
+    if (kind === 'reminder') return '对同一条提醒的同类操作本会话内免问';
     return '该对象的同类写操作本会话内免问';
   }
   // 类级授权（scope='kind' 或缺省）：如实说整类免问
   if (kind === 'lark') return '飞书写操作本会话内免问';
   if (kind === 'kanban' || kind === 'hk') return '同类看板操作本会话内免问';
+  if (kind === 'reminder') return '创建提醒类操作本会话内免问';
   return '同类写操作本会话内免问';
 }
 
@@ -123,6 +126,8 @@ export type GateResult =
 export const DENIED_MESSAGE = '用户拒绝了该写操作，未执行。请如实转告用户，不要换工具或换参数重试同一操作。';
 export const SUPERSEDED_MESSAGE =
   '该写操作的确认已被新的写操作确认替代，本次未执行（并非用户拒绝）。请如实转告用户；如仍需执行，以最新一次确认为准。';
+export const TIMEOUT_MESSAGE =
+  '该写操作因确认超时未执行（并非用户拒绝）。请如实转告用户；如用户仍需要，可重新发起。';
 export const NO_GATE_MESSAGE =
   '当前会话未配置写操作确认通道，写操作已被安全策略阻止。这通常表示服务部署时未启用确认通道，请联系部署者检查配置。';
 
@@ -160,7 +165,9 @@ export async function passGate(req: ConfirmRequest, confirm: ConfirmFn | undefin
   }
   if (ok) return { allowed: true };
   const reason = supersededReqs.has(req) ? 'superseded' : timedOutReqs.has(req) ? 'timeout' : 'denied';
-  return { allowed: false, reason, message: reason === 'superseded' ? SUPERSEDED_MESSAGE : DENIED_MESSAGE };
+  const message =
+    reason === 'superseded' ? SUPERSEDED_MESSAGE : reason === 'timeout' ? TIMEOUT_MESSAGE : DENIED_MESSAGE;
+  return { allowed: false, reason, message };
 }
 
 // --- lark-cli classification ---

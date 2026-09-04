@@ -15,6 +15,18 @@
 - 失败任务 AI 诊断 + 一键重试（bot）：失败推送卡片新增「🔍 AI 诊断」按钮——采集该任务失败 attempt 的可用信息（任务描述、失败摘要、diff 统计，以看板 REST 实际返回为准）调 LLM 生成中文诊断（失败原因归类 + 关键证据摘要 + 建议修复方向）并推诊断卡片、注入会话上下文；LLM 配置与 AI 审查同一派生口径（`OCR_LLM_*` 逐项优先、缺项回退机器人主模型配置），整体超时 6 分钟，LLM 不可用/超时推送明确中文失败提示；诊断卡片带「↻ 按诊断结论重试」按钮，点击即把诊断结论（失败原因 + 修复建议）作为 follow-up 指令发给执行 Agent 重启任务（点击即显式授权，与审批/AI 审查按钮同一语义，不再二次确认；卡片回调沿用白名单与 action 校验）。防重语义：同一 attempt 只诊断一次、重试发起后诊断卡片原地置为无按钮终态（参照确认卡片终态模式）、重复点击给明确回执（`src/kanban/failure-diagnosis.ts`、`src/bot/handler.ts`、`src/channels/feishu-cards.ts`、`src/channels/feishu.ts`）
 - 定时周报（bot，`HTA_WEEKLY_BRIEF=HH:MM`，默认关）：每周到点向白名单用户（owner）推送本周迭代进展——头部为迭代全量计数（进行中/待办/待审阅/已完成/失败），正文为「本周完成 / 待审阅积压 / 失败」三个分组；`HTA_WEEKLY_BRIEF_DAY=1-7` 指定推送星期（默认 5 周五，非法值告警并按默认处理）；「本周完成」按任务最后更新时间落在本周（周一起，本地时区）统计（看板无「完成时间」字段，`updated_at` 为最接近口径，无法解析时保守不计入）；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部任务。可靠性语义与晨报对齐：推送日期落盘（`weekly-brief-state.json`），重启当周当天不重复推；到点前进程未启动当天可补推；看板不可达/推送失败跳过并按 1→2→4…分钟指数退避重试（封顶 30 分钟）；owner 未认领不推；按 owner 粒度补投（`src/bot/weekly-brief.ts`、`src/bot-main.ts`）
 
+## [1.0.32] - 2026-08-25
+
+### Changed
+
+- 建任务类型推断提示：此前经技能或 MCP 建任务时类型一律落默认 `feat`（修 bug 也建成「新功能」）；现系统提示词与技能文档要求模型按任务内容推断类型——修复缺陷/报错/崩溃 → `fix`，新功能/需求 → `feat`，文档 → `docs`，重构 → `refactor`，性能优化 → `perf`，补测试 → `test`，构建/依赖/杂务 → `chore`，即使用户没提类型也按标题与描述的语义显式传参，仅内容性质不明时才省略（`src/agent/prompt.ts`、`skills/helios-kanban-remote/SKILL.md`）
+
+## [1.0.31] - 2026-08-24
+
+### Added
+
+- 看板任务类型支持：新增 `feat` / `fix` / `docs` / `style` / `refactor` / `perf` / `test` / `chore` 类型（省略默认 `feat`），作为合并（squash）提交信息前缀（如 `fix: 修复登录 500`）；技能文档新增 Task types 章节与 hk `--type` 参数、MCP 建/改任务对应 `task_type` 参数，系统提示词补类型说明与映射（`skills/helios-kanban-remote/`、`src/agent/prompt.ts`、`src/agent/tools/kanban-mcp.ts`）
+
 ### Changed
 
 - 长连接断线告警「用户无感」化：可自动恢复的短时抖动（reconnecting/reconnected）完全静默——SDK 会自动重连、断线期间的消息由飞书侧补投，此前电脑待机/唤醒时「断开超 3 分钟 + 已恢复」逐对刷屏；持续断线超过 15 分钟推一条提醒（之后每小时至多一条，告警经飞书 HTTPS API 发送，长连接断线期间也能送达）；重连彻底失败（failed）立即告警且只报一次；连接恢复时按此前是否提醒过补发「已恢复」（`src/bot/ws-alerter.ts`、`src/bot-main.ts`）

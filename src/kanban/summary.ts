@@ -47,6 +47,8 @@ export interface WorkSummaryTotals {
   cancelled: number;
   /** 最近一次 attempt 失败的任务数（与状态计数正交：失败任务可停在任意状态）。 */
   failed: number;
+  /** 本周完成数（done 且 updated_at ≥ 本周一 00:00，截断前全量口径；周报「本周完成」分组计数用）。 */
+  doneThisWeek?: number;
   filesChanged: number;
   additions: number;
   deletions: number;
@@ -188,6 +190,14 @@ export function localDate(d = new Date()): string {
 function startOfToday(): number {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/** 本周周一 00:00（本地时间）：「本周完成」全量计数起点（与周报/复盘同一口径）。 */
+function startOfWeek(): number {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
   return d.getTime();
 }
 
@@ -340,12 +350,18 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
   // 状态计数遍历截断前的 filtered（行自带 status，无需 enrich）：范围内任务超 MAX_TASKS 时
   // 只对截断后的 50 条统计会让「概览」计数系统性偏小；filesChanged 等需 enrich 的数值仍按
   // 截断后的样本口径统计
+  const weekStart = startOfWeek();
   for (const { row } of filtered) {
     // totals 还含 filesChanged 等数值键，计数时必须用显式状态键集合判定，不能用 in
     const statusKey = TASK_STATUS_KEYS.find((s) => s === String(row.status || ''));
     if (statusKey) totals[statusKey]++;
     // 失败标记与状态正交，同循环一并按截断前全量计数
     if (row.last_attempt_failed) totals.failed++;
+    // 本周完成同样按截断前全量计数（周报分组计数用，updated_at 无法解析保守不计入）
+    if (statusKey === 'done') {
+      const t = Date.parse(String(row.updated_at ?? ''));
+      if (Number.isFinite(t) && t >= weekStart) totals.doneThisWeek = (totals.doneThisWeek ?? 0) + 1;
+    }
   }
   for (const t of tasks) {
     if (t.filesChanged !== undefined) totals.filesChanged += t.filesChanged;

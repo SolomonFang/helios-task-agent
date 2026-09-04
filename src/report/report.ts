@@ -9,7 +9,7 @@ import { isLoopbackUrl } from '../infra/url-utils';
 import { escapeHtml, renderReportPage } from './report-page';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken } from './report-server';
-import { pruneOldReports, sanitizeName } from './report-utils';
+import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { TASK_STATUS_KEYS, isKnownStatus, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
 
@@ -122,7 +122,9 @@ export function renderMarkdown(data: WorkSummaryData): string {
         const files = t.changedFiles.map((f) => `\`${f}\``).join('、');
         lines.push(`- 变更文件：${files}${extra > 0 ? ` 等 +${extra} 个` : ''}`);
       }
-      lines.push(`- [查看 diff](<${t.diffUrl}>)`, '');
+      const diffUrl = safeHttpUrl(t.diffUrl);
+      if (diffUrl) lines.push(`- [查看 diff](<${diffUrl}>)`);
+      lines.push('');
     }
   }
   if (!data.tasks.length) lines.push('（该范围内没有匹配的任务）', '');
@@ -161,8 +163,9 @@ function htmlTaskCard(t: WorkSummaryTask): string {
     const more = extra > 0 ? `<code>+${extra} 个</code>` : '';
     parts.push(`<div class="chips">${chips}${more}</div>`);
   }
-  if (t.diffUrl) {
-    parts.push(`<a class="diff-link" href="${escapeHtml(t.diffUrl)}" target="_blank" rel="noopener">查看 diff →</a>`);
+  const diffUrl = safeHttpUrl(t.diffUrl);
+  if (diffUrl) {
+    parts.push(`<a class="diff-link" href="${escapeHtml(diffUrl)}" target="_blank" rel="noopener">查看 diff →</a>`);
   }
   parts.push('</div>');
   return parts.join('\n');

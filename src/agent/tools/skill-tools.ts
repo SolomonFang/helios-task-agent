@@ -59,7 +59,9 @@ export function makeSkillExecHandler({
       }
     }
     const summary = `执行技能脚本：${skill}/${script}`;
-    const detail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
+    // 确认 detail 用相对形态（解释器 + 技能/脚本相对名 + 参数），宿主机绝对路径不进用户面，只进审计日志
+    const detail = summarizeBothEnds(`${interpreter} ${skill}/${script}${argv.length ? ' ' + argv.join(' ') : ''}`);
+    const auditDetail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
     // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定脚本与实际参数
     //（与 hk_cli 的 hk:tasks delete:<id> 同口径——授权 key 绑定操作对象，换参数需重新确认）
     const batchKey = `skill:${skill}/${script}${argv.length ? `:${argv.join(' ')}` : ''}`;
@@ -69,12 +71,12 @@ export function makeSkillExecHandler({
       ctx?.signal,
     );
     if (!gate.allowed) {
-      auditLog({ user: uid, kind: 'skill', summary, detail, decision: gate.reason }, auditHome);
+      auditLog({ user: uid, kind: 'skill', summary, detail: auditDetail, decision: gate.reason }, auditHome);
       return gate.message;
     }
     const out = await run(interpreter, [scriptReal, ...argv], { signal: ctx?.signal, cwd: rootReal });
     auditLog(
-      { user: uid, kind: 'skill', summary, detail, decision: 'approved', ok: !looksLikeStrongFailure(out), resultSnippet: out },
+      { user: uid, kind: 'skill', summary, detail: auditDetail, decision: 'approved', ok: !looksLikeStrongFailure(out), resultSnippet: out },
       auditHome,
     );
     return wrapUntrusted(out);

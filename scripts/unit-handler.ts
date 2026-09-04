@@ -46,6 +46,7 @@ type ChannelUnderTest = Pick<
   | 'removeReaction'
   | 'notifyOpenId'
   | 'notifyCardOpenId'
+  | 'updateCard'
   | 'lastEventAt'
   | 'connectionState'
 >;
@@ -58,6 +59,7 @@ class FakeChannel implements ChannelUnderTest {
   updated: string[] = [];
   notifies: { openId: string; text: string }[] = [];
   cards: { openId: string; card: Record<string, unknown> }[] = [];
+  updatedCards: string[] = [];
   addedReactions: string[] = [];
   removedReactions: string[] = [];
   addReactionCalls = 0;
@@ -104,6 +106,9 @@ class FakeChannel implements ChannelUnderTest {
     if (this.failCard) throw new Error('card mock failure');
     this.cards.push({ openId, card });
     return `card-${++this.messageSeq}`;
+  }
+  async updateCard(messageId: string, _card: Record<string, unknown>): Promise<void> {
+    this.updatedCards.push(messageId);
   }
   lastEventAt(): number {
     return 0;
@@ -195,7 +200,7 @@ interface Fixture {
 function setup(
   llmBaseUrl: string,
   kanbanUrl = 'http://localhost:1',
-  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'progressHeartbeatMs' | 'imageFetcher' | 'roundNotices'>> & {
+  extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'diagnosisRunner' | 'followUpSender' | 'progressHeartbeatMs' | 'imageFetcher' | 'roundNotices'>> & {
     visionEnabled?: boolean;
   } = {},
 ): Fixture {
@@ -246,6 +251,8 @@ function setup(
     helpText: 'HELP-TEXT',
     lastBatchKind: (openId) => lastWriteKind.get(openId),
     ...(extra.aiReviewRunner ? { aiReviewRunner: extra.aiReviewRunner } : {}),
+    ...(extra.diagnosisRunner ? { diagnosisRunner: extra.diagnosisRunner } : {}),
+    ...(extra.followUpSender ? { followUpSender: extra.followUpSender } : {}),
     ...(extra.progressHeartbeatMs ? { progressHeartbeatMs: extra.progressHeartbeatMs } : {}),
     ...(extra.imageFetcher ? { imageFetcher: extra.imageFetcher } : {}),
     ...(extra.roundNotices ? { roundNotices: extra.roundNotices } : {}),
@@ -421,6 +428,26 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- post 富文本：含图片块时提示图片未读取（仅 vision 开启时，单独发图才可读） ----------
+    await checkAsync('handler：vision 开启时 post 含图片块追加「图片未读取」提示，vision 关闭不提示', async () => {
+      const f = setup(llm.baseUrl, undefined, { visionEnabled: true });
+      await f.handlers.handle(mkMsg('u1', '看下这张图 [图片] 说了什么', { messageType: 'post' }));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('（消息中的图片未读取，请单独发送图片）')),
+        `post 含图片块应提示图片未读取，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      assert.ok(f.channel.updated.includes('好的，已收到'), 'post 文字部分仍照常处理');
+      cleanup(f);
+      // vision 关闭时单独发图也不可读，追加该提示会自相矛盾
+      const f2 = setup(llm.baseUrl);
+      await f2.handlers.handle(mkMsg('u1', '看下这张图 [图片] 说了什么', { messageType: 'post' }));
+      assert.ok(
+        !f2.channel.replies.some((r) => r.text.includes('图片未读取')),
+        'vision 关闭时不应提示单独发送图片',
+      );
+      cleanup(f2);
+    });
+
     // ---------- 消息长度上限：超限直接拒答，不排队不送 LLM ----------
     await checkAsync('handler：超长消息直接拒答，不进入队列与 LLM', async () => {
       const f = setup(llm.baseUrl);
@@ -505,10 +532,11 @@ async function main(): Promise<void> {
       const verdict = f.confirmations.request('u1', req);
       // 短应答（≤10 字符）：引导一次如何裁决，消息不入队（不发给模型让确认静默挂起）
       await f.handlers.handle(mkMsg('u1', '好的'));
-      assert.ok(
-        f.channel.replies.some((r) => r.text.includes('请回复「确认」或「取消」')),
-        '短应答应给裁决引导',
-      );
+      const reminder = f.channel.replies.find((r) => r.text.includes('请回复「确认」或「取消」'));
+      assert.ok(reminder, '短应答应给裁决引导');
+      // 文本降级（无卡片）+ 支持免问的确认：不提卡片按钮，补「免问」应答词
+      assert.ok(!reminder.text.includes('点卡片上的按钮'), `文本降级确认不得引用卡片按钮，实际：${reminder.text}`);
+      assert.ok(reminder.text.includes('或回复「免问」'), `支持免问的确认应提示「免问」应答词，实际：${reminder.text}`);
       assert.ok(
         !f.channel.replies.some((r) => r.text.includes('已收到并排队')),
         '短应答不应入队',
@@ -516,9 +544,13 @@ async function main(): Promise<void> {
       // 同一确认第二次短应答：不再重复引导（避免刷屏），消息照常入队
       const p = f.handlers.handle(mkMsg('u1', '在吗'));
       await waitFor(
-        () => f.channel.replies.some((r) => r.text.includes('有未处理的写操作确认卡片')),
+        () => f.channel.replies.some((r) => r.text.includes('有未处理的写操作确认')),
         'pending 排队回执',
       );
+      // 排队回执同为文本降级形态：不提卡片按钮，补「免问」应答词
+      const queued = f.channel.replies.find((r) => r.text.includes('有未处理的写操作确认'))!;
+      assert.ok(!queued.text.includes('点按钮'), `文本降级排队回执不得引用卡片按钮，实际：${queued.text}`);
+      assert.ok(queued.text.includes('「免问」'), `支持免问的确认排队回执应提示「免问」，实际：${queued.text}`);
       assert.equal(
         f.channel.replies.filter((r) => r.text.includes('请回复「确认」或「取消」')).length,
         1,
@@ -532,11 +564,13 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
-    // ---------- 未知命令（走串行队列，无需 LLM） ----------
-    await checkAsync('handler：未知命令提示 /help', async () => {
+    // ---------- 未知命令（识别前移：即时答复，不进串行队列） ----------
+    await checkAsync('handler：未知命令即时提示 /help，不进串行队列', async () => {
       const f = setup(llm.baseUrl);
+      const base = llm.requestCount; // 计数跨用例累计，取基线
       await f.handlers.handle(mkMsg('u1', '/foobar'));
       assert.ok(f.channel.replies.some((r) => r.text.includes('未知命令 /foobar')));
+      assert.equal(llm.requestCount, base, '未知命令不得进入队列/LLM');
       cleanup(f);
     });
 
@@ -574,17 +608,18 @@ async function main(): Promise<void> {
       await waitFor(() => llm.requestCount === base + 1, '任务进入 LLM');
       await f.handlers.handle(mkMsg('u1', '/stop'));
       assert.ok(
-        f.channel.replies.some((r) => r.text.includes('已中断当前任务')),
-        '/stop 应回复已中断当前任务',
+        f.channel.replies.some((r) => r.text.includes('⏹ 已中断（未完成的操作未执行，可继续对话）')),
+        '/stop 回执应与占位终态同一文案',
       );
       await pA;
       assert.ok(
         f.channel.updated.includes('⏹ 已中断（未完成的操作未执行，可继续对话）。'),
         '被中断的消息应把占位消息收尾为中断终态',
       );
-      assert.ok(
-        !f.channel.replies.some((r) => r.text === '⏹ 已中断（未完成的操作未执行，可继续对话）。'),
-        '/stop 已回执过，不得再重复回复中断终态',
+      assert.equal(
+        f.channel.replies.filter((r) => r.text === '⏹ 已中断（未完成的操作未执行，可继续对话）。').length,
+        1,
+        '中断终态只由 /stop 回执一次，被中断轮次只收尾占位、不重复回复',
       );
       assert.equal(llm.requestCount, base + 1, '中断后不得再发起 LLM 请求');
       llm.release();
@@ -602,7 +637,7 @@ async function main(): Promise<void> {
       await new Promise((r) => setTimeout(r, 50)); // 等处理推进到 sendPlaceholder 的 await 窗口
       await f.handlers.handle(mkMsg('u1', '/stop'));
       assert.ok(
-        f.channel.replies.some((r) => r.text.includes('已中断当前任务')),
+        f.channel.replies.some((r) => r.text.includes('⏹ 已中断（未完成的操作未执行，可继续对话）')),
         `占位发送窗口内 /stop 也应能中断，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
       );
       releaseGate(); // 放行占位发送，让轮次走完中断收尾
@@ -633,7 +668,7 @@ async function main(): Promise<void> {
       );
       await f.handlers.handle(mkMsg('u1', '/stop'));
       const stopReply = f.channel.replies.map((r) => r.text).join('\n');
-      assert.ok(stopReply.includes('已中断当前任务'), '应中断当前任务');
+      assert.ok(stopReply.includes('⏹ 已中断（未完成的操作未执行，可继续对话）'), '应中断当前任务');
       assert.ok(stopReply.includes('已丢弃 1 条排队消息'), `应丢弃 1 条排队消息，实际：${stopReply}`);
       // 被丢弃的消息不会执行回调，其 typing 表情由 /stop 兜底移除（含正在中断的 A）
       assert.ok(f.channel.removedReactions.includes(msgB.messageId), '任务B 的 typing 表情应被兜底移除');
@@ -667,6 +702,31 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- 静默期心跳：确认挂起期间提示等待裁决，不谎称「仍在处理」 ----------
+    await checkAsync('handler：确认挂起期间静默心跳提示等待处理写操作确认', async () => {
+      const f = setup(llm.baseUrl, undefined, { progressHeartbeatMs: 40 });
+      llm.mode = 'hang';
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const verdict = f.confirmations.request('u1', { kind: 'kanban', summary: '更新任务', detail: 'update_task x' });
+      // 消息须 >10 字符：短应答会被挂起确认的提醒分支拦截，不会进入队列
+      const p = f.handlers.handle(mkMsg('u1', '这个问题请认真想一会儿再回答'));
+      await waitFor(() => llm.requestCount === base + 1, '消息进入 LLM');
+      await waitFor(
+        () => f.channel.updated.some((t) => t.includes('⏳ 等待你处理上方的写操作确认…')),
+        '确认挂起期间心跳应提示等待处理确认',
+      );
+      assert.ok(
+        !f.channel.updated.some((t) => t.includes('仍在处理')),
+        '确认挂起期间不得刷「仍在处理」（实际在等用户裁决）',
+      );
+      f.confirmations.resolveFromText('u1', '确认');
+      assert.equal(await verdict, 'once');
+      llm.mode = 'ok';
+      llm.release();
+      await p;
+      cleanup(f);
+    });
+
     // ---------- 轮次内插消息：确认卡片等插在占位之后时，最终回复另发新消息保持时间线顺序 ----------
     await checkAsync('handler：轮次内有确认消息插入时最终回复另发新消息，占位收尾为短终态', async () => {
       const roundNotices = createRoundNoticeTracker();
@@ -680,8 +740,8 @@ async function main(): Promise<void> {
       llm.release();
       await p;
       assert.ok(
-        f.channel.updated.some((t) => t.includes('结果见下方')),
-        '占位应收尾为短终态，不能原地改成最终回复（会停在卡片上方）',
+        f.channel.updated.some((t) => t.includes('处理结束，结果见下方')),
+        '占位应收尾为中性短终态，不能原地改成最终回复（会停在卡片上方）',
       );
       assert.ok(!f.channel.updated.includes('好的，已收到'), '最终回复不得原地替换占位');
       assert.ok(f.channel.sent.includes('好的，已收到'), '最终回复应另发新消息落在时间线末尾');
@@ -750,6 +810,10 @@ async function main(): Promise<void> {
       assert.ok(
         f.channel.replies.some((r) => r.text.includes('排队消息已满')),
         '满员后应提示排队消息已满',
+      );
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('/stop 中断当前任务并清空排队')),
+        '拒收文案应如实告知 /stop 会连带中断当前任务',
       );
       assert.equal(f.router.queuedCount('u1'), 20, '满员后不再入队');
       await f.handlers.handle(mkMsg('u1', '/stop')); // 清场：中断长任务并丢弃排队
@@ -838,6 +902,120 @@ async function main(): Promise<void> {
       }
     });
 
+    // ---------- 失败诊断：去重回执按结果形态分支（卡片 vs 文本降级） ----------
+    await checkAsync('handler：诊断去重回执按结果形态分支，文本降级不提卡片按钮', async () => {
+      // 卡片推送成功：去重回执指向诊断卡片
+      const f1 = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => ({ text: '诊断结论：配置缺失', attemptId: 'att-1' }),
+      });
+      const click1 = () =>
+        f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      click1();
+      await waitFor(() => f1.channel.cards.length === 1, '诊断卡片推送');
+      click1();
+      await waitFor(() => f1.channel.notifies.some((n) => n.text.includes('已诊断过')), '去重回执');
+      const cardTip = f1.channel.notifies.find((n) => n.text.includes('已诊断过'))!;
+      assert.ok(cardTip.text.includes('结果见上方诊断卡片'), `有卡片时应指向诊断卡片，实际：${cardTip.text}`);
+      cleanup(f1);
+      // 卡片推送失败（文本降级）：去重回执改指「重试这个任务」，不提卡片按钮
+      const origErr = console.error;
+      console.error = () => {}; // 降级推送会记日志，测试期间静音
+      try {
+        const f2 = setup(llm.baseUrl, 'http://localhost:1', {
+          diagnosisRunner: async () => ({ text: '诊断结论：配置缺失', attemptId: 'att-1' }),
+        });
+        f2.channel.failCard = true;
+        const click2 = () =>
+          f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+        click2();
+        await waitFor(() => f2.channel.notifies.some((n) => n.text.includes('要按诊断结论重试')), '文本降级推送');
+        click2();
+        await waitFor(() => f2.channel.notifies.some((n) => n.text.includes('已诊断过')), '去重回执');
+        const textTip = f2.channel.notifies.find((n) => n.text.includes('已诊断过'))!;
+        assert.ok(textTip.text.includes('回复「重试这个任务」'), `文本降级应指引回复重试，实际：${textTip.text}`);
+        assert.ok(!textTip.text.includes('点卡片上的'), `文本降级不得引用卡片按钮，实际：${textTip.text}`);
+        cleanup(f2);
+      } finally {
+        console.error = origErr;
+      }
+    });
+
+    // ---------- 失败诊断：拿不到 attemptId 时不落去重键，之后的新失败可再诊断 ----------
+    await checkAsync('handler：拿不到 attemptId 的诊断不落去重键，新失败可再诊断', async () => {
+      let calls = 0;
+      const f = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => {
+          calls++;
+          return { text: '诊断结论' }; // attempts 端点异常：拿不到真实 attempt
+        },
+      });
+      const click = () =>
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', title: '任务X' } } });
+      click();
+      await waitFor(() => f.channel.cards.length === 1, '首次诊断卡片推送');
+      click(); // 之后再次失败点「AI 诊断」：不得谎称「已诊断过」
+      await waitFor(() => calls === 2, '新失败应再次诊断');
+      assert.ok(!f.channel.notifies.some((n) => n.text.includes('已诊断过')), '无 attemptId 不得写去重键');
+      cleanup(f);
+    });
+
+    // ---------- 诊断重试：连点竞态只发起一次（落键先于首个 await） ----------
+    await checkAsync('handler：诊断重试连点竞态只发起一次', async () => {
+      let followUps = 0;
+      let releaseFollowUp!: () => void;
+      const gate = new Promise<void>((r) => (releaseFollowUp = r));
+      const f = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => ({ text: '诊断结论', attemptId: 'att-1' }),
+        followUpSender: async () => {
+          followUps++;
+          await gate;
+        },
+      });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
+      const clickRetry = () =>
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+      clickRetry();
+      clickRetry(); // 连点：第一次还挂在 follow-up 请求上，第二次必须被落键拦截
+      releaseFollowUp();
+      await waitFor(() => f.channel.notifies.some((n) => n.text.includes('已按诊断结论发起重试')), '重试发起回执');
+      await new Promise((r) => setTimeout(r, 50)); // 等第二次点击的异步流程走完
+      assert.equal(followUps, 1, '连点竞态不得发起两次重试');
+      assert.ok(
+        f.channel.notifies.some((n) => n.text.includes('重试已发起过')),
+        '第二次点击应给「已发起过」回执',
+      );
+      const launched = f.channel.notifies.find((n) => n.text.includes('已按诊断结论发起重试'))!;
+      assert.ok(launched.text.includes('任务执行方'), `中英混排「执行 Agent」应统一为「任务执行方」，实际：${launched.text}`);
+      cleanup(f);
+    });
+
+    // ---------- 诊断重试：失败含「已被看板清理」时不追加重新点击指引，且落键回补可再点 ----------
+    await checkAsync('handler：诊断重试遇「已被看板清理」不追加重新点击指引，失败回补后可再点', async () => {
+      let followUps = 0;
+      const f = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => ({ text: '诊断结论', attemptId: 'att-1' }),
+        followUpSender: async () => {
+          followUps++;
+          throw new Error('执行记录已被看板清理，请到看板手动重新发起。');
+        },
+      });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
+      const clickRetry = () =>
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+      clickRetry();
+      await waitFor(() => f.channel.notifies.some((n) => n.text.includes('重试发起失败')), '重试失败回执');
+      const fail = f.channel.notifies.find((n) => n.text.includes('重试发起失败'))!;
+      assert.ok(
+        !fail.text.includes('可稍后重新点击'),
+        `「已被看板清理」自带出路，不应追加重新点击指引，实际：${fail.text}`,
+      );
+      clickRetry(); // 发起失败已摘键回补：可再次尝试（不是「已发起过」）
+      await waitFor(() => followUps === 2, '失败回补后应可再次发起');
+      cleanup(f);
+    });
+
     // ---------- 卡片回调：非本机器人 payload / 无操作者静默忽略，未知 id 兜底，有效 id 裁决 ----------
     // （open_id 白名单在 feishu.ts WS 层，由 unit-feishu-filter.ts 覆盖；本用例测 handler 层入口过滤）
     await checkAsync('handler：卡片回调入口过滤（非本机器人/无操作者）与确认裁决', async () => {
@@ -892,6 +1070,25 @@ async function main(): Promise<void> {
         f.channel.replies.at(-1)!.text.includes('写操作逐次确认'),
         `查询分支应打印状态，实际：${f.channel.replies.at(-1)!.text}`,
       );
+      cleanup(f);
+    });
+
+    // ---------- /clear：免问授权随清史一并恢复逐次确认，回执按实际告知 ----------
+    await checkAsync('handler：/clear 告知免问授权已一并恢复逐次确认', async () => {
+      const f = setup(llm.baseUrl);
+      // 用真实 withBatchApproval 装配一个生效中的 batch 授权（直接喂 verdict='batch'）
+      const session = f.router.getOrCreate('u1') as unknown as {
+        batchedConfirm?: ReturnType<typeof withBatchApproval>;
+        activeBatchApprovals(): number;
+      };
+      session.batchedConfirm = withBatchApproval(async () => 'batch');
+      await session.batchedConfirm({ kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' });
+      assert.equal(session.activeBatchApprovals(), 1);
+      await f.handlers.handle(mkMsg('u1', '/clear'));
+      const reply = f.channel.replies.at(-1)!.text;
+      assert.ok(reply.includes('对话历史已清空'), `应告知历史已清空，实际：${reply}`);
+      assert.ok(reply.includes('1 项免问授权已一并恢复逐次确认'), `应告知免问授权一并恢复，实际：${reply}`);
+      assert.equal(session.activeBatchApprovals(), 0, '免问授权应已被撤销');
       cleanup(f);
     });
 

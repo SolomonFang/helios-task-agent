@@ -93,33 +93,40 @@ function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatu
  * 「本周完成」口径：状态为已完成且最后更新时间落在本周（周一 00:00 起，本地时区）。看板任务
  * 没有「完成时间」字段，updated_at 是最接近的口径——已完成的任务很少再被编辑，最后更新时间
  * 通常就是转入已完成的那一刻；updated_at 无法解析的任务保守不计入（宁缺毋假）。
+ * 分组计数用 totals.doneThisWeek（采集侧截断前全量口径，与头部计数行一致）；标题列表仍是
+ * data.tasks 的截断样本。旧采集缺该字段时回退样本计数（只少报不谎报）。
  */
 export function buildWeeklyBriefText(data: WorkSummaryData, now: Date): string {
   const weekStart = startOfWeek(now);
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
+  // 头部日期范围终点不越过推送当天：周一推送就展示「至 周日」是在预报未来
+  const rangeEnd = weekEnd.getTime() > now.getTime() ? now : weekEnd;
   const doneThisWeek = data.tasks.filter((t) => {
     if (t.status !== 'done') return false;
     const ts = Date.parse(t.updatedAt);
     return Number.isFinite(ts) && ts >= weekStart.getTime();
   });
+  const doneThisWeekTotal = data.totals.doneThisWeek ?? doneThisWeek.length;
   const inreview = data.tasks.filter((t) => t.status === 'inreview');
   // 失败按 last_attempt_failed 标记独立分组（与状态正交：失败任务可能停在 inprogress 等任意状态）
   const failed = data.tasks.filter((t) => t.failed);
   // 头部计数全部用 totals（截断前全量，迭代全量口径）；列表仍取截断后的 data.tasks 抽样。
-  // 失败与状态计数正交，非零时注明口径（零值不挂括注，减少噪音）
+  // 失败与状态计数正交，非零时注明口径（零值不挂括注，减少噪音）；
+  // 「已完成」是迭代/全部任务累计口径，与下方「本周完成」分组不同口径，须标注避免误读
   const failedNote = data.totals.failed ? '（含于上方状态）' : '';
+  const doneNote = data.iteration ? '（迭代累计）' : '（累计）';
   const lines = [
-    `📅 看板周报 · ${data.sinceLabel}（${localDateStr(weekStart)} 至 ${localDateStr(weekEnd)}）`,
-    `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done} · 失败 ${data.totals.failed}${failedNote}`,
+    `📅 看板周报 · ${data.sinceLabel}（${localDateStr(weekStart)} 至 ${localDateStr(rangeEnd)}）`,
+    `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done}${doneNote} · 失败 ${data.totals.failed}${failedNote}`,
   ];
   if (!data.tasks.length) {
     lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
   } else {
-    if (!doneThisWeek.length) lines.push('', '本周暂无新完成的任务。');
+    if (!doneThisWeekTotal) lines.push('', '本周暂无新完成的任务。');
     let anySection = false;
     for (const section of [
-      listSection('本周完成', doneThisWeek),
+      listSection('本周完成', doneThisWeek, { total: doneThisWeekTotal }),
       listSection('待审阅积压', inreview, { total: data.totals.inreview }),
       listSection('失败', failed, { showStatus: true, total: data.totals.failed }),
     ]) {
@@ -134,7 +141,7 @@ export function buildWeeklyBriefText(data: WorkSummaryData, now: Date): string {
       const parts: string[] = [];
       if (data.totals.cancelled) parts.push(`已取消 ${data.totals.cancelled} 个`);
       const unknown = data.tasks.filter((t) => !isKnownStatus(t.status)).length;
-      if (unknown) parts.push(`其它状态 ${unknown} 个`);
+      if (unknown) parts.push(`其他状态 ${unknown} 个`);
       if (parts.length) lines.push('', parts.join(' · '));
     }
   }

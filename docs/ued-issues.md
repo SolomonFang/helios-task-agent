@@ -391,3 +391,140 @@
 - CLI 闸口免问词表与授权粒度脱节：类级操作下输入「同对象免问」会被静默授予类级授权（比字面范围大），反之亦然。边缘场景（用户须输入提示里没展示的词），授权行为按 batchKey 正确、仅措辞与授权范围的映射问题，暂缓。
 - src/agent/llm.ts:305、src/agent/confirm.ts:195 两处 console 日志半角冒号（非用户可见面，随下轮顺手清理）。
 - 第八轮遗留项（代码注释黑话、bot 场景 MD 报告在线化、lastWriteKind 并发措辞）维持暂不修结论。
+
+## 第十轮复查（2026-09-04，六大新功能落地后全表面复审）
+
+> 背景：第九轮后经历 5 个提交（建任务类型推断、1.0.32、技能文档同步、提醒/个人日报/迭代复盘/周报/停滞催办/AI 失败诊断六大新功能、多角度审查加固）。本轮 14 路并行审查 = 增量 diff 专项 + 13 个用户可见表面（提醒、推送链路、报告、卡片、确认闸、会话、CLI、向导、prompt/技能文档、文档一致性、工具层、看板链路、AI 审查回归），P1 三条均已人工复核代码确认。修复由 11 路并行完成；验证：typecheck 0 错误，单测 16 个套件 539 条断言全过（含新增用例），smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为审查时点快照。
+
+### P1 误导与高风险
+
+- [x] **T1 提醒跨形态串桶投递：飞书提醒可被 CLI 截胡并标记「已投递」，反向必败重试无休**
+  - 位置：`src/agent/reminder.ts:317`（`due()` 跨全部用户桶）、`src/cli.ts:402`（deliver 忽略 uid 直接打印终端并落盘 delivered）、`src/bot-main.ts:710`（对 uid=`local` 调 `notifyOpenId` 必被飞书拒绝）
+  - 现象：CLI 与 bot 默认共享 `~/.helios-task-agent/reminders.json`。飞书设的提醒到期时若本机开着 CLI，提醒只打印在终端并落盘已投递，飞书永不再推——与创建回执「到点主动推送」相反；反向 CLI 提醒被 bot 每 ≤30 分钟退避重试，永不放弃，日志持续报错。
+  - 方案：Reminder 记录创建形态或 deliver 按 uid 过滤（CLI 只投 `local`、bot 跳过 `local`），跨形态桶不投递不标记。
+
+- [x] **T2 看板可控的 diffUrl 未校验 scheme 直接进报告页 href**
+  - 位置：`src/report/retro.ts:251`、`src/report/daily-report.ts:91`、`src/report/report.ts:165`（MD 侧 `report.ts:125` 同样裸嵌）
+  - 现象：`<a href="${escapeHtml(t.diffUrl)}">`——escapeHtml 只挡属性逃逸，挡不住 `javascript:alert(...)` 这类 scheme；diffUrl 来自看板任务数据（代码自标 UNTRUSTED），用户在自己信任的内部报告页点「查看改动」即在报告源内执行任意脚本。
+  - 方案：渲染前校验 URL 仅放行 `http:`/`https:`，其余按无链接处理（与 W2/B3/N17 外部可控数据中和同族）。
+
+- [x] **T3 prompt 无条件教模型谎称「大部分功能可用」（S1 同型最后存活实例）**
+  - 位置：`src/agent/prompt.ts:51`
+  - 现象：MCP 未连接时 prompt 教模型转告「看板当前通过备用接口连接，大部分功能可用，如遇操作失败请稍后再试」——缺 jq/curl 时备用通道整体不可用，模型会在每次操作失败后仍复读该承诺。banner、/status、/tools、启动告警已全部按 hkMissing 条件化（G2/G4/N16），唯独这句没有；`buildSystemPrompt` 入参根本拿不到 hk 依赖状态。
+  - 方案：`buildSystemPrompt` 增加 hkAvailable 参数，缺依赖时改教「看板读写暂不可用（备用通道缺少 jq、curl，安装后恢复）」。
+
+### P2 文案可理解性与死胡同
+
+- [x] **T4 AI 诊断「模型配置不完整」暴露三个环境变量名且 handler 追加必败重试**
+  - 位置：`src/kanban/failure-diagnosis.ts:201` + `src/bot/handler.ts:342-344`
+  - 现象：watcher 推送失败卡片（不依赖 LLM）后用户点「AI 诊断」，收到「模型配置不完整（LLM_BASE_URL / LLM_API_KEY / LLM_MODEL）…可稍后重新点击失败卡片上的『AI 诊断』重试」——配置不会自愈，重试必败。
+  - 方案：改「模型配置不完整，请联系部署者检查模型配置」，并把「配置不完整」纳入 `hasOwnWayOut` 抑制词。
+
+- [x] **T5 诊断采集阶段英文原文直达用户**：`failure-diagnosis.ts:187`（collect 在 try 外）——看板不可达/健康超时时用户收到「⚠️ AI 诊断失败：《x》\nfetch failed」或「The operation timed out.」。采集段包 try，复用 `friendlyNetError` 转中文定性，原文收 HTA_DEBUG（G8/G10/G17 同型漏网链路）。
+
+- [x] **T6 「可设 HTA_DEBUG=1 重新运行」出路对 bot 用户不可执行**：`src/kanban/http.ts:33`——N19 修复文案面向 CLI 部署者，但新诊断/重试/AI 审查链路把它送达无部署权限的飞书用户。用户面改「请稍后重试；持续失败请联系部署者」，HTA_DEBUG 提示仅 CLI 场景拼接。
+
+- [x] **T7 `html:false` 时截断注记指向不存在的报告**：`src/report/daily-report.ts:262`——只取素材未生成 HTML 时仍输出「…还有 N 个见上方报告链接 / 见报告文件」。注记按 `opts.htmlPath` 条件拼接，否则只报数量（「完整清单可直接问我」）。
+
+- [x] **T8 停滞提醒时长文案可与事实相反**：`src/kanban/watcher.ts:397`、`src/kanban/stale-nudge.ts:15-23`——`Math.round` 把 8.55 小时报成「已超过 9 小时」；`HTA_STALE_NUDGE_HOURS=0.5`（解析器允许小数）时 30 分钟就推「已超过 1 小时」。改 `Math.floor`（只少报不多报），阈值校验 ≥1 或不足 1 小时按分钟描述。
+
+- [x] **T9 周报头部「已完成 N」（迭代累计）与同屏【本周完成】M 直接打架**：`src/bot/weekly-brief.ts:113-114,122`——周报语境下极易把迭代累计读成本周完成数。头部补口径标注「（迭代累计）」或只保留本周口径。
+
+- [x] **T10 催办引导「催一下」在 prompt 无话术映射（F25 同类漏网）**：`src/kanban/watcher.ts:400` + `src/agent/prompt.ts:94`——模型收到「催一下」行为不可预期。补「催一下/查看进度 → 读任务状态与运行记录并汇报」映射。
+
+- [x] **T11 本地写盘失败被误诊「看板服务暂时无响应」**：`src/agent/tools/iteration-retro.ts:36-37`、`src/agent/tools/personal-daily.ts:40-41`——catch 同时罩住看板采集与报告写盘（磁盘满/权限不足），重试必败且把部署者引向看板服务。区分两类失败，写盘失败改「报告文件写入失败，请联系部署者检查报告目录」（N21 同类）。
+
+- [x] **T12 诊断卡片正文 LLM 输出按 lark_md 渲染、无任何中和**：`src/channels/feishu-cards.ts:317-321`——诊断输入含失败日志/任务描述等外部可控数据，经 LLM 复述后 `[文字](链接)`/`<font color>`/`~~删除线~~` 会真实渲染，可伪造警示或钓鱼链接（W2/B3/N17 防护体系在「LLM 中转」分支漏网）。渲染前对诊断文本最小中和（`<at`/`<font` 标签与 `~~`），或证据段改 plain_text 引用块。
+
+- [x] **T13 诊断去重回执在文本降级场景引用不存在的卡片按钮**：`src/bot/handler.ts:272-276` vs `319-325`——诊断卡片推送失败走纯文本后，重复点「AI 诊断」仍收到「结果见上方诊断卡片；点卡片上的『↻ 按诊断结论重试』」。按 `diagnosisResults.get(taskId)?.cardMessageId` 分支，无卡片改「回复『重试这个任务』」（F15 同类漏网）。
+
+- [x] **T14 确认超时后模型仍被告知「用户拒绝了该写操作」**：`src/agent/guard.ts:162-163`——用户刚收到「确认超时，已自动拒绝」，模型最终回复却说「你已拒绝该写操作」，同屏自相矛盾（N43 只透传审计，没管模型话术）。新增 TIMEOUT_MESSAGE：「确认超时未处理，操作未执行（并非用户拒绝）；如仍需执行可重新发起」。
+
+- [x] **T15 skill_exec 确认 detail 暴露宿主机绝对路径**：`src/agent/tools/skill-tools.ts:62`——确认卡片代码块与 CLI 灰字展示 `bash /Users/<部署者用户名>/…/script.sh`，泄露部署目录结构（S17/G8 先例漏网）。detail 改相对形态（`skill/script + 参数`），绝对路径只进审计日志。
+
+- [x] **T16 /clear 静默撤销免问授权，提醒分支成死代码**：`src/agent/session.ts:224`（clearHistory 先撤销全部免问）+ `src/commands.ts:214` + `src/cli.ts:447-448` + `src/bot/handler.ts:840-841`——clearHistory 后 `activeBatchApprovals()` 恒为 0，F21 加的「仍有 N 项免问授权生效中」永不可达；行为已从「保留免问」反转为「撤销免问」，文案既没按新行为告知、旧分支又成死代码。clearHistory 前先取计数，按新语义告知「N 项免问授权已一并恢复逐次确认」。
+
+- [x] **T17 「↻ 按诊断结论重试」连点竞态发起两次重试**：`src/bot/handler.ts:370-378`——`retryLaunched.has` 检查与 `add` 之间隔 `await sendFollowUp`，双击都通过检查，同一执行记录被注入两条相同跟进指令。落键提到首个 await 前，失败时摘键回补（对照 feishu.ts:773 群 @ 冷却先例）。
+
+- [x] **T18 attempts 端点异常时去重键退化 `task:latest` 永久占位**：`src/bot/handler.ts:271,309`——该任务之后再次失败点「AI 诊断」收到「这次失败已诊断过」，实际新失败从未诊断，且被导向一张旧卡片。无 attemptId 时不写 `diagnosedKeys`（或去重键带时间窗）。
+
+- [x] **T19 失败卡片「AI 诊断」按钮与「回复为什么失败」注脚两套引导并存无分工**：`src/channels/feishu-cards.ts:216,229`——两路径产出不同（按钮=正式诊断+一键重试；回复=会话自由发挥），用户无从分辨。卡片 hint 改「点上方『AI 诊断』自动分析失败原因」，回复路径保留为备选。
+
+- [x] **T20 CLI 闸口重问提示被 spinner 反复擦除**：`src/cli.ts:351-380`——输入「好的/ok」后打印「无法识别的回答…」，但 spinner 已重启，每 80ms `\r\x1b[K` 清行，重问提示与用户输入被「思考中…」覆盖（且「思考中」本身在谎称，实际在等用户）。`continue` 前先 `spinner.stop()`（S4/G15 修复路径在真实终端不可见）。
+
+- [x] **T21 CLI /tools 用启动时探测结果，与 /status、bot 端实时探测矛盾**：`src/cli.ts:312,480-484` vs `src/commands.ts:62`、`src/bot/handler.ts:521`——会话中补装 jq/curl 后 /status 显示「备用通道：正常」、同端 /tools 仍显示「缺少 jq 不可用」。CLI /tools 改调用时 `await checkHkDepsAsync()`。
+
+- [x] **T22 net-error fallback 英文原文内联**：`src/config/net-error.ts:26`——未命中映射的错误（代理拦截页、证书错误 unable to verify the first certificate 等）原样拼给用户（G10/G11 漏网分支）。fallback 改通用「网络请求失败」，原文统一收 HTA_DEBUG。
+
+- [x] **T23 llm-verify 5xx 误诊「端点未实现 /models 接口…不代表配置有误」**：`src/config/llm-verify.ts:36-40`——500/502/503（网关故障/服务重启）被当作「兼容网关如此」，还诱导输入 s 保存故障中的配置。5xx 单列「模型服务异常（HTTP N），请稍后重试」。
+
+- [x] **T24 EOF/中断报错「配置未完成，未写入任何更改」两处失实**：`src/config/config-wizard.ts:38,45,199`——bot 两阶段流程模型配置已先落盘，飞书阶段中断时文案与磁盘状态相反；出路「重新运行命令进入向导」对无交互终端部署（systemd/Docker）必然同样 EOF，且未告知 .env 确切路径。改「已完成的步骤已保存，重新运行可从断点继续；无交互终端时请直接编辑 <userEnvPath()>」。
+
+- [x] **T25 prompt 英文术语禁用清单漏 MCP/hk_cli/lark_cli**：`src/agent/prompt.ts:146`——这三个词在 prompt 正文出现十余次，模型照学极易原样搬给用户（F24/G7 系统性清理的回流口）。禁用清单补这三个词，或加一条「工具名只在调用时使用，回复用户一律说『看板/备用通道』」。
+
+- [x] **T26 「周报/本周进展」在 prompt 无映射**：`src/agent/prompt.ts:87-100`——周报已是正式推送功能，但用户主动说「这周完成了什么」时 12 条工作流无一覆盖，模型只能即兴（错用 today 范围或连调 7 次日报）。补一条映射并如实说明无周粒度口径。
+
+- [x] **T27 prompt 相邻工作流口径打架：报告「文件路径」vs「链接」**：`src/agent/prompt.ts:97-99`——#9 教给文件路径（bot 场景会把部署机路径发给飞书用户，G27 还专门删过），#10/#11 教给链接。统一「以工具实际返回为准 + 3~5 行概览」。
+
+- [x] **T28 SKILL.md 多仓启动自相矛盾**：`skills/helios-kanban-remote/SKILL.md:56,178` vs `:186`——Quick workflow 与 Safety rule 5 教 `hk start --repo id1 --repo id2:develop`，Out of scope 却把「Multi-repo workspace create」列为不支持。删除该条或澄清为「与任务无关的独立多仓工作区创建」。
+
+- [x] **T29 投递失败退避中的提醒在列表里显示「已到点」无解释**：`src/agent/reminder.ts:62`——飞书推送失败进入退避时，用户查列表看到「已到点」却没收到推送，也不知系统正在自动重试。`failCount>0` 的条目改显示「已到点，投递失败，正在自动重试」。
+
+- [x] **T30 周期提醒静默降级为一次性**：`src/agent/prompt.ts:100`——用户说「每周一提醒我写周报」，模型只能建一条一次性提醒且无话术要求如实说明。prompt 补「不支持周期性提醒，用户要求重复提醒时必须如实说明」。
+
+- [x] **T31 占位收尾「✅ 已完成」与中止文案同屏矛盾**：`src/bot/handler.ts:714`——插过确认卡片的轮次，占位恒收尾「✅ 已完成，结果见下方」，但正文可能是「已中止」「模型未返回内容」。占位收尾改中性「处理结束，结果见下方」或按内容分支用 ⚠️。
+
+- [x] **T32 CHANGELOG 缺 [1.0.31]、[1.0.32] 节且 [Unreleased] 混入已发布内容（F29/G33/N7 第四次复发）**：`CHANGELOG.md:7-30`——断线告警与第九轮条目实际随 1.0.31 发布却仍挂 [Unreleased]；更新提示的变更链接点进去看不到目标版本内容。按 tag 时点收编 [1.0.31]（补技能类型条目）、新增 [1.0.32] 节。
+
+### P3 细节打磨
+
+- [x] **T33** memory/reminder 对象级免问回执兜底「该对象」（G34 漏网新 kind）：`src/agent/guard.ts:81`——补 memory（同一记忆键）/reminder（同一条提醒）分支。
+- [x] **T34** 内部工具名漏出：「可先用 reminder_list 查看序号」经模型转告用户（`reminder-tools.ts:91`）；「相对时长请用 in_minutes 参数」（`reminder.ts:136`）——改自然语言「先问『我有哪些提醒』」「直接说『30 分钟后』」。
+- [x] **T35** 提醒确认「（本地时间）」实为部署机器时区，远程部署误导：`src/agent/tools/reminder-tools.ts:43`——改「（按部署机器时区）」或在 /status 暴露时区。
+- [x] **T36** 「晚上 12 点」被解析为次日中午 12:00（hour=12 不加 12 规则漏网）：`src/agent/reminder.ts:99`——「晚上」且 hour===12 按 0 点处理或报错确认。
+- [x] **T37** `toolActionLabel` 对 reminder_* 一律「设置提醒」（取消/查询时与动作相反）、对 daily_report/iteration_retro 回落「调用工具」（同类 work_summary 显示「生成报告」）：`src/commands.ts:137-146`。
+- [x] **T38** CLI 空闲时提醒打印打乱 readline 输入行（不重绘提示符）；投递日志「[reminder] 提醒已送达（local）：<正文>」英文标签+内部 uid+正文二次出现：`src/cli.ts:206,406`、`src/agent/reminder.ts:413-420`。
+- [x] **T39** 周报【本周完成】是截断样本（≤50 条）口径，与同文件 totals 全量组不一致，极端时输出谎言「本周暂无新完成的任务」：`src/bot/weekly-brief.ts:99-105,122`——截断时补「（按最近 50 条样本统计）」或由 summary 补全量计数。
+- [x] **T40** 周报头部日期范围含未来日期（周一推送显示「至 周日」）：`src/bot/weekly-brief.ts:99-100,113`——终点取推送当天或改「第 N 周」。
+- [x] **T41** `KANBAN_WATCH=0` 时 `HTA_STALE_NUDGE_HOURS` 静默完全失效零告警：`src/bot-main.ts:575-583`——watch 关闭且 stale 变量已设置时 console.warn 一句。
+- [ ] **T42** 周报错过推送日即整周静默，无补推无告知：`src/bot/weekly-brief.ts:248-249`——当周后续日期补推一次并注明补发，或录入暂不修。
+- [x] **T43** 报告服务启动失败时 bot 推送本机绝对路径（死链+目录泄露，G23/F28 漏网分支）：`src/report/retro.ts:345`、`src/report/daily-report.ts:246`——bot 场景无 linkBaseUrl 时省略 HTML 行。
+- [x] **T44** 日报页未注「当日」为服务器本地时区日界（复盘页已注，姊妹页口径不一）：`src/report/daily-report.ts:188-193`。
+- [x] **T45** 「· …还有 N 个见上方报告链接」数量与指引粘连缺标点：`src/report/daily-report.ts:262`。
+- [x] **T46** 诊断重试遇看板 404/500 裸 HTTP 码直达且 404 重试必败：`src/bot/handler.ts:389-393` + `src/kanban/http.ts:61-66`——404 单独定性「执行记录已被看板清理，请到看板手动重新发起」并纳入 hasOwnWayOut。
+- [x] **T47** hk-cli 两处漏网：默认仓库缺默认分支报裸 UUID 列表（G25 漏网分支，`hk-cli.ts:124`）；「未指定 --branch / --repo ID:branch」CLI 旗标黑话经模型转告（S7 口径，`hk-cli.ts:131-134`）。
+- [x] **T48** 诊断 prompt 任务标题取不到时回退裸 UUID，LLM 大概率复述进卡片：`src/kanban/failure-diagnosis.ts:138`——prompt 里用「该任务」，卡片标题调用方兜底「未命名任务」。
+- [x] **T49** 挂起确认的短应答提醒与排队回执在文本降级场景指引落空（根本没有卡片按钮），且未提「免问」应答词：`src/bot/handler.ts:604,870`。
+- [x] **T50** 确认专属词表漏「免问/都允许」缩略词：超时后回「免问」被当新对话发给模型，模型可能顺口承诺「已开启免问」（实际无授权）；回「同类免问」却得到正确提示，同族词两种待遇：`src/agent/confirm.ts:55` vs `src/cli.ts:349`。
+- [x] **T51** 两端 /help 仍写「查看『同类免问』状态」，与 N29 统一的「免问授权」口径漂移：`src/cli.ts:97`、`src/bot-main.ts:59`。
+- [x] **T52** 去重拦截文案夹英文工具名「改用 update 更新该任务」：`src/agent/tools/gated-write.ts:104-105`。
+- [x] **T53** bot 文本降级确认免问提示同句三个「免问」堆砌：`src/bot-main.ts:394-397`。
+- [x] **T54** 确认挂起期间静默心跳刷「⏳ 仍在处理…（已等待 N 秒）」——实际在等用户点卡片：`src/bot/handler.ts:696`——pending 时改「等待你处理上方的写操作确认」。
+- [x] **T55** 图片消息 LLM 失败尾注引用内部占位「你的上一条消息未处理：「[图片]」，可修改后重发」：`src/bot/handler.ts:938` + `src/commands.ts:247`——图片轮次用原配文，措辞改「可重发图片」。
+- [x] **T56** 排队上限拒收文案「（或先 /stop 清空队列）」隐瞒 /stop 会连带中断当前任务：`src/bot/handler.ts:863`。
+- [x] **T57** /stop 双回执措辞不一（「⏹ 已中断当前任务。」vs 占位「⏹ 已中断（未完成的操作未执行，可继续对话）。」），像两个事件：`src/bot/handler.ts:466,805`。
+- [x] **T58** vision 开启时 post 富文本消息里的配图被静默丢弃，无任何提示：`src/bot/handler.ts:945`——post 含图片块时追加「（消息中的图片未读取，请单独发送图片）」。
+- [x] **T59** 未知斜杠命令走串行队列，排在最长 30 分钟的任务后才回「未知命令」：`src/bot/handler.ts:844-847`——识别前移到即时命令分发。
+- [x] **T60** 「执行 Agent」中英混排两处（G18/N25 漏网）：`src/bot/handler.ts:387`、`src/channels/feishu-cards.ts:344`——统一「任务执行方」。
+- [x] **T61** `/confirm off` 被报「未知命令 /confirm」且与 bot 端行为相反（bot 按状态查询应答）：`src/cli.ts:449,555` vs `src/bot/handler.ts:482-490`。
+- [x] **T62** bin --help 的 --rebind/--reconfig 行缺「先停止当前进程」警告（README/向导已带），且未列出实际支持的 `-v`/`version` 形式：`bin/helios-task-agent.js:20-24`。
+- [x] **T63** /config 改看板地址警示在「MCP 从未连上」场景失实（「当前连接仍指向旧看板」——此时无连接，工具实际走已指向新地址的备用通道，同句下半句也这么说）：`src/cli.ts:540-547`——按 mcpOk 条件化。
+- [x] **T64** 向导取消两端口径漂移（S27 漏网）：CLI /config 按 Esc 中性灰字，bot --reconfig 按 Esc 红色「配置失败：已取消」并 exit 1：`src/bot-main.ts:267-272` vs `src/cli.ts:548-553`。
+- [x] **T65** 启动横幅「配置目录：/…/.env」把 .env 文件标注为目录：`src/bot-main.ts:174`。
+- [x] **T66** 向导看板地址仍写「默认 X」，与可选字段已统一的「回车 = 保留当前 X」口径不一（N11 漏网）：`src/config/config-wizard.ts:164`。
+- [x] **T67** 向导白名单回显 `join(',')` 非「、」（N48 口径）；--rebind 流程内仍引导「再运行 --rebind 回填」循环指路：`src/config/config-wizard.ts:249-250`。
+- [x] **T68** README 示例与产品内 TRY_EXAMPLES 漂移：/help 已含提醒示例而 README 没有；两端都缺「复盘一下这个迭代」「帮我写今天的日报」（U16/N30 同类）：`README.md:243-249`、`README.en.md:238-244` vs `src/commands.ts:27-36`。
+- [x] **T69** 创建任务确认 detail「类型：feat」英文前缀直达用户，且本轮 prompt 改「必须显式传 task_type」后将高频出现：`src/agent/tools/kanban-mcp.ts:27-28`——加中文映射，未命中省略该行（与优先级同口径）。
+- [x] **T70** kanban-mcp 英文报错一律兜底「看板服务暂时无响应，请稍后重试」——对确定性失败（任务不存在/参数非法）归因失实且重试必败：`src/agent/tools/kanban-mcp.ts:96`。
+- [x] **T71** 技能文档细节：SKILL.md 回复模板类型英文键无中文对照（`:119`）；Safety rule 6 与 Out of scope 仍教英文「PR/push/merge/rebase/desktop Web UI」与 prompt 禁令冲突（`:179-186`）；INSTALL.md 完成汇报模板 5 处半角冒号（`:185-189`）。
+- [x] **T72** hk.sh 失败时把 `HTTP <code>: <完整响应体>`（可能是反代整页 HTML）与完整 JSON 两遍倒到 stderr，单行超长 JSON 可经 shared.run 进入模型上下文：`skills/helios-kanban-remote/scripts/hk.sh:29-39`——收敛为「状态码 + message 字段」。
+- [x] **T73** /memory 超预算「（记忆过长，已省略 N 条）」无出路（被省略条目所有用户面不可见）：`src/agent/memory.ts:249`——补「可让我删除不再需要的记忆」。
+- [x] **T74** repo-fs 两条英文参数名残留（S12/G17 漏网）：「需要 root（绝对路径）或 repo_id」「action 必须是 list | read | grep」：`src/agent/repo-fs.ts:146,363`。
+- [x] **T75** 停滞提醒 hint 文本版与卡片注脚是两份独立字符串（仅差末尾句号），S26/N46 同源化先例漏网：`src/kanban/watcher.ts:400` vs `src/channels/feishu-cards.ts:230`——抽 `WATCH_HINT_STALE` 常量。
+- [x] **T76** ws-alerter 重复提醒「已断开超过 N 小时」用 Math.round（1.6 小时报「超过 2 小时」）且丢掉了首提里的重启出路：`src/bot/ws-alerter.ts:84-86`。
+- [x] **T77** 周报「其它状态」与全项目「其他」不统一：`src/bot/weekly-brief.ts:137`。
+
+### 本轮暂不修（记录在案）
+
+- 周报错过推送日不补推（T42）：若修复需引入「本周已推」落盘判重，与晨报「看板不可达当天静默」同属刻意不打扰的设计权衡，修复前维持现状。
+- 提醒/晨报按部署机器时区触发（T35 的根因）：产品级约定，本轮仅修文案标注，时区可配置化留待后续。

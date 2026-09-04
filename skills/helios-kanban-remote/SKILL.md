@@ -116,7 +116,7 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 **任务**：{title}（`{id}`）
 **迭代**：{迭代，无则 —}
 **优先级**：{紧急/高/中/低}
-**类型**：{feat/fix/docs/style/refactor/perf/test/chore}
+**类型**：{新功能/修复/文档/样式/重构/性能优化/测试/杂务}
 **状态**：{中文状态} | 运行状态：{运行中/未运行}{，执行失败}
 **分支**：{分支名}
 **执行器**：{用户指定的名字，如 Claude}
@@ -167,6 +167,8 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 
 `feat` | `fix` | `docs` | `style` | `refactor` | `perf` | `test` | `chore` — 省略默认 `feat`。类型会作为合并（squash）提交信息前缀，如 `fix: 修复登录 500 (helios-kanban a1b2c3d4)`。`tasks create` / `tasks update` / `create-and-start` 用 `--type` 指定；MCP 工具 `create_task` / `update_task` / `create_task_and_start` 对应参数为 `task_type`。
 
+给用户展示时用中文类型（新功能 feat/修复 fix/文档 docs/样式 style/重构 refactor/性能优化 perf/测试 test/杂务 chore），与优先级/状态同口径；英文键仅用于参数与合并提交前缀。
+
 **必须根据任务内容推断类型，不要等用户点名**：修缺陷/报错/崩溃 → `fix`，新功能/需求 → `feat`，文档 → `docs`，重构 → `refactor`，性能优化 → `perf`，补测试 → `test`，构建/依赖/杂务 → `chore`。例如「修复登录 500」即使用户没说类型也必须传 `--type fix`；只有内容性质不明时才省略（落到默认 `feat`）。
 
 ## Safety rules
@@ -176,14 +178,14 @@ Requires `curl` and `jq`. See `scripts/hk.sh --help`.
 3. Phone = dispatch / follow-up / approve — review diffs & merge on desktop.
 4. If `hk health` fails, stop and report connectivity.
 5. Multi-repo: repeat `--repo` (`ID` or `ID:branch`).
-6. PR / push / merge / rebase: tell user to use desktop Web UI.
+6. 合并/推送/变基等操作：引导用户用电脑浏览器打开看板网页版操作。
 7. `@tagname` in `--desc` / follow-up expands via `hk tags` / `/api/tags`.
 
-## Out of scope (point user to Web UI)
+## Out of scope（引导用户用看板网页版操作）
 
-- Create/merge PR, push, rebase, conflict resolution
-- Full diff viewer / open in editor
-- Multi-repo workspace create
+- 创建 / 合并合并请求（PR）、推送、变基（rebase）、冲突解决
+- 完整改动对比查看 / 在编辑器中打开
+- 与任务无关的独立多仓工作区创建（任务内多仓启动支持，见 Safety rule 5）
 
 ## Not installed yet?
 

@@ -33,6 +33,13 @@ export async function verifyLlmConfig(
         message: `API Key 无效或无权访问（HTTP ${res.status}）。请检查 Key 是否复制完整、是否已过期。`,
       };
     }
+    if (res.status >= 500) {
+      return {
+        ok: false,
+        uncertain: true,
+        message: `模型服务异常（HTTP ${res.status}），请稍后重试。`,
+      };
+    }
     return {
       ok: false,
       uncertain: true,

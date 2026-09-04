@@ -52,7 +52,7 @@ export const CONFIRM_NO_RE = wordsToRe(CONFIRM_NO_WORDS);
  * 注意：本词表只用于无 pending 的兜底提示；pending 期间的闸口内裁决（resolveFromText）
  * 仍用上面的完整词表，两条路径互不影响。
  */
-const CONFIRM_EXCLUSIVE_RE = /^(?:确认执行|同类免问|同对象免问|批量允许|以后都|一直允许|始终允许)$/i;
+const CONFIRM_EXCLUSIVE_RE = /^(?:确认执行|同类免问|同对象免问|批量允许|以后都|免问|都允许|batch|一直允许|始终允许|always)$/i;
 
 /**
  * 是否「确认专属词」——用于无 pending 时的即时提示（bot：确认已超时/已处理后用户又回确认专属词）。

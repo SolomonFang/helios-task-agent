@@ -8,7 +8,7 @@ import { ReminderRunner, ReminderStore } from './agent/reminder';
 import { SessionHistoryStore } from './agent/session-store';
 import { connectMcp, diagnoseMcpFailure } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
-import { checkHkDeps, checkLarkCliStatus, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkHkDeps, checkHkDepsAsync, checkLarkCliStatus, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -94,7 +94,7 @@ const HELP = `
   ${c.info('/memory')}   查看持久化记忆（飞书任务源等）
   ${c.info('/status')}   查看状态（模型 / 看板 / 看板连接 / lark-cli / 备用通道）
   ${c.info('/clear')}    清空对话历史（不清记忆）
-  ${c.info('/confirm')}  查看「同类免问」状态；/confirm revoke 撤销免问、恢复逐次确认
+  ${c.info('/confirm')}  查看免问授权状态；/confirm revoke 撤销免问、恢复逐次确认
   ${c.info('/exit')}     退出（/quit 同效；任务运行中按 Ctrl+C 只中断不退出）
 
   ${c.strong('试试对我说')}
@@ -203,8 +203,18 @@ export async function main(): Promise<void> {
    * 否则提醒已 markDelivered 落盘却永久丢失展示。
    */
   const pendingReminderTexts: string[] = [];
-  const printReminder = (text: string) => {
+  /** 主循环是否正停在 › 提示符等待输入：空闲投递提醒时据此决定是否清行重绘（见 printReminder）。 */
+  let atMainPrompt = false;
+  const printReminder = (text: string, redrawPrompt = false) => {
+    // 提醒可能打在用户正在输入的行中间：先清当前行，打印后重绘提示符与已输入内容。
+    // 仅主提示符等待期间重绘；轮次间隙 flush 时提示符尚未打印，重绘会造成双提示符。
+    const redraw = redrawPrompt && isTTY;
+    if (redraw) {
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+    }
     console.log(`\n${c.warn(text)}`);
+    if (redraw) process.stdout.write(c.info('› ') + rl.line);
   };
   const flushPendingReminders = () => {
     if (!pendingReminderTexts.length) return;
@@ -361,6 +371,8 @@ export async function main(): Promise<void> {
       const t = (ans || '').trim().toLowerCase();
       // 无 batchKey 的操作不支持同类免问：提示后重新等待输入，而不是落到「已取消」（行为与意图相反）
       if (!req.batchKey && CONFIRM_BATCH_RE.test(t)) {
+        // 重问期间先停 spinner：否则转圈每 80ms 清行，把这条提示与用户输入一起擦除（且「思考中」失实，实际在等用户）
+        spinner.stop();
         console.log(c.warn('该操作不支持同类免问，请回复 y 确认或 N 取消。'));
         continue;
       }
@@ -376,6 +388,7 @@ export async function main(): Promise<void> {
       }
       // 非空但未命中任何词表（「好的/ok/可以」等随口应答）不是取消意图：提示后重问；空回车与取消词才取消
       if (t && !CONFIRM_NO_RE.test(t)) {
+        spinner.stop();
         console.log(c.warn('无法识别的回答，请回复 y 确认或 N 取消。'));
         continue;
       }
@@ -399,11 +412,16 @@ export async function main(): Promise<void> {
    */
   const reminderRunner = new ReminderRunner({
     store: reminders,
+    // CLI 只投 local 桶：飞书形态（uid 为 open_id）的提醒由 bot 实例投递，跨形态桶不投递不标记已送达
+    deliverable: (uid) => uid === 'local',
     deliver: async (_uid, text) => {
       if (currentCtl) pendingReminderTexts.push(text);
-      else printReminder(text);
+      else printReminder(text, atMainPrompt);
     },
-    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
+    // 投递流水（含内部 uid 与提醒正文）收 HTA_DEBUG：正文已由 deliver 打印，uid「local」是内部细节
+    log: (msg) => {
+      if (process.env.HTA_DEBUG) console.log(c.gray(`[reminder] ${msg}`));
+    },
   });
   reminderRunner.start();
   cleanupRes.reminderRunner = reminderRunner;
@@ -428,7 +446,9 @@ export async function main(): Promise<void> {
   }
 
   for (;;) {
+    atMainPrompt = true;
     const input = await ask(c.info('› '));
+    atMainPrompt = false;
     if (input === null) await cleanup();
     const line = input!.trim();
     if (!line) continue;
@@ -444,11 +464,14 @@ export async function main(): Promise<void> {
       } else if (cmd === '/help') {
         console.log(HELP);
       } else if (cmd === '/clear') {
+        // clearHistory 会一并撤销免问授权：先取计数，按新语义告知（取在 clear 后恒为 0，提示成死文案）
+        const revoked = session.activeBatchApprovals();
         session.clearHistory();
-        console.log(c.gray(clearedText(session.activeBatchApprovals(), '/confirm revoke 可恢复逐次确认')));
-      } else if (cmd === '/confirm' && (fullCmd === '/confirm' || fullCmd === '/confirm revoke' || fullCmd === '/confirm on')) {
-        // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）
-        if (fullCmd !== '/confirm') {
+        console.log(c.gray(clearedText(revoked)));
+      } else if (cmd === '/confirm') {
+        // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）。
+        // 未匹配的子命令（如 /confirm off）按状态查询处理，与 bot 端行为对齐
+        if (fullCmd === '/confirm revoke' || fullCmd === '/confirm on') {
           const n = session.revokeBatchApprovals();
           console.log(
             n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, confirmStateText(0, ''))),
@@ -469,6 +492,8 @@ export async function main(): Promise<void> {
         }
         console.log('');
       } else if (cmd === '/tools') {
+        // 调用时实时探测（与 /status、bot 端对齐）：会话中补装 jq/curl 后不再沿用启动时的陈旧结果
+        const hkMissingNow = await checkHkDepsAsync();
         for (const l of buildToolsLines(
           {
             mcpOk,
@@ -478,8 +503,8 @@ export async function main(): Promise<void> {
             reminderEnabled: true,
             kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
             downNote: c.warn(
-              hkMissing.length
-                ? `看板连接失败，备用通道因缺少 ${hkMissing.join('、')} 不可用（${HK_CLI_INSTALL_HINT}）。`
+              hkMissingNow.length
+                ? `看板连接失败，备用通道因缺少 ${hkMissingNow.join('、')} 不可用（${HK_CLI_INSTALL_HINT}）。`
                 : `看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`,
             ),
             localHeader: c.strong('本地工具：'),
@@ -511,12 +536,15 @@ export async function main(): Promise<void> {
             mcpToolCount: mcp.tools.length,
             mcpDownNote: '连接失败，已切换为备用通道',
             larkOk: larkStatus !== 'missing',
-            // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启
+            // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启；
+            // MCP 从未连上时不存在「旧连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
             extra:
               cfg.kanbanUrl !== mcpBoundKanbanUrl
                 ? [
                     c.warn(
-                      `注意：看板连接仍指向旧地址 ${mcpBoundKanbanUrl}，看板工具操作的是旧看板；/exit 重启后才会连接新地址。`,
+                      mcpOk
+                        ? `注意：看板连接仍指向旧地址 ${mcpBoundKanbanUrl}，看板工具操作的是旧看板；/exit 重启后才会连接新地址。`
+                        : '注意：看板主连接未建立，备用通道已指向新地址。',
                     ),
                   ]
                 : undefined,
@@ -538,10 +566,13 @@ export async function main(): Promise<void> {
               : c.ok(`配置已更新（模型仍为 ${cfg.llmModel}）`),
           );
           if (cfg.kanbanUrl !== prevKanbanUrl) {
+            // MCP 从未连上时不存在「仍指向旧看板的连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
             console.log(
               c.warn(
-                `看板地址已改为 ${cfg.kanbanUrl}，但当前连接仍指向启动时的旧看板，看板工具操作的仍是旧看板；` +
-                  '备用通道已指向新地址。建议 /exit 后重启以连接新地址。',
+                mcpOk
+                  ? `看板地址已改为 ${cfg.kanbanUrl}，但当前连接仍指向启动时的旧看板，看板工具操作的仍是旧看板；` +
+                    '备用通道已指向新地址。建议 /exit 后重启以连接新地址。'
+                  : `看板地址已改为 ${cfg.kanbanUrl}；看板主连接未建立，备用通道已指向新地址。`,
               ),
             );
           }

@@ -82,8 +82,12 @@ export class WsAlerter {
       );
     } else {
       const elapsed = Date.now() - (this.disconnectedAt ?? Date.now());
-      const hours = Math.max(1, Math.round(elapsed / 3_600_000));
-      this.opts.notify(`⚠️ 飞书长连接仍未恢复（已断开超过 ${hours} 小时），仍在自动重连；期间消息会在恢复后补投处理。`);
+      // floor 只少报不多报（round 会把 1.6 小时报成「超过 2 小时」）；重启出路与首提保持一致
+      const hours = Math.max(1, Math.floor(elapsed / 3_600_000));
+      this.opts.notify(
+        `⚠️ 飞书长连接仍未恢复（已断开超过 ${hours} 小时），仍在自动重连；期间消息会在恢复后补投处理。` +
+          '如需立即恢复，请在部署机器上重新运行 helios-task-agent bot。',
+      );
     }
     this.remindTimer = setTimeout(() => this.remind(), this.repeatMs);
     this.remindTimer.unref();

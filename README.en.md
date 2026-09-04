@@ -242,6 +242,8 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 - "Run this task with Claude" / "start" (you decide when and with whom)
 - "What projects are there" / "create a task: …" / "how's it going" / "tell it one more thing…"
 - "Summarize what this iteration did / what was completed today" (generates a report)
+- "Remind me about the standup in 30 minutes / remind me to watch the build at 9am tomorrow" (scheduled reminders)
+- "Retrospect this iteration" / "write my daily report for today" (iteration retro / personal daily report)
 
 Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); with `LLM_VISION=1` you can also send image messages (analyzed by the model with that single request — never written to disk or history, 10MB cap); other types rejected. Replies split ~3000 chars; the progress placeholder updates on tool calls (throttled ~2s) and heartbeats every 10s during silent LLM thinking (with elapsed seconds). Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt. Conversation history is persisted per user (`sessions/`) and restored after restart; `/clear` wipes it from disk too.
 

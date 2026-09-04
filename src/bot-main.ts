@@ -56,7 +56,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
 /stop     中断当前任务与进行中的 AI 审查/诊断（排队消息与待确认写操作一并取消）
-/confirm  查看「同类免问」状态；/confirm revoke 或回复「恢复确认」撤销免问
+/confirm  查看「免问授权」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
 · 建/改/删任务、启动任务的工作区、发飞书消息等写操作会收到确认卡片
@@ -171,7 +171,7 @@ async function main(): Promise<void> {
 
   const version = readPkgVersion();
   console.log(c.strong('Helios Task Agent — 飞书机器人') + c.gray(`  v${version}`));
-  console.log(c.gray(`配置目录：${userEnvPath()}`));
+  console.log(c.gray(`配置文件：${userEnvPath()}`));
 
   // 信号处理尽早注册：向导/更新检查/看板拉起（最长 90s）/MCP 连接期间收到 SIGTERM
   // 走默认终止会让自动拉起的看板子进程成孤儿；这里保证已建立的资源都被清理。
@@ -267,6 +267,11 @@ async function main(): Promise<void> {
   } catch (err) {
     close();
     const message = errMessage(err);
+    // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 CLI /config 口径一致：不打红、不以失败码退出
+    if (message === '已取消') {
+      console.log(c.gray('已取消，配置未变更'));
+      process.exit(0);
+    }
     console.error(c.err(`配置失败：${message}`));
     process.exit(1);
   }
@@ -391,9 +396,10 @@ async function main(): Promise<void> {
       if (lastWriteKind.size >= 1000) lastWriteKind.clear();
       lastWriteKind.set(openId, req.kind);
       const sendText = () => {
-        // 免问提示与卡片口径一致：粒度词（同类/同对象）与后果说明都复用 guard 的统一文案
+        // 免问提示与卡片口径一致：粒度词与后果说明复用 guard 的统一文案；
+        // 后果的「免问」改述为「不再逐次询问」，避免同句「免问」堆砌
         const batchHint = req.batchKey
-          ? `，「${batchScopeWord(req.batchScope)}免问」${batchAckText(req.batchScope, req.kind)}`
+          ? `；回复「${batchScopeWord(req.batchScope)}免问」则${batchAckText(req.batchScope, req.kind).replace('免问', '不再逐次询问')}`
           : '';
         // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
         const detailBlock = req.detail
@@ -402,7 +408,7 @@ async function main(): Promise<void> {
           .join('\n');
         return channel.notifyOpenId(
           openId,
-          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}，「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
+          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}；「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
         );
       };
       if (chatId) {
@@ -490,6 +496,7 @@ async function main(): Promise<void> {
     memory,
     confirmFactory: (openId) => (req, signal) => confirmations.request(openId, req, signal),
     reportLinkBaseUrl: reportServer?.baseUrl,
+    channel: 'bot',
     historyStore,
     reminders,
   });
@@ -642,6 +649,9 @@ async function main(): Promise<void> {
     if (staleNudgeHours) {
       console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${staleNudgeHours} 小时无更新时提醒）`));
     }
+  } else if (process.env.HTA_STALE_NUDGE_HOURS) {
+    // 停滞任务提醒依赖看板推送（watcher）驱动：watch 整体关闭时静默失效会误导部署者
+    console.warn(c.warn('停滞任务提醒依赖看板推送，已随 KANBAN_WATCH=0 一并关闭'));
   }
 
   // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭
@@ -708,6 +718,8 @@ async function main(): Promise<void> {
   const reminderRunner = new ReminderRunner({
     store: reminders,
     deliver: (openId, text) => channel.notifyOpenId(openId, text),
+    // 跨形态不串桶：'local' 是 CLI 形态的提醒，由 CLI 自己投递，bot 不投递也不标记
+    deliverable: (uid) => uid !== 'local',
     log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
   });
   cleanup.reminderRunner = reminderRunner;

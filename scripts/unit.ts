@@ -2824,9 +2824,10 @@ async function run(): Promise<void> {
     assert.equal(sent.length, 1); // 持续断线超阈值：首提
     assert.ok(sent[0]!.includes('已断开超过'));
     assert.ok(sent[0]!.includes('自动重连'));
-    await sleep(90);
+    await sleep(60); // t≈130：重复提醒（t=100）已到、下一条（t=160）未到
     assert.equal(sent.length, 2); // 重复提醒按 repeatMs 节奏至多一条
     assert.ok(sent[1]!.includes('仍未恢复'));
+    assert.ok(sent[1]!.includes('重新运行 helios-task-agent bot'), '重复提醒须保留重启出路');
     alerter.onState('reconnected'); // 提醒过：补「已恢复」
     assert.equal(sent.length, 3);
     assert.ok(sent[2]!.includes('已恢复'));
@@ -3369,6 +3370,10 @@ async function run(): Promise<void> {
       isConfirmWord('以后都') &&
       isConfirmWord('一直允许') &&
       isConfirmWord('始终允许') &&
+      isConfirmWord('免问') && // 免问族缩略词同样拦截（超时后回「免问」不当新对话发给模型）
+      isConfirmWord('都允许') &&
+      isConfirmWord('batch') &&
+      isConfirmWord('always') &&
       !isConfirmWord('确认') && // 日常应答词不再拦截，消息照常入队
       !isConfirmWord('取消') &&
       !isConfirmWord('yes') &&
@@ -3784,15 +3789,16 @@ async function run(): Promise<void> {
       confirmRevokedText(3, '无') === '已恢复逐次确认（撤销 3 项免问授权）。' &&
       confirmRevokedText(0, '无') === '无' &&
       CLEARED_TEXT === '对话历史已清空（记忆保留）。' &&
-      clearedText(0, '') === CLEARED_TEXT &&
-      clearedText(2, '/confirm revoke 可恢复逐次确认') ===
-        '对话历史已清空（记忆保留；仍有 2 项写操作免问授权生效中，/confirm revoke 可恢复逐次确认）。'
+      clearedText() === CLEARED_TEXT &&
+      clearedText(0) === CLEARED_TEXT &&
+      clearedText(2) === '对话历史已清空（记忆保留）；2 项免问授权已一并恢复逐次确认。'
     );
   })());
 
   check('llmFailureParts：CLI 指向 /config，bot 不提 /config；原消息 60 字截断', (() => {
     const cli = llmFailureParts('401 invalid api key', 'x'.repeat(70), 'cli');
     const bot = llmFailureParts('401 invalid api key', '短消息', 'bot');
+    const img = llmFailureParts('401 invalid api key', '[图片]', 'bot', '可重发图片');
     return (
       cli.head === '请求失败：401 invalid api key' &&
       cli.friendly !== null &&
@@ -3800,7 +3806,9 @@ async function run(): Promise<void> {
       cli.tail.includes('…') &&
       !bot.tail.includes('/config') &&
       bot.tail.includes('你的上一条消息未处理') &&
-      !bot.tail.includes('…')
+      bot.tail.includes('可修改后重发') &&
+      !bot.tail.includes('…') &&
+      img.tail === '你的上一条消息未处理：「[图片]」，可重发图片。'
     );
   })());
 
@@ -4008,6 +4016,17 @@ async function run(): Promise<void> {
       kanbanUrl: 'http://x',
     });
     return p.includes('kanban_create_task') && !p.includes('badname') && !p.includes('yyy');
+  })());
+
+  // ---------- 备用通道缺依赖时不得承诺「大部分功能可用」（T3） ----------
+  check('buildSystemPrompt：hkAvailable=false 时如实告知看板读写暂不可用，hk 可用时保留备用通道口径', (() => {
+    const down = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x', hkAvailable: false });
+    const up = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x', hkAvailable: true });
+    return (
+      down.includes('备用通道缺少 jq、curl，安装后恢复') &&
+      !down.includes('大部分功能可用') &&
+      up.includes('大部分功能可用')
+    );
   })());
 
   // ---------- 看板事件卡片：failed 按钮名 + 链接可达性注脚 ----------

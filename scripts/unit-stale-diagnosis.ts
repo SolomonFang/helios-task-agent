@@ -11,7 +11,8 @@ import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
 import { parseStaleNudgeHours, StaleNudgeTracker } from '../src/kanban/stale-nudge';
-import { KanbanWatcher, type WatchEvent } from '../src/kanban/watcher';
+import { KanbanWatcher, WATCH_HINT_STALE, type WatchEvent } from '../src/kanban/watcher';
+import { KanbanHttpError } from '../src/kanban/http';
 import {
   resolveDiagnosisLlm,
   collectFailureContext,
@@ -19,6 +20,7 @@ import {
   runFailureDiagnosis,
   sendDiagnosisFollowUp,
   buildRetryPrompt,
+  DIAGNOSIS_CARD_MAX_CHARS,
 } from '../src/kanban/failure-diagnosis';
 import { buildWatchEventCard, buildDiagnosisCard } from '../src/channels/feishu-cards';
 import { createBotHandlers } from '../src/bot/handler';
@@ -539,6 +541,192 @@ async function main(): Promise<void> {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  // ---------- 第十轮复查：停滞时长口径 / 诊断与重试链路文案 ----------
+  await checkAsync('KanbanWatcher：停滞时长向下取整（8.55 小时报 8 小时，只少报不多报）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-stale-floor-'));
+    const staleAt = new Date(Date.now() - 8.55 * 3600_000).toISOString();
+    const { server, base } = await startStaleMockKanban({ status: 'inprogress', updatedAt: staleAt });
+    try {
+      const sent: WatchEvent[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        staleNudge: { thresholdMs: 8 * 3600_000, statePath: path.join(tmp, 'stale-state.json') },
+        notify: async (e) => {
+          sent.push(e);
+        },
+      });
+      const tick = tickOf(watcher);
+      await tick();
+      await tick();
+      assert.equal(sent.length, 1);
+      assert.ok(sent[0]!.extra?.includes('已超过 8 小时无更新'), `8.55 小时应报 8 小时：${sent[0]!.extra}`);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('KanbanWatcher：阈值允许小数小时，不足 1 小时按分钟描述（不谎称已超过 1 小时）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-stale-min-'));
+    const staleAt = new Date(Date.now() - 40 * 60_000).toISOString(); // 停滞 40 分钟
+    const { server, base } = await startStaleMockKanban({ status: 'inprogress', updatedAt: staleAt });
+    try {
+      const sent: WatchEvent[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        staleNudge: { thresholdMs: 0.5 * 3600_000, statePath: path.join(tmp, 'stale-state.json') },
+        notify: async (e) => {
+          sent.push(e);
+        },
+      });
+      const tick = tickOf(watcher);
+      await tick();
+      await tick();
+      assert.equal(sent.length, 1);
+      const extra = sent[0]!.extra ?? '';
+      assert.ok(extra.includes('分钟无更新'), `不足 1 小时应按分钟描述：${extra}`);
+      assert.ok(!extra.includes('1 小时'), `不得谎称已超过 1 小时：${extra}`);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  check('buildDiagnosisPrompt：标题缺失时用「该任务」指代，不塞裸任务 id', (() => {
+    const prompt = buildDiagnosisPrompt(
+      { taskId: '7f3a9c2e-1111-2222-3333-444455556666', title: '', description: '', attemptSummary: '' },
+      '',
+    );
+    return prompt.includes('该任务') && !prompt.includes('7f3a9c2e');
+  })());
+
+  await checkAsync('runFailureDiagnosis：模型配置缺项给「配置不完整」中文定性，不暴露环境变量名', async () => {
+    await assert.rejects(
+      () =>
+        runFailureDiagnosis({
+          kanbanUrl: 'http://127.0.0.1:1',
+          taskId: 't1',
+          llm: { baseUrl: '', apiKey: '', model: '' },
+          env: {},
+          collectContext: async () => ({ taskId: 't1', title: 'x', description: '', attemptSummary: '' }),
+        }),
+      (err: unknown) => {
+        const m = err instanceof Error ? err.message : String(err);
+        return m.includes('模型配置不完整，请联系部署者检查模型配置') && !m.includes('LLM_BASE_URL');
+      },
+    );
+  });
+
+  await checkAsync('runFailureDiagnosis：采集阶段失败中文化，英文原文与裸 HTTP 码不直达', async () => {
+    const llm = { baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'sk-x', model: 'm' };
+    await assert.rejects(
+      () =>
+        runFailureDiagnosis({
+          kanbanUrl: 'http://127.0.0.1:1',
+          taskId: 't1',
+          llm,
+          collectContext: async () => {
+            throw new TypeError('fetch failed');
+          },
+        }),
+      (err: unknown) => {
+        const m = err instanceof Error ? err.message : String(err);
+        return m.includes('看板不可达') && !m.includes('fetch failed');
+      },
+    );
+    await assert.rejects(
+      () =>
+        runFailureDiagnosis({
+          kanbanUrl: 'http://127.0.0.1:1',
+          taskId: 't1',
+          llm,
+          collectContext: async () => {
+            throw new KanbanHttpError(404);
+          },
+        }),
+      (err: unknown) => {
+        const m = err instanceof Error ? err.message : String(err);
+        return m.includes('已不存在') && !m.includes('HTTP 404');
+      },
+    );
+  });
+
+  await checkAsync('sendDiagnosisFollowUp：看板 404 单独定性「已被看板清理」，裸状态码不直达', async () => {
+    const server404 = http.createServer((_req, res) => {
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server404.listen(0, '127.0.0.1', r));
+    try {
+      const base = `http://127.0.0.1:${(server404.address() as AddressInfo).port}`;
+      await assert.rejects(
+        () => sendDiagnosisFollowUp(base, 'att-x', 'p'),
+        (err: unknown) => {
+          const m = err instanceof Error ? err.message : String(err);
+          return m.includes('已被看板清理') && m.includes('手动重新发起') && !m.includes('HTTP');
+        },
+      );
+    } finally {
+      await stopServer(server404);
+    }
+    const server500 = http.createServer((_req, res) => {
+      res.writeHead(500);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server500.listen(0, '127.0.0.1', r));
+    try {
+      const base = `http://127.0.0.1:${(server500.address() as AddressInfo).port}`;
+      await assert.rejects(() => sendDiagnosisFollowUp(base, 'att-x', 'p'), /看板接口暂时异常/);
+    } finally {
+      await stopServer(server500);
+    }
+  });
+
+  check('buildDiagnosisCard：LLM 输出最小中和（标签/删除线），截断注记给出路，注脚称「任务执行方」', (() => {
+    const card = buildDiagnosisCard('任务X', '一、<font color="red">警告</font> ~~伪造~~ **保留加粗**', 'task-1') as {
+      elements: Array<{ tag: string; text?: { content?: string }; elements?: Array<{ content?: string }> }>;
+    };
+    const body = card.elements[0]!.text?.content ?? '';
+    const note =
+      card.elements
+        .find((e) => e.tag === 'note')
+        ?.elements?.map((n) => n.content || '')
+        .join('\n') ?? '';
+    if (body.includes('<font') || body.includes('~~') || body.includes('</')) return false;
+    if (!body.includes('＜font') || !body.includes('～～') || !body.includes('**保留加粗**')) return false;
+    if (!note.includes('任务执行方') || note.includes('执行 Agent')) return false;
+    const long = buildDiagnosisCard('任务X', 'x'.repeat(DIAGNOSIS_CARD_MAX_CHARS + 10), 'task-1') as {
+      elements: Array<{ text?: { content?: string } }>;
+    };
+    return (long.elements[0]!.text?.content ?? '').includes('过长已截断，完整结论可直接追问');
+  })());
+
+  check('buildWatchEventCard：失败注脚主推「AI 诊断」按钮；stale 注脚复用 WATCH_HINT_STALE', (() => {
+    const noteOf = (e: WatchEvent): string =>
+      (
+        (buildWatchEventCard(e) as { elements: Array<{ tag: string; elements?: Array<{ content?: string }> }> }).elements.find(
+          (el) => el.tag === 'note',
+        )?.elements ?? []
+      )
+        .map((n) => n.content || '')
+        .join('\n');
+    const failed = noteOf({ kind: 'failed', title: 't', url: 'http://kanban/x', taskId: 't1', text: 'x' });
+    if (!failed.includes('点上方「AI 诊断」自动分析失败原因') || !failed.includes('也可回复「为什么失败」')) return false;
+    const stale = noteOf({
+      kind: 'stale',
+      title: 't',
+      url: 'http://kanban/x',
+      taskId: 't1',
+      extra: '状态「进行中」，已超过 9 小时无更新（最后更新：x）',
+      text: 'x',
+    });
+    return stale.includes(WATCH_HINT_STALE);
+  })());
 
   finish();
 }

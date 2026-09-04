@@ -7,6 +7,8 @@
  * 5. buildRetroModel：完成率、本周完成周界（恰好周一 00:00 计入）、失败归类、截断标记
  * 6. HTML 生成与 token 文件名、链接可达性提示
  * 7. 工具注册（handlers/openAiTools/LOCAL_TOOL_SUMMARY）与两个 handler 全链路（loopback mock 看板）
+ * 8. diffUrl scheme 校验（javascript: 等按无链接处理）、日报截断注记与入口一致、
+ *    bot 无链接基地址时省略本机路径、日报页本地时区口径注记
  * 仅用 loopback mock 服务，离线可跑。Run: npx tsx scripts/unit-reports.ts
  */
 
@@ -16,7 +18,16 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { collectDailyData, isWithinDate, localDate, type WorkSummaryData } from '../src/kanban/summary';
+import {
+  collectDailyData,
+  isWithinDate,
+  localDate,
+  type DailyReportData,
+  type WorkSummaryData,
+  type WorkSummaryTask,
+} from '../src/kanban/summary';
+import { renderHtml, renderMarkdown } from '../src/report/report';
+import { safeHttpUrl } from '../src/report/report-utils';
 import {
   buildDailyMaterial,
   partitionDaily,
@@ -527,6 +538,109 @@ async function run(): Promise<void> {
     });
     const html = renderRetroHtml(model);
     return html.includes('迭代复盘') && html.includes('—') && !html.includes('<script');
+  })());
+
+  // ================= 8. diffUrl scheme 校验 / 截断注记 / bot 省略本机路径 =================
+
+  const mkTask = (id: string, over: Partial<WorkSummaryTask> = {}): WorkSummaryTask => ({
+    id,
+    title: `任务${id}`,
+    status: 'done',
+    iteration: '',
+    projectName: 'Alpha',
+    updatedAt: at(y, m, d, 9),
+    diffUrl: '',
+    ...over,
+  });
+  const dailyFixture = (tasks: WorkSummaryTask[]): DailyReportData => ({
+    date: todayStr,
+    isToday: true,
+    generatedAt: new Date().toISOString(),
+    sinceLabel: `${todayStr} 今天 · 全部任务`,
+    counts: { doneToday: tasks.length, inProgress: 0, failedToday: 0, inReviewToday: 0 },
+    diff: null,
+    tasks,
+    truncated: false,
+  });
+  const wsFixture = (tasks: WorkSummaryTask[]): WorkSummaryData => ({
+    scope: 'all',
+    generatedAt: new Date().toISOString(),
+    sinceLabel: '全部任务',
+    tasks,
+    totals: { done: tasks.length, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, failed: 0, filesChanged: 0, additions: 0, deletions: 0 },
+  });
+
+  check('safeHttpUrl：仅放行 http/https，伪协议与畸形串按无链接处理', (() => {
+    return (
+      safeHttpUrl('https://kanban.example.com/diff/1') === 'https://kanban.example.com/diff/1' &&
+      safeHttpUrl('http://127.0.0.1:7964/x') === 'http://127.0.0.1:7964/x' &&
+      safeHttpUrl('javascript:alert(1)') === undefined &&
+      safeHttpUrl('file:///etc/passwd') === undefined &&
+      safeHttpUrl('not a url') === undefined &&
+      safeHttpUrl('') === undefined &&
+      safeHttpUrl(undefined) === undefined
+    );
+  })());
+
+  check('diffUrl 伪协议不进报告：日报/复盘/工作总结 HTML 与 MD 均按无链接处理', (() => {
+    const evil = mkTask('e1', { diffUrl: 'javascript:alert(1)' });
+    const good = mkTask('e2', { diffUrl: 'https://kanban.example.com/diff/1' });
+    const dailyHtml = renderDailyHtml(dailyFixture([evil, good]));
+    if (dailyHtml.includes('javascript:') || !dailyHtml.includes('https://kanban.example.com/diff/1')) return false;
+
+    const ws = wsFixture([evil, good]);
+    const md = renderMarkdown(ws);
+    const html = renderHtml(ws);
+    if (md.includes('javascript:') || html.includes('javascript:')) return false;
+    if (!md.includes('[查看 diff](<https://kanban.example.com/diff/1>)')) return false;
+    if (!html.includes('href="https://kanban.example.com/diff/1"')) return false;
+
+    const retroHtml = renderRetroHtml(
+      buildRetroModel({
+        ...wsFixture([{ ...evil, failed: true, attemptSummary: 'tests failed' }]),
+        totals: { done: 0, inreview: 0, inprogress: 1, todo: 0, cancelled: 0, failed: 1, filesChanged: 0, additions: 0, deletions: 0 },
+      }),
+    );
+    return !retroHtml.includes('javascript:');
+  })());
+
+  check('日报页口径注记含「当日」按部署机器本地时区日界统计（与复盘页口径对齐）', (() => {
+    return renderDailyHtml(dailyFixture([mkTask('t1')])).includes('「当日」按部署机器本地时区日界统计');
+  })());
+
+  check('日报截断注记：指引与实际给出的入口一致，数量与指引间有标点', (() => {
+    const data = dailyFixture(Array.from({ length: 12 }, (_, i) => mkTask(`n${i}`)));
+    const withLink = buildDailyMaterial(data, { htmlPath: '/tmp/r.html', linkBaseUrl: 'http://localhost:51234' });
+    const withFile = buildDailyMaterial(data, { htmlPath: '/tmp/r.html' });
+    const noReport = buildDailyMaterial(data, {});
+    const botNoLink = buildDailyMaterial(data, { htmlPath: '/tmp/r.html', channel: 'bot' });
+    return (
+      withLink.includes('· …还有 2 个，见上方报告链接') &&
+      withFile.includes('· …还有 2 个，见报告文件') &&
+      noReport.includes('· …还有 2 个，完整清单可直接问我') &&
+      botNoLink.includes('· …还有 2 个，完整清单可直接问我')
+    );
+  })());
+
+  check('bot 场景无链接基地址时省略本机路径（死链+目录泄露），CLI 保留本机路径', (() => {
+    const data = dailyFixture([mkTask('b1')]);
+    const daily = buildDailyMaterial(data, { htmlPath: '/home/deploy/reports/r.html', channel: 'bot' });
+    const retro = buildRetroSummary(buildRetroModel(wsFixture([mkTask('b2')])), {
+      htmlPath: '/home/deploy/reports/r.html',
+      channel: 'bot',
+    });
+    const cliDaily = buildDailyMaterial(data, { htmlPath: '/home/deploy/reports/r.html', channel: 'cli' });
+    const cliRetro = buildRetroSummary(buildRetroModel(wsFixture([mkTask('b3')])), {
+      htmlPath: '/home/deploy/reports/r.html',
+    });
+    return (
+      !daily.includes('/home/deploy') &&
+      !retro.includes('/home/deploy') &&
+      daily.includes('日报素材已生成') &&
+      retro.includes('迭代复盘报告已生成') &&
+      cliDaily.includes('- HTML 日报：/home/deploy/reports/r.html') &&
+      cliRetro.includes('- HTML：/home/deploy/reports/r.html')
+    );
   })());
 
   finish();

@@ -12,7 +12,7 @@ import { MemoryStore } from '../src/agent/memory';
 import { readSkillDoc } from '../src/agent/skills';
 import { isValidGitRef } from '../src/kanban/ai-review';
 import { buildTools, summarizeBothEnds } from '../src/agent/tools';
-import { classifyLark, looksLikeStrongFailure, passGate, withBatchApproval, DENIED_MESSAGE, SUPERSEDED_MESSAGE } from '../src/agent/guard';
+import { classifyLark, looksLikeStrongFailure, passGate, withBatchApproval, batchAckText, markTimedOut, DENIED_MESSAGE, SUPERSEDED_MESSAGE, TIMEOUT_MESSAGE } from '../src/agent/guard';
 import { ConfirmationManager } from '../src/agent/confirm';
 import { makeGatedWriter } from '../src/agent/tools/gated-write';
 import { SourceRegistry, kanbanTaskExists } from '../src/agent/source-registry';
@@ -610,6 +610,27 @@ async function main() {
     assert.equal(await p1, false);
     mgr.cancel('u2'); // 清理 u2 的 pending，避免悬挂定时器
   });
+
+  // ---------- 闸门文案：确认超时返回「超时未执行」而非「用户拒绝」（T14） ----------
+  await checkAsync('passGate：timeout 与「用户拒绝」文案可区分', async () => {
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, async (req) => {
+      markTimedOut(req); // 确认管理器超时自动拒绝前的标记（必须先于 resolve）
+      return false;
+    });
+    assert.ok(!res.allowed && res.reason === 'timeout' && res.message === TIMEOUT_MESSAGE, `超时应返回 TIMEOUT 文案，实际：${JSON.stringify(res)}`);
+    assert.notEqual(TIMEOUT_MESSAGE, DENIED_MESSAGE);
+    assert.ok(TIMEOUT_MESSAGE.includes('并非用户拒绝') && TIMEOUT_MESSAGE.includes('可重新发起'), '超时文案须给出出路');
+  });
+
+  // ---------- 「同类免问」回执：memory/reminder 不再落「该对象」兜底（T33） ----------
+  check('batchAckText：memory/reminder 按 scope 如实措辞', (() => {
+    return (
+      batchAckText('object', 'memory') === '对同一记忆键的写操作本会话内免问' &&
+      batchAckText('object', 'reminder') === '对同一条提醒的同类操作本会话内免问' &&
+      batchAckText('kind', 'reminder') === '创建提醒类操作本会话内免问' &&
+      batchAckText(undefined, 'reminder') === '创建提醒类操作本会话内免问'
+    );
+  })());
 
   // ---------- 写确认闸门：轮次中断（AbortSignal）按拒绝收尾，不干等确认超时 ----------
   await checkAsync('ConfirmationManager.request：abort 前已中断直接拒；pending 期间 abort 走 cancel 路径按拒绝收尾', async () => {

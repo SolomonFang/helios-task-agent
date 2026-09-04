@@ -42,10 +42,13 @@ function fakeTask(over: Partial<WorkSummaryTask>): WorkSummaryTask {
 
 function fakeSummary(tasks: WorkSummaryTask[]): WorkSummaryData {
   // totals 是截断前全量计数（周报头部用）：按任务状态推导，保持与 tasks 一致
-  const totals = { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, failed: 0, filesChanged: 0, additions: 0, deletions: 0 };
+  const totals = { done: 0, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, failed: 0, doneThisWeek: 0, filesChanged: 0, additions: 0, deletions: 0 };
+  const weekStart = new Date(2026, 7, 31).getTime(); // 测试当周周一 00:00（与 at() 假时钟同周）
   for (const t of tasks) {
     if (t.status in totals) (totals as Record<string, number>)[t.status]!++;
     if (t.failed) totals.failed++; // 失败标记与状态正交
+    const ts = Date.parse(t.updatedAt);
+    if (t.status === 'done' && Number.isFinite(ts) && ts >= weekStart) totals.doneThisWeek++;
   }
   return {
     scope: 'iteration',
@@ -60,7 +63,8 @@ function fakeSummary(tasks: WorkSummaryTask[]): WorkSummaryData {
 /** 本地时间假时钟（周报判定用本地时区，不能用 UTC 构造）。2026-09-04 是周五，当周周一 08-31、周日 09-06。 */
 const at = (h: number, m: number, day = 4) => new Date(2026, 8, day, h, m);
 
-const HEADER = '📅 看板周报 · 迭代 260717（2026-08-31 至 2026-09-06）';
+// 头部日期范围终点取推送当天（周五 09-04），不含未来的周日 09-06
+const HEADER = '📅 看板周报 · 迭代 260717（2026-08-31 至 2026-09-04）';
 
 async function main(): Promise<void> {
   // ---------- HH:MM 解析 ----------
@@ -115,7 +119,7 @@ async function main(): Promise<void> {
     ]);
     const text = buildWeeklyBriefText(data, at(18, 0));
     assert.ok(text.includes(HEADER), `头部含范围与当周日期: ${text.split('\n')[0]}`);
-    assert.ok(text.includes('进行中 1 · 待办 0 · 待审阅 1 · 已完成 3 · 失败 1（含于上方状态）'), `计数行为迭代全量口径: ${text.split('\n')[1]}`);
+    assert.ok(text.includes('进行中 1 · 待办 0 · 待审阅 1 · 已完成 3（迭代累计） · 失败 1（含于上方状态）'), `计数行为迭代全量口径并标注「已完成」为累计口径: ${text.split('\n')[1]}`);
     assert.ok(text.includes('【本周完成】2 个'), `本周完成只含当周更新: ${text}`);
     assert.ok(text.includes('· 《本周做完的事》') && text.includes('· 《周一凌晨做完的事》'));
     assert.ok(!text.includes('· 《上周做完的事》'), '上周完成的不得出现在本周完成清单');
@@ -150,6 +154,7 @@ async function main(): Promise<void> {
     data.sinceLabel = '全部任务';
     const text = buildWeeklyBriefText(data, at(18, 0));
     assert.ok(text.includes('📅 看板周报 · 全部任务'), `头部含全部任务: ${text.split('\n')[0]}`);
+    assert.ok(text.includes('已完成 0（累计）'), `全部任务范围「已完成」标注累计口径: ${text.split('\n')[1]}`);
     assert.ok(text.includes('总结一下全部任务的看板进展'), `全量范围引导语: ${text}`);
     assert.ok(!text.includes('总结一下这个迭代做了什么'));
   });
@@ -170,6 +175,32 @@ async function main(): Promise<void> {
     assert.ok(text.includes('【本周完成】13 个'), '计数为全量');
     assert.ok(text.includes('· 《任务9》') && !text.includes('· 《任务10》'), '只列前 10 个');
     assert.ok(text.includes('· …还有 3 个'), `应有截断提示: ${text}`);
+  });
+
+  await checkAsync('buildWeeklyBriefText：本周完成分组计数用截断前全量口径（totals.doneThisWeek），样本外任务不丢数也不报「暂无」', () => {
+    // 模拟超 50 条截断：样本里只剩 1 条本周完成，全量计数为 3
+    const data = fakeSummary([fakeTask({ id: 'a', title: '样本里的本周完成', status: 'done', updatedAt: '2026-09-02T10:00:00' })]);
+    data.totals.doneThisWeek = 3;
+    const text = buildWeeklyBriefText(data, at(18, 0));
+    assert.ok(text.includes('【本周完成】3 个'), `分组计数为全量口径: ${text}`);
+    assert.ok(text.includes('· …还有 2 个'), `样本外任务按全量补剩余数: ${text}`);
+    assert.ok(!text.includes('本周暂无新完成的任务'), '全量口径非零时不得报「暂无」');
+    // 极端场景：截断样本里一条本周完成都没有，但全量口径有——不得输出谎言「暂无」
+    const none = fakeSummary([fakeTask({ id: 'b', title: '还在做的活', status: 'inprogress' })]);
+    none.totals.doneThisWeek = 2;
+    const noneText = buildWeeklyBriefText(none, at(18, 0));
+    assert.ok(noneText.includes('【本周完成】2 个'), `样本为空时仍以全量口径计数: ${noneText}`);
+    assert.ok(!noneText.includes('本周暂无新完成的任务'), '样本为空但全量非零时不得报「暂无」');
+  });
+
+  await checkAsync('buildWeeklyBriefText：头部日期范围终点取推送当天，不含未来日期', () => {
+    const data = fakeSummary([fakeTask({ id: 'a', title: '任务A', status: 'inprogress' })]);
+    const monday = new Date(2026, 7, 31, 9, 0); // 周一 08-31 推送（HTA_WEEKLY_BRIEF_DAY=1）
+    const text = buildWeeklyBriefText(data, monday);
+    assert.ok(text.includes('（2026-08-31 至 2026-08-31）'), `周一推送终点为当天: ${text.split('\n')[0]}`);
+    assert.ok(!text.includes('2026-09-06'), '不得展示未来的周日');
+    const friday = buildWeeklyBriefText(data, at(18, 0));
+    assert.ok(friday.includes('（2026-08-31 至 2026-09-04）'), `周五推送终点为周五: ${friday.split('\n')[0]}`);
   });
 
   // ---------- 星期触发 / 当天只推一次 ----------

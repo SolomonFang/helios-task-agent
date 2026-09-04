@@ -12,6 +12,20 @@ export function sanitizeName(s: string, fallback: string): string {
   return s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || fallback;
 }
 
+/**
+ * 外部可控链接（看板任务 diffUrl 等）渲染前校验：仅放行 http:/https:，
+ * 其余（javascript: 等伪协议、畸形串）按无链接处理，返回 undefined。
+ */
+export function safeHttpUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === 'http:' || protocol === 'https:' ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 清理 keepDays 天前的历史报告（.html / .md），避免目录无界增长。 */
 export function pruneOldReports(dir: string, keepDays = 30): void {
   try {

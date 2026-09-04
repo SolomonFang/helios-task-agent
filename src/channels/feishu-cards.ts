@@ -11,9 +11,9 @@
 import { batchScopeWord, kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
 import {
   WATCH_HINT_DONE,
-  WATCH_HINT_FAILED,
   WATCH_HINT_FAILED_LOG,
   WATCH_HINT_REVIEW,
+  WATCH_HINT_STALE,
   linkReachNote,
   type WatchEvent,
   type WatchEventKind,
@@ -226,8 +226,9 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     const hints: Partial<Record<WatchEventKind, string>> = {
       review: WATCH_HINT_REVIEW,
       done: WATCH_HINT_DONE,
-      failed: WATCH_HINT_FAILED,
-      stale: '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可',
+      // 按钮是主路径（正式诊断 + 一键重试），回复「为什么失败」保留为备选表述（文本版无按钮，仍用 WATCH_HINT_FAILED）
+      failed: '点上方「AI 诊断」自动分析失败原因；也可回复「为什么失败」',
+      stale: WATCH_HINT_STALE,
     };
     // 看板链接跑在本机：注明可达范围，避免在别的网络或进程重启后点开报错
     const linkNote = e.url ? linkReachNote(e.url) : null;
@@ -304,6 +305,15 @@ function buttonTitle(title: string): string {
 }
 
 /**
+ * 诊断结论（LLM 输出）进 lark_md 前的最小中和：诊断材料含失败日志/任务描述等外部可控数据，
+ * 经 LLM 复述后 <font color>/<at id> 类标签与 ~~ 删除线会真实渲染（可伪造警示或钓鱼样式），
+ * < > 全角化、~~ 中和；星号/括号等正常 markdown 排版保留（诊断三段式排版依赖加粗与列表）。
+ */
+function diagnosisMdSafe(s: string): string {
+  return s.replace(/</g, '＜').replace(/>/g, '＞').replace(/~~/g, '～～');
+}
+
+/**
  * 失败诊断结果卡片：正文为 LLM 中文诊断（超长截断，完整结论已注入会话），
  * 带「↻ 按诊断结论重试」按钮（点击即显式授权，bot 以诊断结论作 follow-up 重启任务）。
  * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）。
@@ -314,10 +324,13 @@ export function buildDiagnosisCard(
   taskId: string,
   opts?: { settledAt?: string },
 ): Record<string, unknown> {
-  const text =
-    diagnosis.length > DIAGNOSIS_CARD_MAX_CHARS ? `${diagnosis.slice(0, DIAGNOSIS_CARD_MAX_CHARS)}\n…（过长已截断）` : diagnosis;
+  const text = diagnosisMdSafe(
+    diagnosis.length > DIAGNOSIS_CARD_MAX_CHARS
+      ? `${diagnosis.slice(0, DIAGNOSIS_CARD_MAX_CHARS)}\n…（过长已截断，完整结论可直接追问）`
+      : diagnosis,
+  );
   const elements: Array<Record<string, unknown>> = [
-    // 诊断结论是 LLM 输出（markdown 为预期格式），直接按 lark_md 渲染
+    // 诊断结论是 LLM 输出（markdown 为预期格式）：最小中和后按 lark_md 渲染（见 diagnosisMdSafe）
     { tag: 'div', text: { tag: 'lark_md', content: text } },
   ];
   if (opts?.settledAt) {
@@ -341,7 +354,7 @@ export function buildDiagnosisCard(
     elements.push({
       tag: 'note',
       elements: [
-        { tag: 'plain_text', content: '重试会把以上诊断结论作为跟进指令发给执行 Agent（点击即发起，不再二次确认）' },
+        { tag: 'plain_text', content: '重试会把以上诊断结论作为跟进指令发给任务执行方（点击即发起，不再二次确认）' },
       ],
     });
   }

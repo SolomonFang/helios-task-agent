@@ -17,11 +17,11 @@ function printHelp() {
 用法：
   helios-task-agent                 启动终端交互 agent
   helios-task-agent bot             启动飞书私聊机器人（长连接）
-  helios-task-agent bot --rebind    换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置）
-  helios-task-agent bot --reconfig  重跑模型/看板配置向导（飞书凭证保留）
+  helios-task-agent bot --rebind    换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置；先停止当前机器人进程）
+  helios-task-agent bot --reconfig  重跑模型/看板配置向导（飞书凭证保留；先停止当前机器人进程）
   helios-task-agent-bot             等同 helios-task-agent bot
   helios-task-agent help            显示本帮助
-  helios-task-agent --version       显示版本号
+  helios-task-agent --version       显示版本号（-v / version 同效）
 
 配置：首次运行进入交互向导，写入 ~/.helios-task-agent/.env
   （可用 HELIOS_TASK_AGENT_HOME 覆盖目录）。LLM_* 必填；FEISHU_* 仅 bot 需要。

@@ -56,6 +56,7 @@ export function buildTools({
   registry,
   auditHome,
   reportLinkBaseUrl,
+  channel,
   createCounter,
 }: {
   mcp: KanbanMcp | null;
@@ -77,6 +78,8 @@ export function buildTools({
   auditHome?: string;
   /** bot 场景传入报告静态服务基地址：work_summary 报告改推 HTTP 链接（CLI 不传，保留本机路径）。 */
   reportLinkBaseUrl?: string;
+  /** 会话形态：bot 场景报告服务不可用时省略本机路径行（死链+目录泄露）；缺省按 CLI。 */
+  channel?: 'cli' | 'bot';
   /** 会话级创建计数（缺省每次 buildTools 新建；AgentSession 传入以跨工具闭包重建存活）。 */
   createCounter?: CreateCounter;
 }): { openAiTools: OpenAiTool[]; handlers: ToolHandlers } {
@@ -129,11 +132,11 @@ export function buildTools({
   );
   handlers.set(
     'daily_report',
-    makeDailyReportHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
+    makeDailyReportHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl, channel }),
   );
   handlers.set(
     'iteration_retro',
-    makeIterationRetroHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
+    makeIterationRetroHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl, channel }),
   );
 
   if (memory) {

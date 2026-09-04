@@ -40,7 +40,7 @@ export function makeReminderHandlers({
     const timeText = formatLocal(triggerAt);
     // 创建提醒是写操作（写入持久化文件，到点会主动推送打扰用户）：与 memory_set 同口径过确认闸门
     const summary = `创建提醒「${text.slice(0, 50)}」（${timeText}）`;
-    const detail = summarizeBothEnds(`内容：${text}\n触发时间：${timeText}（本地时间）`);
+    const detail = summarizeBothEnds(`内容：${text}\n触发时间：${timeText}（按部署机器时区）`);
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: 'reminder:set', batchScope: 'kind' },
       confirm,
@@ -79,19 +79,19 @@ export function makeReminderHandlers({
         id: r.id,
         text: r.text,
         triggerAt: formatLocal(r.triggerAt),
-        remaining: remainingText(r.triggerAt, nowMs),
+        remaining: remainingText(r.triggerAt, nowMs, r.failCount),
       })),
     });
   };
 
   const reminderCancel: ToolHandler = async (raw, ctx) => {
     const ref = typeof raw.ref === 'string' ? raw.ref.trim() : typeof raw.ref === 'number' ? String(raw.ref) : '';
-    if (!ref) return '参数错误：ref 不能为空（传 reminder_list 返回的序号或 id）';
+    if (!ref) return '参数错误：ref 不能为空（传提醒的序号或 id；序号可以先问「我有哪些提醒」查看）';
     const target = reminders.find(uid, ref);
-    if (!target) return `未找到待触发的提醒「${ref}」（可先用 reminder_list 查看序号）`;
+    if (!target) return `未找到待触发的提醒「${ref}」（可以先问「我有哪些提醒」查看序号）`;
     // 取消是删除性写操作：过确认闸门；免问按对象绑定（防借一次授权取消任意提醒）
     const summary = `取消提醒「${target.text.slice(0, 50)}」（${formatLocal(target.triggerAt)}）`;
-    const detail = `内容：${target.text}\n触发时间：${formatLocal(target.triggerAt)}（本地时间）`;
+    const detail = `内容：${target.text}\n触发时间：${formatLocal(target.triggerAt)}（按部署机器时区）`;
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: `reminder:cancel:${target.id}`, batchScope: 'object', destructive: true },
       confirm,

@@ -65,6 +65,9 @@ export const WATCH_HINT_REVIEW = '没问题回复「标记完成」；要继续�
 /** failed 事件的查看日志引导语（文本版与卡片版同源）。 */
 export const WATCH_HINT_FAILED_LOG = '请到看板查看日志定位问题。';
 
+/** stale 事件的统一引导语（文本版与卡片注脚同源，带句号）。 */
+export const WATCH_HINT_STALE = '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可。';
+
 /**
  * 本机链接可达性注记（watcher 纯文本版事件与 feishu-cards 卡片注脚同源）：
  * 卡片发送失败降级为纯文本时用户必然踩「localhost 打不开」的坑，链接行必须带同口径注记。
@@ -375,7 +378,7 @@ export class KanbanWatcher {
   /**
    * 停滞提醒事件：diff 之后对「进行中」且 updated_at 超阈值的任务各产出一条 stale 事件，
    * 走同一 (事件, owner) 推送/重投管线。文案口径与数据一致：看板没有执行心跳字段，
-   * 只能说「超过 N 小时无更新」，不断言任务卡死。首轮基线轮不调用（tick 里 prev 缺失即返回），
+   * 只能说「超过 N 小时/分钟无更新」，不断言任务卡死。首轮基线轮不调用（tick 里 prev 缺失即返回），
    * 重启不重复轰炸由 tracker 落盘的 nudgedAt 保证。
    */
   private staleEvents(current: WatchState): Array<{ id: string; event: WatchEvent }> {
@@ -394,10 +397,14 @@ export class KanbanWatcher {
       if (!t) continue;
       const url = this.taskUrl(t.projectId, item.id);
       const projectName = this.projectNames.get(t.projectId) || '';
-      const hours = Math.max(1, Math.round((nowMs - item.updatedAtMs) / 3600000));
+      // 时长向下取整（只少报不多报）；阈值允许小数小时（如 0.5），不足 1 小时按分钟描述，不说「已超过 1 小时」
+      const elapsedMs = nowMs - item.updatedAtMs;
+      const duration =
+        elapsedMs >= 3600000
+          ? `已超过 ${Math.floor(elapsedMs / 3600000)} 小时无更新`
+          : `已超过 ${Math.max(1, Math.floor(elapsedMs / 60000))} 分钟无更新`;
       const lastAt = new Date(item.updatedAtMs).toLocaleString('zh-CN', { hour12: false });
-      const detail = `状态「进行中」，已超过 ${hours} 小时无更新（最后更新：${lastAt}）`;
-      const hint = '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可。';
+      const detail = `状态「进行中」，${duration}（最后更新：${lastAt}）`;
       events.push({
         id: `stale:${item.id}`,
         event: {
@@ -407,7 +414,7 @@ export class KanbanWatcher {
           taskId: item.id,
           projectName: projectName || undefined,
           extra: detail,
-          text: `⏰ 看板任务久未更新：《${t.title}》${projectName ? `（项目：${projectName}）` : ''}\n${detail}。\n${url}\n${hint}\n${linkReachNote(url)}`,
+          text: `⏰ 看板任务久未更新：《${t.title}》${projectName ? `（项目：${projectName}）` : ''}\n${detail}。\n${url}\n${WATCH_HINT_STALE}\n${linkReachNote(url)}`,
         },
       });
     }

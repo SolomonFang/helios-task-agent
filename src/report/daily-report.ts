@@ -9,7 +9,7 @@ import { isLoopbackUrl } from '../infra/url-utils';
 import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
 import { escapeHtml, renderReportPage } from './report-page';
 import { newReportToken } from './report-server';
-import { pruneOldReports, sanitizeName } from './report-utils';
+import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
 import { isWithinDate, localDate, type DailyReportData, type WorkSummaryTask } from '../kanban/summary';
@@ -87,8 +87,9 @@ function htmlTaskItem(t: WorkSummaryTask, opts?: { showStatus?: boolean }): stri
   }
   const diff = taskDiffLine(t);
   if (diff) parts.push(`<p class="changes">${escapeHtml(diff)}</p>`);
-  if (t.diffUrl) {
-    parts.push(`<a class="diff-link" href="${escapeHtml(t.diffUrl)}" target="_blank" rel="noopener">查看改动 →</a>`);
+  const diffUrl = safeHttpUrl(t.diffUrl);
+  if (diffUrl) {
+    parts.push(`<a class="diff-link" href="${escapeHtml(diffUrl)}" target="_blank" rel="noopener">查看改动 →</a>`);
   }
   parts.push('</div>');
   return parts.join('\n');
@@ -186,6 +187,7 @@ export function renderDailyHtml(data: DailyReportData): string {
     .join('\n');
   const body = sections || '<p class="empty">（当日没有看板活动记录，也没有进行中的任务）</p>';
   const notes = [
+    '「当日」按部署机器本地时区日界统计。',
     '「今日完成」口径：状态已完成且最后更新时间在当日（看板无「完成时间」字段，与周报「本周完成」同一口径）。',
     '「今日失败」按最近一次执行失败标记统计，与状态分组正交（同一任务可同时属于其它分组）。',
     data.diff
@@ -228,7 +230,7 @@ export function writeDailyReport(data: DailyReportData, opts: { dir?: string } =
  */
 export function buildDailyMaterial(
   data: DailyReportData,
-  opts: { htmlPath?: string; linkBaseUrl?: string } = {},
+  opts: { htmlPath?: string; linkBaseUrl?: string; channel?: 'cli' | 'bot' } = {},
 ): string {
   const part = partitionDaily(data);
   const { counts } = data;
@@ -242,9 +244,10 @@ export function buildDailyMaterial(
           ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，机器人重启后链接失效）'
           : '（链接仅本机所在网络可达；报告保留 30 天，机器人重启后链接失效）',
       );
-    } else {
+    } else if (opts.channel !== 'bot') {
       lines.push(`- HTML 日报：${opts.htmlPath}`);
     }
+    // bot 场景报告服务不可用时无链接可给：本机路径对飞书用户是死链且泄露部署机目录，省略只给文本摘要
   }
   lines.push(
     '',
@@ -259,7 +262,16 @@ export function buildDailyMaterial(
       lines.push(`· 《${t.title || '（无标题）'}》${extra ? extra(t) : ''}${diff ? `（${diff}）` : ''}`);
     }
     if (total > Math.min(tasks.length, 10)) {
-      lines.push(`· …还有 ${total - Math.min(tasks.length, 10)} 个${opts.linkBaseUrl ? '见上方报告链接' : '见报告文件'}`);
+      const rest = total - Math.min(tasks.length, 10);
+      // 指引必须与上方实际给出的入口一致：有链接说链接，有文件说文件（bot 拿不到部署机文件），
+      // 未生成报告（html:false）或 bot 报告服务不可用时只报数量
+      const guide =
+        opts.htmlPath && opts.linkBaseUrl
+          ? '见上方报告链接'
+          : opts.htmlPath && opts.channel !== 'bot'
+            ? '见报告文件'
+            : '完整清单可直接问我';
+      lines.push(`· …还有 ${rest} 个，${guide}`);
     }
   };
   listGroup('今日完成', part.doneToday, counts.doneToday);

@@ -27,15 +27,16 @@ api() {
   response=$(echo "$response" | sed '$d')
 
   if [[ "$http_code" -ge 400 ]]; then
-    echo "HTTP $http_code: $response" >&2
+    local msg
+    msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null || true)
+    echo "HTTP $http_code: ${msg:-request failed}" >&2
     exit 1
   fi
 
   if ! echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
     local msg
-    msg=$(echo "$response" | jq -r '.message // "unknown error"')
-    echo "API error: $msg" >&2
-    echo "$response" >&2
+    msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null || true)
+    echo "API error: ${msg:-unknown error}" >&2
     exit 1
   fi
 

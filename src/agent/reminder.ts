@@ -9,6 +9,9 @@ import { errMessage } from '../infra/err';
  * 提醒按用户分桶（bot 为 open_id，CLI 恒为 local），落盘 <home>/reminders.json
  * （原子写 0600），CLI 与 bot 共用同一文件与同一套核心逻辑；投递通道由调用方注入
  * （bot 注入飞书私聊推送，CLI 注入终端输出），本模块不依赖任何通道实现。
+ * 两形态进程可能同时在线共享同一文件：runner 按 uid 分流（deliverable 选项），
+ * 不属于本进程投递范围的桶不投递、不标记、不退避，保持 pending 等另一形态进程投递
+ * （CLI 只投 local，bot 跳过 local），互不截胡。
  *
  * 时间解析约定（对 LLM 最不易出错的设计）：工具只收两种参数——
  * - in_minutes：相对分钟数（「30 分钟后」直接传 30，LLM 无需知道当前时间）；
@@ -56,10 +59,10 @@ export function formatLocal(ms: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 剩余时间的中文描述（列表/创建回执用）。 */
-export function remainingText(triggerAt: number, nowMs: number): string {
+/** 剩余时间的中文描述（列表/创建回执用）；已到点且投递失败退避中的如实说明正在自动重试。 */
+export function remainingText(triggerAt: number, nowMs: number, failCount?: number): string {
   const diff = triggerAt - nowMs;
-  if (diff <= 0) return '已到点';
+  if (diff <= 0) return failCount && failCount > 0 ? '已到点，投递失败，正在自动重试' : '已到点';
   const min = Math.ceil(diff / 60000);
   if (min < 60) return `${min} 分钟后`;
   const hours = Math.floor(min / 60);
@@ -83,7 +86,8 @@ function validDate(d: Date): boolean {
 function parseAbsoluteAt(raw: string, now: Date): number {
   const s = raw.trim();
   // 「今天/明天/后天/今晚/明晚 HH:mm」与裸「HH:mm」（全角冒号兼容；也接受「9 点」「9 点 5 分」「9 点半」口语形态；
-  // 可带「早上/凌晨/上午/中午/下午/晚上」修饰，下午/晚上且小时 <12 自动 +12）
+  // 可带「早上/凌晨/上午/中午/下午/晚上」修饰，下午/晚上且小时 <12 自动 +12；边界：「中午 1-6 点」按 13-18 点、
+  // 「凌晨 12 点」按当天 0 点、「晚上 12 点」按次日 0 点（口语指当天结束的半夜）处理）
   const cn =
     /^(今天|明天|后天|今晚|明晚)?\s*(?:(早上|凌晨|上午|中午|下午|晚上)\s*)?(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|(半))?)$/u.exec(
       s,
@@ -96,9 +100,15 @@ function parseAbsoluteAt(raw: string, now: Date): number {
     else if (cn[5] !== undefined) minute = Number(cn[5]);
     else minute = 0;
     const modifier = cn[2] || (cn[1] === '今晚' || cn[1] === '明晚' ? '晚上' : undefined);
+    let extraDay = 0;
     if ((modifier === '下午' || modifier === '晚上') && hour < 12) hour += 12;
+    else if (modifier === '晚上' && hour === 12) {
+      hour = 0;
+      extraDay = 1;
+    } else if (modifier === '凌晨' && hour === 12) hour = 0;
+    else if (modifier === '中午' && hour >= 1 && hour <= 6) hour += 12;
     if (hour > 23 || minute > 59) throw new Error(`时间「${raw}」非法：小时须 0-23、分钟须 0-59`);
-    const dayOffset = cn[1] === '明天' || cn[1] === '明晚' ? 1 : cn[1] === '后天' ? 2 : 0;
+    const dayOffset = (cn[1] === '明天' || cn[1] === '明晚' ? 1 : cn[1] === '后天' ? 2 : 0) + extraDay;
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + dayOffset, hour, minute, 0, 0);
     // 裸「HH:mm」：当天已过则顺延到明天（「提醒我 9 点」于 10 点说，显然是明早 9 点）
     if (!cn[1] && d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
@@ -133,7 +143,7 @@ function parseAbsoluteAt(raw: string, now: Date): number {
     if (!Number.isNaN(ms)) return ms;
   }
   throw new Error(
-    `无法识别的时间「${raw}」：支持「HH:mm」「今天/明天/后天 HH:mm」「YYYY-MM-DD HH:mm」（均为本地时间），相对时长请用 in_minutes 参数`,
+    `无法识别的时间「${raw}」：支持「HH:mm」「今天/明天/后天 HH:mm」「YYYY-MM-DD HH:mm」（均为本地时间），相对时长直接说「30 分钟后」即可`,
   );
 }
 
@@ -358,6 +368,11 @@ export interface ReminderRunnerOptions {
   store: ReminderStore;
   /** 投递通道（bot：飞书私聊推送；CLI：终端输出）。抛错视为投递失败，走退避补投。 */
   deliver: (userId: string, text: string) => Promise<void>;
+  /**
+   * 按 uid 分流：返回 false 的桶本进程不投递、不标记、不退避，保持 pending 等另一形态进程投递
+   * （CLI 传 uid==='local'，bot 传 uid!=='local'；缺省视为全部可投，兼容单进程部署）。
+   */
+  deliverable?: (uid: string) => boolean;
   /** 到点检查间隔（默认 15s，最小 1s）；测试可注入更小值。 */
   checkIntervalMs?: number;
   /** 注入时钟（测试用）；默认真实时间。 */
@@ -371,7 +386,7 @@ export interface ReminderRunnerOptions {
  * 到点调度器（CLI 与 bot 共用）：tick 检查到期提醒 → 逐条经注入通道投递。
  * 每条提醒独立标记：投递成功即落盘 delivered（重启不重复推）；失败按 1→2→4…分钟
  * 指数退避（封顶 30 分钟）落盘 nextRetryAt，窗口过后补投——进程重启后到点未投的
- * 首次 tick 即补投，已投的不重复。
+ * 首次 tick 即补投，已投的不重复。deliverable 按 uid 分流跨形态桶（CLI/bot 互不截胡）。
  */
 export class ReminderRunner {
   private readonly opts: ReminderRunnerOptions;
@@ -407,6 +422,8 @@ export class ReminderRunner {
     try {
       const nowMs = (this.opts.now?.() ?? new Date()).getTime();
       for (const { userId, reminder } of this.opts.store.due(nowMs)) {
+        // 跨形态桶分流：不可投递的 uid 原样保留 pending（不动 failCount/nextRetryAt），等另一形态进程投递
+        if (this.opts.deliverable && !this.opts.deliverable(userId)) continue;
         try {
           await this.opts.deliver(userId, buildReminderText(reminder));
           this.opts.store.markDelivered(userId, reminder.id, nowMs);

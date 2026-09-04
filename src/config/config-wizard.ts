@@ -7,6 +7,7 @@ import {
   isFeishuBotConfigured,
   writeEnv,
   resolveEnvWritePath,
+  userEnvPath,
 } from './config';
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from '../infra/deps';
 import { verifyFeishuApp } from './feishu-verify';
@@ -33,16 +34,24 @@ export function makeNeed(
   ask: AskFn,
   askSecret?: AskFn | null,
 ): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string>; secretSuffix: string } {
+  // EOF/中断：bot 两阶段流程模型配置可能已先落盘，文案如实说明断点续跑；
+  // 非 TTY（systemd/Docker）重跑向导必然同样 EOF，出路是给配置文件的确切路径。
+  const eofError = (): Error =>
+    new Error(
+      process.stdin.isTTY
+        ? '输入已结束（已完成的步骤已保存，重新运行可从断点继续）'
+        : `输入已结束（已完成的步骤已保存，重新运行可从断点继续；无交互终端时请直接编辑 ${userEnvPath()}）`,
+    );
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
-    if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
+    if (ans === null) throw eofError();
     return ans.trim();
   };
   /** 敏感信息（API Key / App Secret）：TTY 下掩码回显；非 TTY 或未提供时回退普通输入（明文可见）。 */
   const needSecret = async (promptText: string): Promise<string> => {
     if (!askSecret) return need(promptText);
     const ans = await askSecret(promptText);
-    if (ans === null) throw new Error('输入已结束（配置未完成，未写入任何更改；重新运行命令可再次进入向导）');
+    if (ans === null) throw eofError();
     return ans.trim();
   };
   const secretSuffix = askSecret ? '（输入显示为 *）' : '（输入可见）';
@@ -161,7 +170,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   // 看板地址必须是完整 URL：缺 http(s):// 协议头直接重问
   let kanbanUrl = '';
   for (;;) {
-    const raw = await need(`看板地址（默认 ${old.kanbanUrl}）: `);
+    const raw = await need(`看板地址（回车 = 保留当前 ${old.kanbanUrl}）: `);
     if (!raw) {
       kanbanUrl = old.kanbanUrl;
       break;
@@ -246,8 +255,8 @@ async function promptFeishuConfig(
     reenter = act === 'r';
   }
   const allowedPrompt = existing.allowedOpenIds.length
-    ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join(',')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : '允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突））: ';
+    ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join('、')}${allowClear ? '；输入 - 清除' : ''}）: `
+    : `允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id${allowClear ? '' : '；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突）'}）: `;
   const allowedRaw = await need(allowedPrompt);
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };

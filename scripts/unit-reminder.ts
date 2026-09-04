@@ -1,10 +1,13 @@
 /**
  * 定时提醒（src/agent/reminder.ts + tools/reminder-tools.ts）单测：
  * - 时间解析：相对分钟数 / HH:mm（已过顺延次日）/ 今天·明天·后天 / 口语「9 点·9 点半」/
+ *   口语修饰符边界（「晚上 12 点」按次日 0 点、「凌晨 12 点」按 0 点、「中午 1 点」按 13 点）/
  *   YYYY-MM-DD HH:mm / 带时区标准串；非法输入、过去时间、超 30 天期限、双参数互斥一律拒绝
  * - 存储：按用户分桶隔离、活跃上限 20 条、内容截断、落盘重载、按序号/id 取消
  * - 到点判定边界：triggerAt == now 到期、未来不到期、已取消/已投递不再到期、退避窗口内不投递
- * - Runner：到点投递、投递后不重复、投递失败指数退避补投、重启补投不重复
+ * - Runner：到点投递、投递后不重复、投递失败指数退避补投、重启补投不重复、
+ *   deliverable 按 uid 分流（跨形态桶不投递、不标记、不退避）
+ * - 展示：投递失败退避中的已到点提醒在列表/remainingText 显示「正在自动重试」
  * - 闸门行为：reminder_set / reminder_cancel 未确认不创建/不取消（与 memory_* 同口径过闸）
  * 以 tsx 直接运行：tsx scripts/unit-reminder.ts
  */
@@ -93,6 +96,17 @@ async function main(): Promise<void> {
     assert.equal(parseTriggerAt({ at: '明天 9 点' }, NOW), new Date(2026, 8, 5, 9, 0).getTime());
     assert.equal(parseTriggerAt({ at: '明天 9 点半' }, NOW), new Date(2026, 8, 5, 9, 30).getTime());
     assert.equal(parseTriggerAt({ at: '明天 21 点 5 分' }, NOW), new Date(2026, 8, 5, 21, 5).getTime());
+  });
+
+  await checkAsync('parseTriggerAt：口语修饰符边界——「晚上 12 点」按次日 0 点、「凌晨 12 点」按 0 点、「中午 1 点」按 13 点', () => {
+    assert.equal(parseTriggerAt({ at: '今晚 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime()); // 当天结束的半夜
+    assert.equal(parseTriggerAt({ at: '晚上 12:00' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '明晚 12 点' }, NOW), new Date(2026, 8, 6, 0, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '下午 12 点' }, NOW), new Date(2026, 8, 4, 12, 0).getTime()); // 中午 12 点不误加
+    assert.equal(parseTriggerAt({ at: '中午 12 点' }, NOW), new Date(2026, 8, 4, 12, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '中午 1 点' }, NOW), new Date(2026, 8, 4, 13, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '凌晨 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime()); // 当天 0 点已过，顺延次日
+    assert.equal(parseTriggerAt({ at: '明天凌晨 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
   });
 
   await checkAsync('parseTriggerAt：「YYYY-MM-DD HH:mm」与带时区标准串；非法日期拒绝', () => {
@@ -280,6 +294,46 @@ async function main(): Promise<void> {
     }
   });
 
+  await checkAsync('ReminderRunner：deliverable 按 uid 分流——不可投的桶不投递、不标记、不退避', async () => {
+    const tmp = tmpHome('split');
+    try {
+      const store = new ReminderStore(tmp);
+      store.add('local', 'CLI 的提醒', NOW_MS);
+      store.add('ou_bot', '飞书的提醒', NOW_MS);
+      const sent: Array<[string, string]> = [];
+      const botRunner = new ReminderRunner({
+        store,
+        deliver: async (u, text) => {
+          sent.push([u, text]);
+        },
+        deliverable: (uid) => uid !== 'local', // bot 形态：跳过 local 桶
+        now: () => new Date(NOW_MS),
+      });
+      await tickOf(botRunner)();
+      assert.deepEqual(sent.map(([u]) => u), ['ou_bot'], `只投可投递的桶：${JSON.stringify(sent)}`);
+      const localPending = store.list('local');
+      assert.equal(localPending.length, 1, 'local 桶保持 pending，等 CLI 形态进程投递');
+      assert.equal(localPending[0]!.failCount, undefined, '跨形态桶不进入退避');
+      assert.equal(localPending[0]!.nextRetryAt, undefined);
+      await tickOf(botRunner)(); // 跨形态桶不会被反复尝试，已投的不重复
+      assert.equal(sent.length, 1);
+      // 换 CLI 形态（只投 local）：另一条被投递，飞书桶已被 bot 标记不重复
+      const cliRunner = new ReminderRunner({
+        store,
+        deliver: async (u, text) => {
+          sent.push([u, text]);
+        },
+        deliverable: (uid) => uid === 'local',
+        now: () => new Date(NOW_MS),
+      });
+      await tickOf(cliRunner)();
+      assert.deepEqual(sent.map(([u]) => u), ['ou_bot', 'local']);
+      assert.equal(store.list('local').length, 0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('ReminderRunner：重启补投——到点未投的补投、已投的不重复（新实例从磁盘恢复）', async () => {
     const tmp = tmpHome('restart');
     try {
@@ -365,6 +419,22 @@ async function main(): Promise<void> {
     }
   });
 
+  await checkAsync('reminder_list：投递失败退避中的已到点提醒显示「正在自动重试」', async () => {
+    const tmp = tmpHome('retrylist');
+    try {
+      const env = makeToolEnv(tmp, approveAll);
+      const failed = env.store.add('u1', '到点但投不出去', Date.now() - 1000);
+      env.store.markFailed('u1', failed.id, Date.now()); // 进入退避
+      env.store.add('u1', '还没到点的', Date.now() + 3600_000);
+      const raw = await env.handlers.get('reminder_list')!({});
+      const list = JSON.parse(raw) as { reminders: Array<{ text: string; remaining: string }> };
+      assert.equal(list.reminders[0]!.remaining, '已到点，投递失败，正在自动重试');
+      assert.ok(list.reminders[1]!.remaining.includes('小时后'), `正常条目不受影响：${raw}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- 展示辅助 ----------
   await checkAsync('formatLocal / remainingText / buildReminderText 口径', () => {
     assert.equal(formatLocal(NOW_MS), '2026-09-04 10:00');
@@ -372,6 +442,10 @@ async function main(): Promise<void> {
     assert.equal(remainingText(NOW_MS + 90 * 60000, NOW_MS), '1 小时 30 分钟后');
     assert.equal(remainingText(NOW_MS + 26 * 3600_000, NOW_MS), '1 天 2 小时后');
     assert.equal(remainingText(NOW_MS - 1000, NOW_MS), '已到点');
+    // 已到点且投递失败退避中：如实说明正在自动重试；未到点不受 failCount 影响
+    assert.equal(remainingText(NOW_MS - 1000, NOW_MS, 2), '已到点，投递失败，正在自动重试');
+    assert.equal(remainingText(NOW_MS - 1000, NOW_MS, 0), '已到点');
+    assert.equal(remainingText(NOW_MS + 60000, NOW_MS, 3), '1 分钟后');
     const text = buildReminderText({
       id: 'r1',
       text: '盯一下构建',

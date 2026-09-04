@@ -143,7 +143,7 @@ export async function resolveRepoRoot(opts: {
     if (!fetched.ok) return fetched;
     root = fetched.path;
   }
-  if (!root) return { ok: false, error: '参数错误：需要 root（绝对路径）或 repo_id' };
+  if (!root) return { ok: false, error: '参数错误：需要提供仓库根目录路径或仓库 ID' };
   const rootAbs = path.resolve(root);
   if (!fs.existsSync(rootAbs)) {
     return { ok: false, error: `本地仓库路径不存在：${rootAbs}` };
@@ -360,6 +360,6 @@ export async function runRepoFs(
     case 'grep':
       return { out: await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob), denied };
     default:
-      return { out: '参数错误：action 必须是 list | read | grep', denied: false };
+      return { out: '参数错误：操作类型仅支持：列表 / 读取 / 搜索', denied: false };
   }
 }

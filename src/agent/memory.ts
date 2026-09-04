@@ -246,6 +246,6 @@ export class MemoryStore {
       omitted++;
     }
     const body = render();
-    return omitted ? `${body}\n（记忆过长，已省略 ${omitted} 条）` : body;
+    return omitted ? `${body}\n（记忆过长，已省略 ${omitted} 条，可让我删除不再需要的记忆）` : body;
   }
 }
