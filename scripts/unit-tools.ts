@@ -311,8 +311,8 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- skill_exec batchKey：绑定脚本与实际参数（同脚本换参数各自确认） ----------
-  await checkAsync('skill_exec 批量免问 key：绑定脚本与 argv，同脚本不同参数不共用免问', async () => {
+  // ---------- skill_exec batchKey：绑定脚本（不含参数），同脚本换参数共用免问 ----------
+  await checkAsync('skill_exec 批量免问 key：绑定脚本不含 argv，同脚本不同参数共用免问', async () => {
     const tmp = tmpHome('skillkey');
     try {
       const keys: Array<string | undefined> = [];
@@ -333,9 +333,9 @@ async function main(): Promise<void> {
       assert.deepEqual(
         keys,
         [
-          'skill:helios-kanban-remote/scripts/hk.sh:tasks list',
-          'skill:helios-kanban-remote/scripts/hk.sh:tasks delete abc',
-          'skill:helios-kanban-remote/scripts/hk.sh', // 无参数不拼尾随冒号
+          'skill:helios-kanban-remote/scripts/hk.sh',
+          'skill:helios-kanban-remote/scripts/hk.sh',
+          'skill:helios-kanban-remote/scripts/hk.sh',
         ],
         `实际 keys=${JSON.stringify(keys)}`,
       );

@@ -62,9 +62,9 @@ export function makeSkillExecHandler({
     // 确认 detail 用相对形态（解释器 + 技能/脚本相对名 + 参数），宿主机绝对路径不进用户面，只进审计日志
     const detail = summarizeBothEnds(`${interpreter} ${skill}/${script}${argv.length ? ' ' + argv.join(' ') : ''}`);
     const auditDetail = summarizeBothEnds(`${interpreter} ${scriptReal}${argv.length ? ' ' + argv.join(' ') : ''}`);
-    // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定脚本与实际参数
-    //（与 hk_cli 的 hk:tasks delete:<id> 同口径——授权 key 绑定操作对象，换参数需重新确认）
-    const batchKey = `skill:${skill}/${script}${argv.length ? `:${argv.join(' ')}` : ''}`;
+    // 执行任意脚本 = 任意代码执行，按破坏性对待（超时放宽）；「同类免问」绑定脚本（不含参数）——
+    // 同一脚本换参数（如换 issue-number 批量查询）不再重复确认
+    const batchKey = `skill:${skill}/${script}`;
     const gate = await passGate(
       { kind: 'skill', summary, detail, batchKey, batchScope: 'object', destructive: true },
       confirm,

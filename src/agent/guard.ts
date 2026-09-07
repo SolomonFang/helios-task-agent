@@ -70,11 +70,11 @@ export function batchScopeWord(scope: ConfirmRequest['batchScope']): string {
  * 「同类免问」批准回执正文：按免问粒度（scope）与操作类别（kind）细化措辞——scope='kind'
  * 是类级授权（放行整类），回执必须如实说「整类免问」，不得沿用对象级措辞让用户误以为
  * 只放行了当前对象；scope='object' 才按对象指代细化（lark 的对象是接收人、看板是
- * 任务/审批）。技能授权 key 本就绑定脚本+参数，两种粒度共用脚本粒度措辞。
+ * 任务/审批）。技能授权 key 绑定脚本（不含参数），两种粒度共用脚本粒度措辞。
  * 未传 kind 时回退通用措辞。
  */
 export function batchAckText(scope: ConfirmRequest['batchScope'], kind?: ConfirmKind): string {
-  if (kind === 'skill') return '同一脚本同一参数本会话内免问';
+  if (kind === 'skill') return '同一脚本本会话内免问（不限参数）';
   if (scope === 'object') {
     if (kind === 'lark') return '发往同一接收人的同类操作本会话内免问';
     if (kind === 'kanban' || kind === 'hk') return '对同一任务/审批的同类操作本会话内免问';
