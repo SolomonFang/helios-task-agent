@@ -27,7 +27,7 @@ npx helios-task-agent@latest
 
 ## 安装
 
-要求：Node.js ≥ 20，macOS / Linux。
+要求：Node.js ≥ 20，macOS / Linux / Windows。
 
 ```bash
 npm i -g helios-task-agent
@@ -52,6 +52,12 @@ npm i -g @larksuite/cli && lark-cli auth login
 ```
 
 从源码开发：`npm install && npm start`。
+
+### Windows 注意事项
+
+- **文件权限**：`.env`、会话与审计文件的 `0o600` 权限位在 Windows 上只映射为「只读」属性，不能阻止其他用户读取。多人共用的机器请用 NTFS ACL 保护配置目录（`%USERPROFILE%\.helios-task-agent`）。
+- **优雅退出**：Windows 没有 SIGTERM；进程被服务管理器结束或直接关闭控制台窗口时，优雅退出（停掉自动拉起的看板子进程）可能不会执行，看板进程可能残留——用 `taskkill` 清理或先检查端口占用（默认 7964）。
+- **hk_cli 兜底零依赖**：内置兜底脚本是 `hk.mjs`（纯 Node），不需要 jq / curl 等外部工具。
 
 ## 端到端主流程
 
@@ -107,7 +113,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 ## MCP 健康监督（bot）
 
-约每 60 秒探测 MCP：连续探测失败才降级 `hk_cli`（避免瞬时抖动误报）并自动重连（退避至约 5 分钟一次；有任务执行中不重连，避免打断进行中的工具调用），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.sh`）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
+约每 60 秒探测 MCP：连续探测失败才降级 `hk_cli`（避免瞬时抖动误报）并自动重连（退避至约 5 分钟一次；有任务执行中不重连，避免打断进行中的工具调用），恢复后切回（掉线/恢复都会通知）。`hk_cli` **始终注册**（内置 `skills/helios-kanban-remote/scripts/hk.mjs`，纯 Node 零依赖）；MCP 优先，缺能力或掉线时用 `hk_cli` 补充。
 
 ## 配置目录
 
@@ -262,7 +268,7 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 |------|------|
 | `lark_cli` | 飞书读写（任务、文档、群消息等） |
 | kanban MCP | 优先的看板操作 |
-| `hk_cli` | 始终可用；跑内置 `hk.sh`（HTTP REST），MCP 掉线或缺能力时补充 |
+| `hk_cli` | 始终可用；跑内置 `hk.mjs`（HTTP REST，纯 Node 零依赖），MCP 掉线或缺能力时补充 |
 | `repo_fs` | 可选：对看板关联仓库本机 path 做 `list` / `read` / `grep`（不可越界） |
 | `work_summary` | 生成工作总结报告（HTML/MD） |
 | `daily_report` | 生成个人工作日报（结构化素材 + HTML，支持指定日期） |
@@ -272,7 +278,7 @@ bot 支持文字与富文本消息（链接/@/图片/文件/代码块等转纯�
 | `memory_*` | 持久化偏好与备注 |
 | `reminder_*` | 自然语言定时提醒（到点主动推送；创建/取消需确认） |
 
-包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.sh`）。
+包内自带技能目录：`skills/helios-kanban-remote/`（含 `SKILL.md`、`scripts/hk.mjs`）。
 
 ## 依赖组件
 

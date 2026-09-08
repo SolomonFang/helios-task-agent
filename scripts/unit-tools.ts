@@ -125,7 +125,7 @@ async function main(): Promise<void> {
       const skillDir = path.join(tmp, 'skills', 'helios-kanban-remote');
       fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
       fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: helios-kanban-remote\ndescription: fake\n---\n');
-      fs.writeFileSync(path.join(skillDir, 'scripts', 'hk.sh'), '#!/bin/bash\necho HK_USER_SCRIPT_MARKER\n');
+      fs.writeFileSync(path.join(skillDir, 'scripts', 'hk.mjs'), 'console.log("HK_USER_SCRIPT_MARKER");\n');
       const { handlers } = buildTools({ mcp: null, kanbanUrl: KANBAN_URL });
       const hk = handlers.get('hk_cli')!;
       const outUser = await hk({ args: ['health'] });
@@ -326,16 +326,16 @@ async function main(): Promise<void> {
         },
       });
       const exec = handlers.get('skill_exec')!;
-      // 仓库自带技能脚本（skills/helios-kanban-remote/scripts/hk.sh），闸门在执行前拦截
-      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh', args: ['tasks', 'list'] });
-      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh', args: ['tasks', 'delete', 'abc'] });
-      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.sh' });
+      // 仓库自带技能脚本（skills/helios-kanban-remote/scripts/hk.mjs），闸门在执行前拦截
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.mjs', args: ['tasks', 'list'] });
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.mjs', args: ['tasks', 'delete', 'abc'] });
+      await exec({ skill: 'helios-kanban-remote', script: 'scripts/hk.mjs' });
       assert.deepEqual(
         keys,
         [
-          'skill:helios-kanban-remote/scripts/hk.sh',
-          'skill:helios-kanban-remote/scripts/hk.sh',
-          'skill:helios-kanban-remote/scripts/hk.sh',
+          'skill:helios-kanban-remote/scripts/hk.mjs',
+          'skill:helios-kanban-remote/scripts/hk.mjs',
+          'skill:helios-kanban-remote/scripts/hk.mjs',
         ],
         `实际 keys=${JSON.stringify(keys)}`,
       );

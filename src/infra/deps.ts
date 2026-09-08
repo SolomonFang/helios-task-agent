@@ -1,5 +1,4 @@
-import { execFile, execFileSync } from 'child_process';
-
+import { execFileCompat, execFileSyncCompat } from './proc';
 import { minimalChildEnv } from './proc-env';
 
 /**
@@ -13,8 +12,9 @@ import { minimalChildEnv } from './proc-env';
  */
 function probeSync(cmd: string, args: string[], timeoutMs = 5000): string | null {
   try {
-    // 探测目标是第三方 CLI：不继承完整 process.env（含 LLM_API_KEY/FEISHU_APP_SECRET 等），同 proc-env.ts 策略
-    return execFileSync(cmd, args, {
+    // 探测目标是第三方 CLI：不继承完整 process.env（含 LLM_API_KEY/FEISHU_APP_SECRET 等），同 proc-env.ts 策略；
+    // execFileSyncCompat：win32 上 lark-cli/ocr 是 .cmd shim，原生 execFileSync 起不来（见 proc.ts）
+    return execFileSyncCompat(cmd, args, {
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: timeoutMs,
       encoding: 'utf8',
@@ -33,8 +33,8 @@ export function checkLarkCli(): boolean {
 /** 异步探测助手（事件循环内路径用；为何需要同步/异步双形态见上方 probeSync 注释）。 */
 function probeAsync(cmd: string, args: string[], timeoutMs = 5000): Promise<string | null> {
   return new Promise((resolve) => {
-    // 同 probeSync：第三方 CLI 探测不继承完整 process.env
-    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, env: minimalChildEnv() }, (err, stdout) => {
+    // 同 probeSync：第三方 CLI 探测不继承完整 process.env；win32 .cmd shim 兼容见 proc.ts
+    execFileCompat(cmd, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, env: minimalChildEnv() }, (err, stdout) => {
       resolve(err ? null : String(stdout ?? ''));
     });
   });
@@ -68,15 +68,6 @@ export async function probeLarkCliAuthAsync(): Promise<'unauthorized' | 'ok'> {
 /** checkOcrCli 的异步版。 */
 export async function checkOcrCliAsync(): Promise<boolean> {
   return (await probeAsync('ocr', ['version'])) !== null;
-}
-
-/** checkHkDeps 的异步版（jq/curl 并发探测）。 */
-export async function checkHkDepsAsync(): Promise<string[]> {
-  const [jq, curl] = await Promise.all([probeAsync('jq', ['--version']), probeAsync('curl', ['--version'])]);
-  const missing: string[] = [];
-  if (jq === null) missing.push('jq');
-  if (curl === null) missing.push('curl');
-  return missing;
 }
 
 /** lark-cli 缺失时的引导文案（安装 + 授权；不装则飞书读取不可用，看板功能不受影响）。 */
@@ -117,28 +108,6 @@ export const OCR_INSTALL_HINT = [
   '安装：npm i -g @alibaba-group/open-code-review',
 ].join('\n');
 
-/** jq 是否可用：hk_cli 降级链（hk.sh）解析 API 响应所必需，缺失时 hk.sh 直接退出。 */
-export function checkJq(): boolean {
-  return probeSync('jq', ['--version']) !== null;
-}
-
-/** curl 是否可用：hk_cli 降级链（hk.sh）发起 HTTP 请求所必需。 */
-export function checkCurl(): boolean {
-  return probeSync('curl', ['--version']) !== null;
-}
-
-/** hk_cli 降级链依赖探测：返回缺失的工具名（空数组 = 降级链可用）。 */
-export function checkHkDeps(): string[] {
-  const missing: string[] = [];
-  if (!checkJq()) missing.push('jq');
-  if (!checkCurl()) missing.push('curl');
-  return missing;
-}
-
-/** hk_cli 依赖缺失时的安装提示（macOS brew / Linux 包管理器；分句表述，拼接点不再出现嵌套括号）。 */
-export const HK_CLI_INSTALL_HINT =
-  'macOS：brew install jq curl，无 brew 请先到 https://brew.sh 安装；Linux：如 Ubuntu 用 sudo apt install jq curl';
-
 /** MCP 不可用时的统一降级口径（banner / CLI / bot / 诊断提示共用，单源在此，改动只动一处）。 */
 export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';
 
@@ -156,11 +125,18 @@ export function kanbanPackageSpec(env: NodeJS.ProcessEnv = process.env): string 
  * 看板自动启动失败时的手动拉起提示（CLI 与 bot 共用）。
  * 不带 HOST=0.0.0.0：看板 Web/API 无鉴权，只需绑定回环。
  * port 缺省 7964；autoStart === false 时省略「设置 HELIOS_KANBAN_AUTO_START=0」一行（用户已关闭自动启动，不复读）。
+ * win32 上 `PORT=7964 npx …` 前缀语法不可用，按 cmd / PowerShell 两种 shell 给出等价写法。
  */
 export function kanbanManualStartHint(opts?: { port?: string | number; autoStart?: boolean }): string {
-  const lines = [
-    `可手动执行：PORT=${opts?.port ?? 7964} npx -y ${kanbanPackageSpec()}（多数情况是首次下载慢，重新运行即可）`,
-  ];
+  const port = opts?.port ?? 7964;
+  const spec = kanbanPackageSpec();
+  const lines =
+    process.platform === 'win32'
+      ? [
+          `可手动执行（cmd）：set PORT=${port} && npx -y ${spec}（多数情况是首次下载慢，重新运行即可）`,
+          `或 PowerShell：$env:PORT=${port}; npx -y ${spec}`,
+        ]
+      : [`可手动执行：PORT=${port} npx -y ${spec}（多数情况是首次下载慢，重新运行即可）`];
   if (opts?.autoStart !== false) {
     lines.push('或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。');
   }

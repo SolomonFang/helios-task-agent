@@ -3,7 +3,7 @@
 // 真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
 
 import assert from 'node:assert/strict';
-import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
+import { execFile, spawn, type ChildProcess } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -21,7 +21,7 @@ import { apiGet, fetchKanbanHealth, KanbanHttpError, taskPageUrl } from '../src/
 import { findOcrCommand, resolveReviewTarget } from '../src/kanban/ai-review';
 import { KanbanMcp } from '../src/kanban/mcp';
 import { checkLarkCli, checkLarkCliAsync } from '../src/infra/deps';
-import { check, checkAsync, finish } from './testkit';
+import { checkAsync, finish, writeFakeCli } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
 function groupAlive(pid: number): boolean {
@@ -80,31 +80,36 @@ async function main(): Promise<void> {
     assert.ok(Date.now() - started < 500, 'null 子进程应早返回，不进入 SIGTERM 等待窗口');
   });
 
-  await checkAsync('stopKanbanChild：进程组整体已退出时不发信号也不抛错', async () => {
-    const child = spawn('bash', ['-c', 'exit 0'], { detached: true, stdio: 'ignore' });
-    await waitExit(child);
-    assert.ok(child.exitCode !== null);
-    await stopKanbanChild(child); // 组内无活口：静默返回
-  });
-
-  await checkAsync('stopKanbanChild：壳进程已退出但进程组存活（exitCode 不短路），仍按组杀干净', async () => {
-    // 模拟「npx 先死、看板孙进程被 reparent 后仍在组里」：bash 拉起 sleep 后自己退出
-    const child = spawn('bash', ['-c', 'sleep 30 & exit 0'], { detached: true, stdio: 'ignore' });
-    const pid = child.pid!;
-    try {
+  // 进程组语义（detached + 负 pid 组杀）是 POSIX 专属：win32 无 bash 与进程组，这两个用例整组跳过
+  if (process.platform !== 'win32') {
+    await checkAsync('stopKanbanChild：进程组整体已退出时不发信号也不抛错', async () => {
+      const child = spawn('bash', ['-c', 'exit 0'], { detached: true, stdio: 'ignore' });
       await waitExit(child);
-      assert.ok(child.exitCode !== null, '壳进程应已退出（exitCode 非 null）');
-      assert.ok(groupAlive(pid), '孙进程应仍在进程组里存活');
-      await stopKanbanChild(child);
-      assert.ok(!groupAlive(pid), '进程组应被清理（旧逻辑此处会留孤儿）');
-    } finally {
+      assert.ok(child.exitCode !== null);
+      await stopKanbanChild(child); // 组内无活口：静默返回
+    });
+
+    await checkAsync('stopKanbanChild：壳进程已退出但进程组存活（exitCode 不短路），仍按组杀干净', async () => {
+      // 模拟「npx 先死、看板孙进程被 reparent 后仍在组里」：bash 拉起 sleep 后自己退出
+      const child = spawn('bash', ['-c', 'sleep 30 & exit 0'], { detached: true, stdio: 'ignore' });
+      const pid = child.pid!;
       try {
-        process.kill(-pid, 'SIGKILL'); // 兜底清理，防测试失败泄漏 sleep
-      } catch {
-        /* 已退出 */
+        await waitExit(child);
+        assert.ok(child.exitCode !== null, '壳进程应已退出（exitCode 非 null）');
+        assert.ok(groupAlive(pid), '孙进程应仍在进程组里存活');
+        await stopKanbanChild(child);
+        assert.ok(!groupAlive(pid), '进程组应被清理（旧逻辑此处会留孤儿）');
+      } finally {
+        try {
+          process.kill(-pid, 'SIGKILL'); // 兜底清理，防测试失败泄漏 sleep
+        } catch {
+          /* 已退出 */
+        }
       }
-    }
-  });
+    });
+  } else {
+    console.log('SKIP  stopKanbanChild 进程组用例 ×2  — POSIX 专属（win32 无进程组）');
+  }
 
   // ---------- fillHkStartBranches：argv 形态 ----------
   await checkAsync('fillHkStartBranches argv：--repo 无 :branch 时回填默认分支', async () => {
@@ -198,31 +203,15 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- hk.sh ↔ src/kanban/http.ts 契约一致性（漂移防护） ----------
-  // 两套看板客户端（TS 侧 http.ts 与技能内 bash hk.sh）各自实现信封解析、任务详情 URL、
-  // 健康端点。这里用 loopback mock 看板 + 真实子进程跑 hk.sh 只读路径，断言两侧语义一致；
+  // ---------- hk.mjs ↔ src/kanban/http.ts 契约一致性（漂移防护） ----------
+  // 两套看板客户端（TS 侧 http.ts 与技能内 hk.mjs）各自实现信封解析、任务详情 URL、
+  // 健康端点。这里用 loopback mock 看板 + 真实子进程跑 hk.mjs 只读路径，断言两侧语义一致；
   // 全程离线。注意一个已知且刻意的差异不在断言内：无 success 字段时 TS 侧宽松回退
-  // （data ?? 原始 JSON），hk.sh 严格报错——契约只钉双方共识的严格信封形态。
+  // （data ?? 原始 JSON），hk.mjs 严格报错——契约只钉双方共识的严格信封形态。
 
-  const HK_SH = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+  const HK_MJS = path.join(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.mjs');
 
-  // hk.sh 契约用例以真实子进程跑 bash 脚本，依赖 bash/jq/curl：缺失属环境问题而非产品缺陷，
-  // 按 SKIP 处理（同 unit.ts 的 jq 探测 / smoke.ts 的 SKIP 惯例），避免干净 CI 上误红；
-  // HTA_REQUIRE_E2E=1 时转 FAIL，防止「全绿」掩盖契约用例未真跑
-  const hkDepsMissing = ['bash', 'jq', 'curl'].filter((cmd) => {
-    try {
-      execFileSync(cmd, ['--version'], { stdio: 'ignore' });
-      return false;
-    } catch {
-      return true;
-    }
-  });
-  const runHkContract = (name: string, fn: () => Promise<void>): Promise<void> | void => {
-    if (!hkDepsMissing.length) return checkAsync(name, fn);
-    const detail = `本机缺少 ${hkDepsMissing.join('、')}（hk.sh 运行时依赖）`;
-    if (process.env.HTA_REQUIRE_E2E === '1') check(name, false, `HTA_REQUIRE_E2E=1 禁止跳过：${detail}`);
-    else console.log(`SKIP  ${name}  — ${detail}`);
-  };
+  // hk.mjs 与测试同一 Node 解释器，零外部依赖：契约用例在任何平台都可运行，无需 SKIP 逻辑
 
   interface HkResult {
     code: number;
@@ -230,13 +219,18 @@ async function main(): Promise<void> {
     stderr: string;
   }
 
-  /** 以真实子进程跑 hk.sh 只读命令（bash + jq + curl，打 loopback mock，不触网）。 */
+  /** 以真实子进程跑 hk.mjs 只读命令（当前 Node 解释器，打 loopback mock，不触网）。 */
   function runHk(args: string[], kanbanUrl: string): Promise<HkResult> {
     return new Promise((resolve) => {
-      execFile('bash', [HK_SH, ...args], { env: { ...process.env, HELIOS_KANBAN_URL: kanbanUrl } }, (err, stdout, stderr) => {
-        const code = err && typeof err.code === 'number' ? err.code : 0;
-        resolve({ code, stdout: String(stdout), stderr: String(stderr) });
-      });
+      execFile(
+        process.execPath,
+        [HK_MJS, ...args],
+        { env: { ...process.env, HELIOS_KANBAN_URL: kanbanUrl } },
+        (err, stdout, stderr) => {
+          const code = err && typeof err.code === 'number' ? err.code : 0;
+          resolve({ code, stdout: String(stdout), stderr: String(stderr) });
+        },
+      );
     });
   }
 
@@ -266,7 +260,7 @@ async function main(): Promise<void> {
     };
   }
 
-  await runHkContract('契约：信封成功路径一致——hk.sh 与 apiGet 提取同一份 data', async () => {
+  await checkAsync('契约：信封成功路径一致——hk.mjs 与 apiGet 提取同一份 data', async () => {
     const info = { version: '9.9.9', config: { executor_profile: { executor: 'KIMI_CLI' } } };
     const mock = await contractMock(() => ({ body: { success: true, data: info } }));
     try {
@@ -280,12 +274,12 @@ async function main(): Promise<void> {
     }
   });
 
-  await runHkContract('契约：信封失败路径一致——success:false 时两侧都报错（TS 侧中文定性，原文收 HTA_DEBUG）', async () => {
+  await checkAsync('契约：信封失败路径一致——success:false 时两侧都报错（TS 侧中文定性，原文收 HTA_DEBUG）', async () => {
     const mock = await contractMock(() => ({ body: { success: false, message: 'boom-msg-contract' } }));
     try {
       const hk = await runHk(['info'], mock.baseUrl);
-      assert.notEqual(hk.code, 0, 'hk.sh 应非零退出');
-      assert.ok(hk.stderr.includes('boom-msg-contract'), `hk.sh stderr 应含 message，实际：${hk.stderr}`);
+      assert.notEqual(hk.code, 0, 'hk.mjs 应非零退出');
+      assert.ok(hk.stderr.includes('boom-msg-contract'), `hk.mjs stderr 应含 message，实际：${hk.stderr}`);
       await assert.rejects(apiGet(mock.baseUrl, '/info'), /看板拒绝了请求/);
       // HTA_DEBUG=1 时服务端原文进日志
       const errLogs: string[] = [];
@@ -307,7 +301,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await runHkContract('契约：健康端点路径一致——两侧都打 /api/health', async () => {
+  await checkAsync('契约：健康端点路径一致——两侧都打 /api/health', async () => {
     const mock = await contractMock(() => ({ body: { success: true, data: { status: 'ok' } } }));
     try {
       const hk = await runHk(['health'], mock.baseUrl);
@@ -320,7 +314,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await runHkContract('契约：任务详情 URL 规则一致——/local-projects/<pid>/tasks/<tid>', async () => {
+  await checkAsync('契约：任务详情 URL 规则一致——/local-projects/<pid>/tasks/<tid>', async () => {
     const tid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
     const mock = await contractMock((url) => {
       if (url === `/api/tasks/${tid}`) {
@@ -363,8 +357,12 @@ async function main(): Promise<void> {
     const port = (server.address() as AddressInfo).port;
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-exit-'));
     // sleep 用绝对路径：子进程经 minimalChildEnv 只继承 PATH=bin，裸 `sleep` 会 not found
-    // 导致壳瞬间退出（Linux 回收更快，首轮轮询即误判「进程已退出」，macOS 靠时序侥幸通过）
-    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\n/bin/sleep 0.5\nexit 0\n', { mode: 0o755 });
+    // 导致壳瞬间退出（Linux 回收更快，首轮轮询即误判「进程已退出」，macOS 靠时序侥幸通过）；
+    // win32 用 ping 近似 0.5s 等待（cmd 无 sleep）
+    writeFakeCli(bin, 'npx', {
+      sh: '/bin/sleep 0.5\nexit 0\n',
+      cmd: 'ping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n',
+    });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
     try {
@@ -468,7 +466,7 @@ async function main(): Promise<void> {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), `hta-unit-probe-${name}-`));
     const dump = path.join(bin, 'dump.txt');
     // dump 路径烧进脚本：子进程走 minimalChildEnv，读不到测试进程自定义的传值变量
-    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n/usr/bin/env > ${dump}\n`, { mode: 0o755 });
+    writeFakeCli(bin, name, { sh: `/usr/bin/env > ${dump}\n`, cmd: `set > "${dump}"\r\n` });
     return { bin, dump };
   }
 

@@ -1,20 +1,20 @@
 import path from 'path';
-import { execFile } from 'child_process';
 import { LARK_CLI_INSTALL_HINT } from '../../infra/deps';
 import { resolveSkillDir } from '../skills';
+import { execFileCompat } from '../../infra/proc';
 import { minimalChildEnv } from '../../infra/proc-env';
 import { packageRoot } from '../../infra/paths';
 
-/** hk.sh 包内兜底路径（用户目录无覆盖版本时使用，见 resolveHkScript）。 */
-const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
+/** hk.mjs 包内兜底路径（用户目录无覆盖版本时使用，见 resolveHkScript）。 */
+const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.mjs');
 
 /**
- * hk.sh 定位：与 skill_doc 同一套 resolveSkillDir（用户目录优先覆盖），找不到回退包内路径。
+ * hk.mjs 定位：与 skill_doc 同一套 resolveSkillDir（用户目录优先覆盖），找不到回退包内路径。
  * 每次调用重新解析：运行中新装/更新用户技能即时生效，且与 skill_doc 读到的文档版本一致。
  */
 export function resolveHkScript(): string {
   const dir = resolveSkillDir('helios-kanban-remote');
-  return dir ? path.join(dir, 'scripts', 'hk.sh') : HK_SCRIPT;
+  return dir ? path.join(dir, 'scripts', 'hk.mjs') : HK_SCRIPT;
 }
 
 const MAX_OUTPUT = 8000;
@@ -49,7 +49,8 @@ export function truncate(s: unknown): string {
 
 /** stderr 用户面只带尾部几行（完整内容与英文原文进 HTA_DEBUG 日志，不落用户面）。 */
 function tailLines(s: string, n: number): string {
-  const lines = s.trim().split('\n').filter(Boolean);
+  // \r?\n：Windows 子进程 stderr 是 CRLF，不剥 \r 会漏进用户面文本
+  const lines = s.trim().split(/\r?\n/).filter(Boolean);
   return lines.slice(-n).join('\n');
 }
 
@@ -70,8 +71,9 @@ export function run(
       resolve('⏹ 已中断（未完成的操作未执行，可继续对话）。');
       return;
     }
-    // 最小环境（见 proc-env.ts）：不向 lark-cli / hk.sh / 技能脚本泄露 LLM_API_KEY 等敏感变量
-    execFile(
+    // 最小环境（见 proc-env.ts）：不向 lark-cli / hk.mjs / 技能脚本泄露 LLM_API_KEY 等敏感变量；
+    // execFileCompat：win32 上 lark-cli 等 npm 全局命令是 .cmd shim，原生 execFile 起不来（见 proc.ts）
+    execFileCompat(
       command,
       args,
       { timeout: EXEC_TIMEOUT, maxBuffer: 4 * 1024 * 1024, env: minimalChildEnv(env), signal, cwd },
@@ -93,7 +95,7 @@ export function run(
           // 超时中止：signal 中断已在上方拦截，此处的 killed/SIGTERM 即 EXEC_TIMEOUT 触发
           if (error.killed === true || /timed?\s*out/i.test(error.message)) {
             // 保留「命令执行失败」行首：looksLikeStrongFailure 依行首识别强失败（审计/来源映射/创建计数）。
-            // run() 为 lark-cli / hk.sh / 技能解释器三方共用，超时归因用中性措辞（不按看板服务单点归因）
+            // run() 为 lark-cli / hk.mjs / 技能解释器三方共用，超时归因用中性措辞（不按看板服务单点归因）
             resolve(
               `命令执行失败：执行超时（超过 ${EXEC_TIMEOUT / 1000} 秒已自动中止）。` +
                 '请稍后重试；若持续超时，可能是网络或服务响应慢。',

@@ -1,6 +1,6 @@
 import readline from 'readline';
 
-import { HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './deps';
+import { MCP_FALLBACK_TEXT } from './deps';
 
 const ESC = '\u001b';
 
@@ -97,22 +97,15 @@ export interface BannerStatus {
   larkOk: boolean;
   /** lark-cli 是否已授权（调用方探测；larkOk=false 时忽略）。 */
   larkAuthed: boolean;
-  /** hk_cli 降级链缺失的依赖（调用方探测，如 checkHkDeps()；空数组 = 齐全）。 */
-  hkMissing: string[];
   kanbanUrl: string;
   version: string;
 }
 
 export function printBanner(status: BannerStatus): void {
   // 不清屏：向导刚打印的「配置已保存到 …」等上下文需要保留在视野内
-  // 探测由调用方完成（hkMissing / larkAuthed）：ui 只做渲染，探测逻辑留在 deps 层
-  const hkMissing = status.hkMissing;
-  const mcpSuffix =
-    status.mcp === 'fail'
-      ? hkMissing.length
-        ? '，备用通道不可用（详见下行）'
-        : `，${MCP_FALLBACK_TEXT}，大部分功能可用`
-      : '';
+  // 探测由调用方完成（larkAuthed 等）：ui 只做渲染，探测逻辑留在 deps 层
+  // 备用通道（hk.mjs）零外部依赖、始终可用，MCP 失败时直接按已切换口径展示
+  const mcpSuffix = status.mcp === 'fail' ? `，${MCP_FALLBACK_TEXT}，大部分功能可用` : '';
   const mcpLine =
     status.mcp === 'ok'
       ? c.ok('●') + ` 看板连接         已连接（${status.mcpToolCount} 个工具）`
@@ -126,17 +119,6 @@ export function printBanner(status: BannerStatus): void {
     : larkAuthed
       ? c.ok('●') + ' lark-cli         可用（飞书内容获取）'
       : c.warn('●') + ' lark-cli         未授权，飞书能力不可用（运行 lark-cli auth login 完成授权）';
-  // 备用通道缺依赖的警示按主通道状态分时态：主通道正常时是「将来没有兜底」，已中断时是「当前不可用」
-  const hkLine =
-    hkMissing.length > 0
-      ? [
-          '  ' +
-            c.warn('●') +
-            (status.mcp === 'fail'
-              ? ` 备用通道         缺少 ${hkMissing.join('、')}，看板读写当前不可用，安装后可恢复。${HK_CLI_INSTALL_HINT}`
-              : ` 备用通道         缺少 ${hkMissing.join('、')}，看板主通道中断时将没有备用通道可用。${HK_CLI_INSTALL_HINT}`),
-        ]
-      : [];
   const lines = [
     '',
     c.strong(c.info('  ██╗  ██╗███████╗██╗     ██╗ ██████╗ ███████╗')),
@@ -151,7 +133,6 @@ export function printBanner(status: BannerStatus): void {
     '',
     '  ' + mcpLine,
     '  ' + larkLine,
-    ...hkLine,
     // 模型与看板地址只是配置展示（未做健康检查）：用中性灰点，避免与上面两行的「连接正常」绿点混淆
     '  ' + c.gray('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
     '  ' + c.gray('●') + ` 看板地址         ${status.kanbanUrl}`,

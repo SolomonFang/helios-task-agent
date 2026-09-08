@@ -1,10 +1,9 @@
-import { execFile } from 'child_process';
-
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 import { MCP_FALLBACK_TEXT } from '../infra/deps';
+import { execFileCompat, killProcessTree } from '../infra/proc';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -55,6 +54,7 @@ export class KanbanMcp {
         if (settled) return;
         timeoutSnapshot = await collectDescendants(transport.pid);
         if (settled) return; // await 期间 connect 已落定，transport 归属成功/失败路径处理，不再误关
+        killTransportTree(transport.pid);
         await transport.close().catch(() => {});
       })();
     }, timeoutMs);
@@ -77,6 +77,7 @@ export class KanbanMcp {
       // 快照须在 kill 之前：孙进程在直接子进程死后被 reparent，事后按父 pid 已找不到。
       // 超时路径复用定时器里 close 前已完成的快照（此刻直接子进程已死，现采快照为空）。
       const snapshot = timeoutSnapshot ?? (await collectDescendants(transport.pid));
+      killTransportTree(transport.pid);
       await transport.close().catch(() => {});
       await sweepOrphanedTree(snapshot);
       this.transportPid = null;
@@ -132,7 +133,10 @@ export class KanbanMcp {
     // SDK 的 StdioClientTransport 不透传 spawn 选项（无 detached 进程组杀），只 SIGTERM/SIGKILL
     // 直接子进程（npx 壳）；孙进程（真正的 server）被 reparent 成孤儿。close 前先快照子进程树，
     // close 后 best-effort 补杀仍存活的孙进程（有界、失败吞掉、幂等）。
+    // win32 无 ps/进程组语义：killTransportTree 用 taskkill /T /F 从根整树杀，在 close 前执行
+    // （根进程死后 taskkill 按 pid 找不到树），无需子孙枚举。
     const snapshot = await collectDescendants(this.transportPid);
+    killTransportTree(this.transportPid);
     this.transportPid = null;
     if (this.client) {
       try {
@@ -150,7 +154,7 @@ export class KanbanMcp {
 function commandsOf(pids: number[]): Promise<Map<number, string> | null> {
   if (pids.length === 0) return Promise.resolve(new Map());
   return new Promise((resolve) => {
-    execFile('ps', ['-p', pids.join(','), '-o', 'pid=,command='], { timeout: 3000 }, (err, stdout) => {
+    execFileCompat('ps', ['-p', pids.join(','), '-o', 'pid=,command='], { timeout: 3000 }, (err, stdout) => {
       if (err) return resolve(null);
       const out = new Map<number, string>();
       for (const line of stdout.split('\n')) {
@@ -163,14 +167,25 @@ function commandsOf(pids: number[]): Promise<Map<number, string> | null> {
 }
 
 /**
+ * win32 的孤儿树清理：taskkill /T /F 从根 pid 杀整棵进程树（见 proc.ts killProcessTree），
+ * 无需 POSIX 那套 ps 子孙枚举。须在 SDK close 杀根进程之前调用（根死后按 pid 找不到树）。
+ * 非 win32 平台为 no-op（走 collectDescendants/sweepOrphanedTree 路径）。
+ */
+function killTransportTree(pid: number | null): void {
+  if (process.platform !== 'win32' || pid === null) return;
+  killProcessTree(pid);
+}
+
+/**
  * 快照 rootPid 的全部后代进程（pid → 命令行，不含 root 自身）。仅 darwin/linux；
- * ps 失败或平台不支持返回 null，调用方按「无可清理」处理（best-effort，不影响主流程）。
+ * ps 失败或平台不支持（win32 改走 killTransportTree 的 taskkill 整树杀）返回 null，
+ * 调用方按「无可清理」处理（best-effort，不影响主流程）。
  */
 function collectDescendants(rootPid: number | null): Promise<Map<number, string> | null> {
   if (rootPid === null) return Promise.resolve(null);
   if (process.platform !== 'darwin' && process.platform !== 'linux') return Promise.resolve(null);
   return new Promise((resolve) => {
-    execFile('ps', ['-axo', 'pid=,ppid=,command='], { timeout: 3000 }, (err, stdout) => {
+    execFileCompat('ps', ['-axo', 'pid=,ppid=,command='], { timeout: 3000 }, (err, stdout) => {
       if (err) return resolve(null);
       const ppidOf = new Map<number, number>();
       const cmdOf = new Map<number, string>();
@@ -225,21 +240,14 @@ async function sweepOrphanedTree(snapshot: Map<number, string> | null): Promise<
  * MCP 启动失败的已知模式诊断：命中返回给用户看的排查提示，未命中返回 null。
  * 典型场景：本机看板进程运行时间过长，其端口文件（vibe-kanban.port）被系统
  * 清理，MCP 服务启动即退出（Error: No such file or directory），重启看板即恢复。
- *
- * opts.fallbackAvailable === false 时（调用方已知 hk_cli 降级链缺 jq/curl）不得
- * 再宣称「已自动切换为备用通道」——此时备用通道同样不可用，如实告知。
  */
-export function diagnoseMcpFailure(stderrTail: string, opts?: { fallbackAvailable?: boolean }): string | null {
+export function diagnoseMcpFailure(stderrTail: string): string | null {
   if (!stderrTail) return null;
   if (/vibe-kanban\.port|Reading port from/i.test(stderrTail) && /No such file|not found|error/i.test(stderrTail)) {
-    const fallback =
-      opts?.fallbackAvailable === false
-        ? '看板读写暂不可用（备用通道缺少 jq、curl）。'
-        : `当前${MCP_FALLBACK_TEXT}。`;
     return (
       '看板连接失败：看板运行时间过久，其端口记录文件可能已被系统清理。' +
       '退出并重新运行本程序即可恢复（会同时重启看板）。' +
-      fallback
+      `当前${MCP_FALLBACK_TEXT}。`
     );
   }
   return null;
@@ -260,16 +268,12 @@ export interface McpBootResult {
  * onCreate：实例一创建（connect 发起前）即同步回调。连接窗口最长 45s，期间收到退出
  * 信号时调用方若等 resolve 才登记清理，in-flight 的 stdio 子进程会成孤儿——参照
  * kanban 的 onSpawn 模式，创建即登记（配合 KanbanMcp 的 closePending 兜底关闭）。
- *
- * fallbackAvailable：调用方已知 hk_cli 备用通道缺依赖（jq/curl）时传 false，
- * 诊断提示不再宣称「已自动切换为备用通道」。
  */
 export async function connectMcp(
   cfg: { mcpCommand: string; mcpArgs: string[] },
   opts: {
     onCreate?: (mcp: KanbanMcp) => void;
     onLog?: (msg: string) => void;
-    fallbackAvailable?: boolean;
   } = {},
 ): Promise<McpBootResult> {
   const mcp = new KanbanMcp({ command: cfg.mcpCommand, args: cfg.mcpArgs });
@@ -288,7 +292,7 @@ export async function connectMcp(
   } catch (err) {
     const e = err instanceof Error ? err : new Error(String(err));
     if (process.env.HTA_DEBUG) console.error(`\n[mcp] ${e.stack || e.message}`);
-    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail(), { fallbackAvailable: opts.fallbackAvailable }) };
+    return { mcp, ok: false, error: e.message, hint: diagnoseMcpFailure(mcp.getStderrTail()) };
   } finally {
     if (beat) clearInterval(beat);
   }

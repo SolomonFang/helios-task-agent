@@ -271,7 +271,7 @@ export function classifyLark(args: string[]): 'read' | 'write' {
   return 'write';
 }
 
-// --- hk.sh classification ---
+// --- hk classification ---
 
 const HK_WRITE_COMMANDS = new Set(['start', 'create-and-start', 'follow-up', 'stop', 'approve', 'deny']);
 const HK_READ_COMMANDS = new Set(['health', 'info', 'repos', 'branches', 'status', 'workspaces', 'tags', 'approvals']);

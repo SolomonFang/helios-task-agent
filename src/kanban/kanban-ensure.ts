@@ -1,8 +1,9 @@
-import { spawn, type ChildProcess } from 'child_process';
+import type { ChildProcess } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 import { kanbanPackageSpec, kanbanManualStartHint } from '../infra/deps';
+import { killProcessTree, processTreeAlive, spawnCompat } from '../infra/proc';
 import { minimalChildEnv } from '../infra/proc-env';
 
 export interface KanbanEnsureResult {
@@ -130,7 +131,7 @@ export async function ensureKanbanRunning(
   }
 
   log(`未检测到看板，正在启动 npx ${kanbanPackageSpec()}（PORT=${port}）…`);
-  const child = spawn('npx', ['-y', kanbanPackageSpec()], {
+  const child = spawnCompat('npx', ['-y', kanbanPackageSpec()], {
     // 最小环境（见 proc-env.ts）：npx 只需 PATH/HOME 与代理/registry，不继承敏感变量
     env: minimalChildEnv({
       // 默认只监听回环：看板 Web/API 无鉴权，绑定 0.0.0.0 会暴露到局域网
@@ -138,7 +139,8 @@ export async function ensureKanbanRunning(
       PORT: port,
     }),
     stdio: ['ignore', 'pipe', 'pipe'],
-    // 自成进程组：stopKanbanChild 按组杀，npx 拉起的看板孙进程（真正的监听者）才能一并退出
+    // 自成进程组（POSIX）：stopKanbanChild 按组杀，npx 拉起的看板孙进程（真正的监听者）才能一并退出；
+    // win32 上 detached 无害（清理走 taskkill /T 整树杀，见 proc.ts killProcessTree）
     detached: true,
   });
   onSpawn?.(child);
@@ -207,27 +209,16 @@ export async function ensureKanbanRunning(
   );
 }
 
-/** 按进程组发信号（spawn 时 detached: true）；组杀失败（如平台不支持负 pid）回退只杀 child。 */
+/** 按进程树发信号：POSIX 按进程组（detached: true），win32 走 taskkill /T /F（见 proc.ts）。 */
 function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-child.pid!, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      /* 已退出 */
-    }
-  }
+  if (child.pid === undefined) return;
+  killProcessTree(child.pid, signal);
 }
 
 /** 进程组是否还有存活成员（npx 壳退出后，被 reparent 的看板孙进程仍在组里）。 */
 function treeAlive(child: ChildProcess): boolean {
-  try {
-    process.kill(-child.pid!, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  if (child.pid === undefined) return false;
+  return processTreeAlive(child.pid);
 }
 
 export async function stopKanbanChild(child: ChildProcess | null): Promise<void> {

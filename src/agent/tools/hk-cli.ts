@@ -90,8 +90,9 @@ export function makeHkCliHandler({
       return '参数错误：args 必须是字符串数组';
     }
     const argv = args as string[];
+    // hk.mjs 用当前 Node 解释器执行（process.execPath）：零外部依赖，不依赖 PATH 上的 bash，Windows 可用
     if (classifyHk(argv) === 'read') {
-      return wrapUntrusted(await run('bash', [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }));
+      return wrapUntrusted(await run(process.execPath, [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }));
     }
     const isCreate = argv[0] === 'create-and-start' || (argv[0] === 'tasks' && argv[1] === 'create');
     const isStart = argv[0] === 'start' || argv[0] === 'create-and-start';
@@ -130,7 +131,7 @@ export function makeHkCliHandler({
                 const branch = defaults[repoId];
                 if (branch) argv.push('--branch', branch);
               } else {
-                // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk.sh 静默回退 main
+                // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk 静默回退 main
                 return await fillHkStartBranches(argv, kanbanUrl, {
                   signal: ctx?.signal,
                   noRepoError:
@@ -145,7 +146,7 @@ export function makeHkCliHandler({
             return null;
           }
         : undefined,
-      execute: () => run('bash', [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }),
+      execute: () => run(process.execPath, [resolveHkScript(), ...argv], { env: hkEnv, signal: ctx?.signal }),
       signal: ctx?.signal,
     });
   };

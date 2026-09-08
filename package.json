@@ -10,12 +10,12 @@
   },
   "scripts": {
     "start": "tsx src/cli.ts",
-    "test": "fail=''; for t in unit unit-safety unit-kanban unit-resilience unit-bot unit-handler unit-coverage unit-feishu-filter unit-daily-brief unit-weekly-brief unit-session-store unit-repo-fs unit-tools unit-stale-diagnosis unit-reports unit-reminder; do tsx \"scripts/$t.ts\" || fail=\"$fail $t\"; done; if [ -n \"$fail\" ]; then echo \"\"; echo \"失败的测试套件：$fail\"; exit 1; fi",
+    "test": "tsx scripts/run-tests.ts",
     "smoke": "tsx scripts/smoke.ts",
     "test:e2e": "tsx scripts/e2e-mock.ts",
     "build": "tsc",
     "typecheck": "tsc -p tsconfig.typecheck.json",
-    "prepack": "rm -rf dist && npm run build",
+    "prepack": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npm run build",
     "verify": "npm run typecheck && npm test && HTA_REQUIRE_E2E=1 npm run smoke && HTA_REQUIRE_E2E=1 npm run test:e2e && npm run build && node bin/helios-task-agent.js --version && node -e \"require('./dist/cli');require('./dist/bot-main')\"",
     "prepublishOnly": "npm run typecheck && npm test",
     "bot": "tsx src/bot-main.ts"
@@ -50,7 +50,8 @@
   "homepage": "https://github.com/SolomonFang/helios-task-agent#readme",
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "engines": {
     "node": ">=20"
@@ -58,10 +59,12 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "cross-spawn": "^7.0.6",
     "dotenv": "^16.4.5",
     "openai": "^4.77.0"
   },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^20.19.43",
     "tsx": "^4.23.10",
     "typescript": "^5.9.3"

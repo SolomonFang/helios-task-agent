@@ -8,7 +8,11 @@
  * - LANG/LC_*：本地化输出（中文文案、排序）；
  * - HTTP(S)_PROXY/NO_PROXY、NPM_CONFIG_REGISTRY：npx/npm 拉包所需的网络配置
  *   （镜像地址与代理，均非凭证；npm_config_* 不整体放行，避免泄露 _authToken 类键）；
- * - 其余一律不带，调用方按需显式追加（如 hk.sh 的 HELIOS_KANBAN_*、ocr 的 OCR_LLM_*）。
+ * - Windows 必需项：缺 SystemRoot/SystemDrive 会导致子进程 DNS 解析与加密 API 失败；
+ *   缺 PATHEXT 时 .cmd/.bat 无法被解析执行（npm 全局 bin 全是 .cmd shim）；
+ *   npm/npx/lark-cli 读配置与缓存依赖 APPDATA/LOCALAPPDATA/USERPROFILE；
+ *   ComSpec/HOMEDRIVE/HOMEPATH/USERNAME/USERDOMAIN/ProgramData 为系统与工具链兜底定位项；
+ * - 其余一律不带，调用方按需显式追加（如 hk.mjs 的 HELIOS_KANBAN_*、ocr 的 OCR_LLM_*）。
  */
 
 /** 原样放行（存在才带）的运行必需变量。 */
@@ -31,6 +35,19 @@ const PASS_THROUGH_VARS = [
   'http_proxy',
   'https_proxy',
   'no_proxy',
+  // Windows 必需项（POSIX 下不存在则自动跳过）：见文件头注释
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'USERNAME',
+  'USERDOMAIN',
+  'SystemRoot',
+  'SystemDrive',
+  'ComSpec',
+  'PATHEXT',
+  'ProgramData',
 ];
 
 /** 组装子进程环境：base 中的放行清单 + extra（后者覆盖前者）。 */

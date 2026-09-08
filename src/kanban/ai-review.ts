@@ -1,9 +1,9 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import type { ExecFileOptions } from 'child_process';
 import { ocrPackageSpec } from '../infra/deps';
+import { execFileCompat } from '../infra/proc';
 import { minimalChildEnv } from '../infra/proc-env';
 import { apiGet, validateRows } from './http';
 
@@ -17,7 +17,16 @@ import { apiGet, validateRows } from './http';
  *   ~/.opencodereview/config.json 里有 provider/llm 时尊重用户配置，不再注入对应项。
  */
 
-const execFileP = promisify(execFile);
+// execFileCompat：win32 上 ocr/npx 都是 .cmd shim，原生 execFile 不带 shell 起不来（见 proc.ts）；
+// 错误形状对齐原生 execFile（.killed/.code/.stdout/.stderr），下方 catch 分支无需改动。
+// 手写 promisify（原生 execFile 的 promisify 定制返回 {stdout,stderr}，util.promisify 包装不出该形状）。
+const execFileP = (cmd: string, args: string[], options: ExecFileOptions): Promise<{ stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    execFileCompat(cmd, args, options, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve({ stdout, stderr });
+    });
+  });
 
 /** attempt 详情里与定位审查目录/所属任务相关的字段（宽松解析，看板版本间字段可能不同）。 */
 interface AttemptRow {

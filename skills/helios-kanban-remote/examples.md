@@ -7,7 +7,7 @@ export HELIOS_KANBAN_URL="http://100.64.0.5:7964"
 export HELIOS_KANBAN_PROJECT_ID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 export HELIOS_KANBAN_REPO_ID="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 export HELIOS_KANBAN_ITERATION="260717"
-HK="bash scripts/hk.sh"
+HK="node scripts/hk.mjs"
 ```
 
 ## Pick the right project

@@ -246,7 +246,7 @@ const SKILL_NAME_RE = /^[\w][\w.-]*$/;
  * 支持 ~/ 前缀。源与目标相同或互相嵌套时拒绝（先删后拷会把源一起删掉）。
  */
 export function installSkill(srcPath: string): { name: string; dir: string; replaced: boolean } {
-  const expanded = srcPath.trim().replace(/^~(?=$|\/)/, os.homedir());
+  const expanded = srcPath.trim().replace(/^~(?=$|[\\/])/, os.homedir());
   const src = path.resolve(expanded);
   if (!fs.existsSync(src) || !fs.statSync(src).isDirectory()) {
     throw new Error(`路径不存在或不是目录：${srcPath}`);

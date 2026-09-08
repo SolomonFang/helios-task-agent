@@ -30,7 +30,7 @@ Install progress:
 - [ ] Step 1: Detect environment
 - [ ] Step 2: Get skill files from this repo
 - [ ] Step 3: Install to agent skills directory
-- [ ] Step 4: Check dependencies (curl, jq)
+- [ ] Step 4: Check dependencies (Node >= 20)
 - [ ] Step 5: Configure HELIOS_KANBAN_URL
 - [ ] Step 6: Verify connectivity
 - [ ] Step 7: Report result to user
@@ -85,7 +85,7 @@ echo "Using bundled skill: $SRC_DIR"
 RAW="https://raw.githubusercontent.com/SolomonFang/helios-task-agent/main/skills/helios-kanban-remote"
 SRC_DIR="${TMPDIR:-/tmp}/helios-kanban-remote"
 rm -rf "$SRC_DIR" && mkdir -p "$SRC_DIR/scripts"
-for f in SKILL.md INSTALL.md reference.md examples.md scripts/hk.sh; do
+for f in SKILL.md INSTALL.md reference.md examples.md scripts/hk.mjs; do
   curl -fsSL "$RAW/$f" -o "$SRC_DIR/$f" || { echo "error: fetch failed: $f"; exit 1; }
 done
 echo "Fetched skill to: $SRC_DIR"
@@ -99,8 +99,8 @@ echo "Fetched skill to: $SRC_DIR"
 mkdir -p "$SKILLS_ROOT"
 rm -rf "$SKILL_DIR"
 cp -r "$SRC_DIR" "$SKILL_DIR"
-chmod +x "$SKILL_DIR/scripts/hk.sh"
-HK="$SKILL_DIR/scripts/hk.sh"
+chmod +x "$SKILL_DIR/scripts/hk.mjs"   # POSIX 便利（可直接执行）；Windows 上不需要，一律 node hk.mjs 调用
+HK="$SKILL_DIR/scripts/hk.mjs"
 
 # Verify
 test -f "$SKILL_DIR/SKILL.md" && test -f "$HK" && echo "OK: installed to $SKILL_DIR"
@@ -110,19 +110,10 @@ test -f "$SKILL_DIR/SKILL.md" && test -f "$HK" && echo "OK: installed to $SKILL_
 
 ### Step 4: Check dependencies
 
-```bash
-command -v curl >/dev/null || { echo "MISSING: curl"; exit 1; }
-command -v jq   >/dev/null || { echo "MISSING: jq"; exit 1; }
-```
-
-If `jq` is missing, install when possible:
+`hk.mjs` is a zero-dependency Node script — the only requirement is Node >= 20:
 
 ```bash
-# macOS
-brew install jq
-
-# Debian/Ubuntu
-sudo apt-get update && sudo apt-get install -y jq
+node --version || { echo "MISSING: node (need >= 20)"; exit 1; }
 ```
 
 ---
@@ -167,8 +158,8 @@ HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
 ### Step 6: Verify connectivity
 
 ```bash
-bash "$HK" health
-bash "$HK" projects
+node "$HK" health
+node "$HK" projects
 ```
 
 Success: `health` returns `"success": true`; `projects` returns a JSON array.
@@ -184,7 +175,7 @@ If failed → check URL, kanban process, network (Tailscale). Do not claim insta
 
 - **来源**：npm 包 `helios-task-agent` 内置副本
 - **安装路径**：`{SKILL_DIR}`
-- **CLI**：`{SKILL_DIR}/scripts/hk.sh`
+- **CLI**：`{SKILL_DIR}/scripts/hk.mjs`
 - **Kanban 地址**：`{HELIOS_KANBAN_URL}`
 - **连通性**：正常
 

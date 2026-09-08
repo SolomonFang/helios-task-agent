@@ -4,7 +4,7 @@
  * 与少量文案参数保留；文案、顺序与降级逻辑与两端原实现一致（纯重构）。
  */
 
-import { probeLarkCliAuthAsync, checkHkDepsAsync, LARK_CLI_AUTH_HINT, HK_CLI_INSTALL_HINT } from './infra/deps';
+import { probeLarkCliAuthAsync, LARK_CLI_AUTH_HINT } from './infra/deps';
 import { fetchKanbanHealth } from './kanban/http';
 import { localToolSummary } from './agent/tools';
 import { installSkill, loadSkillDigests, uninstallSkill } from './agent/skills';
@@ -60,18 +60,9 @@ export async function buildStatusLines(
 ): Promise<string[]> {
   // 探测全部走异步版：/status 在 bot 事件循环里执行，同步 execFileSync 串行探测最坏阻塞十几秒
   const health = await fetchKanbanHealth(opts.kanbanUrl);
-  // hk_cli 降级链依赖（jq/curl）：MCP 掉线时 hk.sh 才能兜底，缺失则降级链是断的
-  const hkMissing = await checkHkDepsAsync();
   // larkOk 只代表二进制存在，补探测授权态，区分未安装/未授权/可用
   const larkAuthed = opts.larkOk ? (await probeLarkCliAuthAsync()) === 'ok' : false;
-  const mcpText = opts.mcpOk
-    ? p.ok(`正常（${opts.mcpToolCount} 个工具）`)
-    : p.warn(
-        // 备用通道缺依赖时不再拼接 downNote 的「已切换」说法（自相矛盾），直接给完整降级口径
-        hkMissing.length
-          ? `连接失败，备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
-          : opts.mcpDownNote,
-      );
+  const mcpText = opts.mcpOk ? p.ok(`正常（${opts.mcpToolCount} 个工具）`) : p.warn(opts.mcpDownNote);
   const larkText = !opts.larkOk
     ? p.warn('未安装（运行 npm i -g @larksuite/cli 安装，然后 lark-cli auth login 完成授权）')
     : larkAuthed
@@ -87,16 +78,8 @@ export async function buildStatusLines(
     `看板：${healthText}（${opts.kanbanUrl}）`,
     `看板连接：${mcpText}`,
     `lark-cli：${larkText}`,
-    // MCP 掉线时缺依赖明细已在「看板连接」行给出，这里不重复；MCP 正常时这里补原因与安装出路
-    `备用通道：${
-      hkMissing.length
-        ? p.warn(
-            opts.mcpOk
-              ? `不可用（缺少 ${hkMissing.join('、')}，主通道中断时将无备用；${HK_CLI_INSTALL_HINT}）`
-              : '不可用',
-          )
-        : p.ok('正常')
-    }`,
+    // 备用通道（hk.mjs）与 agent 同一 Node 解释器运行，零外部依赖，始终可用
+    `备用通道：${p.ok('可用（无外部依赖）')}`,
   ];
   return opts.extra?.length ? [...lines, ...opts.extra] : lines;
 }

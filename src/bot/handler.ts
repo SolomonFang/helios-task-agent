@@ -24,7 +24,7 @@ import {
 import { buildAiReviewCard, buildDiagnosisCard } from '../channels/feishu-cards';
 import { isAllPass, writeReviewReport } from '../report/review-report';
 import type { ReportServer } from '../report/report-server';
-import { checkLarkCliAsync, checkOcrCliAsync, checkHkDepsAsync, HK_CLI_INSTALL_HINT } from '../infra/deps';
+import { checkLarkCliAsync, checkOcrCliAsync } from '../infra/deps';
 import { batchAckText, wrapUntrusted, type ConfirmKind } from '../agent/guard';
 import {
   buildMemoryLines,
@@ -535,8 +535,6 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   };
 
   const handleTools = async (msg: InboundMessage): Promise<void> => {
-    // hk_cli 降级链依赖缺失时「功能不受影响」是谎言：按探测结果条件化 downNote
-    const hkMissing = await checkHkDepsAsync();
     const lines = buildToolsLines(
       {
         mcpOk: supervisor.isAlive && mcp.tools.length > 0,
@@ -545,9 +543,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         memoryEnabled: true,
         reminderEnabled: true,
         kanbanHeader: `看板工具（${mcp.tools.length} 个）`,
-        downNote: hkMissing.length
-          ? `看板工具：看板连接已断开，且备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
-          : '看板工具：看板连接已断开，已切换为备用通道，大部分功能可用，如遇操作失败请稍后再试',
+        downNote: '看板工具：看板连接已断开，已切换为备用通道，大部分功能可用，如遇操作失败请稍后再试',
         localHeader: '本地工具',
         bullet: '· ',
       },

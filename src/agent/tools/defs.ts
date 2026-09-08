@@ -28,7 +28,7 @@ export const LOCAL_TOOLS: OpenAiTool[] = [
     function: {
       name: 'hk_cli',
       description:
-        '执行 helios-kanban-remote 技能的 hk.sh（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
+        '执行 helios-kanban-remote 技能的 hk.mjs（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
         '例如 ["health"]、["projects"]、["projects","update",id,"--description","…"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
         '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。写操作会触发用户确认闸门。',
       parameters: {
@@ -37,7 +37,7 @@ export const LOCAL_TOOLS: OpenAiTool[] = [
           args: {
             type: 'array',
             items: { type: 'string' },
-            description: '传给 hk.sh 的参数数组',
+            description: '传给 hk.mjs 的参数数组',
           },
         },
         required: ['args'],

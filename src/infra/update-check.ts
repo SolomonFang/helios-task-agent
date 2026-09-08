@@ -1,9 +1,9 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFile, spawn } from 'child_process';
 import { defaultDataHome, packageRoot } from './paths';
 import { ensurePrivateDirSync, writeFilePrivateSync } from './private-file';
+import { execFileCompat, spawnCompat } from './proc';
 import { minimalChildEnv } from './proc-env';
 
 /**
@@ -105,8 +105,9 @@ export function normalizeRegistry(r: string): string {
 let cachedRegistry: string | null = null;
 function npmConfigRegistry(): Promise<string> {
   return new Promise((resolve) => {
-    // 最小环境（同 defaultRunUpdate）：不向 npm 子进程泄露 LLM_API_KEY 等敏感变量
-    execFile('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir(), env: minimalChildEnv() }, (err, stdout) => {
+    // 最小环境（同 defaultRunUpdate）：不向 npm 子进程泄露 LLM_API_KEY 等敏感变量；
+    // execFileCompat：win32 上 npm 是 .cmd shim，原生 execFile 起不来（见 proc.ts）
+    execFileCompat('npm', ['config', 'get', 'registry'], { timeout: 3000, cwd: os.homedir(), env: minimalChildEnv() }, (err, stdout) => {
       resolve(!err ? normalizeRegistry(stdout || '') : '');
     });
   });
@@ -209,8 +210,9 @@ export interface PromptUpdateDeps {
 
 function defaultRunUpdate(tag: 'latest' | 'next'): Promise<boolean> {
   return new Promise((resolve) => {
-    // cwd 取用户主目录避免读项目级 .npmrc；最小环境防止 LLM_API_KEY 等敏感变量泄给子进程
-    const child = spawn('npm', ['i', '-g', `${PKG_NAME}@${tag}`], {
+    // cwd 取用户主目录避免读项目级 .npmrc；最小环境防止 LLM_API_KEY 等敏感变量泄给子进程；
+    // spawnCompat：win32 上 npm 是 .cmd shim，原生 spawn 不带 shell 起不来（见 proc.ts）
+    const child = spawnCompat('npm', ['i', '-g', `${PKG_NAME}@${tag}`], {
       stdio: 'inherit',
       cwd: os.homedir(),
       env: minimalChildEnv(),

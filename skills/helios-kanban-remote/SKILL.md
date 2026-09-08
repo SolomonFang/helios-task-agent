@@ -104,10 +104,10 @@ Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so comma
 ## Use the CLI
 
 ```bash
-bash scripts/hk.sh <command> [args]
+node scripts/hk.mjs <command> [args]
 ```
 
-Requires `curl` and `jq`. See `scripts/hk.sh --help`.
+Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs --help`.
 
 ## Response format for chat
 
@@ -201,8 +201,8 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 ## MCP (same machine) vs this skill (remote)
 
 - **Same host as the kanban server** → prefer the MCP server. It covers the full orchestration surface: project/task CRUD, `create_project`, `create_task_and_start`, `start/stop_workspace_session`, `follow_up_session`, `queue_message`, `get_task_status`, `list_approvals` / `respond_to_approval`, `list_branches`, `list_tags`. (Tool names belong to the upstream package and may drift as it evolves.)
-- **Remote (phone bot, another host)** → use `hk.sh` over HTTP, as this skill documents.
-- New capabilities land in the MCP server first; `hk.sh` mirrors them for remote use. If the two drift, the REST API in [reference.md](reference.md) is the source of truth.
+- **Remote (phone bot, another host)** → use `hk.mjs` over HTTP, as this skill documents.
+- New capabilities land in the MCP server first; `hk.mjs` mirrors them for remote use. If the two drift, the REST API in [reference.md](reference.md) is the source of truth.
 
 ```json
 {

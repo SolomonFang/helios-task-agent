@@ -11,8 +11,6 @@ export interface SystemPromptOpts {
   mcpOk: boolean;
   mcpToolNames: string[];
   kanbanUrl: string;
-  /** 备用通道（hk_cli 降级链）依赖 jq/curl 是否齐备；缺省时不得再承诺「大部分功能可用」。缺省按可用处理。 */
-  hkAvailable?: boolean;
   projectId?: string;
   repoId?: string;
   iteration?: string;
@@ -40,20 +38,18 @@ export function buildSystemPrompt({
   mcpOk,
   mcpToolNames,
   kanbanUrl,
-  hkAvailable,
   projectId,
   repoId,
   iteration,
   memoryText,
 }: SystemPromptOpts): string {
+  // 备用通道 hk_cli（hk.mjs）与 agent 同一 Node 解释器运行，零外部依赖，MCP 掉线时始终可用
   const kanbanTools = mcpOk
     ? `当前已通过 MCP 连接 helios-kanban（${kanbanUrl}），可用工具：${mcpToolNames
         .map((n) => `kanban_${n}`)
         .filter((n) => OPENAI_FN_NAME.test(n))
         .join(', ')}。**优先使用这些 MCP 工具**；MCP 缺能力时再用 hk_cli。`
-    : hkAvailable === false
-      ? `当前 MCP 未连接，且备用通道（hk_cli 依赖 jq、curl）也不可用，看板读写暂不可用。请如实告知用户：看板读写暂不可用（备用通道缺少 jq、curl，安装后恢复），不要承诺看板功能可用或建议稍后再试。`
-      : `当前 MCP 未连接，请使用 hk_cli 工具（目标 ${kanbanUrl}）操作看板，并告知用户：看板当前通过备用接口连接，大部分功能可用，如遇操作失败请稍后再试。不确定子命令时先 \`["--help"]\`。`;
+    : `当前 MCP 未连接，请使用 hk_cli 工具（目标 ${kanbanUrl}）操作看板，并告知用户：看板当前通过备用接口连接，大部分功能可用，如遇操作失败请稍后再试。不确定子命令时先 \`["--help"]\`。`;
 
   const defaults = [
     projectId ? `默认项目 ID：${projectId}` : null,

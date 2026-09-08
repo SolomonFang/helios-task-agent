@@ -6,9 +6,9 @@ import { ensureConfig } from './config/config-wizard';
 import { AgentSession } from './agent/session';
 import { ReminderRunner, ReminderStore } from './agent/reminder';
 import { SessionHistoryStore } from './agent/session-store';
-import { connectMcp, diagnoseMcpFailure } from './kanban/mcp';
+import { connectMcp } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
-import { checkHkDeps, checkHkDepsAsync, checkLarkCliStatus, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -255,7 +255,10 @@ export async function main(): Promise<void> {
       kanbanChild.stdout?.destroy();
       kanbanChild.stderr?.destroy();
       kanbanChild.unref();
-      console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：kill -- -${kanbanChild.pid}（进程组）`));
+      // win32 无进程组 kill：taskkill /T 杀整棵进程树，/F 强制
+      const stopHint =
+        process.platform === 'win32' ? `taskkill /PID ${kanbanChild.pid} /T /F` : `kill -- -${kanbanChild.pid}（进程组）`;
+      console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：${stopHint}`));
     }
     rl.close();
     clearTimeout(forceTimer);
@@ -317,14 +320,8 @@ export async function main(): Promise<void> {
     },
   });
   boot.stop();
-  // 降级链探测先于告警：banner 的 hkLine 已完整展示缺依赖信息（含安装命令），banner 外不再重复打印
-  // （同 lark-cli 的 U15 先例：banner 行内已表达的，不再 banner 外复述）
-  const hkMissing = checkHkDeps();
-  if (!mcpOk) {
-    // 诊断提示在 connectMcp 内生成时尚未知降级链状态：缺 jq/curl 时按「无备用通道」重算，避免谎称已切换备用通道
-    const hint = hkMissing.length ? diagnoseMcpFailure(mcp.getStderrTail(), { fallbackAvailable: false }) : mcpHint;
-    if (hint) console.log(c.warn(hint));
-  }
+  // 备用通道（hk.mjs）零外部依赖、始终可用：诊断提示无需再按降级链状态重算，直接展示 connectMcp 结论
+  if (!mcpOk && mcpHint) console.log(c.warn(mcpHint));
 
   const larkStatus = checkLarkCliStatus();
 
@@ -338,7 +335,6 @@ export async function main(): Promise<void> {
     mcpToolCount: mcpOk ? mcp.tools.length : 0,
     larkOk: larkStatus !== 'missing',
     larkAuthed: larkStatus === 'ok',
-    hkMissing,
   });
   // banner 状态行已含未授权/未找到说明；warnStartupDeps 只补 banner 放不下的安装命令（未授权指引已在 banner 行内）
   warnStartupDeps(larkStatus, { style: 'cli' });
@@ -492,8 +488,6 @@ export async function main(): Promise<void> {
         }
         console.log('');
       } else if (cmd === '/tools') {
-        // 调用时实时探测（与 /status、bot 端对齐）：会话中补装 jq/curl 后不再沿用启动时的陈旧结果
-        const hkMissingNow = await checkHkDepsAsync();
         for (const l of buildToolsLines(
           {
             mcpOk,
@@ -502,11 +496,7 @@ export async function main(): Promise<void> {
             memoryEnabled: true,
             reminderEnabled: true,
             kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
-            downNote: c.warn(
-              hkMissingNow.length
-                ? `看板连接失败，备用通道因缺少 ${hkMissingNow.join('、')} 不可用（${HK_CLI_INSTALL_HINT}）。`
-                : `看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`,
-            ),
+            downNote: c.warn(`看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`),
             localHeader: c.strong('本地工具：'),
             bullet: '  ',
           },

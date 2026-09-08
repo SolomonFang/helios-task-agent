@@ -28,7 +28,7 @@ import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
 import { startReportServer, type ReportServer } from './report/report-server';
-import { checkLarkCliStatus, checkHkDeps, checkHkDepsAsync, HK_CLI_INSTALL_HINT, MCP_FALLBACK_TEXT } from './infra/deps';
+import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { batchAckText, batchScopeWord, wrapUntrusted, type ConfirmKind } from './agent/guard';
 import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
@@ -321,13 +321,6 @@ async function main(): Promise<void> {
   const larkStatus = checkLarkCliStatus();
   // bot 无 banner，lark-cli 需完整告警文案；OCR 检查为 bot 特有（AI 审查功能依赖）
   warnStartupDeps(larkStatus, { style: 'bot', checkOcr: true });
-  // 备用通道依赖（jq/curl）：缺失时看板主连接中断后看板读写不可用，不能宣称「功能不受影响」
-  const hkMissing = checkHkDeps();
-  if (hkMissing.length) {
-    console.log(
-      c.warn(`备用通道缺少 ${hkMissing.join('、')}：看板主连接中断时看板读写将不可用（${HK_CLI_INSTALL_HINT}）`),
-    );
-  }
   migrateAndValidateSkills();
 
   const ensured = await ensureKanbanOrExit({
@@ -363,19 +356,13 @@ async function main(): Promise<void> {
     },
     // 连接等待期每 ~10 秒覆写当前行补进度（bot 无 spinner，否则最长 45s 无反馈像卡死）
     onLog: (msg) => process.stdout.write(c.gray(`\r${msg}`)),
-    // hk_cli 降级链缺依赖（jq/curl）时，诊断提示不得宣称「已自动切换为备用通道」
-    fallbackAvailable: hkMissing.length === 0,
   });
   if (mcpOk) {
     process.stdout.write(c.ok(`\r看板已连接（${mcp.tools.length} 个工具）          \n`));
   } else {
     // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
     if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
-    // 备用通道缺依赖（jq/curl）时「已自动切换为备用通道」是谎言：按探测结果条件化主文案
-    const firstFailText = hkMissing.length
-      ? `备用通道缺少 ${hkMissing.join('、')}，看板读写暂不可用（${HK_CLI_INSTALL_HINT}）`
-      : MCP_FALLBACK_TEXT;
-    process.stdout.write(c.warn(`\r看板连接失败，${firstFailText}          \n`));
+    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}          \n`));
     if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
@@ -519,15 +506,8 @@ async function main(): Promise<void> {
     },
     onLost: () => {
       router.setMcpOk(false);
-      void (async () => {
-        // hk_cli 降级链依赖（jq/curl）缺失时「已切换备用通道」是谎言：按探测结果条件化
-        const hkMissing = await checkHkDepsAsync();
-        const fallback = hkMissing.length
-          ? `看板读写暂不可用（缺少 ${hkMissing.join('、')}，${HK_CLI_INSTALL_HINT}）`
-          : MCP_FALLBACK_TEXT;
-        console.log(c.warn(`看板连接已中断，${fallback}，将自动重连…`));
-        notifyOwners(`⚠️ 看板连接已中断：${fallback}，恢复后自动切回。`);
-      })();
+      console.log(c.warn(`看板连接已中断，${MCP_FALLBACK_TEXT}，将自动重连…`));
+      notifyOwners(`⚠️ 看板连接已中断：${MCP_FALLBACK_TEXT}，恢复后自动切回。`);
     },
     onRecovered: () => {
       router.setMcpOk(true);

@@ -26,7 +26,7 @@ Agent 自助安装（从 npm 包 `helios-task-agent` 内置副本拷贝到技能
 https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-remote/INSTALL.md
 ```
 
-依赖：`curl`、`jq`。Kanban 服务需可达（建议 Tailscale，Web/API 无鉴权，仅在可信网络绑定 `0.0.0.0`）：
+依赖：仅需 Node >= 20（hk.mjs 为零依赖 Node 脚本）。Kanban 服务需可达（建议 Tailscale，Web/API 无鉴权，仅在可信网络绑定 `0.0.0.0`）：
 
 ```bash
 HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
@@ -45,7 +45,7 @@ HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
 
 ```bash
 export HELIOS_KANBAN_URL="http://100.x.x.x:7964"
-HK="bash scripts/hk.sh"
+HK="node scripts/hk.mjs"
 
 $HK health
 $HK projects
@@ -58,7 +58,7 @@ $HK follow-up <task_id> 请补充单元测试
 完整命令与对话映射见 [SKILL.md](SKILL.md)；场景示例见 [examples.md](examples.md)；REST 端点见 [reference.md](reference.md)。
 
 ```bash
-bash scripts/hk.sh --help
+node scripts/hk.mjs --help
 ```
 
 ## 目录
@@ -69,12 +69,12 @@ helios-kanban-remote/
   INSTALL.md        # Agent 自助安装
   reference.md      # REST API
   examples.md       # 端到端示例
-  scripts/hk.sh     # CLI（curl + jq）
+  scripts/hk.mjs    # CLI（零依赖 Node 脚本，需 Node >= 20）
 ```
 
 ## MCP（同机）vs 本技能（远程）
 
-同机跑 Kanban 时优先 MCP，覆盖完整编排面。远程（手机 bot、另一台机器）用 `hk.sh`。能力先上 MCP，再镜像到 CLI；不一致时以 [reference.md](reference.md) 的 REST API 为准。
+同机跑 Kanban 时优先 MCP，覆盖完整编排面。远程（手机 bot、另一台机器）用 `hk.mjs`。能力先上 MCP，再镜像到 CLI；不一致时以 [reference.md](reference.md) 的 REST API 为准。
 
 ```json
 {

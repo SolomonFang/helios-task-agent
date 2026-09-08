@@ -27,7 +27,7 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 
 ## Install
 
-Requires: Node.js ≥ 20, macOS / Linux.
+Requires: Node.js ≥ 20, macOS / Linux / Windows.
 
 ```bash
 npm i -g helios-task-agent
@@ -52,6 +52,12 @@ npm i -g @larksuite/cli && lark-cli auth login
 ```
 
 From source: `npm install && npm start`.
+
+### Windows notes
+
+- **File permissions**: the `0o600` permission bits on `.env`, session, and audit files only map to the read-only attribute on Windows — they do not stop other users from reading them. On a shared machine, protect the config directory (`%USERPROFILE%\.helios-task-agent`) with NTFS ACLs.
+- **Graceful shutdown**: Windows has no SIGTERM; when the process is killed by a service manager or the console window is closed, graceful shutdown (stopping the auto-started kanban child) may not run and the kanban process may be left behind — clean it up with `taskkill` or check the port (default 7964) before restarting.
+- **Zero-dependency `hk_cli` fallback**: the bundled fallback script is `hk.mjs` (pure Node) — no jq / curl or other external tools needed.
 
 ## End-to-end flow
 
@@ -106,7 +112,7 @@ Stale-task nudge (`HTA_STALE_NUDGE_HOURS=8`, off by default): pushes a reminder 
 
 ## MCP health supervisor (bot)
 
-~60s probe. Degrades to `hk_cli` only after consecutive probe failures (no flapping on transient jitter); auto-reconnect with backoff (down to ~every 5 min), skipped while a task is running so in-flight calls aren't killed; on recover: switch back (all transitions notified). `hk_cli` is **always** registered (bundled `hk.sh`); MCP is preferred.
+~60s probe. Degrades to `hk_cli` only after consecutive probe failures (no flapping on transient jitter); auto-reconnect with backoff (down to ~every 5 min), skipped while a task is running so in-flight calls aren't killed; on recover: switch back (all transitions notified). `hk_cli` is **always** registered (bundled `hk.mjs`, pure Node with zero dependencies); MCP is preferred.
 
 ## Config home
 
@@ -257,7 +263,7 @@ Reminders are bucketed per user too (tools: `reminder_set` / `list` / `cancel`, 
 |------|------|
 | `lark_cli` | Feishu/Lark I/O |
 | kanban MCP | Preferred board API |
-| `hk_cli` | Always on; bundled `hk.sh` REST fallback/supplement |
+| `hk_cli` | Always on; bundled `hk.mjs` REST fallback/supplement (pure Node, zero dependencies) |
 | `repo_fs` | Optional `list` / `read` / `grep` under a kanban repo path |
 | `work_summary` | Generate work-summary reports (HTML/MD) |
 | `daily_report` | Generate a personal daily report (structured material + HTML; date selectable) |

@@ -5,7 +5,6 @@ import { SourceRegistry } from './source-registry';
 import { createClient, runAgentTurn, trimHistory } from './llm';
 import type { SessionHistoryStore } from './session-store';
 import { errMessage } from '../infra/err';
-import { checkHkDeps } from '../infra/deps';
 import { buildSystemPrompt } from './prompt';
 import { buildTools, type CreateCounter } from './tools';
 import { withBatchApproval, type BatchConfirmFn, type ConfirmFn } from './guard';
@@ -22,13 +21,6 @@ import type {
 
 /** 待注入后台事件的缓存上限：超出丢弃最旧，避免 watcher 风暴/积压撑爆上下文。 */
 const MAX_PENDING_NOTES = 20;
-
-// 备用通道（hk_cli 降级链）依赖探测：进程内只探一次并缓存（同步探测，jq/curl 缺失时即刻返回）。
-let hkDepsAvailable: boolean | undefined;
-function hkAvailable(): boolean {
-  if (hkDepsAvailable === undefined) hkDepsAvailable = checkHkDeps().length === 0;
-  return hkDepsAvailable;
-}
 
 export interface AgentSessionOptions {
   /** CLI 默认 local；飞书通道传 open_id。 */
@@ -143,7 +135,6 @@ export class AgentSession {
       mcpOk: this.mcpOk,
       mcpToolNames: this.mcpOk && this.mcp ? this.mcp.tools.map((t) => t.name) : [],
       kanbanUrl: this.cfg.kanbanUrl,
-      hkAvailable: hkAvailable(),
       projectId: this.cfg.kanbanProjectId || undefined,
       repoId: this.cfg.kanbanRepoId || undefined,
       iteration: this.cfg.kanbanIteration || undefined,

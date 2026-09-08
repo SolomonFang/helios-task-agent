@@ -79,9 +79,6 @@ import { WsAlerter } from '../src/bot/ws-alerter';
 import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
 import { minimalChildEnv } from '../src/infra/proc-env';
 import {
-  checkCurl,
-  checkHkDeps,
-  checkJq,
   checkLarkCli,
   checkLarkCliStatus,
   probeLarkCliAuth,
@@ -118,7 +115,7 @@ import { renderReply, printBanner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { statusLabel, type WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
-import { check, checkAsync, finish } from './testkit';
+import { check, checkAsync, finish, writeFakeCli } from './testkit';
 
 // --- mock OpenAI client helpers ---
 
@@ -1614,9 +1611,7 @@ async function run(): Promise<void> {
     assert.ok(hint!.includes('端口记录文件'), '诊断应点明端口文件');
     assert.ok(hint!.includes('重新运行本程序'), '诊断应给出可操作的恢复动作');
     assert.ok(hint!.includes('（会同时重启看板）。'), '重启说明应独立成句（不与备用通道说明叠成双括号）');
-    const noFallback = diagnoseMcpFailure(portFileStderr, { fallbackAvailable: false });
-    assert.ok(noFallback!.includes('备用通道缺少 jq、curl'), '备用通道不可用时应如实告知');
-    assert.ok(!noFallback!.includes('已自动切换'), '备用通道不可用时不得宣称已自动切换');
+    assert.ok(hint!.includes(MCP_FALLBACK_TEXT), '诊断应带备用通道口径（hk.mjs 无外部依赖，备用通道始终可用）');
     assert.equal(diagnoseMcpFailure('Error: spawn npx ENOENT'), null, '其他启动错误不误诊');
     assert.equal(diagnoseMcpFailure(''), null, '空 stderr 返回 null');
   });
@@ -2922,7 +2917,10 @@ async function run(): Promise<void> {
     const port = (probe.address() as AddressInfo).port;
     await new Promise((r) => probe.close(r));
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-'));
-    fs.writeFileSync(path.join(bin, 'npx'), '#!/bin/sh\nexec /bin/sleep 60\n', { mode: 0o755 });
+    writeFakeCli(bin, 'npx', {
+      sh: 'exec /bin/sleep 60\n',
+      cmd: 'timeout /t 60 /nobreak >nul\r\n',
+    });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
     let spawned: import('child_process').ChildProcess | null = null;
@@ -2934,12 +2932,14 @@ async function run(): Promise<void> {
             waitMs: 3000,
             onSpawn: (ch) => {
               spawned = ch;
-              // detached: true → child 是进程组组长，拉起即刻负 pid 可探测到组
-              try {
-                process.kill(-ch.pid!, 0);
-                groupAliveAtSpawn = true;
-              } catch {
-                groupAliveAtSpawn = false;
+              // detached: true → child 是进程组组长，拉起即刻负 pid 可探测到组（POSIX 专属判定）
+              if (process.platform !== 'win32') {
+                try {
+                  process.kill(-ch.pid!, 0);
+                  groupAliveAtSpawn = true;
+                } catch {
+                  groupAliveAtSpawn = false;
+                }
               }
             },
           }),
@@ -2948,9 +2948,12 @@ async function run(): Promise<void> {
       assert.ok(spawned, 'onSpawn 必须在等待就绪前回调');
       // spawned 只在闭包回调里赋值，CFA 仍视为 null——经 cast 恢复联合类型再收窄
       const child = spawned as import('child_process').ChildProcess | null;
-      assert.ok(typeof child!.pid === 'number' && groupAliveAtSpawn, 'child 应为独立进程组组长');
-      // 超时路径 ensure 内部调 stopKanbanChild：组杀后不留孤儿
-      assert.throws(() => process.kill(-child!.pid!, 0));
+      assert.ok(typeof child!.pid === 'number', 'child 应有 pid');
+      if (process.platform !== 'win32') {
+        assert.ok(groupAliveAtSpawn, 'child 应为独立进程组组长');
+        // 超时路径 ensure 内部调 stopKanbanChild：组杀后不留孤儿
+        assert.throws(() => process.kill(-child!.pid!, 0));
+      }
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -2958,40 +2961,30 @@ async function run(): Promise<void> {
     }
   });
 
-  // ---------- hk.sh：tasks list --limit 非纯数字直接拒绝（jq 注入防护） ----------
-  // 本机未装 jq 属于环境问题（hk.sh 的运行时依赖），按 SKIP 处理（同 smoke.ts 的 SKIP 惯例）而不是 FAIL
-  let jqOk = true;
-  try {
-    execFileSync('jq', ['--version'], { stdio: 'ignore' });
-  } catch {
-    jqOk = false;
-  }
-  if (!jqOk) {
-    console.log('SKIP  hk.sh：tasks list --limit 注入串在 API 调用前报错退出  — 本机未安装 jq（hk.sh 依赖）');
-  } else {
-    await checkAsync('hk.sh：tasks list --limit 注入串在 API 调用前报错退出', async () => {
-      const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.sh');
-      let code = 0;
-      let stderr = '';
-      try {
-        execFileSync('bash', [hk, 'tasks', 'list', '--limit', '1] + [env.X] | .[0:99'], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: {
-            ...process.env,
-            HELIOS_KANBAN_PROJECT_ID: 'p-test', // 先过 project_id 检查；校验发生在 API 调用之前，无需真实看板
-            HELIOS_KANBAN_URL: 'http://127.0.0.1:1',
-          },
-        });
-      } catch (err) {
-        const e = err as { status?: number | null; stderr?: string };
-        code = e.status ?? -1;
-        stderr = String(e.stderr || '');
-      }
-      assert.notEqual(code, 0, '非法 --limit 应非零退出');
-      assert.match(stderr, /invalid --limit/);
-    });
-  }
+  // ---------- hk.mjs：tasks list --limit 非纯数字直接拒绝（注入防护） ----------
+  // hk.mjs 零外部依赖（当前 Node 解释器即可运行），本用例在任何平台无条件执行
+  await checkAsync('hk.mjs：tasks list --limit 注入串在 API 调用前报错退出', async () => {
+    const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.mjs');
+    let code = 0;
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, [hk, 'tasks', 'list', '--limit', '1] + [env.X] | .[0:99'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          HELIOS_KANBAN_PROJECT_ID: 'p-test', // 先过 project_id 检查；校验发生在 API 调用之前，无需真实看板
+          HELIOS_KANBAN_URL: 'http://127.0.0.1:1',
+        },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stderr?: string };
+      code = e.status ?? -1;
+      stderr = String(e.stderr || '');
+    }
+    assert.notEqual(code, 0, '非法 --limit 应非零退出');
+    assert.match(stderr, /invalid --limit/);
+  });
 
   // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
@@ -3004,8 +2997,8 @@ async function run(): Promise<void> {
     );
   })());
 
-  // ---------- deps：lark-cli 三态与 hk 降级链依赖探测（临时 PATH 注入假二进制，不依赖本机真实环境） ----------
-  await checkAsync('deps：checkLarkCliStatus 三态 / probeLarkCliAuth 保守判失败 / checkHkDeps 缺失项', async () => {
+  // ---------- deps：lark-cli 三态探测（临时 PATH 注入假二进制，不依赖本机真实环境） ----------
+  await checkAsync('deps：checkLarkCliStatus 三态 / probeLarkCliAuth 保守判失败', async () => {
     // 假命令用系统二进制的符号链接：true = 退出 0 无输出（模拟「已安装但 auth status
     // 输出异常」），false = 命令失败；「已授权」用 shebang 直指 node 的脚本输出 JSON
     // （探测走 minimalChildEnv，NODE_OPTIONS --require 注入已不可达，故改用脚本形态）。
@@ -3021,9 +3014,6 @@ async function run(): Promise<void> {
       process.env.PATH = bin;
       assert.equal(checkLarkCli(), false);
       assert.equal(checkLarkCliStatus(), 'missing');
-      assert.equal(checkJq(), false);
-      assert.equal(checkCurl(), false);
-      assert.deepEqual(checkHkDeps(), ['jq', 'curl']);
       // 已安装但 auth status 输出为空 → 保守判未授权（不误报可用）
       link('lark-cli', '/usr/bin/true');
       assert.equal(checkLarkCli(), true);
@@ -3041,10 +3031,6 @@ async function run(): Promise<void> {
         { mode: 0o755 },
       );
       assert.equal(checkLarkCliStatus(), 'ok');
-      // jq 装了、curl 没装 → 缺 curl
-      link('jq', '/usr/bin/true');
-      assert.equal(checkJq(), true);
-      assert.deepEqual(checkHkDeps(), ['curl']);
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -3052,8 +3038,8 @@ async function run(): Promise<void> {
     }
   });
 
-  // ---------- banner：lark 三态与 hk 降级链状态写进文案（探测结果由调用方传入） ----------
-  await checkAsync('printBanner：lark 未授权/未安装与 hk 缺失（jq/curl）体现在文案', async () => {
+  // ---------- banner：lark 三态与 MCP 失败时的备用通道口径写进文案（探测结果由调用方传入） ----------
+  await checkAsync('printBanner：lark 未授权/未安装与 MCP 失败时的备用通道文案', async () => {
     const capture = (fn: () => void): string => {
       const out: string[] = [];
       const origLog = console.log;
@@ -3071,38 +3057,33 @@ async function run(): Promise<void> {
       baseUrl: 'https://x',
       kanbanUrl: 'http://localhost:7964',
       larkAuthed: false,
-      hkMissing: [] as string[],
     };
-    // lark 已安装未授权 + jq/curl 缺失 + MCP 掉线
-    const unauth = capture(() =>
-      printBanner({ ...base, mcp: 'fail', mcpToolCount: 0, larkOk: true, hkMissing: ['jq', 'curl'] }),
-    );
+    // lark 已安装未授权 + MCP 掉线（备用通道零依赖始终可用，按已切换口径展示）
+    const unauth = capture(() => printBanner({ ...base, mcp: 'fail', mcpToolCount: 0, larkOk: true }));
     // banner 行内联精简指引（不重复 LARK_CLI_AUTH_HINT 全句，避免「未授权」出现两次）
     assert.ok(unauth.includes('lark-cli') && unauth.includes('未授权') && unauth.includes('lark-cli auth login'));
-    assert.ok(unauth.includes('备用通道不可用（详见下行）') && unauth.includes('缺少 jq、curl'));
+    assert.ok(unauth.includes(MCP_FALLBACK_TEXT) && unauth.includes('大部分功能可用'));
     // lark 未安装（larkOk=false）→ 不看授权态，直接「未找到」
     const missing = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: false }));
     assert.ok(missing.includes('未找到') && !missing.includes('未授权'));
-    // 已授权 + hk 依赖齐全 → 无警示文案
-    const ok = capture(() =>
-      printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: true, larkAuthed: true }),
-    );
-    assert.ok(ok.includes('可用（飞书内容获取）') && !ok.includes('降级链'));
+    // 已授权 + MCP 正常 → 无警示文案
+    const ok = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: true, larkAuthed: true }));
+    assert.ok(ok.includes('可用（飞书内容获取）') && !ok.includes('连接失败'));
   });
 
-  // ---------- /status 状态行：lark 三态与 hk 降级链 ----------
-  await checkAsync('buildStatusLines：lark 未授权/未安装/ok 与 hk 缺失写入状态行', async () => {
+  // ---------- /status 状态行：lark 三态与备用通道 ----------
+  await checkAsync('buildStatusLines：lark 未授权/未安装/ok 与备用通道状态行', async () => {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-status-'));
     const prevPath = process.env.PATH;
     const opts = { model: 'm', kanbanUrl: 'http://127.0.0.1:1', mcpOk: false, mcpToolCount: 0, mcpDownNote: 'MCP 不可用' };
     try {
-      // 未授权：lark-cli = true（--version 退出 0；auth status 无输出 → 保守判未授权），PATH 无 jq/curl
+      // 未授权：lark-cli = true（--version 退出 0；auth status 无输出 → 保守判未授权）
       fs.symlinkSync('/usr/bin/true', path.join(bin, 'lark-cli'));
       process.env.PATH = bin;
       const unauth = (await buildStatusLines({ ...opts, larkOk: true }, plainPaint)).join('\n');
       assert.ok(unauth.includes(`lark-cli：${LARK_CLI_AUTH_HINT}`));
-      assert.ok(unauth.includes('备用通道：不可用')); // 缺依赖明细在「看板连接」行，本行不重复
-      assert.ok(unauth.includes('备用通道缺少 jq、curl，看板读写暂不可用')); // 看板连接掉线且备用通道缺依赖时必须警示（不得再说「已切换」）
+      assert.ok(unauth.includes('看板连接：MCP 不可用')); // mcpOk=false 时原样展示通道文案
+      assert.ok(unauth.includes('备用通道：可用')); // hk.mjs 零外部依赖，备用通道始终可用
       const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
       assert.ok(missing.includes('lark-cli：未安装'));
       // 已授权：shebang 直指 node 的假 lark-cli 输出 available=true（探测走 minimalChildEnv，NODE_OPTIONS 注入不可达）
@@ -4018,15 +3999,10 @@ async function run(): Promise<void> {
     return p.includes('kanban_create_task') && !p.includes('badname') && !p.includes('yyy');
   })());
 
-  // ---------- 备用通道缺依赖时不得承诺「大部分功能可用」（T3） ----------
-  check('buildSystemPrompt：hkAvailable=false 时如实告知看板读写暂不可用，hk 可用时保留备用通道口径', (() => {
-    const down = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x', hkAvailable: false });
-    const up = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x', hkAvailable: true });
-    return (
-      down.includes('备用通道缺少 jq、curl，安装后恢复') &&
-      !down.includes('大部分功能可用') &&
-      up.includes('大部分功能可用')
-    );
+  // ---------- MCP 掉线时提示词走备用通道口径（备用通道零依赖始终可用） ----------
+  check('buildSystemPrompt：mcpOk=false 时指引 hk_cli 备用通道并保留「大部分功能可用」口径', (() => {
+    const down = buildSystemPrompt({ mcpOk: false, mcpToolNames: [], kanbanUrl: 'http://x' });
+    return down.includes('hk_cli') && down.includes('大部分功能可用');
   })());
 
   // ---------- 看板事件卡片：failed 按钮名 + 链接可达性注脚 ----------

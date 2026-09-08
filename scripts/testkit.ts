@@ -4,6 +4,8 @@
  * 脚本末尾调用 finish() 汇总并以非零退出码报告失败。
  */
 
+import fs from 'fs';
+import path from 'path';
 import { errMessage } from '../src/infra/err';
 
 let failures = 0;
@@ -20,6 +22,19 @@ export async function checkAsync(name: string, fn: () => void | Promise<void>): 
     check(name, true);
   } catch (err) {
     check(name, false, errMessage(err));
+  }
+}
+
+/**
+ * 平台感知的假 CLI 写入：POSIX 写 <bin>/<name>（sh 脚本，0o755）；
+ * win32 写 <bin>/<name>.cmd（@echo off 批处理，spawnCompat 经 PATHEXT 解析 .cmd shim）。
+ * sh/cmd 内容都由调用方给出（两者语义需等价）。
+ */
+export function writeFakeCli(bin: string, name: string, { sh, cmd }: { sh: string; cmd: string }): void {
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(bin, `${name}.cmd`), `@echo off\r\n${cmd}`);
+  } else {
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${sh}`, { mode: 0o755 });
   }
 }
 

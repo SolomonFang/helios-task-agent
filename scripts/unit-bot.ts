@@ -340,22 +340,25 @@ async function main(): Promise<void> {
       }
     });
 
-    await checkAsync('退出码：cli 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
-      const { child, tmp, out } = spawnAgent('cli.ts', kanban.url, {});
-      try {
-        // 非 TTY 时 Spinner 无输出，无法用 stdout 作同步点。改为等慢命令孙子进程出现：
-        // 孙子进程存在 = connectMcp 已发起，而信号处理在连接之前注册，此时 SIGINT 必走优雅退出。
-        // （此前用 healthSeen + 150ms 固定余量，高负载下信号偶尔落在处理注册之前 → 假失败）
-        await kanban.healthSeen;
-        await waitMcpConnecting(child.pid!);
-        child.kill('SIGINT');
-        const code = await waitExit(child);
-        assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
-        assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
-      } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
-      }
-    });
+    // win32 无 ps 命令（waitMcpConnecting 的进程表探测不可用），且信号语义不同，跳过该用例
+    if (process.platform !== 'win32') {
+      await checkAsync('退出码：cli 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
+        const { child, tmp, out } = spawnAgent('cli.ts', kanban.url, {});
+        try {
+          // 非 TTY 时 Spinner 无输出，无法用 stdout 作同步点。改为等慢命令孙子进程出现：
+          // 孙子进程存在 = connectMcp 已发起，而信号处理在连接之前注册，此时 SIGINT 必走优雅退出。
+          // （此前用 healthSeen + 150ms 固定余量，高负载下信号偶尔落在处理注册之前 → 假失败）
+          await kanban.healthSeen;
+          await waitMcpConnecting(child.pid!);
+          child.kill('SIGINT');
+          const code = await waitExit(child);
+          assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
+          assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      });
+    }
   } finally {
     kanban.server.closeAllConnections?.();
     await new Promise((r) => kanban.server.close(r));
