@@ -64,7 +64,7 @@ export interface RetroModel {
   counts: { done: number; inreview: number; inprogress: number; todo: number; cancelled: number };
   /** 完成率 = 已完成 ÷ 任务总数（含已取消）；total=0 时为 null（不显示 0% 冒充）。 */
   completionRate: number | null;
-  /** 本周完成数（done 且 updated_at ≥ 本周一 00:00，enrich 样本口径，与周报「本周完成」一致）。 */
+  /** 本周完成数（done 且 updated_at ≥ 本周一 00:00，与周报同一口径：采集侧截断前全量优先，缺该字段回退样本计数）。 */
   doneThisWeek: number;
   /** 本周范围标签（YYYY-MM-DD 至 YYYY-MM-DD），口径标注用。 */
   weekRange: string;
@@ -75,7 +75,7 @@ export interface RetroModel {
   /** 失败归类（enrich 样本口径）；样本内失败任务数为各组任务数之和。 */
   failureGroups: RetroFailureGroup[];
   diff: { filesChanged: number; additions: number; deletions: number };
-  /** 清单样本被截断（概览计数为全量，失败归类/本周完成/diff 为样本口径）。 */
+  /** 清单样本被截断（概览计数与「本周完成」为全量，失败归类/diff 为样本口径）。 */
   truncated: boolean;
   /** enrich 样本条数。 */
   sampleSize: number;
@@ -108,11 +108,14 @@ export function buildRetroModel(data: WorkSummaryData, now = new Date()): RetroM
   const weekStart = startOfWeek(now);
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
-  const doneThisWeek = data.tasks.filter((t) => {
+  // 与周报同款口径（weekly-brief 的 buildWeeklyBriefText）：采集侧截断前全量优先，
+  // 旧采集缺 totals.doneThisWeek 字段时回退样本计数（只少报不谎报）
+  const sampleDoneThisWeek = data.tasks.filter((t) => {
     if (t.status !== 'done') return false;
     const ts = Date.parse(t.updatedAt);
     return Number.isFinite(ts) && ts >= weekStart.getTime();
   }).length;
+  const doneThisWeek = totals.doneThisWeek ?? sampleDoneThisWeek;
 
   // 失败归类只认 attempt 摘要（标题不是失败证据）；无摘要任务归「其他」
   const groups = new Map<string, WorkSummaryTask[]>();
@@ -272,10 +275,10 @@ export function renderRetroHtml(model: RetroModel): string {
     : '<p class="empty">本范围内没有执行失败的任务。</p>';
   const notes = [
     '完成率 = 已完成 ÷ 任务总数（含已取消）。',
-    `「本周完成」口径：状态已完成且最后更新时间在本周（${model.weekRange}，本地时区），与周报同一口径；看板无「完成时间」字段，按最后更新时间近似。`,
+    `「本周完成」口径：状态已完成且最后更新时间在本周（${model.weekRange}，本地时区），按截断前全量统计，与周报同一口径；看板无「完成时间」字段，按最后更新时间近似。`,
     '失败归因是对失败摘要的关键词规则归类（确定性规则，未经模型判读）；无失败摘要的任务归入「其他」。',
     model.truncated
-      ? `范围内任务共 ${model.total} 个，清单样本为最近 ${model.sampleSize} 条：失败归类、本周完成与改动统计按样本口径，概览计数为全量口径。`
+      ? `范围内任务共 ${model.total} 个，清单样本为最近 ${model.sampleSize} 条：失败归类与改动统计按样本口径，概览计数与「本周完成」为全量口径。`
       : '失败归因与改动统计覆盖范围内全部任务。',
     '失败标记与任务状态正交：失败任务可能停在任意状态，与五状态分布不互斥。',
   ];
@@ -373,7 +376,7 @@ export function buildRetroSummary(
     lines.push('', '该范围内没有任务，以上指标均为空口径，解读时请如实说明，不要编造。');
   }
   if (model.truncated) {
-    lines.push(`（失败归类、本周完成与改动统计按最近 ${model.sampleSize} 条样本口径，概览计数为全量口径）`);
+    lines.push(`（失败归类与改动统计按最近 ${model.sampleSize} 条样本口径，概览计数与本周完成为全量口径）`);
   }
   return lines.join('\n');
 }

@@ -142,6 +142,8 @@ export class KanbanWatcher {
   private state: WatchState | null;
   /** 最近一次落盘快照的序列化结果（tasks/approvals）：tick 里比较与写盘复用它，不再每轮重复 stringify。 */
   private lastSnapshotJson: { tasks: string; approvals: string } | null;
+  /** 最近一次落盘的 pending 序列化结果：与 tasks/approvals 同口径，pending 非空但内容不变的空转 tick 不重复写。 */
+  private lastPendingJson: string | null;
   /** 项目 id → 项目名（每轮 collect 刷新；stale 事件展示用，不进快照）。 */
   private projectNames = new Map<string, string>();
   /** 停滞提醒状态跟踪器（staleNudge 开启时构造；决策与落盘见 stale-nudge.ts）。 */
@@ -151,6 +153,7 @@ export class KanbanWatcher {
     this.opts = opts;
     this.state = this.load();
     this.lastSnapshotJson = this.state ? KanbanWatcher.serializeSnapshot(this.state) : null;
+    this.lastPendingJson = this.state?.pending ? JSON.stringify(this.state.pending, null, 2) : null;
     if (opts.staleNudge) {
       this.staleTracker = new StaleNudgeTracker({
         statePath: opts.staleNudge.statePath,
@@ -227,12 +230,14 @@ export class KanbanWatcher {
       // 与 JSON.stringify(state, null, 2) 等价的拼装：嵌套部分每行补两格缩进
       const indent = (json: string) => json.replace(/\n/g, '\n  ');
       const pending = this.state?.pending;
-      const pendingPart = pending ? `,\n  "pending": ${indent(JSON.stringify(pending, null, 2))}` : '';
+      const pendingJson = pending ? JSON.stringify(pending, null, 2) : null;
+      const pendingPart = pendingJson ? `,\n  "pending": ${indent(pendingJson)}` : '';
       writeFileAtomicPrivateSync(
         this.opts.statePath,
         `{\n  "tasks": ${indent(snapshotJson.tasks)},\n  "approvals": ${indent(snapshotJson.approvals)}${pendingPart}\n}\n`,
       );
       this.lastSnapshotJson = snapshotJson;
+      this.lastPendingJson = pendingJson;
     } catch {
       /* best-effort */
     }
@@ -485,7 +490,7 @@ export class KanbanWatcher {
     };
   }
 
-  /** 仅在快照有变化或本轮碰过待重投队列（含刚清零需落盘出队的）时写盘，无变化的空转 tick 不重复写 state 文件。 */
+  /** 仅在快照有变化或待重投队列内容有变化（含刚清零需落盘出队的）时写盘，无变化的空转 tick 不重复写 state 文件。 */
   private persistIfChanged(
     prev: WatchState,
     pendingTouched: boolean,
@@ -494,8 +499,12 @@ export class KanbanWatcher {
     const last = this.lastSnapshotJson;
     const snapshotChanged =
       !last || snapshotJson.tasks !== last.tasks || snapshotJson.approvals !== last.approvals;
-    const touched = pendingTouched || Boolean(prev.pending && Object.keys(prev.pending).length);
-    if (snapshotChanged || touched) this.persist(snapshotJson);
+    // pending 与 tasks/approvals 同口径按内容比较：owner 持续不可达时队列长期非空，
+    // 但内容一字节没变的空转 tick 不得全量重写 state 文件
+    const pending = this.state?.pending;
+    const pendingJson = pending ? JSON.stringify(pending, null, 2) : null;
+    const queueActive = pendingTouched || Boolean(prev.pending && Object.keys(prev.pending).length);
+    if (snapshotChanged || (queueActive && pendingJson !== this.lastPendingJson)) this.persist(snapshotJson);
   }
 
   /** 拉取一轮快照；approvals 端点失败时 approvalsUnknown=true（调用方沿用旧快照，见 tick）。 */

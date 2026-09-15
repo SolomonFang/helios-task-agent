@@ -3,7 +3,7 @@ import path from 'path';
 import { defaultDataHome } from './paths';
 import { appendFilePrivateSync, ensurePrivateDirSync } from './private-file';
 
-export type AuditDecision = 'approved' | 'denied' | 'blocked_dup' | 'no_gate' | 'timeout' | 'superseded' | 'error';
+export type AuditDecision = 'approved' | 'denied' | 'blocked_dup' | 'no_gate' | 'timeout' | 'superseded' | 'send_failed' | 'error';
 
 /**
  * kind 取值约定：kanban / hk / lark / memory / skill 为写闸门决策记录；

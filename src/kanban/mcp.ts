@@ -124,7 +124,11 @@ export class KanbanMcp {
       if (block.type === 'text') return block.text ?? '';
       return JSON.stringify(block);
     });
-    return parts.join('\n') || '（空结果）';
+    const text = parts.join('\n') || '（空结果）';
+    // MCP 工具执行失败以 isError:true 返回（SDK 不抛错）：转为异常，让调用方既有
+    // 错误通道（mcpFailureText 中文化 / gated-write 审计失败判定）统一接管
+    if (result.isError) throw new Error(text);
+    return text;
   }
 
   async close(): Promise<void> {

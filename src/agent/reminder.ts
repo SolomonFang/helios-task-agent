@@ -338,9 +338,9 @@ export class ReminderStore {
     return out.sort((a, b) => a.reminder.triggerAt - b.reminder.triggerAt);
   }
 
-  /** 投递成功落盘：已投递状态持久化，进程重启不重复推送。 */
-  markDelivered(userId: string, id: string, nowMs: number): void {
-    this.mutate((file) => {
+  /** 投递成功落盘：已投递状态持久化，进程重启不重复推送。返回 false = 落盘失败（调用方须兜底/告警，不得当作已标记）。 */
+  markDelivered(userId: string, id: string, nowMs: number): boolean {
+    return this.mutate((file) => {
       const r = (file.users[userId] || []).find((x) => x.id === id);
       if (r && r.status === 'pending') {
         r.status = 'delivered';
@@ -351,9 +351,9 @@ export class ReminderStore {
     });
   }
 
-  /** 投递失败落盘：连续失败指数退避（1→2→4…分钟，封顶 30 分钟），到点未投的之后补投。 */
-  markFailed(userId: string, id: string, nowMs: number): void {
-    this.mutate((file) => {
+  /** 投递失败落盘：连续失败指数退避（1→2→4…分钟，封顶 30 分钟），到点未投的之后补投。返回 false = 落盘失败（退避未生效，调用方须告警）。 */
+  markFailed(userId: string, id: string, nowMs: number): boolean {
+    return this.mutate((file) => {
       const r = (file.users[userId] || []).find((x) => x.id === id);
       if (r && r.status === 'pending') {
         r.failCount = (r.failCount || 0) + 1;
@@ -392,6 +392,11 @@ export class ReminderRunner {
   private readonly opts: ReminderRunnerOptions;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
+  /**
+   * 已投递但落盘失败的提醒（uid:id）：磁盘持续故障期间内存兜底去重，
+   * 避免每轮 tick 重复推送同一条；进程重启后可能补推一次（重复优于丢失）。
+   */
+  private readonly deliveredUnpersisted = new Set<string>();
 
   constructor(opts: ReminderRunnerOptions) {
     this.opts = opts;
@@ -424,13 +429,22 @@ export class ReminderRunner {
       for (const { userId, reminder } of this.opts.store.due(nowMs)) {
         // 跨形态桶分流：不可投递的 uid 原样保留 pending（不动 failCount/nextRetryAt），等另一形态进程投递
         if (this.opts.deliverable && !this.opts.deliverable(userId)) continue;
+        const dedupeKey = `${userId}:${reminder.id}`;
+        if (this.deliveredUnpersisted.has(dedupeKey)) continue; // 已投递仅落盘失败：内存兜底不重复推送
         try {
           await this.opts.deliver(userId, buildReminderText(reminder));
-          this.opts.store.markDelivered(userId, reminder.id, nowMs);
-          this.opts.log?.(`提醒已送达（${userId}）：${reminder.text.slice(0, 50)}`);
+          if (this.opts.store.markDelivered(userId, reminder.id, nowMs)) {
+            this.opts.log?.(`提醒已送达（${userId}）：${reminder.text.slice(0, 50)}`);
+          } else {
+            this.deliveredUnpersisted.add(dedupeKey);
+            this.opts.log?.(`提醒已送达但落盘失败（${userId}），存储恢复前不再重复推送：${reminder.text.slice(0, 50)}`);
+          }
         } catch (err) {
-          this.opts.store.markFailed(userId, reminder.id, nowMs);
-          this.opts.log?.(`提醒投递失败（${userId}），退避后补投: ${errMessage(err)}`);
+          if (this.opts.store.markFailed(userId, reminder.id, nowMs)) {
+            this.opts.log?.(`提醒投递失败（${userId}），退避后补投: ${errMessage(err)}`);
+          } else {
+            this.opts.log?.(`提醒投递失败且退避落盘失败（${userId}），存储恢复前将每轮立即重试: ${errMessage(err)}`);
+          }
         }
       }
     } catch (err) {

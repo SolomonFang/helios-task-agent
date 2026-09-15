@@ -1,7 +1,8 @@
 // 停滞任务提醒（stale nudge）与失败 AI 诊断/重试的单测：
 // - 停滞判定边界：恰好 N 小时 / 未到期 / 状态流转重置 / 24h 再提醒 / 重启不重复
 // - 诊断按钮 action 路由、同一 attempt 防重复诊断、重试 follow-up 指令含诊断结论、重试防重
-// - LLM 失败路径中文化。仅用本地 mock server 与注入执行器，无外部网络。
+// - 诊断组合 signal（调用方中断/超时兜底，不依赖 AbortSignal.any）、重试会话按 created_at 取最新、
+//   LLM 失败路径中文化。仅用本地 mock server 与注入执行器，无外部网络。
 // Run: npx tsx scripts/unit-stale-diagnosis.ts
 
 import assert from 'node:assert/strict';
@@ -31,7 +32,7 @@ import { McpSupervisor } from '../src/bot/supervisor';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import type { FeishuChannel } from '../src/channels/feishu';
 import type { AgentConfig } from '../src/types';
-import { check, checkAsync, finish } from './testkit';
+import { check, checkAsync, finish, modeOk } from './testkit';
 
 async function stopServer(server: http.Server): Promise<void> {
   server.closeAllConnections?.();
@@ -189,8 +190,7 @@ async function main(): Promise<void> {
       const t1 = new StaleNudgeTracker({ statePath, thresholdMs: 8 * 3600_000 });
       assert.equal(t1.due([{ id: 't1', status: 'inprogress', updatedAtMs: staleAt }], now).length, 1);
       assert.ok(fs.existsSync(statePath), '提醒状态应落盘');
-      const mode = fs.statSync(statePath).mode & 0o777;
-      assert.equal(mode, 0o600, `state 文件应为 0600，实际 ${mode.toString(8)}`);
+      assert.ok(modeOk(statePath, 0o600), 'state 文件应为 0600');
       // 模拟进程重启：新实例从盘上恢复，同一阶段 24h 内不再提醒
       const t2 = new StaleNudgeTracker({ statePath, thresholdMs: 8 * 3600_000 });
       assert.equal(t2.due([{ id: 't1', status: 'inprogress', updatedAtMs: staleAt }], now + 3600_000).length, 0, '重启后不得重复提醒');
@@ -355,7 +355,90 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------- runFailureDiagnosis：组合 signal（复用 http.ts 手写组合，不依赖 Node 20.3+ 的 AbortSignal.any） ----------
+  await checkAsync('runFailureDiagnosis：调用方 signal 中断与超时兜底都经组合 signal 生效', async () => {
+    const base = 'http://127.0.0.1:1';
+    const llm = { baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'sk-x', model: 'm' };
+    const ctxInject = async () => ({ taskId: 't1', title: 'x', description: '', attemptSummary: '' });
+    // 调用方 signal 中断：传入 complete 的组合 signal 同步触发，文案归「已中断」
+    const controller = new AbortController();
+    await assert.rejects(
+      () =>
+        runFailureDiagnosis({
+          kanbanUrl: base,
+          taskId: 't1',
+          llm,
+          collectContext: ctxInject,
+          signal: controller.signal,
+          complete: async (_p, _l, signal) => {
+            controller.abort();
+            assert.ok(signal?.aborted, '组合 signal 应随调用方 signal 中断而触发');
+            throw new Error('The operation was aborted');
+          },
+        }),
+      /已中断/,
+    );
+    // 超时兜底：complete 只监听 signal，到点被组合 signal 终止并按超时收尾
+    //（AbortSignal.timeout 的定时器不挂事件循环：backup 定时器保活进程，
+    //  组合 signal 若失效则由 backup 报错让用例失败而非静默跳过）
+    await assert.rejects(
+      () =>
+        runFailureDiagnosis({
+          kanbanUrl: base,
+          taskId: 't1',
+          llm,
+          timeoutMs: 50,
+          collectContext: ctxInject,
+          complete: (_p, _l, signal) =>
+            new Promise<string>((_resolve, reject) => {
+              const backup = setTimeout(() => reject(new Error('组合 signal 未在超时兜底到点前触发')), 500);
+              signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(backup);
+                  reject(new Error('aborted'));
+                },
+                { once: true },
+              );
+            }),
+        }),
+      /AI 诊断超时/,
+    );
+  });
+
   // ---------- sendDiagnosisFollowUp / buildRetryPrompt ----------
+  await checkAsync('sendDiagnosisFollowUp：会话按 created_at 取最新，不依赖 /sessions 返回顺序', async () => {
+    const posted: string[] = [];
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      const json = (data: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data }));
+      };
+      if (url.startsWith('/api/sessions?workspace_id=')) {
+        // 最新会话排在前面：旧逻辑 .pop() 取末元素会错取 sess-old
+        return json([
+          { id: 'sess-new', created_at: '2026-01-02T10:00:00Z' },
+          { id: 'sess-old', created_at: '2026-01-01T10:00:00Z' },
+        ]);
+      }
+      if (req.method === 'POST' && url.startsWith('/api/sessions/')) {
+        posted.push(url);
+        return json({});
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      await sendDiagnosisFollowUp(base, 'att-1', 'p');
+      assert.deepEqual(posted, ['/api/sessions/sess-new/follow-up'], `应发到 created_at 最新的会话，实际：${posted.join(',')}`);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   await checkAsync('sendDiagnosisFollowUp：定位最新会话并 POST follow-up；无会话给中文错误', async () => {
     const posted: Array<{ url: string; body: string }> = [];
     const server = http.createServer((req, res) => {

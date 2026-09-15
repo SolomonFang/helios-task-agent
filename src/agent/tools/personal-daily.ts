@@ -1,7 +1,7 @@
 import type { ToolHandler } from '../../types';
 import { wrapUntrusted } from '../guard';
 import { collectDailyData, type DailyReportData } from '../../kanban/summary';
-import { buildDailyMaterial, resolveReportDate, writeDailyReport } from '../../report/daily-report';
+import { buildDailyMaterial, isFutureReportDate, resolveReportDate, writeDailyReport } from '../../report/daily-report';
 import { errMessage } from '../../infra/err';
 
 /** daily_report handler：采集某日看板活动素材（+ 可选 HTML 日报），供 LLM 组织个人工作日报。 */
@@ -21,6 +21,9 @@ export function makeDailyReportHandler({
   return async (raw) => {
     const date = resolveReportDate(raw.date);
     if (!date) {
+      if (isFutureReportDate(raw.date)) {
+        return '该日期尚未到来：只能生成今天或过去日期的日报。';
+      }
       return '日期参数无法识别：支持「今天」「昨天」或 YYYY-MM-DD（如 2026-09-01）；省略默认为今天。';
     }
     // 迭代口径与 work_summary 一致：参数优先，缺省用配置的默认迭代，未配置则全部任务

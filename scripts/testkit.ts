@@ -15,6 +15,15 @@ export const check = (name: string, ok: boolean, detail = '') => {
   if (!ok) failures++;
 };
 
+/**
+ * 权限位断言（平台感知）：Windows 的 statSync().mode 是合成值（可写文件恒 0666、目录 0777），
+ * 无法表达 0600/0700，win32 下退化为「存在即可」；POSIX 精确比较低 9 位权限。
+ */
+export function modeOk(p: string, expected: number): boolean {
+  if (process.platform === 'win32') return fs.existsSync(p);
+  return (fs.statSync(p).mode & 0o777) === expected;
+}
+
 /** try/catch 包装：异常即 FAIL。 */
 export async function checkAsync(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {

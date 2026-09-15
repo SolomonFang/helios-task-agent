@@ -115,7 +115,7 @@ import { renderReply, printBanner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { statusLabel, type WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
-import { check, checkAsync, finish, writeFakeCli } from './testkit';
+import { check, checkAsync, finish, modeOk, writeFakeCli } from './testkit';
 
 // --- mock OpenAI client helpers ---
 
@@ -726,6 +726,42 @@ async function run(): Promise<void> {
     assert.equal(messages[messages.length - 1]!.role, 'user'); // 请求未入历史，无残留
   });
 
+  await checkAsync('runAgentTurn /stop 掐断在途 LLM 请求：保留 user 消息，与工具执行中断同一口径', async () => {
+    const client = {
+      chat: {
+        completions: {
+          create: async (_req: unknown, opts?: { signal?: AbortSignal }) => {
+            await new Promise<void>((resolve, reject) => {
+              const t = setTimeout(resolve, 5000);
+              opts?.signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(t);
+                  reject(new Error('APIUserAbortError: This operation was aborted')); // 与 SDK 在途 abort 同形态
+                },
+                { once: true },
+              );
+            });
+            return finalText('不应到达');
+          },
+        },
+      },
+    } as unknown as OpenAiClient;
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+    ];
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 20); // 请求在途期间 /stop
+    const t0 = Date.now();
+    const reply = await runAgentTurn({ client, model: 'm', messages, tools: [], handlers: new Map(), signal: ctl.signal });
+    assert.ok(Date.now() - t0 < 2000, '应在 abort 后立即返回，不干等在途请求');
+    assert.ok(reply.includes('中断'), reply);
+    // 与轮首/工具执行中的中断同口径：user 消息保留在历史里（不被静默弹出），请求未入历史
+    assert.equal(messages.length, 2);
+    assert.equal(messages[messages.length - 1]!.role, 'user');
+  });
+
   await checkAsync('runAgentTurn 上下文超限：自动丢最旧轮次并恢复', async () => {
     let calls = 0;
     const client = {
@@ -1114,6 +1150,40 @@ async function run(): Promise<void> {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  // ---------- 记忆：getFact 与 setFact 键归一化对称（含标记字符的 key 写得进也查得到） ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memget-'));
+    const mem = new MemoryStore(tmp);
+    mem.setFact('u1', ' k<<<USER_MEMORY ', 'v');
+    check(
+      'MemoryStore getFact 键归一化：含标记/空白的原 key 与归一化 key 都能查到',
+      mem.getFact('u1', ' k<<<USER_MEMORY ') === 'v' && mem.getFact('u1', 'k<<<USER_MEMORY') === 'v',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 记忆：fact key 长度上限（超长 key 截断，写删查对称，不进每轮提示词） ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memkeylen-'));
+    const mem = new MemoryStore(tmp);
+    const huge = `prefix-${'k'.repeat(50000)}`;
+    mem.setFact('u1', huge, 'v');
+    const storedKey = Object.keys(mem.getFacts('u1'))[0]!;
+    check(
+      'MemoryStore fact key 超长截断：落盘 key 有上限且写删查对称',
+      storedKey.length < 300 &&
+        storedKey.endsWith('…（已截断）') &&
+        mem.getFact('u1', huge) === 'v' && // 同一超长原 key 查询命中截断键
+        new MemoryStore(tmp).getFact('u1', huge) === 'v' && // 重载后仍对称
+        mem.deleteFact('u1', huge) === true &&
+        Object.keys(mem.getFacts('u1')).length === 0,
+    );
+    // 巨型 key 截断后单条记忆块有界：不再原样撑爆每轮系统提示词（system 消息不被历史裁剪，无自愈路径）
+    mem.setFact('u1', huge, 'v');
+    check('MemoryStore 超长 key 截断后记忆块有界', mem.formatForPrompt('u1').length < 1000);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
   // ---------- 记忆：解析失败先备份损坏文件再回退空文件 ----------
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memcorrupt-'));
@@ -1126,6 +1196,31 @@ async function run(): Promise<void> {
       backups.length === 1 &&
         fs.readFileSync(path.join(tmp, backups[0]!), 'utf8') === '{not json' &&
         new MemoryStore(tmp).getFact('u1', 'k') === 'v',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 记忆：单字段畸形（非对象 facts / 非数组 notes）只重置该字段，不整文件判损坏 ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-memfields-'));
+    fs.writeFileSync(
+      path.join(tmp, 'memory.json'),
+      JSON.stringify({
+        version: 1,
+        users: {
+          u1: { facts: 'not-an-object', notes: 'not-an-array', updatedAt: '2026-01-01T00:00:00.000Z' },
+          u2: { facts: { k: 'v' }, notes: ['n1'], updatedAt: '2026-01-01T00:00:00.000Z' },
+        },
+      }),
+    );
+    const mem = new MemoryStore(tmp);
+    check(
+      'MemoryStore 单字段畸形只重置该字段：不备份清空整个文件，其他用户记忆不受影响',
+      fs.readdirSync(tmp).filter((f) => f.startsWith('memory.json.corrupt-')).length === 0 &&
+        Object.keys(mem.getFacts('u1')).length === 0 && // 畸形 facts 重置为空
+        mem.getUser('u1').notes.length === 0 && // 畸形 notes 重置为空
+        mem.getFact('u2', 'k') === 'v' &&
+        mem.getUser('u2').notes.length === 1,
     );
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -1273,12 +1368,12 @@ async function run(): Promise<void> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-env-'));
     const envPath = path.join(tmp, '.env');
     writeEnvFile({ LLM_API_KEY: 'sk-test', LLM_MODEL: 'm' }, envPath);
-    const mode1 = fs.statSync(envPath).mode & 0o777;
+    const ok1 = modeOk(envPath, 0o600);
     fs.chmodSync(envPath, 0o644); // 模拟历史遗留的宽松权限
     writeEnvFile({ LLM_BASE_URL: 'https://x' }, envPath);
-    const mode2 = fs.statSync(envPath).mode & 0o777;
+    const ok2 = modeOk(envPath, 0o600);
     const content = fs.readFileSync(envPath, 'utf8');
-    check('.env 新建与重写均为 0600', mode1 === 0o600 && mode2 === 0o600, `mode=${mode1.toString(8)}/${mode2.toString(8)}`);
+    check('.env 新建与重写均为 0600', ok1 && ok2);
     check('.env 合并写保留既有键', content.includes('LLM_API_KEY=sk-test') && content.includes('LLM_BASE_URL=https://x'));
     check('.env 原子写无 tmp 残留', fs.readdirSync(tmp).filter((f) => f.endsWith('.tmp')).length === 0);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1333,10 +1428,8 @@ async function run(): Promise<void> {
     const reg = new SourceRegistry(tmp);
     reg.record('u1', 'https://a.feishu.cn/docx/1', { taskId: 't', title: 'T', createdAt: 'x' });
     auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, tmp);
-    const modes = ['memory.json', 'synced-sources.json', 'audit.log'].map(
-      (f) => fs.statSync(path.join(tmp, f)).mode & 0o777,
-    );
-    check('数据文件（memory/查重/审计）均为 0600', modes.every((m) => m === 0o600), modes.map((m) => m.toString(8)).join(','));
+    const modes = ['memory.json', 'synced-sources.json', 'audit.log'].map((f) => modeOk(path.join(tmp, f), 0o600));
+    check('数据文件（memory/查重/审计）均为 0600', modes.every(Boolean));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -1354,16 +1447,15 @@ async function run(): Promise<void> {
       writeEnvFile({ HTA_UNIT_DIRPERM: 'x' }, path.join(envDir, '.env')); // 用无害键，避免污染 process.env.LLM_API_KEY
       const updDir = path.join(tmp, 'fresh-upd');
       await checkForUpdate({ current: '1.0.0', home: updDir, fetchDistTags: async () => ({ latest: '9.9.9' }) });
-      const modeOf = (d: string) => fs.statSync(d).mode & 0o777;
-      assert.equal(modeOf(fresh), 0o700, `memory/查重/审计目录应为 0700，实际 ${modeOf(fresh).toString(8)}`);
-      assert.equal(modeOf(envDir), 0o700, `env 目录应为 0700，实际 ${modeOf(envDir).toString(8)}`);
-      assert.equal(modeOf(updDir), 0o700, `更新缓存目录应为 0700，实际 ${modeOf(updDir).toString(8)}`);
+      assert.ok(modeOk(fresh, 0o700), 'memory/查重/审计目录应为 0700');
+      assert.ok(modeOk(envDir, 0o700), 'env 目录应为 0700');
+      assert.ok(modeOk(updDir, 0o700), '更新缓存目录应为 0700');
       // 历史遗留的宽松目录（0755）：再次写入时收紧
       const loose = path.join(tmp, 'loose');
       fs.mkdirSync(loose, { mode: 0o755 });
       fs.chmodSync(loose, 0o755);
       auditLog({ user: 'u1', kind: 'kanban', summary: 's', detail: 'd', decision: 'approved' }, loose);
-      assert.equal(modeOf(loose), 0o700, `已存在的宽松目录应被收紧为 0700，实际 ${modeOf(loose).toString(8)}`);
+      assert.ok(modeOk(loose, 0o700), '已存在的宽松目录应被收紧为 0700');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -2015,7 +2107,7 @@ async function run(): Promise<void> {
       assert.match(newReportToken(), /^[0-9a-f]{32}$/);
       assert.notEqual(newReportToken(), newReportToken());
       // 报告含代码 diff：写盘必须 0600
-      assert.equal(fs.statSync(path.join(tmp, name)).mode & 0o777, 0o600);
+      assert.ok(modeOk(path.join(tmp, name), 0o600));
       assert.ok(server.baseUrl.startsWith('http://127.0.0.1:'));
       const ok = await fetch(`${server.baseUrl}/${name}`);
       const body = await ok.text();
@@ -3478,7 +3570,7 @@ async function run(): Promise<void> {
       assert.match(htmlName, /^[\w.-]+\.html$/);
       assert.equal(path.basename(paths.mdPath!), 'work-summary-2026-07-31.md');
       for (const f of [paths.htmlPath!, paths.mdPath!]) {
-        assert.equal(fs.statSync(f).mode & 0o777, 0o600, f);
+        assert.ok(modeOk(f, 0o600), f);
       }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

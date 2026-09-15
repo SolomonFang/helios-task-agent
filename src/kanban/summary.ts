@@ -276,22 +276,24 @@ async function enrichTask(
   }
   try {
     const pool = sortTaskAttempts(await apiGet(kanbanUrl, `/task-attempts?task_id=${taskId}`));
-    // 从新到旧找第一份有 diff 统计的 attempt
+    // 从新到旧找第一份有 diff 统计的 attempt：diffUrl 与统计指向同一 attempt，
+    // 不拼出「旧 attempt 的统计 + 最新 attempt 的链接」
     for (let i = pool.length - 1; i >= 0; i--) {
       const stats = statsLookup.get(pool[i]!.id);
-      if (i === pool.length - 1) {
-        task.diffUrl = attemptDiffUrl(pageUrl, pool[i]!.id);
+      if (!stats) continue;
+      task.diffUrl = attemptDiffUrl(pageUrl, pool[i]!.id);
+      if (stats.filesChanged !== undefined) task.filesChanged = stats.filesChanged;
+      if (stats.additions !== undefined) task.additions = stats.additions;
+      if (stats.deletions !== undefined) task.deletions = stats.deletions;
+      if (stats.changedFiles?.length) {
+        task.changedFilesTotal = stats.changedFiles.length;
+        task.changedFiles = stats.changedFiles.slice(0, 10);
       }
-      if (stats) {
-        if (stats.filesChanged !== undefined) task.filesChanged = stats.filesChanged;
-        if (stats.additions !== undefined) task.additions = stats.additions;
-        if (stats.deletions !== undefined) task.deletions = stats.deletions;
-        if (stats.changedFiles?.length) {
-          task.changedFilesTotal = stats.changedFiles.length;
-          task.changedFiles = stats.changedFiles.slice(0, 10);
-        }
-        break;
-      }
+      break;
+    }
+    // 没有任何 attempt 有统计时，链接回退最新 attempt 的 diff 视图
+    if (task.diffUrl === pageUrl && pool.length) {
+      task.diffUrl = attemptDiffUrl(pageUrl, pool[pool.length - 1]!.id);
     }
   } catch {
     /* attempts 拉取失败回退任务页链接 */

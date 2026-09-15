@@ -469,10 +469,68 @@ async function main(): Promise<void> {
       try {
         const store = new ReminderStore(blocker);
         assert.throws(() => store.add('u1', '写不进去', NOW_MS), /提醒保存失败/);
+        // markDelivered / markFailed 落盘失败必须返回 false（调用方据此兜底/告警，不得当作已标记）
+        assert.equal(store.markDelivered('u1', 'r1', NOW_MS), false);
+        assert.equal(store.markFailed('u1', 'r1', NOW_MS), false);
         assert.ok(errLogs.some((m) => m.includes('[reminder] 提醒存储写入失败')), `应留痕，实际日志：${errLogs.join(' | ')}`);
       } finally {
         console.error = origErr;
       }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- Runner：落盘失败的兜底（已投递不重复推送 / 退避未生效告警） ----------
+  await checkAsync('ReminderRunner：投递成功但落盘失败时内存兜底不重复推送并告警；退避落盘失败告警', async () => {
+    const tmp = tmpHome('markfail');
+    try {
+      const store = new ReminderStore(tmp);
+      store.add('u1', '落不了盘的', NOW_MS - 1000); // 已到点
+      const logs: string[] = [];
+      const sent: string[] = [];
+      // 包一层 store：due 正常读盘，markDelivered 模拟持续写盘失败（提醒在盘上保持 pending）
+      const flaky = {
+        due: (nowMs: number) => store.due(nowMs),
+        markDelivered: () => false,
+        markFailed: (u: string, id: string, nowMs: number) => store.markFailed(u, id, nowMs),
+      } as unknown as ReminderStore;
+      const runner = new ReminderRunner({
+        store: flaky,
+        deliver: async (_u, text) => {
+          sent.push(text);
+        },
+        now: () => new Date(NOW_MS),
+        log: (m) => logs.push(m),
+      });
+      const tick = tickOf(runner);
+      await tick(); // 投递成功但落盘失败：告警 + 内存记下不再重推
+      assert.equal(sent.length, 1);
+      assert.ok(logs.some((m) => m.includes('落盘失败')), `已送达未落盘应告警：${logs.join(' | ')}`);
+      await tick(); // 磁盘故障期间不每轮（默认 15s）重复推送同一条
+      await tick();
+      assert.equal(sent.length, 1, '已投递但落盘失败的提醒不得重复推送');
+
+      // markFailed 落盘失败：退避记不上会每轮立即重试，必须告警
+      const failLogs: string[] = [];
+      let calls = 0;
+      const flakyFail = {
+        due: (nowMs: number) => store.due(nowMs),
+        markDelivered: () => true,
+        markFailed: () => false,
+      } as unknown as ReminderStore;
+      const failRunner = new ReminderRunner({
+        store: flakyFail,
+        deliver: async () => {
+          calls++;
+          throw new Error('channel down');
+        },
+        now: () => new Date(NOW_MS),
+        log: (m) => failLogs.push(m),
+      });
+      await tickOf(failRunner)();
+      assert.equal(calls, 1);
+      assert.ok(failLogs.some((m) => m.includes('退避落盘失败')), `退避落盘失败应告警：${failLogs.join(' | ')}`);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

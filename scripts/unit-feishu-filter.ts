@@ -12,6 +12,7 @@ import {
   groupMentionInCooldown,
   isCardActionAllowed,
   resolveAccess,
+  splitText,
   type FeishuReceivePayload,
 } from '../src/channels/feishu';
 import { checkAsync, finish } from './testkit';
@@ -281,6 +282,22 @@ async function main(): Promise<void> {
     } finally {
       console.warn = origWarn;
     }
+  });
+
+  // ---------- splitText：硬切不得在 emoji 代理对中间断开（孤代理 JSON 化后渲染为 U+FFFD） ----------
+  await checkAsync('splitText：硬切边界落在代理对中间时回退一个 code unit', async () => {
+    // 'a'*2999 + '😀'（2 个 code unit）+ 尾巴：默认 limit=3000 的硬切点正好落在代理对中间
+    const text = `${'a'.repeat(2999)}😀${'b'.repeat(100)}`;
+    const chunks = splitText(text);
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0]!.length, 2999, '首段应回退到代理对之前（不产生孤高代理）');
+    assert.ok(chunks[1]!.startsWith('😀'), 'emoji 应完整保留在下一段开头');
+    assert.equal(chunks.join(''), text, '拆分拼接后不得丢字/变形');
+    // 对照：边界无代理对时仍按 limit 硬切（行为不变）
+    const plain = 'a'.repeat(4000);
+    const plainChunks = splitText(plain);
+    assert.equal(plainChunks[0]!.length, 3000, '无代理对时硬切点不变');
+    assert.equal(plainChunks.join(''), plain);
   });
 
   finish();

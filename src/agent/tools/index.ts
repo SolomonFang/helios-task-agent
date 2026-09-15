@@ -97,6 +97,7 @@ export function buildTools({
   });
 
   if (mcp && mcp.connected) {
+    const seen = new Set<string>();
     for (const tool of mcp.tools) {
       const name = `kanban_${tool.name}`;
       if (!OPENAI_FN_NAME.test(name)) {
@@ -106,6 +107,13 @@ export function buildTools({
         if (process.env.HTA_DEBUG) console.error(`[tools] 非法工具名「${name}」：须匹配 ${OPENAI_FN_NAME.source}`);
         continue;
       }
+      if (seen.has(name)) {
+        // 重名工具：重复 function name 同样会被 API 400 整包拒绝，且 handlers.set 会静默覆盖前者；
+        // 与非法名同口径跳过并告警
+        console.warn(`[tools] 跳过重名 MCP 工具「${name}」（同名工具已注册）`);
+        continue;
+      }
+      seen.add(name);
       openAiTools.push({
         type: 'function',
         function: {

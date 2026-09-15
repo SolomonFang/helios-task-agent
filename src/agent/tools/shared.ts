@@ -82,6 +82,15 @@ export function run(
           resolve('⏹ 已中断（未完成的操作未执行，可继续对话）。');
           return;
         }
+        // maxBuffer 超限：proc.ts 置 killed=true 模拟原生，但既非执行超时也非业务失败，单独如实归因
+        if (error?.bufferExceeded) {
+          logExecFailure(command, args, error, stderr || '');
+          resolve(
+            `命令执行失败：${error.bufferExceeded === 'stderr' ? '错误输出' : '输出'}过大（超过 4MB 上限），已截断中止。` +
+              '请缩小输出范围后重试（如加强过滤条件、分页查询）。',
+          );
+          return;
+        }
         if (error && !stdout) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
             const hint =

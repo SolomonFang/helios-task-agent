@@ -42,8 +42,9 @@ function envelopeData(json: unknown): unknown {
  * AbortSignal.any 需 Node 20.3+（engines 要求 >=20），这里手写等价组合：
  * 挂在调用方 signal 上的监听器随 ctl 触发（任一分支到点）即摘除，不会在
  * 调用方 signal 上累积滞留（waitForWorkspaceReady 以同一 turn 级 signal 高频轮询）。
+ * 同样不能用 AbortSignal.any 的地方（如 failure-diagnosis）复用本函数，勿另写变体。
  */
-function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+export function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
   if (!signal) return timeout;
   if (signal.aborted) return signal;

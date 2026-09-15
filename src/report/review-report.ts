@@ -31,11 +31,16 @@ export interface ReviewReportData {
   text: string;
 }
 
-/** 行内格式：**bold**、`code`（输入须已 HTML 转义）。 */
+/** 行内格式：**bold**、`code`（输入须已 HTML 转义）。先摘 code span（占位符），避免反引号内的 ** 被 bold 规则吃掉。 */
 function renderInline(escaped: string): string {
-  return escaped
+  const codes: string[] = [];
+  const withPlaceholders = escaped.replace(/`([^`]+)`/g, (_m, code: string) => {
+    codes.push(code);
+    return '\x00' + (codes.length - 1) + '\x00';
+  });
+  return withPlaceholders
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>');
+    .replace(/\x00(\d+)\x00/g, (_m, i: string) => `<code>${codes[Number(i)]!}</code>`);
 }
 
 /** 轻量 markdown → HTML：代码围栏、标题、无序/有序列表、段落。 */

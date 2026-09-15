@@ -26,10 +26,11 @@ export function makeMemoryHandlers({
     // 与空 key 同口径：缺失/非字符串/空 value 直接报参数错误，不静默写空串
     if (typeof raw.value !== 'string' || !raw.value) return '参数错误：value 不能为空';
     const value = raw.value;
-    // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，展示 key 与 value。
+    // 记忆会原样回注系统提示词（持久化注入通道）：写操作一律过确认闸门，卡片 detail 展示完整 value；
+    // summary 只含 key 与长度——summary 原样进 audit.log，落 value 原文会让审计文件变成敏感数据副本。
     // 「同类免问」绑定具体 key（对象级）：免问一次不得放行本会话任意 key 的记忆写
     const storedKey = normalizeFactKey(key);
-    const summary = `写入记忆「${key.trim()}」：${value.slice(0, 100)}`;
+    const summary = `写入记忆「${key.trim()}」（${value.length} 字符）`;
     // 确认卡片 detail 用中文两行（不拼 key=value 伪调用串——用户面不出现代码形态）
     const detail = summarizeBothEnds(`键：${key.trim()}\n值：${value}`);
     const gate = await passGate(
@@ -97,9 +98,10 @@ export function makeMemoryHandlers({
 
   const memoryNote: ToolHandler = async (raw, ctx) => {
     const text = typeof raw.text === 'string' ? raw.text : '';
-    // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门；
+    // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门；summary 不含备注原文
+    // （同 memory_set 口径：summary 原样进 audit.log），完整内容在卡片 detail 展示；
     // 备注无 key 可绑定，不提供「同类免问」（无 batchKey 时卡片/词表裁决不出 batch 分支）
-    const summary = `追加记忆备注：${text.slice(0, 100)}`;
+    const summary = `追加记忆备注（${text.length} 字符）`;
     const detail = summarizeBothEnds(`备注：${text}`);
     const gate = await passGate(
       { kind: 'memory', summary, detail, destructive: true },

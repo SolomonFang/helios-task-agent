@@ -15,12 +15,14 @@ export function sanitizeName(s: string, fallback: string): string {
 /**
  * 外部可控链接（看板任务 diffUrl 等）渲染前校验：仅放行 http:/https:，
  * 其余（javascript: 等伪协议、畸形串）按无链接处理，返回 undefined。
+ * 返回 new URL().href 归一化结果：原始串里的裸 > 等字符被百分号转义，
+ * 不破坏 report.ts 的 <url> 角括号链接语法。
  */
 export function safeHttpUrl(url: string | undefined): string | undefined {
   if (!url) return undefined;
   try {
-    const protocol = new URL(url).protocol;
-    return protocol === 'http:' || protocol === 'https:' ? url : undefined;
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : undefined;
   } catch {
     return undefined;
   }

@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
 import { buildTools, localToolSummary, LOCAL_TOOL_SUMMARY, type CreateCounter } from '../src/agent/tools';
+import { run } from '../src/agent/tools/shared';
 import { AgentSession } from '../src/agent/session';
 import { SourceRegistry } from '../src/agent/source-registry';
 import { MemoryStore } from '../src/agent/memory';
@@ -311,6 +312,39 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- lark_cli batchKey：带值 flag 排在对象前时成对跳过，未知 flag fail-closed 退化类级 ----------
+  await checkAsync('lark_cli 批量免问 key：--msg-type text 等带值 flag 不误绑为对象，未知 flag 退化类级 key', async () => {
+    const tmp = tmpHome('larkflag');
+    try {
+      const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: KANBAN_URL,
+        auditHome: tmp,
+        confirm: async (req) => {
+          seen.push({ batchKey: req.batchKey, batchScope: req.batchScope });
+          return false;
+        },
+      });
+      const lark = handlers.get('lark_cli')!;
+      await lark({ args: ['im', 'send', '--msg-type', 'text', 'ou_alice', 'hi'] }); // flag 值 text 不得绑为对象
+      await lark({ args: ['im', 'send', '--msg-type=text', 'ou_bob', 'hi'] }); // 等号形态同样跳过
+      await lark({ args: ['im', 'send', '--unknown-bool', 'ou_carol', 'hi'] }); // 未知 flag：无法判断带不带值，fail-closed
+      assert.deepEqual(
+        seen,
+        [
+          { batchKey: 'lark:im send:ou_alice', batchScope: 'object' },
+          { batchKey: 'lark:im send:ou_bob', batchScope: 'object' },
+          // 解析不可靠：退化类级 key 且粒度如实降为 kind（不借 ou_carol 之名放大授权）
+          { batchKey: 'lark:im send', batchScope: 'kind' },
+        ],
+        `实际 seen=${JSON.stringify(seen)}`,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- skill_exec batchKey：绑定脚本（不含参数），同脚本换参数共用免问 ----------
   await checkAsync('skill_exec 批量免问 key：绑定脚本不含 argv，同脚本不同参数共用免问', async () => {
     const tmp = tmpHome('skillkey');
@@ -374,6 +408,51 @@ async function main(): Promise<void> {
       console.warn = origWarn;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // ---------- MCP 重名工具：跳过后者并 warn，不重复注册、不静默覆盖 handler ----------
+  await checkAsync('MCP 重名工具：跳过重复注册并 warn（重复 function name 会被 API 400 整包拒绝）', async () => {
+    const tmp = tmpHome('mcpdup');
+    const origWarn = console.warn;
+    const warns: string[] = [];
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      const mcp = {
+        connected: true,
+        tools: [
+          { name: 'dup_tool', description: 'first', inputSchema: { type: 'object', properties: {} } },
+          { name: 'dup_tool', description: 'second', inputSchema: { type: 'object', properties: {} } },
+        ],
+        callTool: async () => 'ok',
+      } as unknown as KanbanMcp;
+      const { openAiTools, handlers } = buildTools({ mcp, kanbanUrl: KANBAN_URL, auditHome: tmp });
+      const names = openAiTools.map((t) => t.function.name).filter((n) => n === 'kanban_dup_tool');
+      assert.equal(names.length, 1, '重名工具只应注册一次');
+      const desc = openAiTools.find((t) => t.function.name === 'kanban_dup_tool')!.function.description ?? '';
+      assert.ok(desc.includes('first'), `应保留先注册者: ${desc}`);
+      assert.ok(handlers.has('kanban_dup_tool'));
+      assert.ok(
+        warns.some((w) => w.includes('重名') && w.includes('kanban_dup_tool')),
+        `应有重名跳过告警: ${JSON.stringify(warns)}`,
+      );
+    } finally {
+      console.warn = origWarn;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- run()：maxBuffer 超限如实归因「输出过大已截断中止」，不谎称超时/非零退出 ----------
+  await checkAsync('run：maxBuffer 超限报输出过大（stderr 不谎称执行超时，stdout 不谎称非零退出）', async () => {
+    const errOut = await run(process.execPath, ['-e', "process.stderr.write('x'.repeat(6 * 1024 * 1024))"]);
+    assert.ok(errOut.includes('错误输出过大'), `stderr 超限应如实归因: ${errOut.slice(0, 120)}`);
+    assert.ok(errOut.includes('截断中止'), `应注明已截断中止: ${errOut.slice(0, 160)}`);
+    assert.ok(!errOut.includes('执行超时'), 'stderr 超限不得谎称执行超时');
+    const stdOut = await run(process.execPath, ['-e', "process.stdout.write('x'.repeat(6 * 1024 * 1024))"]);
+    assert.ok(stdOut.includes('输出过大'), `stdout 超限应如实归因: ${stdOut.slice(0, 120)}`);
+    assert.ok(!stdOut.includes('非零退出'), 'stdout 超限不得谎称非零退出');
+    assert.ok(!stdOut.includes('执行超时'), 'stdout 超限不得谎称执行超时');
   });
 
   // ---------- localToolSummary：memory 行按启用标志拼接 ----------

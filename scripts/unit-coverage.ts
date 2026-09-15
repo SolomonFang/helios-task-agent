@@ -5,6 +5,11 @@
 //    + abort/超时收尾取消挂起 waiter（fake reader 注入 waiter 语义，验证中断后输入不被吞）
 // 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径 + net-error 的 err.cause 解包映射
 // 5. cli 启动窗口信号处理（信号注册前移到 ensureKanbanOrExit 之前：探测在途时 SIGTERM/SIGINT 优雅退出）
+// 6. config 安全与解析对齐：cwd .env 高危键大小写不敏感过滤 + npm_config_ 前缀拒绝、
+//    parseEnvFile 与 dotenv 对齐（# 行内注释 / export 前缀）、serializeEnvValue 单引号包裹的对称性
+// 7. cli 首次向导 Esc 取消的退出口径（伪装 TTY 的包装入口注入 ESC 字节，端到端验证灰字 + 退出码 0）
+//    + 看板存活判定复用 infra/proc.processTreeAlive（win32 不再恒 false）
+// 8. kanban-ensure 拉起失败分支按树杀（PATH 桩 npx 留 sleep 孙进程，验证不留孤儿）
 // 仅用 loopback mock 服务与 PATH 桩，离线可跑。Run: npx tsx scripts/unit-coverage.ts
 
 import assert from 'node:assert/strict';
@@ -14,6 +19,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
+import { pathToFileURL } from 'url';
 import dotenv from 'dotenv';
 import { collectWorkSummary } from '../src/kanban/summary';
 import { createBotHandlers } from '../src/bot/handler';
@@ -24,13 +30,14 @@ import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
 import { PRESETS, currentConfig, ensureEnvLoaded, loadEnvFiles, ocrLlmOverrides, writeEnv, writeEnvFile } from '../src/config/config';
 import { ensureConfig, resolveAllowedOpenIds } from '../src/config/config-wizard';
+import { ensureKanbanRunning } from '../src/kanban/kanban-ensure';
 import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
 import { friendlyNetError } from '../src/config/net-error';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import { check, checkAsync, finish } from './testkit';
+import { check, checkAsync, finish, modeOk } from './testkit';
 
 /** 轮询等待条件成立（按钮回调的审查流程全异步），超时抛错。 */
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15000): Promise<void> {
@@ -557,7 +564,7 @@ async function run(): Promise<void> {
         envPath,
       );
       // 凭证文件权限必须 0600
-      assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+      assert.ok(modeOk(envPath, 0o600));
       // 合并写：更新一项、空值删一项，无关键保留
       writeEnvFile({ LLM_MODEL: 'cov-model-2', CUSTOM_COV_KEY: undefined }, envPath);
       const parsed = dotenv.parse(fs.readFileSync(envPath));
@@ -993,6 +1000,223 @@ async function run(): Promise<void> {
       assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
     } finally {
       await stopServer(kanban.server);
+    }
+  });
+
+  // ================= 盲区 6：config 安全过滤与 dotenv 解析对齐 =================
+
+  await checkAsync('config：cwd .env 高危键过滤大小写不敏感，npm_config_ 前缀整体拒绝', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-cwdeny-'));
+    const KEYS = [
+      'PATH',
+      'NODE_OPTIONS',
+      'npm_config_registry',
+      'NPM_CONFIG_REGISTRY',
+      'Path',
+      'Node_Options',
+      'Npm_Config_Registry',
+      'COV_CWD_BENIGN',
+    ];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    const origCwd = process.cwd();
+    try {
+      fs.writeFileSync(
+        path.join(tmp, '.env'),
+        [
+          'Npm_Config_Registry=https://evil-registry.invalid', // npm 读取时小写化 → 精确匹配可全平台绕过
+          'Node_Options=--require /tmp/evil', // win32 上 process.env 大小写不敏感，即真实 NODE_OPTIONS
+          'Path=/tmp/evil-bin', // win32 上即真实 PATH
+          'COV_CWD_BENIGN=benign-ok', // 非高危键不受影响
+          '',
+        ].join('\n'),
+      );
+      process.chdir(tmp);
+      loadEnvFiles();
+      assert.notEqual(process.env.npm_config_registry, 'https://evil-registry.invalid', 'npm_config_ 前缀应整体拒绝');
+      assert.notEqual(process.env.NPM_CONFIG_REGISTRY, 'https://evil-registry.invalid');
+      assert.notEqual(process.env.NODE_OPTIONS, '--require /tmp/evil');
+      assert.notEqual(process.env.PATH, '/tmp/evil-bin');
+      if (process.platform !== 'win32') {
+        // POSIX 上大小写变体若漏过滤会落成同名新变量，可直接观测
+        assert.equal(process.env.Npm_Config_Registry, undefined);
+        assert.equal(process.env.Node_Options, undefined);
+        assert.equal(process.env.Path, undefined);
+      }
+      assert.equal(process.env.COV_CWD_BENIGN, 'benign-ok', '非高危键应正常覆盖');
+    } finally {
+      process.chdir(origCwd);
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('config：parseEnvFile 与 dotenv 对齐——未加引号值截断 # 行内注释、剥离 export 前缀', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-parse-'));
+    const envPath = path.join(tmp, '.env');
+    const KEYS = ['COV_INLINE', 'COV_EXPORTED'];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    try {
+      fs.writeFileSync(envPath, 'COV_INLINE=value # 注释\nexport COV_EXPORTED=旧值\n');
+      // dotenv 基线：确认本测试断言的语义与 dotenv 一致
+      const baseline = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(baseline.COV_INLINE, 'value');
+      assert.equal(baseline.COV_EXPORTED, '旧值');
+      // 合并写：` # 注释` 不得烘焙进配置值；export 行应识别为同一键，新旧两行不得并存（否则 dotenv 重启时旧值复活）
+      writeEnvFile({ COV_EXPORTED: '新值' }, envPath);
+      const body = fs.readFileSync(envPath, 'utf8');
+      assert.ok(!body.includes('注释'), `行内注释不应烘焙进配置值，实际：\n${body}`);
+      assert.ok(body.includes('COV_INLINE=value'), `实际：\n${body}`);
+      assert.equal(body.match(/^COV_EXPORTED=/gm)?.length, 1, `COV_EXPORTED 应只剩一行，实际：\n${body}`);
+      assert.ok(body.includes('COV_EXPORTED=新值'), `实际：\n${body}`);
+      // dotenv 重启加载口径与进程内（applyProcessEnv）均读回新值
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.COV_EXPORTED, '新值');
+      assert.equal(parsed.COV_INLINE, 'value');
+      assert.equal(process.env.COV_INLINE, 'value');
+      assert.equal(process.env.COV_EXPORTED, '新值');
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('config：含 \\ 或 " 的值单引号包裹写盘，与 dotenv 重启加载对称', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-quote-'));
+    const envPath = path.join(tmp, '.env');
+    const KEYS = ['COV_QUOTED', 'COV_OTHER'];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    try {
+      const v = 'a\\b"c'; // 同时含反斜杠与双引号（双引号转义写法会被 dotenv 重启读成带反斜杠字面量）
+      writeEnvFile({ COV_QUOTED: v }, envPath);
+      const body = fs.readFileSync(envPath, 'utf8');
+      assert.ok(body.includes(`COV_QUOTED='${v}'`), `应单引号包裹，实际：\n${body}`);
+      // dotenv 重启加载口径：读回与写入完全一致
+      assert.equal(dotenv.parse(fs.readFileSync(envPath)).COV_QUOTED, v);
+      // 本项目写读链路往返：二次合并写后值不变（parseEnvFile 对单引号同样原样取内层）
+      writeEnvFile({ COV_OTHER: '1' }, envPath);
+      assert.equal(dotenv.parse(fs.readFileSync(envPath)).COV_QUOTED, v);
+      assert.equal(process.env.COV_QUOTED, v);
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ================= 盲区 7：cli 退出口径与看板存活判定 =================
+
+  check('cli：看板存活判定复用 infra/proc.processTreeAlive（win32 不再因负数 pid 恒 false）', (() => {
+    const src = fs.readFileSync(path.join(repoRoot, 'src', 'cli.ts'), 'utf8');
+    return src.includes("from './infra/proc'") && src.includes('processTreeAlive') && !src.includes('process.kill(-');
+  })());
+
+  // Esc 取消依赖 TTY 判定的 selectList（keypress 拒成 '已取消'）：生成一个伪装 TTY 的包装入口
+  // （isTTY 置真 + setRawMode 桩，管道 stdin 即可注入 ESC 字节），端到端验证首次向导取消的口径。
+  await checkAsync('cli 首次向导：Esc 取消走中性口径（灰字提示 + 退出码 0）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-esc-'));
+    // 包装入口：伪装 TTY 让向导首问走 selectList 的 keypress 路径（真实终端语义不变，仅打通管道注入）
+    const wrapper = path.join(tmp, 'fake-tty-entry.mjs');
+    fs.writeFileSync(
+      wrapper,
+      [
+        'const stdin = process.stdin;',
+        'stdin.isTTY = true;',
+        'stdin.isRaw = false;',
+        'stdin.setRawMode = (v) => { stdin.isRaw = v; return stdin; };',
+        'const { main } = await import(process.env.HTA_CLI_ENTRY);',
+        'main().catch((err) => { console.error(err); process.exit(1); });',
+        '',
+      ].join('\n'),
+    );
+    const child = spawn(process.execPath, [tsxCli, wrapper], {
+      cwd: tmp,
+      env: {
+        ...process.env,
+        HTA_CLI_ENTRY: pathToFileURL(path.join(repoRoot, 'src', 'cli.ts')).href,
+        // 无 LLM 配置 → 首次运行进入配置向导（空串防止项目 .env 经 dotenv 注入配置）
+        LLM_BASE_URL: '',
+        LLM_API_KEY: '',
+        LLM_MODEL: '',
+        HELIOS_TASK_AGENT_HOME: tmp, // 数据目录隔离；home .env 不存在
+        HELIOS_TASK_AGENT_ENV: path.join(tmp, 'nonexistent.env'), // 中和父进程可能带来的强制 env
+        HTA_UPDATE_CHECK: '0',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let buf = '';
+    child.stdout.on('data', (d: Buffer) => (buf += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (buf += d.toString()));
+    try {
+      await Promise.race([
+        waitFor(() => buf.includes('配置模型'), '向导首问渲染'),
+        new Promise<never>((_r, rej) =>
+          child.once('exit', (c) => rej(new Error(`cli 在向导首问前退出（code=${c}）；输出：${buf}`))),
+        ),
+      ]);
+      child.stdin.write('\x1b'); // Esc：selectList reject '已取消'
+      const code = await new Promise<number | null>((resolve, reject) => {
+        const t = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error(`子进程退出超时；输出：${buf}`));
+        }, 20000);
+        child.on('exit', (c) => {
+          clearTimeout(t);
+          resolve(c);
+        });
+      });
+      assert.equal(code, 0, `Esc 取消应退出码 0（与 /config、bot-main 同口径），实际 ${code}；输出：${buf}`);
+      assert.ok(buf.includes('已取消'), `应有中性取消提示，输出：${buf}`);
+      assert.ok(!buf.includes('配置失败'), `取消不应打成红色「配置失败」，输出：${buf}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ================= 盲区 8：kanban-ensure 失败分支进程树清理 =================
+
+  await checkAsync('kanban-ensure：壳进程已退出的拉起失败分支先杀进程树，不留孤儿孙进程', async () => {
+    if (process.platform === 'win32') return; // 孙进程 pid 捕获依赖 POSIX sh；win32 走 taskkill 分支
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-orphan-'));
+    const binDir = path.join(tmp, 'bin');
+    fs.mkdirSync(binDir);
+    const gpidFile = path.join(tmp, 'grandchild.pid');
+    // npx 壳桩：拉起常驻孙进程（同进程组）后立即以失败码退出，模拟「拉起失败但孙进程残留」
+    fs.writeFileSync(
+      path.join(binDir, 'npx'),
+      ['#!/bin/sh', 'sleep 30 &', `echo $! > '${gpidFile}'`, 'exit 1', ''].join('\n'),
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}${path.delimiter}${prevPath ?? ''}`;
+      await assert.rejects(
+        () => ensureKanbanRunning('http://127.0.0.1:1', { autoStart: true, waitMs: 15000 }),
+        /启动后退出/,
+      );
+      const gpid = Number(fs.readFileSync(gpidFile, 'utf8').trim());
+      // 孙进程应已被失败分支的 stopKanbanChild 按组杀掉；信号到回收有短暂窗口，轮询确认
+      let alive = true;
+      for (let i = 0; i < 50 && alive; i++) {
+        try {
+          process.kill(gpid, 0);
+        } catch {
+          alive = false;
+        }
+        if (alive) await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.equal(alive, false, `孙进程 ${gpid} 应被一并杀掉（孤儿残留会稍后变健康占用端口）`);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

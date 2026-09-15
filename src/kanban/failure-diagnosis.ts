@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { apiGet, apiPost, pickLatestAttempt, KanbanHttpError } from './http';
+import { apiGet, apiPost, combinedSignal, pickLatestAttempt, KanbanHttpError } from './http';
 import { errMessage } from '../infra/err';
 import type { OcrLlmConfig } from './ai-review';
 
@@ -219,10 +219,9 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
   const llm = resolveDiagnosisLlm(opts.llm, opts.env);
   const timeoutMs = opts.timeoutMs ?? DIAGNOSIS_TIMEOUT_MS;
   // 总时长兜底：OpenAI 客户端的 timeout 只是单次尝试（maxRetries:2 叠加最坏 3 倍），
-  // 用 AbortSignal.timeout 与调用方 signal 组合约束整段 complete（含全部重试）
-  const signals = [AbortSignal.timeout(timeoutMs)];
-  if (opts.signal) signals.push(opts.signal);
-  const turnSignal = AbortSignal.any(signals);
+  // 用超时兜底与调用方 signal 组合约束整段 complete（含全部重试）；
+  // AbortSignal.any 需 Node 20.3+（engines 只要求 >=20），复用 http.ts 的手写组合
+  const turnSignal = combinedSignal(opts.signal, timeoutMs);
   const complete =
     opts.complete ??
     (async (p: string, l: DiagnosisLlmConfig, signal?: AbortSignal): Promise<string> => {
@@ -294,10 +293,13 @@ export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string
     throw followUpRequestError(err);
   }
   const list = Array.isArray(raw) ? raw : [];
-  const sessionId = list
-    .map((s) => (s && typeof s === 'object' ? String((s as Record<string, unknown>).id || '') : ''))
-    .filter(Boolean)
-    .pop();
+  // /sessions 返回顺序不保证：按 created_at 升序取末位（最新）会话；
+  // 无该字段的行按空串排前，原相对顺序作为兜底（稳定排序）
+  const sessions = list
+    .map((s) => (s && typeof s === 'object' ? (s as Record<string, unknown>) : null))
+    .filter((s): s is Record<string, unknown> => Boolean(s && s.id))
+    .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+  const sessionId = sessions.length ? String(sessions[sessions.length - 1]!.id) : '';
   if (!sessionId) {
     throw new Error('找不到该任务的执行会话（可能已被看板清理），无法自动重试。请到看板手动重新发起该任务。');
   }

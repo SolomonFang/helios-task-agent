@@ -6,11 +6,15 @@ import { auditLog } from '../../infra/audit';
 import { readSkillDoc, resolveSkillDir } from '../skills';
 import { ALLOWED_INTERPRETERS, run, SCRIPT_INTERPRETERS, summarizeBothEnds, truncate } from './shared';
 
-/** skill_doc handler：技能文档是本仓库自带内容（非外部注入），无需 UNTRUSTED 包裹。 */
+/**
+ * skill_doc handler：技能文档不全是本仓库自带内容——用户可 /skills install 任意本地路径的技能
+ * （用户数据目录优先于包内目录），内容按半可信对待：与其他外部读回同一口径套 UNTRUSTED 包裹
+ * （wrapUntrusted 同时中和伪造标记），防技能文档向对话注入「可信指令」。
+ */
 export function makeSkillDocHandler(): ToolHandler {
   return async (raw) => {
     const name = typeof raw.name === 'string' ? raw.name : '';
-    return truncate(readSkillDoc(name));
+    return wrapUntrusted(truncate(readSkillDoc(name)));
   };
 }
 

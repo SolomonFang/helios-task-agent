@@ -30,7 +30,8 @@ export function resolveUnderRoot(
   const rootAbs = path.resolve(root);
   const target = path.resolve(rootAbs, relPath || '.');
   const rel = path.relative(rootAbs, target);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  // '..' 或 '../…' 才算越界；仓库内名为 '..dots' 的合法条目（rel 以 '..' 开头但非上级引用）不得误伤
+  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
     return { ok: false, error: `路径越界：禁止访问仓库根目录之外的路径（目标路径：${relPath}）` };
   }
   // 符号链接防逃逸：字符串路径在界内但真实路径可能在界外
@@ -38,7 +39,7 @@ export function resolveUnderRoot(
     const realRoot = fs.realpathSync(rootAbs);
     const realTarget = fs.realpathSync(target);
     const relReal = path.relative(realRoot, realTarget);
-    if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+    if (relReal === '..' || relReal.startsWith('..' + path.sep) || path.isAbsolute(relReal)) {
       return { ok: false, error: `路径越界：符号链接指向仓库根目录之外（目标路径：${relPath}）` };
     }
     return { ok: true, abs: realTarget };
@@ -126,7 +127,7 @@ function isUnderRegisteredRepo(rootAbs: string, repoPaths: string[]): boolean {
       continue;
     }
     const rel = path.relative(realRepo, realRoot);
-    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return true;
+    if (rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel))) return true;
   }
   return false;
 }

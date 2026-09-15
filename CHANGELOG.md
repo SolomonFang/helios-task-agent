@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 多角度深度审查修复（安全/并发/bot 链路/看板集成/配置启动/报告定时/agent 核心/测试工程八个角度）：
+  - 安全：lark-cli「同对象免问」在带值 flag 排在接收人之前时（如 `im send --msg-type text ou_x hi`）batchKey 错绑到 flag 值上，一次免问静默放大到任意接收人——现按带值 flag 表成对跳过参数、未知 flag 形态 fail-closed 退化为类级免问（`src/agent/tools/lark-cli.ts`）；cwd `.env` 高危键过滤改大小写不敏感并整体拒绝 `npm_config_*` 前缀（原精确匹配在 Windows 上可用 `Path=`/`Node_Options=` 绕过、全平台可用 `Npm_Config_Registry=` 劫持 MCP 自动拉起的 npx registry）（`src/config/config.ts`）；MCP `callTool` 检查 `result.isError`，工具级失败不再被当成功（读路径英文原文直达用户、写路径审计误记 ok 并白耗创建配额）（`src/kanban/mcp.ts`）；用户安装技能的 SKILL.md 按不可信内容处理（skill_doc 输出 UNTRUSTED 包裹、技能摘要注入系统提示词前中和伪造标记）（`src/agent/tools/skill-tools.ts`、`src/agent/skills.ts`）；MCP 重名工具去重告警（重名可致 tools 数组被 API 整包 400）（`src/agent/tools/index.ts`）
+  - 配置：`.env` 解析与 dotenv 对齐——未加引号值剥离行内注释、键剥离 `export ` 前缀（此前向导写盘会把注释烘焙进配置值、`export K=旧值` 与新值并存致重启后旧凭证复活）；含 `\`/`"` 的值改单引号包裹序列化（原双引号转义写法重启后 dotenv 读回带反斜杠字面量、凭证静默失效）（`src/config/config.ts`）
+  - 兼容：`AbortSignal.any` 需 Node 20.3+ 而 engines 只要求 >=20，AI 诊断在 Node 20.0–20.2 上整体崩溃，改复用手写组合 signal（`src/kanban/failure-diagnosis.ts`、`src/kanban/http.ts`）；CLI 停止提示的进程树探活复用带 win32 分支的 `processTreeAlive`（原 `process.kill(-pid)` 在 Windows 恒 false，taskkill 提示成死代码）（`src/cli.ts`）
+  - 归因如实：子进程输出超 4MB maxBuffer 中止不再谎称「执行超时/非零退出」（`src/infra/proc.ts`、`src/agent/tools/shared.ts`）；确认卡片发送失败新增 send_failed 终态，闸门不再谎称「用户拒绝了该写操作」，aborted-before-send 路径补审计留痕（`src/agent/confirm.ts`、`src/agent/guard.ts`）；敲键盘表情的「永久降级」改按飞书业务错误码判定（原统一中文错误文案使降级正则永不命中，缺权限时每条消息白打一次必败 API）（`src/channels/feishu.ts`、`src/bot/handler.ts`）；诊断结果双路推送都失败时摘除去重键（原谎称「结果见上方消息」）；非属主点确认卡片如实提示「只有发起人可以裁决」（`src/bot/handler.ts`）
+  - 数据与口径：memory fact 的 key 补 200 字符截断（原巨型 key 绕过所有上下文自愈机制，会话每轮必超限报废），getFact 键归一化与写删对称，load 单字段畸形只重置该字段不再整文件陪葬（`src/agent/memory.ts`）；迭代复盘「本周完成」改用全量口径 `totals.doneThisWeek`（与周报一致，原截断样本口径致两份报告数字打架且注记自相矛盾）（`src/report/retro.ts`）；日报拒绝未来日期并给专门提示（`src/report/daily-report.ts`、`src/agent/tools/personal-daily.ts`）；报告 diff 链接与 diff 统计归属同一 attempt（`src/kanban/summary.ts`）；重试 follow-up 按 created_at 取最新会话不再依赖返回顺序（`src/kanban/failure-diagnosis.ts`）；reminder 投递/退避落盘失败时内存兜底防每 15 秒重复轰炸（`src/agent/reminder.ts`）
+  - 细节：/stop 掐断在途 LLM 请求时保留该轮 user 消息（`src/agent/llm.ts`）；vision 关闭时纯图片消息拒答并引导打字（原把字面量「[图片]」当对话送模型）；`/confirm  revoke` 多余空白可识别；splitText 避开 emoji 代理对中间硬切；watcher 空转 tick 不再每轮重写相同 state 文件；resolveUnderRoot 不再误伤 `..` 开头的合法文件名；classifyHk 识别 `projects list` 只读形态；审计 summary 不再落 memory value 原文；报告 MD 链接 URL 归一化防裸 `>` 截断；renderInline 先摘 code span 再做 bold；看板拉起失败分支杀进程树防孤儿孙进程；首次向导按 Esc 取消改灰字退出码 0 与 /config、bot 一致；Windows 下 0600/0700 权限断言走平台感知 helper（win32 `statSync().mode` 为合成值，原断言必红）；run-tests 补单套件 10 分钟超时兜底；verify 冒烟补 `require('./dist/index')`
+
 ### Added
 
 - 配置向导支持单独配置 AI 审查（open-code-review）模型：首次启动或 `/config` 重配时，看板默认值之后新增可选步骤——可为 AI 审查/失败诊断单独设置模型、Base URL（展示与输入均为 base 形态，写入时补全为 `…/chat/completions` 完整端点，与 `buildOcrEnv` 派生口径一致；http 明文端点沿用显式确认闸门，重输提示带场景名、可选字段回车可放弃）与专用 API Key（独立询问：只隔离 key 不必先配模型，与首次审查安全提示的首推用法对齐；掩码提示融入单括号），全部可回车跳过；与看板可选字段同一口径（有当前值回车保留、输入 `-` 清除，清除模型后残留的 URL/key 覆盖项仍会逐项出示可一并清除）；覆盖项含显式 URL/key 时联网预检（全复用则跳过不重复打扰），失败可按项修改重试、保存必须显式输入 `s`；选择写入 `OCR_LLM_MODEL` / `OCR_LLM_URL` / `OCR_LLM_TOKEN`（`writeEnv` 新增第三参 `OcrLlmOverrides`：字段缺席不动现有值、空串清除该项，换绑/飞书写入路径不传参即不触及 OCR 键）；保存确认如实标注单独配置的审查模型（`src/config/config-wizard.ts`、`src/config/config.ts`、`src/types.ts`）

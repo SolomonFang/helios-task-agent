@@ -15,7 +15,8 @@ import { isKnownStatus, statusLabel } from '../kanban/status';
 import { isWithinDate, localDate, type DailyReportData, type WorkSummaryTask } from '../kanban/summary';
 
 /**
- * 解析日报目标日期：缺省 / 「今天」/「昨天」/ YYYY-MM-DD；无法识别返回 null（工具层转成中文提示）。
+ * 解析日报目标日期：缺省 / 「今天」/「昨天」/ YYYY-MM-DD；无法识别或未来日期返回 null
+ * （工具层转成中文提示；未来日期没有看板活动可统计，生成「未来日报」只会误导）。
  * now 可注入便于单测。
  */
 export function resolveReportDate(raw: unknown, now = new Date()): string | null {
@@ -30,7 +31,16 @@ export function resolveReportDate(raw: unknown, now = new Date()): string | null
   // 真实日期校验（2026-02-31 之类非法值拒绝，不静默滚动到下月）
   const probe = new Date(y!, mo! - 1, d!);
   if (probe.getFullYear() !== y || probe.getMonth() !== mo! - 1 || probe.getDate() !== d) return null;
+  // 未来日期拒绝（YYYY-MM-DD 定长格式按字典序比较即时间序，与 localDate 同为本地时区口径）
+  if (v > localDate(now)) return null;
   return v;
+}
+
+/** 输入是「格式合法但尚未到来」的日期（区别于格式错误，供调用方给出针对性提示）。 */
+export function isFutureReportDate(raw: unknown, now = new Date()): boolean {
+  const v = typeof raw === 'string' ? raw.trim() : '';
+  // 以远端未来为基准做合法性校验（绕过未来拒绝），再与今天比较
+  return resolveReportDate(v, new Date(9999, 11, 31)) !== null && v > localDate(now);
 }
 
 export interface DailyPartition {

@@ -94,6 +94,17 @@ const CWD_RESTRICTED_KEYS = new Set([
   'HTA_TEST_CRASH',
 ]);
 
+/**
+ * 高危键匹配必须大小写不敏感：win32 上 process.env 键大小写不敏感（恶意 .env 写
+ * `Path=`/`Node_Options=` 即改写真实 PATH/NODE_OPTIONS）；npm 读取 npm_config_* 时
+ * 也会小写化（`Npm_Config_Registry=https://evil` 全平台生效），故 npm_config_ 前缀
+ * 整体拒绝，不单列 registry 一项。
+ */
+const CWD_RESTRICTED_KEYS_LOWER = new Set([...CWD_RESTRICTED_KEYS].map((k) => k.toLowerCase()));
+function isCwdRestrictedKey(key: string): boolean {
+  return CWD_RESTRICTED_KEYS_LOWER.has(key.toLowerCase()) || /^npm_config_/i.test(key);
+}
+
 export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   const loaded: string[] = [];
   const home = userEnvPath();
@@ -109,11 +120,11 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   // 文件（该键本身已列入 CWD_RESTRICTED_KEYS，此处为双保险）。
   const forcedEnvSnapshot = process.env.HELIOS_TASK_AGENT_ENV;
   if (fs.existsSync(cwd) && path.resolve(cwd) !== path.resolve(project)) {
-    // 不用 dotenv.config(override)：先解析再过滤高危键，其余键仍覆盖项目 .env。
+    // 不用 dotenv.config(override)：先解析再过滤高危键（大小写不敏感，见 isCwdRestrictedKey），其余键仍覆盖项目 .env。
     const parsed = dotenv.parse(fs.readFileSync(cwd));
     const dropped: string[] = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (CWD_RESTRICTED_KEYS.has(k)) {
+      if (isCwdRestrictedKey(k)) {
         dropped.push(k);
         continue;
       }
@@ -257,19 +268,30 @@ function parseEnvFile(filePath: string): Record<string, string> {
   for (const line of text.split(/\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
+    // 与 dotenv 对齐：剥离键的 `export ` 前缀——否则 `export K=旧值` 会被读成键
+    // 'export K'，向导写入新值后新旧两行并存，dotenv 重启加载时旧值覆盖新值复活
+    const body = trimmed.replace(/^export\s+/, '');
+    const eq = body.indexOf('=');
     if (eq <= 0) continue;
-    const key = trimmed.slice(0, eq).trim();
-    let val = trimmed.slice(eq + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) {
-      // 双引号值按 serializeEnvValue 的写法对称反转义（单趟扫描，\\ 最后判定）
-      val = val
-        .slice(1, -1)
-        .replace(/\\(.)/gs, (_, c: string) =>
+    const key = body.slice(0, eq).trim();
+    let val = body.slice(eq + 1).trim();
+    if (val.startsWith('"')) {
+      // 双引号值取到配对闭引号（其后可跟行内注释，与 dotenv 一致忽略），
+      // 并按 serializeEnvValue 的写法对称反转义（单趟扫描，\\ 最后判定）
+      const m = val.match(/^"((?:\\[\s\S]|[^"\\])*)"/);
+      if (m) {
+        val = m[1]!.replace(/\\(.)/gs, (_, c: string) =>
           c === 'n' ? '\n' : c === 'r' ? '\r' : c === '"' || c === '\\' ? c : `\\${c}`,
         );
-    } else if (val.startsWith("'") && val.endsWith("'")) {
-      val = val.slice(1, -1);
+      }
+    } else if (val.startsWith("'")) {
+      const m = val.match(/^'([^']*)'/);
+      if (m) val = m[1]!;
+    } else {
+      // 与 dotenv 对齐：未加引号的值在首个 # 处截断行内注释——否则向导写盘会把
+      // ` # 注释` 灌进 process.env，并被 serializeEnvValue 加引号永久烘焙进配置值
+      const hash = val.indexOf('#');
+      if (hash >= 0) val = val.slice(0, hash).trimEnd();
     }
     out[key] = val;
   }
@@ -277,13 +299,17 @@ function parseEnvFile(filePath: string): Record<string, string> {
 }
 
 /**
- * 写 .env 时的值序列化：不含空白/#/引号/换行时直写（保持既有输出风格）；
- * 否则双引号包裹并转义，避免含 " #" 的值被 dotenv 当注释截断。
- * 注意 dotenv@16 的 parse 只展开双引号内的 \n/\r、不反转义 \" \\，含双引号或
- * 反斜杠的值以本文件 parseEnvFile 读回为准（本项目写入的均为 URL/key/id 等简单值）。
+ * 写 .env 时的值序列化：不含空白/#/引号/换行时直写（保持既有输出风格）。
+ * 含 \ 或 " 的值优先单引号包裹：dotenv@16 对双引号值只展开 \n \r、不反转义 \" \\，
+ * 双引号转义写法当前会话（parseEnvFile）正确、重启加载（dotenv）却会读到带反斜杠的
+ * 字面量，凭证静默失效；单引号值在 dotenv 与 parseEnvFile 里都是原样取内层，写读对称。
+ * 其余情况双引号包裹并转义（此时值不含 \ 与 "，只产出 dotenv 会展开的 \n \r 转义，
+ * 写读仍对称）。例外：值同时含 ' 与 \ 或 " 时无法单引号包裹，回退双引号转义，
+ * dotenv 重启读回不反转义——本项目写入的均为 URL/key/id 等简单值，不触及。
  */
 function serializeEnvValue(v: string): string {
   if (v !== '' && !/[\s#"'\\]/.test(v)) return v;
+  if (/[\\"]/.test(v) && !v.includes("'") && !/[\r\n]/.test(v)) return `'${v}'`;
   return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
 }
 

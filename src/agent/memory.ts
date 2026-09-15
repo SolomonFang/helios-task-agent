@@ -12,6 +12,11 @@ const MAX_FACTS = 100;
 /** 单条 fact value / note 的长度上限：记忆每轮回注系统提示词，无上限会被超长文本撑爆上下文。 */
 const MAX_ENTRY_LEN = 1000;
 /**
+ * fact key 长度上限：key 与 value 一样每轮全量回注系统提示词，无上限时巨型 key 会
+ * 撑爆每轮请求且（system 消息不被历史裁剪覆盖）永远无法自愈。
+ */
+const MAX_KEY_LEN = 200;
+/**
  * 记忆块注入系统提示词的总字符预算：单条上限之外的总闸。100 条 facts + 50 条 notes
  * 最坏约 15 万字符，每轮全量回注会撑爆上下文且（system 消息不被裁剪）无自愈路径。
  */
@@ -44,9 +49,10 @@ function neutralizeMemoryMarkers(s: string): string {
   return out;
 }
 
-/** fact 键归一化（trim + 标记中和）：setFact/deleteFact 共用，保证写删对称。 */
+/** fact 键归一化（trim + 标记中和 + 长度截断）：setFact/deleteFact/getFact 共用，保证写删查对称。 */
 export function normalizeFactKey(key: string): string {
-  return neutralizeMemoryMarkers(key.trim());
+  const k = neutralizeMemoryMarkers(key.trim());
+  return k.length > MAX_KEY_LEN ? `${k.slice(0, MAX_KEY_LEN)}…（已截断）` : k;
 }
 
 function emptyUser(): UserMemory {
@@ -87,12 +93,16 @@ export class MemoryStore {
       // 存量数据幂等中和：升级前写入的伪造标记同样处理（已中和的内容不受影响）
       for (const user of Object.values(file.users)) {
         if (!user || typeof user !== 'object') continue;
+        // 字段级类型守卫：单字段被手工编辑成畸形（非对象 facts / 非数组 notes）只重置该字段，
+        // 不落入外层 catch 把整个文件判损坏、清空所有用户记忆
+        const rawFacts =
+          user.facts && typeof user.facts === 'object' && !Array.isArray(user.facts) ? user.facts : {};
         const facts: Record<string, string> = {};
-        for (const [k, v] of Object.entries(user.facts || {})) {
+        for (const [k, v] of Object.entries(rawFacts)) {
           facts[normalizeFactKey(k)] = neutralizeMemoryMarkers(String(v));
         }
         user.facts = facts;
-        user.notes = (user.notes || []).map((n) => neutralizeMemoryMarkers(String(n)));
+        user.notes = (Array.isArray(user.notes) ? user.notes : []).map((n) => neutralizeMemoryMarkers(String(n)));
       }
       return file;
     } catch {
@@ -173,7 +183,8 @@ export class MemoryStore {
   }
 
   getFact(userId: string, key: string): string | undefined {
-    return this.data.users[userId]?.facts[key];
+    // 与 setFact/deleteFact 同一归一化：含标记字符/超长/带空白的原 key「写得进也查得到」
+    return this.data.users[userId]?.facts[normalizeFactKey(key)];
   }
 
   getFacts(userId: string): Record<string, string> {

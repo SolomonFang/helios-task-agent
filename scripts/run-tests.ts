@@ -29,7 +29,11 @@ const tsxCli = require.resolve('tsx/cli');
 
 const failed: string[] = [];
 for (const suite of SUITES) {
-  const r = spawnSync(process.execPath, [tsxCli, path.join(__dirname, `${suite}.ts`)], { stdio: 'inherit' });
+  // 单套件挂死（如 mock server 永不退出）时兜底杀掉并计失败，避免 npm test 永久卡住
+  const r = spawnSync(process.execPath, [tsxCli, path.join(__dirname, `${suite}.ts`)], {
+    stdio: 'inherit',
+    timeout: 10 * 60_000,
+  });
   if (r.status !== 0) failed.push(suite);
 }
 

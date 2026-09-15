@@ -17,7 +17,7 @@ import { SessionHistoryStore } from '../src/agent/session-store';
 import { AgentSession } from '../src/agent/session';
 import { SessionRouter } from '../src/agent/session-router';
 import { MemoryStore } from '../src/agent/memory';
-import { check, checkAsync, finish } from './testkit';
+import { check, checkAsync, finish, modeOk } from './testkit';
 import type { AgentConfig, ChatMessage } from '../src/types';
 
 const cfg: AgentConfig = {
@@ -111,9 +111,9 @@ async function main(): Promise<void> {
       assert.equal(restored[0]!.content, '你好');
       // 0600 权限
       const file = path.join(tmp, 'sessions', 'ou_abc.json');
-      assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+      assert.ok(modeOk(file, 0o600));
       // 目录 0700 权限
-      assert.equal(fs.statSync(path.join(tmp, 'sessions')).mode & 0o777, 0o700);
+      assert.ok(modeOk(path.join(tmp, 'sessions'), 0o700));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

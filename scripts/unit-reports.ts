@@ -1,14 +1,15 @@
 /**
  * 按需报告单测（个人工作日报 daily_report + 迭代复盘 iteration_retro）：
- * 1. 日期解析（今天/昨天/YYYY-MM-DD/非法值）与日界边界（恰好 00:00 计入、次日 00:00 不计入）
- * 2. collectDailyData 采集：日界过滤、进行中不受日期限制、失败/待审阅当日口径、diff 汇总与无数据 null
+ * 1. 日期解析（今天/昨天/YYYY-MM-DD/非法值/未来日期拒绝）与日界边界（恰好 00:00 计入、次日 00:00 不计入）
+ * 2. collectDailyData 采集：日界过滤、进行中不受日期限制、失败/待审阅当日口径、diff 汇总与无数据 null、
+ *    diff 链接与统计同一 attempt（无统计回退最新 attempt 链接）
  * 3. 无数据时的诚实文案（空看板 / 无 diff 数据均不编造）
  * 4. classifyFailure 规则命中、首中优先与未命中归「其他」
  * 5. buildRetroModel：完成率、本周完成周界（恰好周一 00:00 计入）、失败归类、截断标记
  * 6. HTML 生成与 token 文件名、链接可达性提示
  * 7. 工具注册（handlers/openAiTools/LOCAL_TOOL_SUMMARY）与两个 handler 全链路（loopback mock 看板）
- * 8. diffUrl scheme 校验（javascript: 等按无链接处理）、日报截断注记与入口一致、
- *    bot 无链接基地址时省略本机路径、日报页本地时区口径注记
+ * 8. diffUrl scheme 校验（javascript: 等按无链接处理）与 href 归一化、日报截断注记与入口一致、
+ *    bot 无链接基地址时省略本机路径、日报页本地时区口径注记、review 行内 code span 优先于 bold
  * 仅用 loopback mock 服务，离线可跑。Run: npx tsx scripts/unit-reports.ts
  */
 
@@ -28,8 +29,10 @@ import {
 } from '../src/kanban/summary';
 import { renderHtml, renderMarkdown } from '../src/report/report';
 import { safeHttpUrl } from '../src/report/report-utils';
+import { renderReviewMarkdown } from '../src/report/review-report';
 import {
   buildDailyMaterial,
+  isFutureReportDate,
   partitionDaily,
   renderDailyHtml,
   resolveReportDate,
@@ -129,6 +132,26 @@ async function run(): Promise<void> {
       resolveReportDate('2026-02-31') === null &&
       resolveReportDate('2026-13-01') === null &&
       resolveReportDate('大后天') === null
+    );
+  })());
+
+  check('resolveReportDate：未来日期拒绝（不生成「未来日报」），显式今天仍放行', (() => {
+    const fixed = new Date(2026, 8, 4, 15, 30); // 2026-09-04
+    return (
+      resolveReportDate('2026-09-04', fixed) === '2026-09-04' &&
+      resolveReportDate('2026-09-05', fixed) === null &&
+      resolveReportDate('2027-01-01', fixed) === null
+    );
+  })());
+
+  check('isFutureReportDate：仅「格式合法且尚未到来」为真（区分格式错误）', (() => {
+    const fixed = new Date(2026, 8, 4, 15, 30); // 2026-09-04
+    return (
+      isFutureReportDate('2026-09-05', fixed) === true &&
+      isFutureReportDate('2026-09-04', fixed) === false &&
+      isFutureReportDate('2026-09-01', fixed) === false &&
+      isFutureReportDate('2026-13-01', fixed) === false &&
+      isFutureReportDate('大后天', fixed) === false
     );
   })());
 
@@ -238,6 +261,40 @@ async function run(): Promise<void> {
       assert.ok(material.includes('看板未提供当日任务的改动数据'), `无 diff 时应如实说明：${material}`);
     } finally {
       await stopServer(kanban.server);
+    }
+  });
+
+  await checkAsync('采集 enrich：diff 链接与 diff 统计指向同一 attempt，无统计时回退最新 attempt 链接', async () => {
+    const attempts = [
+      { id: 'att-old', created_at: '2026-01-01' },
+      { id: 'att-new', created_at: '2026-01-02' },
+    ];
+    // 只有旧 attempt 有统计：统计与链接都落 att-old（不拼「旧统计 + 最新链接」）
+    const kanban = await startMockKanban({
+      tasks: [{ id: 't1', title: '有统计', status: 'done', updated_at: at(y, m, d, 9) }],
+      attemptStats: [{ workspace_id: 'att-old', files_changed: 2, additions: 5, deletions: 1 }],
+      taskAttempts: { t1: attempts },
+    });
+    try {
+      const data = await collectDailyData({ kanbanUrl: kanban.url, date: todayStr });
+      const t = data.tasks[0]!;
+      assert.equal(t.filesChanged, 2);
+      assert.ok(t.diffUrl.includes('/attempts/att-old'), `链接应与统计同一 attempt：${t.diffUrl}`);
+    } finally {
+      await stopServer(kanban.server);
+    }
+    // 全无统计：链接回退最新 attempt 的 diff 视图
+    const kanban2 = await startMockKanban({
+      tasks: [{ id: 't1', title: '无统计', status: 'done', updated_at: at(y, m, d, 9) }],
+      taskAttempts: { t1: attempts },
+    });
+    try {
+      const data = await collectDailyData({ kanbanUrl: kanban2.url, date: todayStr });
+      const t = data.tasks[0]!;
+      assert.equal(t.filesChanged, undefined);
+      assert.ok(t.diffUrl.includes('/attempts/att-new'), `无统计时应回退最新 attempt 链接：${t.diffUrl}`);
+    } finally {
+      await stopServer(kanban2.server);
     }
   });
 
@@ -366,6 +423,14 @@ async function run(): Promise<void> {
     const truncated = buildRetroModel({ ...data, totals: { ...data.totals, done: 40 } }, retroNow);
     assert.equal(truncated.truncated, true);
     assert.ok(buildRetroSummary(truncated, {}).includes('样本口径'), '截断时摘要应注明样本口径');
+    assert.ok(
+      buildRetroSummary(truncated, {}).includes('本周完成为全量口径'),
+      '截断注记应如实说明「本周完成」为全量口径（不再与失败归类并列样本口径）',
+    );
+
+    // totals.doneThisWeek（采集侧截断前全量）优先于样本计数，与周报同一口径
+    const withTotals = buildRetroModel({ ...data, totals: { ...data.totals, doneThisWeek: 9 } }, retroNow);
+    assert.equal(withTotals.doneThisWeek, 9, 'totals.doneThisWeek 存在时应优先全量口径，不数截断样本');
   });
 
   // ================= 6. HTML 生成与 token 文件名 =================
@@ -580,6 +645,18 @@ async function run(): Promise<void> {
       safeHttpUrl('') === undefined &&
       safeHttpUrl(undefined) === undefined
     );
+  })());
+
+  check('safeHttpUrl：返回归一化 href，裸 > 百分号转义（不破坏 MD 角括号链接）', (() => {
+    return (
+      safeHttpUrl('http://kanban.example.com/a>b') === 'http://kanban.example.com/a%3Eb' &&
+      safeHttpUrl('http://kanban.example.com/中文') === 'http://kanban.example.com/%E4%B8%AD%E6%96%87'
+    );
+  })());
+
+  check('renderReviewMarkdown：反引号内的 ** 不被加粗（code span 优先于 bold）', (() => {
+    const html = renderReviewMarkdown('看 `a **b** c` 与 **重点**');
+    return html.includes('<code>a **b** c</code>') && html.includes('<strong>重点</strong>');
   })());
 
   check('diffUrl 伪协议不进报告：日报/复盘/工作总结 HTML 与 MD 均按无链接处理', (() => {

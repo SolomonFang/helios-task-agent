@@ -11,6 +11,7 @@ import path from 'path';
 import { defaultDataHome, SKILLS_DIR } from '../infra/paths';
 import { ensurePrivateDirSync } from '../infra/private-file';
 import { errMessage } from '../infra/err';
+import { neutralizeMarkers, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from './guard';
 
 /** 用户自定义技能目录：数据目录下 skills/（升级 npm 包不会抹掉，也无安装目录写权限问题）。 */
 export function userSkillsDir(): string {
@@ -220,8 +221,10 @@ export function renderSkillsBlock(): string {
   const renderEntry = (s: SkillDigest, withDigest: boolean): string =>
     [
       `## 技能：${s.name}`,
-      s.description,
-      withDigest ? s.digest : '',
+      // 技能可来自 /skills install 的任意本地路径：注入系统提示词（可信区）前中和伪造的
+      // UNTRUSTED 标记（同 memory 写入前的中和思路），防伪造开/闭标记扰乱边界语义
+      neutralizeMarkers(s.description, [UNTRUSTED_OPEN, UNTRUSTED_CLOSE]),
+      withDigest ? neutralizeMarkers(s.digest, [UNTRUSTED_OPEN, UNTRUSTED_CLOSE]) : '',
       `完整文档：\`${s.dir}/SKILL.md\`（用 skill_doc 读取）`,
     ]
       .filter(Boolean)

@@ -88,8 +88,13 @@ export function createRoundNoticeTracker(): RoundNoticeTracker {
   };
 }
 
-/** 表情回执永久性错误判定：权限/能力缺失类错误重试不会自愈，降级禁用；其余（限流/网络抖动）视为瞬时，下条消息再试。 */
-const REACTION_PERMANENT_RE = /permission|权限|not.?support|不支持|forbidden|invalid.?emoji/i;
+/**
+ * 表情回执永久性错误码（err.code，见 FeishuApiError）：缺权限/授权方式错误类重试不会自愈，降级禁用；
+ * 其余（限流/网络抖动/消息被撤回等单条问题）视为瞬时，下条消息再试。
+ * 99991668=应用未开通该 API 所需权限 scope；99991672=无接口数据权限；
+ * 231002/231008=操作者无权对该消息添加表情回复/无访问权限；231013=授权方式不合法。
+ */
+const REACTION_PERMANENT_CODES = new Set([99991668, 99991672, 231002, 231008, 231013]);
 
 /** 飞书长连接状态英文枚举 → 中文（/status 展示）；未列入的未知值回退原文。 */
 const WS_STATE_LABEL: Record<string, string> = {
@@ -329,7 +334,13 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         const excerpt = text.length > 3000 ? `${text.slice(0, 3000)}\n…（结果过长已截断）` : text;
         await channel
           .notifyOpenId(openId, `🔍 AI 失败诊断：《${title}》\n${excerpt}\n\n要按诊断结论重试，回复「重试这个任务」。`)
-          .catch((e) => console.error(`[diagnosis] 降级文本推送也失败: ${errMessage(e)}`));
+          .catch((e) => {
+            // 降级文本也失败：结果未送达，摘除去重键允许重新诊断——否则用户再点「AI 诊断」
+            // 会被谎指「已诊断过，结果见上方消息」，而上方什么都没有
+            diagnosedKeys.delete(`${taskId}:${realAttemptId}`);
+            diagnosedKeys.delete(dedupeKey);
+            console.error(`[diagnosis] 降级文本推送也失败: ${errMessage(e)}`);
+          });
       }
       // 注入会话：用户追问「按诊断结论修一下」时 agent 有上下文
       try {
@@ -428,7 +439,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       return;
     }
     if (!value.hta_confirm) return;
-    const result = confirmations.resolveFromCard(openId, String(value.hta_confirm), String(value.decision || ''));
+    const confirmId = String(value.hta_confirm);
+    const result = confirmations.resolveFromCard(openId, confirmId, String(value.decision || ''));
     // 卡片裁决落地后同样复位短应答提醒：下一份确认可再提醒一次
     if (result !== 'ignored') confirmShortReplyReminded.delete(openId);
     if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
@@ -438,7 +450,20 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         .notifyOpenId(openId, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`)
         .catch(() => {});
     else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
-    else void channel.notifyOpenId(openId, '该确认已处理或已过期，无需重复操作。').catch(() => {});
+    else {
+      // 区分「这不是你的确认」与「确认已处理或已过期」：多白名单用户场景下 B 点 A 的卡片，
+      // resolveFromCard 按 B 查不到 pending 返回 'ignored'，不能谎称已处理（防御性只读窥视，同 pendingConfirmForm）
+      const pendings = (confirmations as unknown as { pendings?: Map<string, { id?: string }> }).pendings;
+      const foreignPending = [...(pendings?.values() ?? [])].some((p) => p.id === confirmId);
+      void channel
+        .notifyOpenId(
+          openId,
+          foreignPending
+            ? '这是其他用户发起的写操作确认，只有发起人可以裁决，请等待对方处理。'
+            : '该确认已处理或已过期，无需重复操作。',
+        )
+        .catch(() => {});
+    }
   };
 
   /** /stop：中断当前轮次与 AI 审查、取消写操作闸门、丢弃排队消息并兜底清理其敲键盘表情。 */
@@ -495,8 +520,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const session = router.getOrCreate(msg.senderId);
     // /confirm on 是历史别名；语义化写法 /confirm revoke。
     // 必须对完整 text 判定：parseCommand 只取第一个空白分词（恒为 '/confirm'），
-    // 用 cmd === '/confirm revoke' 判的话该分支永不可达，撤销会静默失效（安全语义 bug）
-    const lower = text.trim().toLowerCase();
+    // 用 cmd === '/confirm revoke' 判的话该分支永不可达，撤销会静默失效（安全语义 bug）。
+    // 比较前折叠连续空白：多敲空格/Tab 落入查询分支会静默不撤销
+    const lower = text.trim().toLowerCase().replace(/\s+/g, ' ');
     if (text === '恢复确认' || lower === '/confirm revoke' || lower === '/confirm on') {
       const n = session.revokeBatchApprovals();
       await channel.reply(
@@ -662,9 +688,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         }
       } catch (err) {
         const message = errMessage(err);
-        if (REACTION_PERMANENT_RE.test(message)) {
+        const code = (err as { code?: unknown }).code;
+        if (typeof code === 'number' && REACTION_PERMANENT_CODES.has(code)) {
           reactionUnsupported = true;
-          console.warn(`[feishu] 敲键盘表情回执不可用，已降级为仅占位消息: ${message}`);
+          console.warn(`[feishu] 敲键盘表情回执不可用（错误码 ${code}），已降级为仅占位消息: ${message}`);
         } else {
           console.warn(`[feishu] 敲键盘表情回执失败（瞬时错误，下条消息重试）: ${message}`);
         }
@@ -1015,8 +1042,19 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
 
     // post 富文本里的配图只被展平为「[图片]」占位、并未读取（vision 开启时单独发图才可读）
-    if (cfg.visionEnabled && fmsg.messageType === 'post' && text.includes('[图片]')) {
-      await channel.reply(msg, '（消息中的图片未读取，请单独发送图片）');
+    if (fmsg.messageType === 'post' && text.includes('[图片]')) {
+      // vision 关闭时图片不可读：展平后只剩占位的消息直接拒答，
+      // 否则「[图片]」字面量会被当对话内容送给模型，得到莫名其妙的回答
+      if (!cfg.visionEnabled && /^(\[图片\]\s*)+$/.test(text)) {
+        await channel.reply(
+          msg,
+          '这条消息只有图片，当前配置无法读取图片：请把图片里的关键信息打字或粘贴成文字发给我。',
+        );
+        return;
+      }
+      if (cfg.visionEnabled) {
+        await channel.reply(msg, '（消息中的图片未读取，请单独发送图片）');
+      }
     }
 
     // 写操作确认应答优先处理：闸门在等答复，若进串行队列会死锁

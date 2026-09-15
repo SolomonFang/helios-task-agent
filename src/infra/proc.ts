@@ -12,6 +12,7 @@
  * - 命令不存在 → error.code === 'ENOENT'，stdout 为空；
  * - 非零退出 → error.code 为退出码（数字），stdout/stderr 照常带回；
  * - timeout 触发 → error.killed === true、error.signal === 'SIGTERM'（调用方据此判超时）；
+ * - maxBuffer 超限 → 同置 killed 模拟原生，另加 error.bufferExceeded 标记超出的流（与超时区分）；
  * - AbortSignal 触发 → 杀子进程并回调 AbortError（调用方自行查 signal.aborted）。
  */
 
@@ -23,6 +24,8 @@ export interface ExecFileCompatError extends Error {
   code?: string | number | null;
   killed?: boolean;
   signal?: NodeJS.Signals | null;
+  /** maxBuffer 超限中止时标记超出的流：此路径也置 killed=true 模拟原生，调用方须先查本字段再判超时。 */
+  bufferExceeded?: 'stdout' | 'stderr';
   stdout?: string;
   stderr?: string;
 }
@@ -140,6 +143,7 @@ export function execFileCompat(
       const err = new Error(`${bufferExceeded} maxBuffer length exceeded`) as ExecFileCompatError;
       err.killed = true;
       err.signal = signal ?? killSignal;
+      err.bufferExceeded = bufferExceeded;
       done(err);
       return;
     }

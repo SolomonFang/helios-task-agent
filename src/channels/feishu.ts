@@ -63,6 +63,20 @@ export class ImageTooLargeError extends Error {
   }
 }
 
+/**
+ * 飞书接口业务错误（res.code !== 0）：抛给上层（会原样拼进用户消息）的文案不含内部细节；
+ * 原始 code 挂在 err.code 上，供上层做错误分级（如表情回执的永久/瞬时判定）。
+ */
+export class FeishuApiError extends Error {
+  constructor(
+    action: string,
+    public readonly code: number | undefined,
+  ) {
+    super(`飞书接口拒绝了${action}请求，请稍后重试`);
+    this.name = 'FeishuApiError';
+  }
+}
+
 /** 机器人 open_id 获取失败后的重试冷却：避免一次网络抖动导致群 @ 回执永久降级到重启。 */
 const BOT_OPENID_RETRY_MS = 10 * 60 * 1000;
 
@@ -253,6 +267,12 @@ export function splitText(text: string, limit = 3000): string[] {
     let cut = rest.lastIndexOf('\n\n', limit);
     if (cut < limit * 0.5) cut = rest.lastIndexOf('\n', limit);
     if (cut < limit * 0.5) cut = limit;
+    // 按 UTF-16 code unit 硬切时边界可能落在 emoji 代理对中间（JSON 化后渲染为 U+FFFD）：
+    // 尾部落单高代理则回退一个 code unit（cut>1 保底：回退到 0 会空转死循环）
+    if (cut > 1 && cut < rest.length) {
+      const tail = rest.charCodeAt(cut - 1);
+      if (tail >= 0xd800 && tail <= 0xdbff) cut--;
+    }
     chunks.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n+/, '');
   }
@@ -546,10 +566,10 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
-  /** 飞书接口返回非 0：code/msg 详情落日志，抛给上层（会原样拼进用户消息）的是不含内部细节的自救文案。 */
+  /** 飞书接口返回非 0：code/msg 详情落日志，抛给上层的是不含内部细节的自救文案（code 附在 err.code）。 */
   private apiError(action: string, res: { code?: number; msg?: string }): Error {
     console.error(`[feishu] ${action}失败: code=${res.code} msg=${res.msg}`);
-    return new Error(`飞书接口拒绝了${action}请求，请稍后重试`);
+    return new FeishuApiError(action, res.code);
   }
 
   private async createMessage(receiveIdType: 'chat_id' | 'open_id', receiveId: string, text: string): Promise<string | undefined> {

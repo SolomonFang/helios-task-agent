@@ -65,10 +65,15 @@ class FakeChannel implements ChannelUnderTest {
   addReactionCalls = 0;
   /** 模拟表情回执失败（addReaction 抛错）。 */
   failReactions = false;
-  /** 失败时的错误文案：权限类（永久性）或网络类（瞬时）。 */
-  reactionError = 'no reaction permission';
+  /**
+   * 失败时的错误码：与真实通道同形——统一中文自救文案 + err.code（FeishuApiError）。
+   * 真实通道永远产生不了原始英文错误，注入英文文案会给永久性判定虚假信心。
+   */
+  reactionErrorCode: number | undefined = undefined;
   /** 模拟卡片推送失败（notifyCardOpenId 抛错）。 */
   failCard = false;
+  /** 模拟 notifyOpenId 按内容选择性失败（命中子串即抛错）。 */
+  failNotifyIfIncludes: string | null = null;
   /** 模拟 sendText / updateText 按内容选择性失败（命中子串即抛错，占位/进度文案不受影响）。 */
   failSendIfIncludes: string | null = null;
   failUpdateIfIncludes: string | null = null;
@@ -92,7 +97,11 @@ class FakeChannel implements ChannelUnderTest {
   }
   async addReaction(messageId: string, _emojiType: string): Promise<string | undefined> {
     this.addReactionCalls++;
-    if (this.failReactions) throw new Error(this.reactionError);
+    if (this.failReactions) {
+      const err = new Error('飞书接口拒绝了表情回复请求，请稍后重试') as Error & { code?: number };
+      err.code = this.reactionErrorCode;
+      throw err;
+    }
     this.addedReactions.push(messageId);
     return `r-${++this.reactionSeq}`;
   }
@@ -100,6 +109,7 @@ class FakeChannel implements ChannelUnderTest {
     this.removedReactions.push(messageId);
   }
   async notifyOpenId(openId: string, text: string): Promise<void> {
+    if (this.failNotifyIfIncludes && text.includes(this.failNotifyIfIncludes)) throw new Error('notify mock failure');
     this.notifies.push({ openId, text });
   }
   async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<string | undefined> {
@@ -448,6 +458,24 @@ async function main(): Promise<void> {
       cleanup(f2);
     });
 
+    // ---------- vision 关闭：纯图片 post 展平后只剩占位，直接拒答（不把「[图片]」字面量送模型） ----------
+    await checkAsync('handler：vision 关闭时纯图片 post 直接拒答，含文字的 post 照常处理', async () => {
+      const f = setup(llm.baseUrl);
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '[图片]', { messageType: 'post' }));
+      await f.handlers.handle(mkMsg('u1', '[图片] [图片]', { messageType: 'post' }));
+      assert.equal(
+        f.channel.replies.filter((r) => r.text.includes('这条消息只有图片')).length,
+        2,
+        `纯占位 post 应直接拒答，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      assert.equal(llm.requestCount, base, '纯占位消息不得发 LLM 请求');
+      // 有文字内容的 post 仍照常处理
+      await f.handlers.handle(mkMsg('u1', '看下这张图 [图片] 说了什么', { messageType: 'post' }));
+      await waitFor(() => llm.requestCount === base + 1, '含文字的 post 进入 LLM');
+      cleanup(f);
+    });
+
     // ---------- 消息长度上限：超限直接拒答，不排队不送 LLM ----------
     await checkAsync('handler：超长消息直接拒答，不进入队列与 LLM', async () => {
       const f = setup(llm.baseUrl);
@@ -766,10 +794,11 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
-    // ---------- typing 回执失败降级：不再重试，消息照常处理 ----------
+    // ---------- typing 回执失败降级：永久性错误码不再重试，消息照常处理 ----------
     await checkAsync('handler：敲键盘表情不可用时降级为静默，不再重试', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failReactions = true;
+      f.channel.reactionErrorCode = 231002; // 操作者无权对该消息添加表情回复（永久性）
       await f.handlers.handle(mkMsg('u1', '/clear'));
       await f.handlers.handle(mkMsg('u1', '/clear'));
       assert.equal(f.channel.addReactionCalls, 1, '首次失败后不应再尝试加表情');
@@ -785,11 +814,11 @@ async function main(): Promise<void> {
     await checkAsync('handler：敲键盘表情瞬时错误（限流/网络）下条消息重试', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failReactions = true;
-      f.channel.reactionError = '飞书接口拒绝了表情回复请求，请稍后重试';
+      f.channel.reactionErrorCode = 99991400; // 限流（瞬时）：不得永久禁用
       await f.handlers.handle(mkMsg('u1', '/clear'));
       await f.handlers.handle(mkMsg('u1', '/clear'));
       assert.equal(f.channel.addReactionCalls, 2, '瞬时错误后下条消息应重试加表情');
-      f.channel.reactionError = 'no reaction permission'; // 永久性错误：此后禁用
+      f.channel.reactionErrorCode = 99991668; // 应用未开通 API 权限 scope（永久性）：此后禁用
       await f.handlers.handle(mkMsg('u1', '/clear'));
       await f.handlers.handle(mkMsg('u1', '/clear'));
       assert.equal(f.channel.addReactionCalls, 3, '永久性错误后不再重试');
@@ -959,6 +988,38 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- 失败诊断：卡片与降级文本都推送失败时摘去重键，不谎指「结果见上方消息」 ----------
+    await checkAsync('handler：诊断双路推送都失败时摘去重键，可重新诊断', async () => {
+      let calls = 0;
+      const f = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => {
+          calls++;
+          return { text: '诊断结论：配置缺失', attemptId: 'att-1' };
+        },
+      });
+      f.channel.failCard = true; // 卡片推送失败
+      f.channel.failNotifyIfIncludes = 'AI 失败诊断'; // 降级文本也失败（「已开始」/去重回执不受影响）
+      const origErr = console.error;
+      const errLogs: string[] = [];
+      console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
+      try {
+        const click = () =>
+          f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+        click();
+        await waitFor(() => errLogs.some((m) => m.includes('降级文本推送也失败')), '双路推送均失败');
+        assert.equal(calls, 1);
+        click(); // 去重键已摘：不得谎称「已诊断过」，应可重新诊断
+        await waitFor(() => calls === 2, '双路失败后可重新诊断');
+        assert.ok(
+          !f.channel.notifies.some((n) => n.text.includes('已诊断过')),
+          '结果未送达不得谎指「结果见上方消息」',
+        );
+        cleanup(f);
+      } finally {
+        console.error = origErr;
+      }
+    });
+
     // ---------- 诊断重试：连点竞态只发起一次（落键先于首个 await） ----------
     await checkAsync('handler：诊断重试连点竞态只发起一次', async () => {
       let followUps = 0;
@@ -1040,6 +1101,25 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- 卡片回调：非确认属主点别人的确认卡片，提示「不是你的确认」而非谎称已处理 ----------
+    await checkAsync('handler：非确认属主点确认卡片提示只有发起人可裁决，确认本身不受影响', async () => {
+      const f = setup(llm.baseUrl);
+      const req: ConfirmRequest = { kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' };
+      const verdict = f.confirmations.request('u1', req);
+      await waitFor(() => f.confirmPrompts.length === 1, '确认卡片已发出');
+      const id = f.confirmPrompts[0]!.id;
+      // u2（白名单另一用户）点 u1 的确认卡片：按 u2 查不到 pending，但确认并未过期
+      f.handlers.onCardAction({ operator: { open_id: 'u2' }, action: { value: { hta_confirm: id, decision: 'yes' } } });
+      await waitFor(() => f.channel.notifies.length === 1, '非属主点击回执');
+      const notice = f.channel.notifies.at(-1)!.text;
+      assert.ok(notice.includes('其他用户发起的写操作确认'), `应提示只有发起人可裁决，实际：${notice}`);
+      assert.ok(!notice.includes('已处理或已过期'), '不得谎称已处理或已过期');
+      // u1 的确认不受影响，仍可正常裁决
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_confirm: id, decision: 'yes' } } });
+      assert.equal(await verdict, 'once');
+      cleanup(f);
+    });
+
     // ---------- /confirm revoke：完整文本判定（parseCommand 只取首分词，cmd 恒为 '/confirm'） ----------
     await checkAsync('handler：/confirm revoke 真正撤销「同类免问」（而非只打印状态）', async () => {
       const f = setup(llm.baseUrl);
@@ -1054,6 +1134,23 @@ async function main(): Promise<void> {
       await f.handlers.handle(mkMsg('u1', '/confirm revoke'));
       const reply = f.channel.replies.at(-1)!.text;
       assert.ok(reply.includes('已恢复逐次确认') && reply.includes('撤销 1 项免问授权'), `应撤销 1 项免问授权，实际：${reply}`);
+      assert.equal(session.activeBatchApprovals(), 0, '免问授权应已被撤销');
+      cleanup(f);
+    });
+
+    // ---------- /confirm revoke：多余空白（多敲空格/Tab）同样撤销，不静默落入查询分支 ----------
+    await checkAsync('handler：/confirm  revoke（多余空白）也真正撤销「同类免问」', async () => {
+      const f = setup(llm.baseUrl);
+      const session = f.router.getOrCreate('u1') as unknown as {
+        batchedConfirm?: ReturnType<typeof withBatchApproval>;
+        activeBatchApprovals(): number;
+      };
+      session.batchedConfirm = withBatchApproval(async () => 'batch');
+      await session.batchedConfirm({ kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' });
+      assert.equal(session.activeBatchApprovals(), 1);
+      await f.handlers.handle(mkMsg('u1', '/confirm  \trevoke'));
+      const reply = f.channel.replies.at(-1)!.text;
+      assert.ok(reply.includes('已恢复逐次确认'), `多余空白也应撤销，实际：${reply}`);
       assert.equal(session.activeBatchApprovals(), 0, '免问授权应已被撤销');
       cleanup(f);
     });

@@ -284,6 +284,22 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- '..'-开头的合法文件名不误判越界 ----------
+  await checkAsync('resolveUnderRoot：仓库内名为 ..dots 的合法文件不误判越界，../ 仍拒绝', async () => {
+    const root = tmpRepo('dotdot');
+    try {
+      fs.writeFileSync(path.join(root, '..dots'), 'dotfile-content\n');
+      const out = await repoFsRead(root, '..dots');
+      assert.ok(out.includes('dotfile-content'), out);
+      assert.ok(!out.includes('路径越界'), out);
+      assert.ok((await repoFsList(root, '.')).includes('..dots'));
+      assert.ok((await repoFsGrep(root, 'dotfile', '..dots')).includes('..dots:1:'), 'grep 直接以 ..dots 为目标应放行');
+      assert.ok((await repoFsRead(root, '../outside')).includes('路径越界'), '../ 越界仍应拒绝');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   finish();
 }
 

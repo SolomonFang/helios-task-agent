@@ -179,6 +179,9 @@ export async function ensureKanbanRunning(
       return { started: true, child, url };
     }
     if (child.exitCode !== null) {
+      // 壳已退出但孙进程可能还在进程组里（见 stopKanbanChild 注释）：抛错前按树杀，
+      // 否则健康检查未过就离开会把孙进程留成孤儿，稍后可能变健康占用端口
+      await stopKanbanChild(child);
       // macOS 上 spawn ENOENT 可能不走 'error' 事件，而以 libuv 负 errno（-2）作为退出码落地：
       // 与上方 spawnErr 分支同一语义（npx 不可用），不能误报成「端口被占用」
       if (child.exitCode === -2) {

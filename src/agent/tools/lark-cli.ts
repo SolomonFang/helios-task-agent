@@ -18,6 +18,41 @@ const LARK_ACTION_LABELS: Record<string, string> = {
   'calendar delete': '删除日程',
 };
 
+/**
+ * lark-cli 带值 flag（各命令 --help 中标注 string/int/strings 的形态；布尔开关如 --dry-run/--json 不在内）。
+ * 无法穷举：未命中的 flag 一律按「无法可靠解析」fail-closed（见 larkTargetArg）。
+ */
+const LARK_VALUE_FLAGS = new Set([
+  '--as', '--format', '--jq', '-q', '--params', '--data', '--output', '-o', '--output-dir', '--profile',
+  '--page-size', '--page-token', '--page-limit', '--page-delay',
+  '--msg-type', '--content', '--text', '--markdown', '--image', '--file', '--video', '--video-cover', '--audio',
+  '--chat-id', '--user-id', '--message-id', '--idempotency-key',
+  '--query', '--start', '--end', '--start-time', '--end-time',
+  '--doc', '--doc-format', '--api-version', '--command', '--lang', '--keyword', '--detail', '--scope',
+  '--domain', '--exclude', '--device-code',
+  '--member-id', '--member-type', '--member-role', '--space-id', '--calendar-id', '--file-token', '--version',
+]);
+
+/**
+ * 「同类免问」key 的对象实参解析：跳过带值 flag 及其值（--flag value 成对、--flag=value 占一位），
+ * 取命令路径后第一个位置实参（接收对象/资源 id）。遇到未知 flag 时无法判断它带不带值，
+ * 继续解析可能把 flag 值误绑成对象（授权放大）——fail-closed 返回 undefined，
+ * 调用方退化为类级 key（batchScope 同步降为 'kind'）。
+ */
+function larkTargetArg(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (!a.startsWith('-')) return a;
+    if (a.includes('=')) continue;
+    if (LARK_VALUE_FLAGS.has(a)) {
+      i++; // 带值 flag：值占下一位，成对跳过
+      continue;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 /** lark_cli handler：写操作过确认闸门，读操作留审计（不记读回内容）。 */
 export function makeLarkCliHandler({
   uid,
@@ -40,12 +75,13 @@ export function makeLarkCliHandler({
       // 与看板通道 summarizeMcp 的 fallback 口径一致，不透传英文子命令原文）
       const summary = action ?? '飞书写操作';
       const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
-      // 「同类免问」按命令路径 + 对象归类（如 lark:im send:ou_x）：子命令后第一个非 flag 实参
-      // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；无该实参时退化为命令路径，
+      // 「同类免问」按命令路径 + 对象归类（如 lark:im send:ou_x）：子命令后第一个位置实参
+      // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；带值 flag 成对跳过，
+      // 解析不可靠（未知 flag 排在对象前）或无该实参时退化为命令路径，
       // 粒度同步降为类级（batchScope 须与 key 的实际粒度一致，卡片文案才不失实）。
       // 飞书写整体按破坏性对待（超时放宽）
       const sub = argv[1] && !argv[1].startsWith('-') ? ` ${argv[1]}` : '';
-      const target = argv.slice(sub ? 2 : 1).find((a) => !a.startsWith('-'));
+      const target = larkTargetArg(argv.slice(sub ? 2 : 1));
       const batchKey = target ? `lark:${argv[0]}${sub}:${target}` : `lark:${argv[0]}${sub}`;
       const gate = await passGate(
         // 对象级免问：key 绑接收对象/资源 id，批准发给 ou_x 不授权发给 ou_y；无对象则类级

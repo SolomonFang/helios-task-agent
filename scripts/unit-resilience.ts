@@ -382,6 +382,48 @@ async function main(): Promise<void> {
     }
   });
 
+  await checkAsync('KanbanWatcher：pending 非空但内容不变的空转 tick 不重复写 state 文件', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-rewrite-'));
+    const kanbanState = { taskStatus: 'inprogress' };
+    const { server, base } = await startMockKanban(kanbanState);
+    const statePath = path.join(tmp, 'watch-state.json');
+    try {
+      let attempts = 0;
+      let o1Down = true;
+      const watcher = new KanbanWatcher({
+        kanbanUrl: base,
+        projectId: 'p1',
+        statePath,
+        notify: async () => undefined,
+        owners: () => ['o1'],
+        notifyOwner: async () => {
+          attempts++;
+          if (o1Down) throw new Error('o1 unreachable'); // 持续不可达：pending 非空且内容不变
+        },
+      });
+      const tick = tickOf(watcher);
+      await tick(); // 基线
+      kanbanState.taskStatus = 'done';
+      await tick(); // 推送失败 → pending 落盘
+      assert.equal(attempts, 1);
+      const written = fs.statSync(statePath);
+      await tick(); // 重投仍失败、pending 内容一字节没变：不得重写 state 文件
+      await tick();
+      assert.equal(attempts, 3);
+      const after = fs.statSync(statePath);
+      assert.equal(after.ino, written.ino, '内容不变的空转 tick 不得重写 state 文件（原子写会换 inode）');
+      // pending 内容变化（送达成功出队）仍要落盘：回归保护，不能为了省写把出队丢掉
+      o1Down = false;
+      await tick();
+      assert.notEqual(fs.statSync(statePath).ino, after.ino, 'pending 出队属于内容变化，必须落盘');
+      const onDisk = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { pending?: unknown };
+      assert.equal(onDisk.pending, undefined);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('KanbanWatcher：旧格式 pending（无 enqueuedAt）兼容加载并继续重投', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-res-watch-old-'));
     const kanbanState = { taskStatus: 'done' }; // 与手工 state 快照一致：不再 diff 出新事件

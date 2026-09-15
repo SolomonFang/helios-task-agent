@@ -1,5 +1,6 @@
 // Unit tests: kanban 进程清理、拉起轮询竞态、http 层错误分类、ai-review 返回体校验与 hk start 分支补全、
-// 依赖探测/ocr 探测最小环境、combinedSignal 监听器释放、MCP connect settled 护栏、workspace-ready 瞬时错误分类。
+// 依赖探测/ocr 探测最小环境、combinedSignal 监听器释放、MCP connect settled 护栏、callTool isError 转抛错、
+// workspace-ready 瞬时错误分类。
 // 真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
 
 import assert from 'node:assert/strict';
@@ -560,7 +561,11 @@ process.stdin.on('data', (c) => {
     const respond = () => {
       const result = msg.method === 'initialize'
         ? { protocolVersion: msg.params.protocolVersion, capabilities: {}, serverInfo: { name: 'fake', version: '0' } }
-        : { tools: [] };
+        : msg.method === 'tools/call'
+          ? (msg.params && msg.params.arguments && msg.params.arguments.fail
+              ? { content: [{ type: 'text', text: 'simulated tool failure: boom' }], isError: true }
+              : { content: [{ type: 'text', text: 'tool ok' }, { type: 'text', text: 'second part' }] })
+          : { tools: [] };
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');
     };
     if (delay) setTimeout(respond, delay);
@@ -596,6 +601,23 @@ process.stdin.on('data', (c) => {
       await assert.rejects(mcp.connect({ timeoutMs: 300 }), '应在超时内抛错');
       assert.ok(Date.now() - started < 3000, `超时应及时返回，实际耗时 ${Date.now() - started}ms`);
       assert.equal(mcp.connected, false);
+    } finally {
+      await mcp.close().catch(() => {});
+      fs.rmSync(path.dirname(script), { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('KanbanMcp.callTool：isError:true 结果转为抛错，走调用方既有错误通道', async () => {
+    const script = fakeMcpServerScript();
+    const mcp = new KanbanMcp({ command: process.execPath, args: [script, '0'] });
+    try {
+      await mcp.connect({ timeoutMs: 10000 });
+      // 成功路径：content 拼接照旧
+      const ok = await mcp.callTool('list_tasks');
+      assert.equal(ok, 'tool ok\nsecond part');
+      // isError:true（MCP 工具执行失败的协议形态，SDK 不抛错）：必须转异常，
+      // 否则英文错误原文绕过 mcpFailureText 中文化、gated-write 审计误记 ok
+      await assert.rejects(() => mcp.callTool('create_task', { fail: true }), /simulated tool failure: boom/);
     } finally {
       await mcp.close().catch(() => {});
       fs.rmSync(path.dirname(script), { recursive: true, force: true });

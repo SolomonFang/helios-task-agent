@@ -28,6 +28,7 @@ import { CONFIRM_BATCH_RE, CONFIRM_NO_RE, CONFIRM_YES_RE } from './agent/confirm
 import { batchAckText, batchScopeWord, kindLabel, type ConfirmFn } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
+import { processTreeAlive } from './infra/proc';
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void; cancelPending: () => void };
 
@@ -70,19 +71,6 @@ function createLineReader(rl: readline.Interface): LineReader {
   };
   nextLine.cancelPending = cancelPending;
   return nextLine;
-}
-
-/**
- * 进程组是否还有存活成员：与 kanban-ensure.ts 的 treeAlive 同一判定（spawn 时 detached: true，
- * npx 壳退出后被 reparent 的看板孙进程仍在组里）。exitCode 不能作依据，见 stopKanbanChild 注释。
- */
-function kanbanTreeAlive(child: ChildProcess): boolean {
-  try {
-    process.kill(-child.pid!, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 const HELP = `
@@ -173,6 +161,13 @@ export async function main(): Promise<void> {
     cfg = await ensureConfig(ask, { choose, askSecret });
   } catch (err) {
     const message = errMessage(err);
+    // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 /config、bot-main 同一口径：
+    // 灰字提示 + 退出码 0，不打成红色「配置失败」
+    if (message === '已取消') {
+      console.log(c.gray('已取消，配置未变更'));
+      rl.close();
+      process.exit(0);
+    }
     console.error(c.err(`\n配置失败：${message}`));
     rl.close();
     process.exit(1);
@@ -248,10 +243,10 @@ export async function main(): Promise<void> {
     // 退出前补一次展示，否则这批提醒永久丢失
     flushPendingReminders();
     // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可。
-    // 存活判定与 stopKanbanChild 一致用进程组（kanban-ensure.ts 的 treeAlive）：
+    // 存活判定与 stopKanbanChild 一致用进程树（infra/proc.ts 的 processTreeAlive，含 win32 分支）：
     // detached 的 npx 壳可能先退、被 reparent 的看板孙进程仍在组里占端口，exitCode===null 会漏提示；
     // 停止命令也按进程组给（壳已死时 kill <pid> 打的是死壳，杀不到看板孙进程）。
-    if (kanbanChild && kanbanTreeAlive(kanbanChild)) {
+    if (kanbanChild && kanbanChild.pid !== undefined && processTreeAlive(kanbanChild.pid)) {
       kanbanChild.stdout?.destroy();
       kanbanChild.stderr?.destroy();
       kanbanChild.unref();

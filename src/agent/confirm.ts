@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type { ConfirmRequest, ConfirmSettle, ConfirmVerdict } from './guard';
-import { markSuperseded, markTimedOut } from './guard';
+import { markSendFailed, markSuperseded, markTimedOut } from './guard';
 import { errMessage } from '../infra/err';
 
 /**
@@ -185,9 +185,10 @@ export class ConfirmationManager {
       this.pendings.set(openId, pending);
       if (signal) {
         if (signal.aborted) {
-          // 轮次已中断：不发送确认请求，直接按拒绝收尾
+          // 轮次已中断：不发送确认请求，直接按拒绝收尾（与其他收尾路径一样留痕）
           clearTimeout(timer);
           this.pendings.delete(openId);
+          this.logSettle(openId, req, 'denied');
           resolve(false);
           return;
         }
@@ -219,12 +220,15 @@ export class ConfirmationManager {
         .catch((err) => {
           // 卡片与文本降级都发送失败：用户无法裁决。 pending 仍属本条时才收尾——
           // 尽快以「拒绝」返回（工具不再干等超时），并回调 bot 层走最后可达路径告知用户。
+          // 先标记 send_failed 再 resolve：闸门据此把「确认请求未送达」与「用户拒绝」区分开
           const message = errMessage(err);
           console.error(`[confirm] 确认请求发送失败，按拒绝处理: ${message}`);
           const p = this.pendings.get(openId);
           if (p && p.id === id) {
             clearTimeout(p.timer);
             this.pendings.delete(openId);
+            markSendFailed(req);
+            this.logSettle(openId, req, 'send_failed');
             p.resolve(false);
             try {
               this.opts.onSendFailed?.(openId, req, message);
@@ -286,11 +290,11 @@ export class ConfirmationManager {
   }
 
   /**
-   * 裁决留痕（批准/拒绝/超时/被替代同型日志）：open_id 只记头尾摘要，不完整落日志；
-   * memory 写操作的 summary 含 value 摘要（memory_set 的 value 前 100 字符，
-   * 见 tools/memory-tools.ts）——裁决日志只记 key 部分（「：」前），不落 value
+   * 裁决留痕（批准/拒绝/超时/被替代/发送失败同型日志）：open_id 只记头尾摘要，不完整落日志；
+   * memory 类 summary 在源头已不含 value 原文（只含 key 与长度，见 tools/memory-tools.ts），
+   * 「：」截断保留作纵深防御（历史/外部构造的 value 形态 summary 不落 value）。
    */
-  private logSettle(openId: string, req: ConfirmRequest, settle: ConfirmSettle): void {
+  private logSettle(openId: string, req: ConfirmRequest, settle: ConfirmSettle | 'send_failed'): void {
     const maskedUser = openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
     const loggedSummary = req.kind === 'memory' ? req.summary.split('：')[0]! : req.summary.slice(0, 80);
     console.log(`[confirm] user=${maskedUser} verdict=${settle} summary="${loggedSummary}"`);

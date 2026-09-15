@@ -250,8 +250,11 @@ export async function runAgentTurn({
         resp = await createReq();
       } catch (err) {
         if (timedOut) return timeoutText; // 墙钟到点掐断在途请求：请求未入历史，直接收尾
+        // /stop 掐断在途请求（SDK 抛 APIUserAbortError）：与轮首/工具执行中的中断同一优雅口径——
+        // 保留 user 消息（请求未入历史，无需补配对），不让上层 catch 把用户消息弹出历史
+        if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
         const msgText = errMessage(err);
-        if (!CONTEXT_OVERFLOW_RE.test(msgText) || signal?.aborted) throw err;
+        if (!CONTEXT_OVERFLOW_RE.test(msgText)) throw err;
         // 首轮带图：图片只注入请求载荷副本、不进 messages 历史，dropOldestTurn 减不掉它，
         // 重试载荷不变注定失败——直接抛出，不做无谓重试
         if (image && round === 0) throw err;
@@ -264,6 +267,7 @@ export async function runAgentTurn({
             recovered = true;
           } catch (retryErr) {
             if (timedOut) return timeoutText;
+            if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。'; // 与主请求在途中断同口径
             const retryText = errMessage(retryErr);
             if (!CONTEXT_OVERFLOW_RE.test(retryText)) throw retryErr;
           }
