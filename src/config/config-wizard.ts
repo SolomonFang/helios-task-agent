@@ -109,74 +109,96 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     }
   };
 
+  /**
+   * 已配置过的重配场景（/config、bot --reconfig）在预设列表末尾追加「跳过」项：
+   * 选中（或非 TTY 输入 0 / 直接回车）即保留现有模型配置，直接进看板默认值等后续步骤，
+   * 不再追问 API Key、也不重复联网校验。首次配置（isConfigured() 为假）无此项。
+   */
+  const old = currentConfig();
+  const skippable = isConfigured();
+  const SKIP_IDX = PRESETS.length;
   let idx: number;
   if (choose && process.stdin.isTTY) {
-    idx = await choose(PRESETS);
+    idx = await choose(
+      skippable ? [...PRESETS, { name: `跳过，保留当前模型（${old.llmModel}）`, baseUrl: '', model: '' }] : PRESETS,
+    );
   } else {
     // 与 wizardChoose 的 selectList 同一口径：重配时标题给出当前模型
-    const current = currentConfig().llmModel;
-    console.log(c.strong(`\n配置模型（OpenAI 兼容协议${current ? `，当前 ${current}` : ''}）：\n`));
+    console.log(c.strong(`\n配置模型（OpenAI 兼容协议${old.llmModel ? `，当前 ${old.llmModel}` : ''}）：\n`));
+    if (skippable) console.log(`  ${c.info('0)')} 跳过，保留当前模型（${old.llmModel}）`);
     PRESETS.forEach((p, i) => {
       console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
     });
     for (;;) {
-      const pick = await need(`\n请输入 1 到 ${PRESETS.length} 的数字（默认 1）: `);
+      const pick = await need(
+        skippable
+          ? `\n请输入 0 到 ${PRESETS.length} 的数字（默认 0 = 跳过）: `
+          : `\n请输入 1 到 ${PRESETS.length} 的数字（默认 1）: `,
+      );
       if (!pick) {
-        idx = 0;
+        idx = skippable ? SKIP_IDX : 0;
         break;
       }
       const n = Number(pick);
-      if (Number.isInteger(n) && n >= 1 && n <= PRESETS.length) {
-        idx = n - 1;
+      if (Number.isInteger(n) && n >= (skippable ? 0 : 1) && n <= PRESETS.length) {
+        idx = n === 0 ? SKIP_IDX : n - 1;
         break;
       }
-      console.log(c.err(`无效输入，请输入 1 到 ${PRESETS.length} 的数字`));
+      console.log(c.err(`无效输入，请输入 ${skippable ? 0 : 1} 到 ${PRESETS.length} 的数字`));
     }
   }
-  const preset = PRESETS[idx]!;
-  console.log(c.gray(`已选择 ${preset.name}`));
+  const skipModel = skippable && idx === SKIP_IDX;
 
-  const old = currentConfig();
-  let baseUrl = preset.baseUrl;
-  if (!baseUrl) {
-    baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
-    baseUrl = await ensureSecureBaseUrl(baseUrl);
-  }
-  const apiKeyInput = await needSecret(`API Key${secretSuffix}: `);
-  if (!apiKeyInput) throw new Error('API Key 不能为空');
-  let apiKey = apiKeyInput;
-  const modelInput = await need(preset.model ? `模型名（默认 ${preset.model}）: ` : '模型名（必填，如 gpt-4o）: ');
-  let model = modelInput || preset.model;
-  if (!model) throw new Error('模型名不能为空');
-
-  // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
-  // 两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
-  for (;;) {
-    console.log(c.gray('正在联网校验模型配置…'));
-    const check = await verifyLlmConfig(baseUrl, apiKey);
-    if (check.ok) {
-      console.log(c.ok('模型配置校验通过'));
-      break;
-    }
-    if (check.uncertain) {
-      console.log(c.warn(`无法预检：${check.message}`));
+  let baseUrl = old.llmBaseUrl;
+  let apiKey = old.llmApiKey;
+  let model = old.llmModel;
+  if (skipModel) {
+    console.log(c.gray(`跳过模型配置，保留当前模型 ${model}`));
+  } else {
+    const preset = PRESETS[idx]!;
+    console.log(c.gray(`已选择 ${preset.name}`));
+    if (preset.baseUrl) {
+      baseUrl = preset.baseUrl;
     } else {
-      console.log(c.err(`模型配置校验失败：${check.message}`));
-    }
-    const act = (await need('回车 = 直接重试；输入 k 改 API Key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
-    if (act === 's' || act === 'save' || act === '保存') break;
-    if (act === 'b' || act === 'base' || act === 'url') {
-      baseUrl = await need(`Base URL（当前 ${baseUrl}）: `);
-      if (!baseUrl) throw new Error('Base URL 不能为空');
+      baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
       baseUrl = await ensureSecureBaseUrl(baseUrl);
-    } else if (act === 'm' || act === 'model') {
-      model = await need(`模型名（当前 ${model}）: `);
-      if (!model) throw new Error('模型名不能为空');
-    } else if (act === 'k' || act === 'key') {
-      apiKey = await needSecret(`API Key${secretSuffix}: `);
-      if (!apiKey) throw new Error('API Key 不能为空');
     }
-    // 其余输入（含回车）= 不修改，用当前配置直接重试
+    const apiKeyInput = await needSecret(`API Key${secretSuffix}: `);
+    if (!apiKeyInput) throw new Error('API Key 不能为空');
+    apiKey = apiKeyInput;
+    const modelInput = await need(preset.model ? `模型名（默认 ${preset.model}）: ` : '模型名（必填，如 gpt-4o）: ');
+    model = modelInput || preset.model;
+    if (!model) throw new Error('模型名不能为空');
+
+    // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
+    // 两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
+    for (;;) {
+      console.log(c.gray('正在联网校验模型配置…'));
+      const check = await verifyLlmConfig(baseUrl, apiKey);
+      if (check.ok) {
+        console.log(c.ok('模型配置校验通过'));
+        break;
+      }
+      if (check.uncertain) {
+        console.log(c.warn(`无法预检：${check.message}`));
+      } else {
+        console.log(c.err(`模型配置校验失败：${check.message}`));
+      }
+      const act = (await need('回车 = 直接重试；输入 k 改 API Key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
+      if (act === 's' || act === 'save' || act === '保存') break;
+      if (act === 'b' || act === 'base' || act === 'url') {
+        baseUrl = await need(`Base URL（当前 ${baseUrl}）: `);
+        if (!baseUrl) throw new Error('Base URL 不能为空');
+        baseUrl = await ensureSecureBaseUrl(baseUrl);
+      } else if (act === 'm' || act === 'model') {
+        model = await need(`模型名（当前 ${model}）: `);
+        if (!model) throw new Error('模型名不能为空');
+      } else if (act === 'k' || act === 'key') {
+        apiKey = await needSecret(`API Key${secretSuffix}: `);
+        if (!apiKey) throw new Error('API Key 不能为空');
+      }
+      // 其余输入（含回车）= 不修改，用当前配置直接重试
+    }
   }
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
   // 看板地址必须是完整 URL：缺 http(s):// 协议头直接重问

@@ -816,6 +816,78 @@ async function run(): Promise<void> {
     assert.equal(saved.parsed.OCR_LLM_TOKEN, 'sk-bad', '显式 s 应原样保存');
   });
 
+  await checkAsync('config-wizard：已配置时首步可跳过模型配置（回车默认 = 跳过），保留现有模型且不再联网校验', async () => {
+    // 跳过后不应触发任何联网校验（旧 Base URL 指向不可达地址，一旦校验必然失败并多消费回答）
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-skip-'));
+    const envPath = path.join(tmp, '.env');
+    fs.writeFileSync(envPath, 'LLM_BASE_URL=http://127.0.0.1:1/v1\nLLM_API_KEY=sk-old\nLLM_MODEL=old-model\n');
+    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    const prompts: string[] = [];
+    try {
+      process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      // ensureEnvLoaded 为懒加载且进程环境优先于文件：真实用户配置可能已先入 process.env，须显式覆盖
+      process.env.LLM_BASE_URL = 'http://127.0.0.1:1/v1';
+      process.env.LLM_API_KEY = 'sk-old';
+      process.env.LLM_MODEL = 'old-model';
+      const answers = [
+        '', // 配置模型：已配置过，默认 0 = 跳过
+        '', // 看板地址：保留当前
+        '', // 默认项目 ID：跳过
+        '', // 默认仓库 ID：跳过
+        '', // 默认迭代：跳过
+        '', // AI 审查模型：回车 = 与上方一致
+        '', // AI 审查专用 API Key：回车复用
+      ];
+      const ask = async (p: string): Promise<string | null> => {
+        prompts.push(p);
+        return answers.shift() ?? null;
+      };
+      await ensureConfig(ask, { force: true });
+      assert.equal(answers.length, 0, `跳过后向导应恰好消费全部预设回答（若误触发联网校验会多消费），剩余：${answers.join('|')}`);
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.LLM_BASE_URL, 'http://127.0.0.1:1/v1', '跳过后 Base URL 应保持不变');
+      assert.equal(parsed.LLM_API_KEY, 'sk-old', '跳过后 API Key 应保持不变');
+      assert.equal(parsed.LLM_MODEL, 'old-model', '跳过后模型应保持不变');
+      assert.ok(prompts[0]?.includes('默认 0 = 跳过'), `已配置时首问应提供跳过默认项，实际：${prompts[0]}`);
+      assert.ok(prompts[1]?.includes('看板地址'), `跳过后应直接进入看板地址步骤，实际：${prompts[1]}`);
+      const ocrPrompt = prompts.find((p) => p.includes('AI 审查模型'));
+      assert.ok(ocrPrompt?.includes('与上方一致（old-model）'), `AI 审查模型问题应回显保留的模型名，实际：${ocrPrompt}`);
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('config-wizard：已配置时输入 0 显式跳过模型配置，等价于回车默认', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-skip0-'));
+    const envPath = path.join(tmp, '.env');
+    fs.writeFileSync(envPath, 'LLM_BASE_URL=http://127.0.0.1:1/v1\nLLM_API_KEY=sk-old\nLLM_MODEL=old-model\n');
+    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    try {
+      process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      process.env.LLM_BASE_URL = 'http://127.0.0.1:1/v1';
+      process.env.LLM_API_KEY = 'sk-old';
+      process.env.LLM_MODEL = 'old-model';
+      const answers = ['0', '', '', '', '', '', ''];
+      const ask = async (): Promise<string | null> => answers.shift() ?? null;
+      await ensureConfig(ask, { force: true });
+      assert.equal(answers.length, 0, `剩余：${answers.join('|')}`);
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.LLM_MODEL, 'old-model', '输入 0 跳过后模型应保持不变');
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('llm-verify：401 判失败、404 判 uncertain、连接失败返回失败而非抛异常', async () => {
     const plan = [200, 401, 404];
     let n = 0;
