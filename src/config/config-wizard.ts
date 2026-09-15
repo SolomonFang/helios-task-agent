@@ -5,6 +5,7 @@ import {
   isConfigured,
   feishuBotConfig,
   isFeishuBotConfigured,
+  ocrLlmOverrides,
   writeEnv,
   resolveEnvWritePath,
   userEnvPath,
@@ -12,7 +13,7 @@ import {
 import { checkLarkCli, LARK_CLI_INSTALL_HINT } from '../infra/deps';
 import { verifyFeishuApp } from './feishu-verify';
 import { verifyLlmConfig } from './llm-verify';
-import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig } from '../types';
+import type { AgentConfig, AskFn, ChooseFn, FeishuBotConfig, OcrLlmOverrides } from '../types';
 
 export function printFeishuSetupChecklist(): void {
   console.log(c.strong('\n飞书开放平台（一次性，约 2 分钟）\n'));
@@ -73,27 +74,38 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   /**
    * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
    * 给出醒目警告并要求显式确认；不确认则重新输入，直到拿到 https 或用户确认。
+   * opts.label：重输/警告文案的场景名（主模型 / AI 审查）；opts.allowEmpty：可选字段
+   * 在重输提示处回车 = 放弃设置本项（返回 ''），不算校验失败。
    */
-  const ensureSecureBaseUrl = async (url: string): Promise<string> => {
+  const ensureSecureBaseUrl = async (url: string, opts: { label?: string; allowEmpty?: boolean } = {}): Promise<string> => {
+    const label = opts.label ?? 'Base URL';
+    const reprompt = async (): Promise<string> => {
+      const v = await need(`${label}（如 https://api.deepseek.com/v1）: `);
+      if (!v) {
+        if (opts.allowEmpty) return '';
+        throw new Error(`${label} 不能为空`);
+      }
+      return v;
+    };
     let u = url;
     for (;;) {
       if (/^https:\/\//i.test(u)) return u;
       // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
       if (!/^http:\/\//i.test(u)) {
         console.log(c.err('请输入以 https:// 开头的地址。http:// 明文端点会要求显式确认（本机地址除外），建议用 https://，如 https://api.deepseek.com/v1。'));
-        u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
-        if (!u) throw new Error('Base URL 不能为空');
+        u = await reprompt();
+        if (!u) return '';
         continue;
       }
       // loopback 放行：IPv6 本机地址在 URL 中带方括号（http://[::1]:8080），一并覆盖
       if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(u)) return u;
       console.log(
-        c.err(`⚠️ 警告：Base URL 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
+        c.err(`⚠️ 警告：${label} 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
       );
-      const ok = (await need('确认继续使用该明文端点？（输入 YES 继续 / 回车 = 重新输入 Base URL）: ')).toUpperCase();
+      const ok = (await need('确认继续使用该明文端点？（输入 YES 继续 / 回车 = 重新输入）: ')).toUpperCase();
       if (ok === 'YES' || ok === 'Y') return u;
-      u = await need('Base URL（如 https://api.deepseek.com/v1）: ');
-      if (!u) throw new Error('Base URL 不能为空');
+      u = await reprompt();
+      if (!u) return '';
     }
   };
 
@@ -195,6 +207,92 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   );
   const kanbanIteration = kanbanIterationRaw === '-' ? '' : kanbanIterationRaw || old.kanbanIteration;
 
+  /**
+   * AI 审查（open-code-review）/ 失败诊断的独立模型配置（OCR_LLM_*，逐项优先、
+   * 缺项回退上方机器人模型配置，语义见 ai-review.ts buildOcrEnv）。全部可回车跳过；
+   * 与看板可选字段同一口径：有当前值时回车 = 保留、输入 - = 清除。
+   * 专用 key 独立询问：「只隔离 key、不换模型」是安全提示（handler.ts 首次审查）首推的
+   * 用法，不能要求先配模型；Base URL 只在配了模型或已有 URL 覆盖项时追问（换 provider
+   * 才需要，已有残留 URL 覆盖项时也要给用户看到并清除的入口）。
+   */
+  console.log(
+    c.gray('AI 审查（open-code-review）与失败诊断默认复用上方模型配置；想单独用别的模型跑审查、或给它隔离一个专用 key 时再填，可直接回车跳过。'),
+  );
+  // OCR_LLM_URL 存的是完整 chat 端点（…/chat/completions）；展示与输入都用 base URL 形态
+  // （与上方主模型的 Base URL 口径一致），写入时再补全后缀（与 buildOcrEnv 派生口径相同）。
+  const toBaseUrl = (u: string) => u.replace(/\/+$/, '').replace(/\/(chat\/completions|messages)$/, '');
+  const toOcrEndpoint = (u: string) =>
+    /\/(chat\/completions|messages)\/?$/.test(u) ? u : `${u.replace(/\/+$/, '')}/chat/completions`;
+  const ocrNow = ocrLlmOverrides();
+  const ocr: OcrLlmOverrides = {};
+  const ocrModelRaw = await need(
+    `AI 审查模型（可选${ocrNow.model ? `，回车 = 保留当前 ${ocrNow.model}，输入 - 清除` : `，回车 = 与上方一致（${model}）`}）: `,
+  );
+  if (ocrModelRaw) ocr.model = ocrModelRaw === '-' ? '' : ocrModelRaw;
+  let ocrModel = ocrModelRaw === '-' ? '' : ocrModelRaw || ocrNow.model;
+  if (ocrModel || ocrNow.url) {
+    const ocrUrlRaw = await need(
+      `AI 审查 Base URL（可选${ocrNow.url ? `，回车 = 保留当前 ${toBaseUrl(ocrNow.url)}，输入 - 清除` : `，回车 = 复用 ${baseUrl}`}）: `,
+    );
+    if (ocrUrlRaw) {
+      if (ocrUrlRaw === '-') ocr.url = '';
+      else {
+        const u = await ensureSecureBaseUrl(ocrUrlRaw, { label: 'AI 审查 Base URL', allowEmpty: true });
+        if (u) ocr.url = toOcrEndpoint(u);
+      }
+    }
+  }
+  // secretSuffix 自带括号，融入可选说明括号内，避免两对括号连排
+  const secretInner = secretSuffix.replace(/^[（(]|[）)]$/g, '');
+  const ocrTokenRaw = await needSecret(
+    `AI 审查专用 API Key（可选${ocrNow.token ? '，回车 = 保留当前已配置的 key，输入 - 清除' : '，回车 = 复用上方 API Key'}；${secretInner}）: `,
+  );
+  if (ocrTokenRaw) ocr.token = ocrTokenRaw === '-' ? '' : ocrTokenRaw;
+
+  /**
+   * OCR 配置联网预检：仅当覆盖项含显式 URL/key 时——端点与 key 全复用时主流程刚校验过，
+   * 不重复打扰。交互与主模型校验循环同一口径：回车 = 重试，保存必须显式输入 s。
+   */
+  let effOcrUrl = ocr.url !== undefined ? ocr.url : ocrNow.url;
+  let effOcrToken = ocr.token !== undefined ? ocr.token : ocrNow.token;
+  if (ocrModel && (effOcrUrl || effOcrToken)) {
+    for (;;) {
+      console.log(c.gray('正在联网校验 AI 审查模型配置…'));
+      const check = await verifyLlmConfig(effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl, effOcrToken || apiKey);
+      if (check.ok) {
+        console.log(c.ok('AI 审查模型配置校验通过'));
+        break;
+      }
+      if (check.uncertain) {
+        console.log(c.warn(`无法预检：${check.message}`));
+      } else {
+        console.log(c.err(`AI 审查模型配置校验失败：${check.message}`));
+      }
+      const act = (await need('回车 = 直接重试；输入 k 改专用 key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
+      if (act === 's' || act === 'save' || act === '保存') break;
+      if (act === 'b' || act === 'base' || act === 'url') {
+        const raw = await need(`AI 审查 Base URL（当前 ${effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl}）: `);
+        if (raw) {
+          const u = await ensureSecureBaseUrl(raw, { label: 'AI 审查 Base URL', allowEmpty: true });
+          if (u) ocr.url = toOcrEndpoint(u);
+        }
+      } else if (act === 'm' || act === 'model') {
+        const m = await need(`AI 审查模型（当前 ${ocrModel}）: `);
+        if (m) {
+          ocr.model = m === '-' ? '' : m;
+          ocrModel = m === '-' ? '' : m;
+          if (!ocrModel) break; // 模型已清除，没有可预检的对象
+        }
+      } else if (act === 'k' || act === 'key') {
+        const t = await needSecret(`AI 审查专用 API Key${secretSuffix}: `);
+        if (t) ocr.token = t === '-' ? '' : t;
+      }
+      // 其余输入（含回车）= 不修改，用当前配置直接重试
+      effOcrUrl = ocr.url !== undefined ? ocr.url : ocrNow.url;
+      effOcrToken = ocr.token !== undefined ? ocr.token : ocrNow.token;
+    }
+  }
+
   const cfg: AgentConfig = {
     ...old,
     llmBaseUrl: baseUrl,
@@ -205,8 +303,10 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     kanbanRepoId,
     kanbanIteration,
   };
-  const saved = writeEnv(cfg);
-  console.log(c.ok(`\n配置已保存到 ${saved}（模型：${model}）\n`));
+  const saved = writeEnv(cfg, undefined, ocr);
+  // 显式配过（哪怕与主模型同名）或与主模型不同，都在确认里如实标注
+  const ocrNote = ocrModel && (ocrModel !== model || ocr.model !== undefined) ? `；AI 审查模型：${ocrModel}` : '';
+  console.log(c.ok(`\n配置已保存到 ${saved}（模型：${model}${ocrNote}）\n`));
   return cfg;
 }
 

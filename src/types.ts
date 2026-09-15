@@ -38,6 +38,17 @@ export interface LlmPreset {
   model: string;
 }
 
+/**
+ * AI 审查/失败诊断（open-code-review）的独立 LLM 覆盖项（对应 OCR_LLM_URL/TOKEN/MODEL，
+ * 缺省回退机器人主 LLM 配置，语义见 src/kanban/ai-review.ts 的 buildOcrEnv）。
+ * 向导写入语义：字段缺席 = 不动现有值；空串 = 清除该项。
+ */
+export interface OcrLlmOverrides {
+  url?: string;
+  token?: string;
+  model?: string;
+}
+
 export type AskFn = (prompt: string) => Promise<string | null>;
 export type ChooseFn = (presets: LlmPreset[]) => Promise<number>;
 

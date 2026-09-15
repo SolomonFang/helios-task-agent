@@ -22,8 +22,8 @@ import { SessionRouter } from '../src/agent/session-router';
 import { ConfirmationManager } from '../src/agent/confirm';
 import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
-import { currentConfig, ensureEnvLoaded, loadEnvFiles, writeEnvFile } from '../src/config/config';
-import { resolveAllowedOpenIds } from '../src/config/config-wizard';
+import { PRESETS, currentConfig, ensureEnvLoaded, loadEnvFiles, ocrLlmOverrides, writeEnv, writeEnvFile } from '../src/config/config';
+import { ensureConfig, resolveAllowedOpenIds } from '../src/config/config-wizard';
 import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
@@ -583,6 +583,230 @@ async function run(): Promise<void> {
       }
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  await checkAsync('config：writeEnv 支持 OCR_LLM_* 独立覆盖项（写入/缺席保留/空串清除），ocrLlmOverrides 读回', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-ocr-'));
+    const envPath = path.join(tmp, '.env');
+    const KEYS = [
+      'LLM_BASE_URL',
+      'LLM_API_KEY',
+      'LLM_MODEL',
+      'HELIOS_KANBAN_URL',
+      'OCR_LLM_URL',
+      'OCR_LLM_TOKEN',
+      'OCR_LLM_MODEL',
+      'HELIOS_TASK_AGENT_ENV',
+    ];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    const cfg: AgentConfig = {
+      llmBaseUrl: 'https://cov-llm/v1',
+      llmApiKey: 'sk-cov',
+      llmModel: 'cov-model',
+      mcpCommand: 'npx',
+      mcpArgs: [],
+      kanbanUrl: 'http://localhost:7964',
+      kanbanProjectId: '',
+      kanbanRepoId: '',
+      kanbanIteration: '',
+    };
+    try {
+      process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      writeEnv(cfg, undefined, { model: 'ocr-model', url: 'https://ocr-llm/v1/chat/completions' });
+      let parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.OCR_LLM_MODEL, 'ocr-model');
+      assert.equal(parsed.OCR_LLM_URL, 'https://ocr-llm/v1/chat/completions');
+      assert.equal(parsed.OCR_LLM_TOKEN, undefined, '未提供的覆盖项不应写入');
+      // 缺席 = 不动现有值：不带 ocr 参数重写，OCR 键保留
+      writeEnv({ ...cfg, llmModel: 'cov-model-2' });
+      parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.LLM_MODEL, 'cov-model-2');
+      assert.equal(parsed.OCR_LLM_MODEL, 'ocr-model');
+      // 空串 = 清除该项；未触及的项保留
+      writeEnv(cfg, undefined, { model: '' });
+      parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.OCR_LLM_MODEL, undefined);
+      assert.equal(parsed.OCR_LLM_URL, 'https://ocr-llm/v1/chat/completions');
+      // 读回 helper：去空白、缺省空串
+      assert.deepEqual(ocrLlmOverrides({ OCR_LLM_URL: ' https://a/v1 ', OCR_LLM_MODEL: 'm' }), {
+        url: 'https://a/v1',
+        token: '',
+        model: 'm',
+      });
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('config-wizard：向导可单独配置 AI 审查模型/专用 key（OCR_LLM_* 落盘，URL 回车复用不写入）', async () => {
+    // 联网预检走 loopback mock（/models 一律 200）
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"data":[]}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-'));
+    const envPath = path.join(tmp, '.env');
+    const KEYS = [
+      'LLM_BASE_URL',
+      'LLM_API_KEY',
+      'LLM_MODEL',
+      'HELIOS_KANBAN_URL',
+      'HELIOS_KANBAN_PROJECT_ID',
+      'HELIOS_KANBAN_REPO_ID',
+      'HELIOS_KANBAN_ITERATION',
+      'OCR_LLM_URL',
+      'OCR_LLM_TOKEN',
+      'OCR_LLM_MODEL',
+      'HELIOS_TASK_AGENT_ENV',
+    ];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    try {
+      process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      const answers = [
+        String(PRESETS.length), // 自定义（OpenAI 兼容接口）
+        `${base}/v1`, // Base URL（loopback 免明文确认）
+        'sk-wiz', // API Key
+        'wiz-model', // 模型名
+        '', // 看板地址：保留当前
+        '', // 默认项目 ID：跳过
+        '', // 默认仓库 ID：跳过
+        '', // 默认迭代：跳过
+        'ocr-fast-model', // AI 审查模型：单独配置
+        '', // AI 审查 Base URL：回车复用
+        'sk-ocr', // AI 审查专用 API Key
+      ];
+      const ask = async (): Promise<string | null> => answers.shift() ?? null;
+      await ensureConfig(ask, { force: true });
+      assert.equal(answers.length, 0, `向导应恰好消费全部预设回答，剩余：${answers.join('|')}`);
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      assert.equal(parsed.LLM_BASE_URL, `${base}/v1`);
+      assert.equal(parsed.LLM_MODEL, 'wiz-model');
+      assert.equal(parsed.OCR_LLM_MODEL, 'ocr-fast-model');
+      assert.equal(parsed.OCR_LLM_TOKEN, 'sk-ocr');
+      assert.equal(parsed.OCR_LLM_URL, undefined, 'URL 回车复用不应写入覆盖项');
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+      await stopServer(server);
+    }
+  });
+
+  /**
+   * 向导场景测试脚手架：loopback /models mock（一律 200）+ 预设回答驱动 ensureConfig，
+   * 返回写出的 .env 解析结果与全部提示文案。answers 只需覆盖看板默认值之后的 OCR 段
+   * （前 8 个回答固定：自定义 preset、loopback Base URL、key、模型名、看板默认值 ×4）。
+   */
+  async function runWizardScenario(
+    answers: string[],
+    presetEnv: Record<string, string> = {},
+    presetFile = '',
+    onRequest?: (auth: string) => number,
+  ): Promise<{ parsed: Record<string, string>; prompts: string[]; leftover: string[] }> {
+    const server = http.createServer((req, res) => {
+      const status = onRequest ? onRequest(String(req.headers.authorization || '')) : 200;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end('{"data":[]}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-'));
+    const envPath = path.join(tmp, '.env');
+    if (presetFile) fs.writeFileSync(envPath, presetFile);
+    const KEYS = [
+      'LLM_BASE_URL',
+      'LLM_API_KEY',
+      'LLM_MODEL',
+      'HELIOS_KANBAN_URL',
+      'HELIOS_KANBAN_PROJECT_ID',
+      'HELIOS_KANBAN_REPO_ID',
+      'HELIOS_KANBAN_ITERATION',
+      'OCR_LLM_URL',
+      'OCR_LLM_TOKEN',
+      'OCR_LLM_MODEL',
+      'HELIOS_TASK_AGENT_ENV',
+    ];
+    const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
+    const prompts: string[] = [];
+    try {
+      process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      for (const [k, v] of Object.entries(presetEnv)) process.env[k] = v;
+      const queue = [String(PRESETS.length), `${base}/v1`, 'sk-wiz', 'wiz-model', '', '', '', '', ...answers];
+      const ask = async (p: string): Promise<string | null> => {
+        prompts.push(p);
+        return queue.shift() ?? null;
+      };
+      await ensureConfig(ask, { force: true });
+      const parsed = dotenv.parse(fs.existsSync(envPath) ? fs.readFileSync(envPath) : '');
+      return { parsed, prompts, leftover: queue };
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+      await stopServer(server);
+    }
+  }
+
+  await checkAsync('config-wizard：只隔离专用 key（不配模型）可达——key 问题独立询问，URL 问题不出现', async () => {
+    const { parsed, prompts, leftover } = await runWizardScenario([
+      '', // AI 审查模型：回车 = 与上方一致
+      'sk-ocr-only', // AI 审查专用 API Key
+    ]);
+    assert.equal(leftover.length, 0, `向导应恰好消费全部预设回答，剩余：${leftover.join('|')}`);
+    assert.equal(parsed.OCR_LLM_TOKEN, 'sk-ocr-only');
+    assert.equal(parsed.OCR_LLM_MODEL, undefined, '未配模型不应写入模型覆盖项');
+    assert.equal(parsed.OCR_LLM_URL, undefined, '未配模型不应写入 URL 覆盖项');
+    const modelPrompt = prompts.find((p) => p.includes('AI 审查模型'));
+    assert.ok(modelPrompt?.includes('与上方一致（wiz-model）'), `模型问题应带上上方模型名，实际：${modelPrompt}`);
+    assert.ok(!prompts.some((p) => p.includes('AI 审查 Base URL')), '未配模型且无 URL 残留时不应追问 Base URL');
+    const tokenPrompt = prompts.find((p) => p.includes('AI 审查专用 API Key'));
+    assert.ok(tokenPrompt?.includes('；输入可见）'), `key 问题应为单括号排版，实际：${tokenPrompt}`);
+    assert.ok(!tokenPrompt?.includes('）（'), `不应两对括号连排，实际：${tokenPrompt}`);
+  });
+
+  await checkAsync('config-wizard：清除模型后残留 URL/key 覆盖项可见并可一并清除（当前 URL 以 base 形态展示）', async () => {
+    const { parsed, prompts, leftover } = await runWizardScenario(
+      ['-', '-', '-'], // 模型 / Base URL / 专用 key 全部输入 - 清除
+      {
+        OCR_LLM_URL: 'https://ocr-old/v1/chat/completions',
+        OCR_LLM_TOKEN: 'sk-ocr-old',
+        OCR_LLM_MODEL: 'ocr-old-model',
+      },
+      'OCR_LLM_URL=https://ocr-old/v1/chat/completions\nOCR_LLM_TOKEN=sk-ocr-old\nOCR_LLM_MODEL=ocr-old-model\n',
+    );
+    assert.equal(leftover.length, 0, `向导应恰好消费全部预设回答，剩余：${leftover.join('|')}`);
+    assert.equal(parsed.OCR_LLM_MODEL, undefined, '模型覆盖项应被清除');
+    assert.equal(parsed.OCR_LLM_URL, undefined, 'URL 残留覆盖项应可一并清除');
+    assert.equal(parsed.OCR_LLM_TOKEN, undefined, 'key 残留覆盖项应可一并清除');
+    const modelPrompt = prompts.find((p) => p.includes('AI 审查模型'));
+    assert.ok(modelPrompt?.includes('保留当前 ocr-old-model'), `实际：${modelPrompt}`);
+    const urlPrompt = prompts.find((p) => p.includes('AI 审查 Base URL'));
+    assert.ok(urlPrompt?.includes('保留当前 https://ocr-old/v1'), `当前值应以 base URL 形态展示，实际：${urlPrompt}`);
+    assert.ok(!urlPrompt?.includes('chat/completions'), `不应展示完整端点形态，实际：${urlPrompt}`);
+  });
+
+  await checkAsync('config-wizard：OCR 显式 key 触发联网预检——失败可改 key 重试（k），显式 s 仍然保存', async () => {
+    // 预检对 sk-bad 一律 401（确定的配置错误），其余 key 200
+    const byAuth = (auth: string) => (auth === 'Bearer sk-bad' ? 401 : 200);
+    // 失败 → 输入 k 改专用 key → 重试通过
+    const retried = await runWizardScenario(['ocr-model', '', 'sk-bad', 'k', 'sk-good'], {}, '', byAuth);
+    assert.equal(retried.leftover.length, 0, `剩余：${retried.leftover.join('|')}`);
+    assert.equal(retried.parsed.OCR_LLM_TOKEN, 'sk-good', '改 key 重试后应落盘新 key');
+    assert.equal(retried.parsed.OCR_LLM_MODEL, 'ocr-model');
+    // 失败 → 显式 s 仍然保存（回车只会重试，不会误保存）
+    const saved = await runWizardScenario(['ocr-model', '', 'sk-bad', 's'], {}, '', byAuth);
+    assert.equal(saved.leftover.length, 0, `剩余：${saved.leftover.join('|')}`);
+    assert.equal(saved.parsed.OCR_LLM_TOKEN, 'sk-bad', '显式 s 应原样保存');
   });
 
   await checkAsync('llm-verify：401 判失败、404 判 uncertain、连接失败返回失败而非抛异常', async () => {

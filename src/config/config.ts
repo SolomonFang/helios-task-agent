@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { defaultDataHome, packageRoot } from '../infra/paths';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import { kanbanPackageSpec } from '../infra/deps';
-import type { AgentConfig, FeishuBotConfig, LlmPreset } from '../types';
+import type { AgentConfig, FeishuBotConfig, LlmPreset, OcrLlmOverrides } from '../types';
 
 /** User-level config. Wizards write here. */
 export function userEnvPath(): string {
@@ -241,6 +241,15 @@ export function isFeishuBotConfigured(): boolean {
   return Boolean(cfg.appId && cfg.appSecret);
 }
 
+/** AI 审查/失败诊断的独立 LLM 覆盖配置（OCR_LLM_*；空串 = 未配置，回退机器人主 LLM 配置）。 */
+export function ocrLlmOverrides(env: NodeJS.ProcessEnv = process.env): Required<OcrLlmOverrides> {
+  return {
+    url: (env.OCR_LLM_URL || '').trim(),
+    token: (env.OCR_LLM_TOKEN || '').trim(),
+    model: (env.OCR_LLM_MODEL || '').trim(),
+  };
+}
+
 function parseEnvFile(filePath: string): Record<string, string> {
   const out: Record<string, string> = {};
   if (!fs.existsSync(filePath)) return out;
@@ -299,6 +308,9 @@ export function writeEnvFile(
     'LLM_BASE_URL',
     'LLM_API_KEY',
     'LLM_MODEL',
+    'OCR_LLM_URL',
+    'OCR_LLM_TOKEN',
+    'OCR_LLM_MODEL',
     'HELIOS_KANBAN_URL',
     'HELIOS_KANBAN_PROJECT_ID',
     'HELIOS_KANBAN_REPO_ID',
@@ -320,7 +332,7 @@ export function writeEnvFile(
   return filePath;
 }
 
-export function writeEnv(cfg: AgentConfig, feishu?: Partial<FeishuBotConfig>): string {
+export function writeEnv(cfg: AgentConfig, feishu?: Partial<FeishuBotConfig>, ocr?: OcrLlmOverrides): string {
   const updates: Record<string, string | undefined> = {
     LLM_BASE_URL: cfg.llmBaseUrl,
     LLM_API_KEY: cfg.llmApiKey,
@@ -330,6 +342,12 @@ export function writeEnv(cfg: AgentConfig, feishu?: Partial<FeishuBotConfig>): s
     HELIOS_KANBAN_REPO_ID: cfg.kanbanRepoId || undefined,
     HELIOS_KANBAN_ITERATION: cfg.kanbanIteration || undefined,
   };
+  if (ocr) {
+    // 字段缺席 = 不动现有值（合并写保留）；空串 = 清除该项（writeEnvFile 将空值删键）
+    if (ocr.url !== undefined) updates.OCR_LLM_URL = ocr.url || undefined;
+    if (ocr.token !== undefined) updates.OCR_LLM_TOKEN = ocr.token || undefined;
+    if (ocr.model !== undefined) updates.OCR_LLM_MODEL = ocr.model || undefined;
+  }
   if (feishu) {
     if (feishu.appId !== undefined) updates.FEISHU_APP_ID = feishu.appId || undefined;
     if (feishu.appSecret !== undefined) updates.FEISHU_APP_SECRET = feishu.appSecret || undefined;
