@@ -47,6 +47,26 @@ function hkCreateTitle(args: string[]): string {
   return '';
 }
 
+/**
+ * hk 创建的目标项目：--project 旗标 > 位置参数 project_id（首个 UUID 形态非旗标参数，
+ * 与 hkCreateTitle 跳过 UUID 的口径互证）> 环境默认项目。查重粒度为 (来源 URL, 项目)，
+ * 同来源拆到多项目（中控/APP/后端各一个任务）时按项目区分，不互斥。
+ */
+function hkCreateProjectId(args: string[], envProjectId?: string): string | undefined {
+  const rest = args[0] === 'create-and-start' ? args.slice(1) : args.slice(2);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === '--project') return typeof rest[i + 1] === 'string' ? rest[i + 1] : undefined;
+    if (a.startsWith('--project=')) return a.slice('--project='.length);
+    if (a.startsWith('--')) {
+      if (!a.includes('=')) i++; // --flag value 形态成对跳过（同 hkCreateTitle）
+      continue;
+    }
+    if (/^[0-9a-fA-F-]{36}$/.test(a)) return a;
+  }
+  return envProjectId || undefined;
+}
+
 function batchKeyForHk(argv: string[]): { key: string; scope: 'kind' | 'object' } {
   const cmd = argv[0] ?? '';
   // start/create-and-start 类级免问（同 batchKeyForMcp 的启动类）：启动不改写看板数据，
@@ -112,6 +132,7 @@ export function makeHkCliHandler({
       isStart,
       urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
       title,
+      projectId: isCreate ? hkCreateProjectId(argv, kanbanProjectId) : undefined,
       batchKey,
       batchScope,
       destructive: isDestructive(`${argv[0] ?? ''} ${argv[1] ?? ''}`),

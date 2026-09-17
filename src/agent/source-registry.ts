@@ -8,6 +8,10 @@ import { errMessage } from '../infra/err';
  * Dedupe registry: remembers which Feishu/Lark source URLs already became
  * kanban tasks, so「同步我的任务」run twice does not create duplicates.
  * Persisted to <home>/synced-sources.json, keyed per user.
+ *
+ * 查重粒度为 (来源 URL, 项目)：同一来源文档涉及多个项目（如中控/APP/后端）时，
+ * 每个项目各建一个任务不互斥；只有同 URL + 同项目才判定重复。项目维度的键为
+ * projectId，缺省（无项目参数的旧数据/旧调用）统一挂在 '' 键下。
  */
 
 export interface SyncedSource {
@@ -16,7 +20,8 @@ export interface SyncedSource {
   createdAt: string;
 }
 
-type RegistryData = Record<string, Record<string, SyncedSource>>;
+/** data[uid][url][projectKey] = SyncedSource；projectKey 为 projectId，无项目信息时为 ''。 */
+type RegistryData = Record<string, Record<string, Record<string, SyncedSource>>>;
 
 /** 运行时校验单条映射：三个字段都必须为 string（盘上文件可能被手改/写坏）。 */
 function isSyncedSource(v: unknown): v is SyncedSource {
@@ -97,6 +102,21 @@ export class SourceRegistry {
     }
   }
 
+  /**
+   * 解析单 URL 下的记录集。兼容两种盘上格式：
+   * - 旧格式：url → SyncedSource（无项目维度），迁移为 { '': entry }；
+   * - 新格式：url → { projectKey: SyncedSource }。
+   */
+  private static parseUrlBucket(v: unknown): Record<string, SyncedSource> | null {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    if (isSyncedSource(v)) return { '': v };
+    const out: Record<string, SyncedSource> = {};
+    for (const [projectKey, e] of Object.entries(v as Record<string, unknown>)) {
+      if (isSyncedSource(e)) out[projectKey] = e;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
   private load(): RegistryData {
     try {
       if (!fs.existsSync(this.filePath)) return {};
@@ -106,9 +126,10 @@ export class SourceRegistry {
       const out: RegistryData = {};
       for (const [uid, entries] of Object.entries(raw as Record<string, unknown>)) {
         if (!entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
-        const clean: Record<string, SyncedSource> = {};
-        for (const [url, e] of Object.entries(entries as Record<string, unknown>)) {
-          if (isSyncedSource(e)) clean[url] = e;
+        const clean: Record<string, Record<string, SyncedSource>> = {};
+        for (const [url, v] of Object.entries(entries as Record<string, unknown>)) {
+          const bucket = SourceRegistry.parseUrlBucket(v);
+          if (bucket) clean[url] = bucket;
         }
         if (Object.keys(clean).length) out[uid] = clean;
       }
@@ -119,13 +140,20 @@ export class SourceRegistry {
   }
 
   private persist(): void {
-    // 条数上限：淘汰每用户 createdAt 最旧的条目。与 remove 一样，淘汰结果可能被
-    // 持有旧内存快照的其他实例在下一次 persist 时复活（取舍见 mergeFromDisk 注释）。
+    // 条数上限：淘汰每用户 createdAt 最旧的记录（按 (url, projectKey) 单条计）。
+    // 与 remove 一样，淘汰结果可能被持有旧内存快照的其他实例在下一次 persist 时
+    // 复活（取舍见 mergeFromDisk 注释）。
     for (const entries of Object.values(this.data)) {
-      const keys = Object.keys(entries);
-      if (keys.length <= MAX_SOURCES_PER_USER) continue;
-      const byOldest = keys.sort((a, b) => entries[a]!.createdAt.localeCompare(entries[b]!.createdAt));
-      for (const k of byOldest.slice(0, keys.length - MAX_SOURCES_PER_USER)) delete entries[k];
+      const flat: { url: string; projectKey: string; createdAt: string }[] = [];
+      for (const [url, bucket] of Object.entries(entries)) {
+        for (const [projectKey, e] of Object.entries(bucket)) flat.push({ url, projectKey, createdAt: e.createdAt });
+      }
+      if (flat.length <= MAX_SOURCES_PER_USER) continue;
+      flat.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      for (const item of flat.slice(0, flat.length - MAX_SOURCES_PER_USER)) {
+        delete entries[item.url]![item.projectKey];
+        if (!Object.keys(entries[item.url]!).length) delete entries[item.url];
+      }
     }
     try {
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n');
@@ -150,31 +178,64 @@ export class SourceRegistry {
       this.diskCache = { fingerprint, data: this.load() };
     }
     for (const [uid, entries] of Object.entries(this.diskCache.data)) {
-      this.data[uid] = { ...entries, ...(this.data[uid] || {}) };
+      const mine = this.data[uid] || {};
+      const merged: Record<string, Record<string, SyncedSource>> = { ...entries };
+      for (const [url, bucket] of Object.entries(mine)) {
+        // 两级合并：同 URL 下按 projectKey 逐条合并，内存视图优先
+        merged[url] = { ...(entries[url] || {}), ...bucket };
+      }
+      this.data[uid] = merged;
     }
   }
 
-  lookup(userId: string, url: string): SyncedSource | undefined {
+  /**
+   * 查重：命中返回记录与命中的 projectKey。
+   * - 传 projectId：仅同 URL + 同项目判定重复（同来源跨项目各建一个任务不互斥）；
+   * - 不传 projectId：优先 '' 键（同为无项目创建），否则任一记录兜底拦截——
+   *   无项目参数时无法判定落到哪个项目，保守视为重复。
+   */
+  find(userId: string, url: string, projectId?: string): { projectKey: string; entry: SyncedSource } | undefined {
     // 与 record/remove 一致先合并盘上数据：长驻进程的内存快照看不到 CLI 等其他
     // 实例新写入的映射，不合并会让重复建任务拦截失效
     this.mergeFromDisk();
-    return this.data[userId]?.[url];
+    const bucket = this.data[userId]?.[url];
+    if (!bucket) return undefined;
+    if (projectId) {
+      const entry = bucket[projectId];
+      return entry ? { projectKey: projectId, entry } : undefined;
+    }
+    if (bucket['']) return { projectKey: '', entry: bucket[''] };
+    const [projectKey, entry] = Object.entries(bucket)[0] || [];
+    return entry ? { projectKey: projectKey!, entry } : undefined;
   }
 
-  record(userId: string, url: string, entry: SyncedSource): void {
+  lookup(userId: string, url: string, projectId?: string): SyncedSource | undefined {
+    return this.find(userId, url, projectId)?.entry;
+  }
+
+  record(userId: string, url: string, entry: SyncedSource, projectId?: string): void {
     this.mergeFromDisk();
     if (!this.data[userId]) this.data[userId] = {};
-    this.data[userId]![url] = entry;
+    if (!this.data[userId]![url]) this.data[userId]![url] = {};
+    this.data[userId]![url]![projectId || ''] = entry;
     this.persist();
   }
 
-  remove(userId: string, url: string): void {
-    // Merge first so persist does not stomp other instances' keys; deleting
-    // after the merge guarantees the removed key cannot be resurrected by it.
+  /**
+   * 传 projectKey（含 ''）只删该键；不传则删除整个 URL 桶。
+   * Merge first so persist does not stomp other instances' keys; deleting
+   * after the merge guarantees the removed key cannot be resurrected by it.
+   */
+  remove(userId: string, url: string, projectKey?: string): void {
     this.mergeFromDisk();
-    if (this.data[userId] && url in this.data[userId]!) {
-      delete this.data[userId]![url];
-      this.persist();
+    const entries = this.data[userId];
+    if (!entries || !(url in entries)) return;
+    if (projectKey === undefined) {
+      delete entries[url];
+    } else {
+      delete entries[url]![projectKey];
+      if (!Object.keys(entries[url]!).length) delete entries[url];
     }
+    this.persist();
   }
 }

@@ -155,6 +155,8 @@ export function makeKanbanMcpHandler({
       isStart,
       urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
       title: typeof args.title === 'string' ? args.title : '',
+      // 查重粒度 (来源 URL, 项目)：同来源拆到多项目时按 project_id 区分（口径同 formatMcpDetail）
+      projectId: String(args.project_id ?? args.projectId ?? '') || undefined,
       batchKey,
       batchScope,
       destructive: isDestructive(tool.name),

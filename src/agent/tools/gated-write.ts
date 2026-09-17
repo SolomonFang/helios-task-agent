@@ -41,6 +41,8 @@ export interface GatedWriteParams {
   isStart: boolean;
   urls: string[];
   title: string;
+  /** 创建目标项目 ID：查重粒度为 (来源 URL, 项目)，同来源跨项目各建一个任务不互斥。 */
+  projectId?: string;
   /** 「同类免问」key；缺省（undefined）= 本次不提供免问（写工具缺可识别对象 id 时 fail-closed）。 */
   batchKey?: string;
   /** 「同类免问」粒度（见 guard.ConfirmRequest.batchScope）：类级或对象级，由 key 生成处一并给出。 */
@@ -83,15 +85,16 @@ export function makeGatedWriter({
    * CLI 与 bot 两个进程并发同步同一来源时可双双通过查重、各建一个任务。
    * 单进程内串行（事件循环 + 同用户串行队列），风险仅限跨进程并发；当前以注释明示，不改行为。
    */
-  const checkDuplicates = async (urls: string[], signal?: AbortSignal): Promise<string | null> => {
+  const checkDuplicates = async (urls: string[], projectId: string | undefined, signal?: AbortSignal): Promise<string | null> => {
     for (const url of urls) {
-      const hit = registry.lookup(uid, url);
-      if (!hit) continue;
+      const found = registry.find(uid, url, projectId);
+      if (!found) continue;
+      const hit = found.entry;
       // taskId 为 unknown 的是历史遗留数据（recordSources 只写 extractUuid 非空的记录）：
       // 无从核验任务是否仍存活，拦截文案引导的「先删除原任务」也无从操作——
       // 永久拦截即成死锁，清理该映射后放行
       if (hit.taskId === 'unknown') {
-        registry.remove(uid, url);
+        registry.remove(uid, url, found.projectKey);
         continue;
       }
       const exists = await kanbanTaskExists(kanbanUrl, hit.taskId, signal);
@@ -102,26 +105,27 @@ export function makeGatedWriter({
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
           `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
           '如确需重建，请先在「看板」中删除原任务（或告知用户该任务已存在）；\n' +
-          '如用户是想把最新内容合并进原任务，改用更新操作修改该任务，不要重复创建。'
+          '如用户是想把最新内容合并进原任务，改用更新操作修改该任务，不要重复创建；\n' +
+          '如同一来源需要拆到多个项目（如中控/APP/后端各一个任务），请在创建时显式指定不同的目标项目。'
         );
       }
-      registry.remove(uid, url); // 原任务已被删除 → 清理映射后放行
+      registry.remove(uid, url, found.projectKey); // 原任务已被删除 → 清理映射后放行
     }
     return null;
   };
 
-  const recordSources = (urls: string[], result: string, title: string): void => {
+  const recordSources = (urls: string[], result: string, title: string, projectId?: string): void => {
     // 用强失败判定：成功结果的内容文本（如描述提到 error）不应阻碍来源映射记录
     if (!urls.length || looksLikeStrongFailure(result)) return;
     const taskId = extractUuid(result);
     if (!taskId) return;
     const entry = { taskId, title, createdAt: new Date().toISOString() };
-    for (const url of urls) registry.record(uid, url, entry);
+    for (const url of urls) registry.record(uid, url, entry, projectId);
   };
 
   return async (p) => {
     if (p.urls.length) {
-      const dup = await checkDuplicates(p.urls, p.signal);
+      const dup = await checkDuplicates(p.urls, p.projectId, p.signal);
       if (dup) {
         auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'blocked_dup' }, auditHome);
         return dup;
@@ -156,7 +160,7 @@ export function makeGatedWriter({
       { user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'approved', ok, resultSnippet: result },
       auditHome,
     );
-    if (ok && p.urls.length) recordSources(p.urls, result, p.title);
+    if (ok && p.urls.length) recordSources(p.urls, result, p.title, p.projectId);
     if (ok && p.isCreate) createCounter.count++;
     return wrapUntrusted(result);
   };

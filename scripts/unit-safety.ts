@@ -973,6 +973,50 @@ async function main() {
     }
   });
 
+  // ---------- runGatedWrite：同来源 URL 拆到不同项目不互斥（查重粒度 URL+项目） ----------
+  await checkAsync('runGatedWrite：同来源不同项目放行，同项目拦截，无项目参数保守拦截', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-gated-proj-'));
+    try {
+      const registry = new SourceRegistry(tmp);
+      const write = makeGatedWriter({
+        uid: 'u1',
+        registry,
+        kanbanUrl: 'http://localhost:1', // 不可达：kanbanTaskExists 保守视为存在 → 命中映射即拦截
+        confirm: async () => 'once',
+        auditHome: tmp,
+        createCounter: { count: 0 },
+      });
+      const create = (projectId?: string) =>
+        write({
+          kind: 'kanban',
+          summary: '创建任务',
+          detail: () => 'kanban_create_task',
+          isCreate: true,
+          isStart: false,
+          urls: ['https://a.feishu.cn/docx/multi1'],
+          title: '任务A',
+          projectId,
+          batchKey: 'kanban:create_task',
+          batchScope: 'kind',
+          destructive: false,
+          execute: async () => '{"success":true,"data":{"id":"11111111-1111-1111-1111-111111111111"}}',
+        });
+      const first = await create('proj-zk');
+      assert.ok(!first.includes('已同步过'), `首次创建应放行，实际：${first}`);
+      assert.equal(registry.lookup('u1', 'https://a.feishu.cn/docx/multi1', 'proj-zk')?.taskId, '11111111-1111-1111-1111-111111111111');
+      const dupSame = await create('proj-zk');
+      assert.ok(dupSame.includes('已同步过'), `同 URL 同项目应拦截，实际：${dupSame}`);
+      const otherProj = await create('proj-app');
+      assert.ok(!otherProj.includes('已同步过'), `同 URL 不同项目应放行，实际：${otherProj}`);
+      const noProj = await create(undefined);
+      assert.ok(noProj.includes('已同步过'), `无项目参数应保守拦截（URL 已有记录），实际：${noProj}`);
+      const audit = fs.readFileSync(path.join(tmp, 'audit.log'), 'utf8');
+      assert.equal(audit.split('\n').filter((l) => l.includes('blocked_dup')).length, 2, `应有 2 条 blocked_dup 审计，实际：${audit}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   finish();
 }
 

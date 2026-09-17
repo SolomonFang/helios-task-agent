@@ -984,11 +984,13 @@ async function run(): Promise<void> {
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-regcap-'));
     const reg = new SourceRegistry(tmp);
-    // 直接向内存塞入上限条数，避免上千次落盘
-    const priv = reg as unknown as { data: Record<string, Record<string, { taskId: string; title: string; createdAt: string }>> };
+    // 直接向内存塞入上限条数，避免上千次落盘（新结构：url → { projectKey: entry }）
+    const priv = reg as unknown as {
+      data: Record<string, Record<string, Record<string, { taskId: string; title: string; createdAt: string }>>>;
+    };
     priv.data.u1 = {};
     for (let i = 0; i < 1000; i++) {
-      priv.data.u1[`https://a.feishu.cn/docx/${i}`] = { taskId: `t-${i}`, title: 'T', createdAt: String(i).padStart(4, '0') };
+      priv.data.u1[`https://a.feishu.cn/docx/${i}`] = { '': { taskId: `t-${i}`, title: 'T', createdAt: String(i).padStart(4, '0') } };
     }
     reg.record('u1', 'https://a.feishu.cn/docx/new', { taskId: 't-new', title: 'T', createdAt: '1000' });
     const reloaded = new SourceRegistry(tmp);
@@ -998,6 +1000,56 @@ async function run(): Promise<void> {
         reloaded.lookup('u1', 'https://a.feishu.cn/docx/0') === undefined &&
         reloaded.lookup('u1', 'https://a.feishu.cn/docx/1')?.taskId === 't-1' &&
         reloaded.lookup('u1', 'https://a.feishu.cn/docx/new')?.taskId === 't-new',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 来源查重：(URL, 项目) 复合键——同来源拆到多项目不互斥 ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-regproj-'));
+    const reg = new SourceRegistry(tmp);
+    const url = 'https://a.feishu.cn/docx/multi';
+    reg.record('u1', url, { taskId: 't-zk', title: '任务A-中控', createdAt: 'x' }, 'proj-zk');
+    reg.record('u1', url, { taskId: 't-app', title: '任务A-APP', createdAt: 'x' }, 'proj-app');
+    const reloaded = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 同 URL 不同项目各自记录/查询，未建的项目不拦截',
+      reloaded.lookup('u1', url, 'proj-zk')?.taskId === 't-zk' &&
+        reloaded.lookup('u1', url, 'proj-app')?.taskId === 't-app' &&
+        reloaded.lookup('u1', url, 'proj-be') === undefined,
+    );
+    check(
+      'SourceRegistry 无项目参数查询：保守命中该 URL 任一记录',
+      reloaded.lookup('u1', url) !== undefined,
+    );
+    reg.remove('u1', url, 'proj-zk');
+    const after = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 按项目键删除不波及其他项目',
+      after.lookup('u1', url, 'proj-zk') === undefined && after.lookup('u1', url, 'proj-app')?.taskId === 't-app',
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 来源查重：旧格式（url → SyncedSource，无项目维度）迁移 ----------
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-reglegacy-'));
+    fs.writeFileSync(
+      path.join(tmp, 'synced-sources.json'),
+      JSON.stringify({ u1: { 'https://a.feishu.cn/docx/legacy': { taskId: 't-old', title: '旧任务', createdAt: 'x' } } }),
+    );
+    const reg = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 旧格式迁移：无项目记录可查，带项目的创建不被旧记录拦截（可补齐其他项目）',
+      reg.lookup('u1', 'https://a.feishu.cn/docx/legacy')?.taskId === 't-old' &&
+        reg.lookup('u1', 'https://a.feishu.cn/docx/legacy', 'proj-app') === undefined,
+    );
+    reg.record('u1', 'https://a.feishu.cn/docx/legacy', { taskId: 't-app', title: '任务A-APP', createdAt: 'y' }, 'proj-app');
+    const reloaded = new SourceRegistry(tmp);
+    check(
+      'SourceRegistry 旧格式迁移后可按项目补录，且不影响无项目查询',
+      reloaded.lookup('u1', 'https://a.feishu.cn/docx/legacy')?.taskId === 't-old' &&
+        reloaded.lookup('u1', 'https://a.feishu.cn/docx/legacy', 'proj-app')?.taskId === 't-app',
     );
     fs.rmSync(tmp, { recursive: true, force: true });
   }
