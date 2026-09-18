@@ -11,7 +11,8 @@ import type { KanbanMcp } from './kanban/mcp';
 import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
-import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
+import { checkForUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
+import { createGracefulExit, handleWizardCancel, installCrashGuards, maybePromptUpdate } from './infra/process-lifecycle';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -160,15 +161,13 @@ export async function main(): Promise<void> {
   try {
     cfg = await ensureConfig(ask, { choose, askSecret });
   } catch (err) {
-    const message = errMessage(err);
     // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 /config、bot-main 同一口径：
     // 灰字提示 + 退出码 0，不打成红色「配置失败」
-    if (message === '已取消') {
-      console.log(c.gray('已取消，配置未变更'));
+    if (handleWizardCancel(err)) {
       rl.close();
       process.exit(0);
     }
-    console.error(c.err(`\n配置失败：${message}`));
+    console.error(c.err(`\n配置失败：${errMessage(err)}`));
     rl.close();
     process.exit(1);
   }
@@ -217,48 +216,34 @@ export async function main(): Promise<void> {
     console.log('');
   };
 
-  let cleaningUp = false;
   /**
-   * 退出清理：幂等（Ctrl+C 连按 / process+rl 双通道 SIGINT 不重入）+ 8s 强退兜底（对齐 bot 模式）。
-   * exitCode 由触发路径决定：正常退出 0；uncaughtException 传 1——以 0 退出会被
-   * launchd/systemd 当成干净停止而不触发自动重启。
+   * 退出清理：幂等（Ctrl+C 连按 / process+rl 双通道 SIGINT 不重入）+ 8s 强退兜底（对齐 bot 模式，
+   * 实现见 infra/process-lifecycle.ts）。exitCode 由触发路径决定：正常退出 0；uncaughtException 传 1。
    */
-  const cleanup = async (exitCode = 0): Promise<void> => {
-    if (cleaningUp) return;
-    cleaningUp = true;
-    // 强退兜底：mcp.close 挂住时进程不得永不退（unref：该定时器自身不得阻止正常退出）
-    const forceTimer = setTimeout(() => {
-      console.error(c.err('\n退出清理超时，强制结束进程'));
-      process.exit(1);
-    }, 8000);
-    forceTimer.unref();
-    spinner.stop();
-    try {
+  const cleanup = createGracefulExit({
+    cleanup: async () => {
+      spinner.stop();
       await cleanupRes.reminderRunner?.stop();
       await cleanupRes.mcp?.close();
-    } catch {
-      /* 尽力清理，失败照常退出 */
-    }
-    // 轮次后直接 /exit（或退出信号）时缓冲提醒尚未 flush，但已 markDelivered 落盘：
-    // 退出前补一次展示，否则这批提醒永久丢失
-    flushPendingReminders();
-    // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可。
-    // 存活判定与 stopKanbanChild 一致用进程树（infra/proc.ts 的 processTreeAlive，含 win32 分支）：
-    // detached 的 npx 壳可能先退、被 reparent 的看板孙进程仍在组里占端口，exitCode===null 会漏提示；
-    // 停止命令也按进程组给（壳已死时 kill <pid> 打的是死壳，杀不到看板孙进程）。
-    if (kanbanChild && kanbanChild.pid !== undefined && processTreeAlive(kanbanChild.pid)) {
-      kanbanChild.stdout?.destroy();
-      kanbanChild.stderr?.destroy();
-      kanbanChild.unref();
-      // win32 无进程组 kill：taskkill /T 杀整棵进程树，/F 强制
-      const stopHint =
-        process.platform === 'win32' ? `taskkill /PID ${kanbanChild.pid} /T /F` : `kill -- -${kanbanChild.pid}（进程组）`;
-      console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：${stopHint}`));
-    }
-    rl.close();
-    clearTimeout(forceTimer);
-    process.exit(exitCode);
-  };
+      // 轮次后直接 /exit（或退出信号）时缓冲提醒尚未 flush，但已 markDelivered 落盘：
+      // 退出前补一次展示，否则这批提醒永久丢失
+      flushPendingReminders();
+      // 不 kill 自动拉起的看板：用户可能正在用 Web UI；留下停止方式即可。
+      // 存活判定与 stopKanbanChild 一致用进程树（infra/proc.ts 的 processTreeAlive，含 win32 分支）：
+      // detached 的 npx 壳可能先退、被 reparent 的看板孙进程仍在组里占端口，exitCode===null 会漏提示；
+      // 停止命令也按进程组给（壳已死时 kill <pid> 打的是死壳，杀不到看板孙进程）。
+      if (kanbanChild && kanbanChild.pid !== undefined && processTreeAlive(kanbanChild.pid)) {
+        kanbanChild.stdout?.destroy();
+        kanbanChild.stderr?.destroy();
+        kanbanChild.unref();
+        // win32 无进程组 kill：taskkill /T 杀整棵进程树，/F 强制
+        const stopHint =
+          process.platform === 'win32' ? `taskkill /PID ${kanbanChild.pid} /T /F` : `kill -- -${kanbanChild.pid}（进程组）`;
+        console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：${stopHint}`));
+      }
+      rl.close();
+    },
+  });
   const onSigint = () => {
     if (currentCtl) {
       currentCtl.abort();
@@ -274,20 +259,8 @@ export async function main(): Promise<void> {
   process.on('SIGINT', onSigint);
   rl.on('SIGINT', onSigint);
   process.on('SIGTERM', () => void cleanup(0));
-  // 长驻 REPL 兜底（与 bot 同策略）：漏网 rejection 记日志不退出；
-  // uncaughtException 复用 cleanup 优雅退出（退出码 1，见 cleanup 注释）。
-  // handler 自身只做同步日志，不得再抛异常。
-  process.on('unhandledRejection', (reason) => {
-    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
-    console.error(c.err(`未处理的 Promise rejection（进程保持运行）：${msg}`));
-  });
-  process.on('uncaughtException', (err) => {
-    console.error(c.err(`未捕获异常，执行优雅退出：${err.stack || err.message}`));
-    void cleanup(1);
-  });
-  // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
-  // 验证崩溃退出码为 1（setImmediate 抛出才走 uncaughtException，同步 throw 只会 reject main）
-  if (process.env.HTA_TEST_CRASH) setImmediate(() => { throw new Error('HTA_TEST_CRASH'); });
+  // 长驻 REPL 兜底（与 bot 同策略）+ HTA_TEST_CRASH 测试钩子：见 infra/process-lifecycle.ts
+  installCrashGuards(cleanup);
 
   const bootKanban = new Spinner('检查 helios-kanban…').start();
   const ensured = await ensureKanbanOrExit({
@@ -428,7 +401,7 @@ export async function main(): Promise<void> {
       // 不 drain 的话更新确认的 ask 会立即消费最早缓存的陈旧行——恰好是 y/yes 就会在用户
       // 没看到提示时执行 npm i -g（与向导交互后 drain 同一模式，见 wizardChoose/wizardAskSecret 调用处）
       nextLine.drain();
-      const outcome = await promptVersionUpdate({ info, ask, log: (m) => console.log(c.gray(m)) });
+      const outcome = await maybePromptUpdate(info, ask);
       if (outcome === 'updated') {
         console.log(c.ok('请重新运行 helios-task-agent 使用新版本。'));
         await cleanup();
@@ -562,10 +535,8 @@ export async function main(): Promise<void> {
             );
           }
         } catch (err) {
-          const message = errMessage(err);
           // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，不打成红色「配置失败」
-          if (message === '已取消') console.log(c.gray('已取消，配置未变更'));
-          else console.error(c.err(`配置失败：${message}`));
+          if (!handleWizardCancel(err)) console.error(c.err(`配置失败：${errMessage(err)}`));
         }
       } else {
         console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));

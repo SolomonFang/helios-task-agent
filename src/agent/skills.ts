@@ -47,14 +47,20 @@ export function parseFrontmatter(raw: string): { data: Record<string, string | s
     const kv = lines[i]!.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
     if (!kv) continue;
     const [, key, rest = ''] = kv;
+    // 续行吞并仅对块标量（>-/|）与列表（空 rest）启用：标量 key（如 name: foo）后的缩进行
+    // 与该 key 无关，吞掉会静默丢弃内容
     const cont: string[] = [];
-    while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]!)) cont.push(lines[++i]!);
+    if (rest === '>-' || rest === '>' || rest === '|' || rest === '|-' || rest === '') {
+      while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]!)) cont.push(lines[++i]!);
+      // 列表项允许顶格写法（合法 YAML）：上面的续行循环只收缩进行，顶格 `- item` 单独补收
+      if (rest === '') while (i + 1 < lines.length && /^-\s+/.test(lines[i + 1]!)) cont.push(lines[++i]!);
+    }
     if (rest === '>-' || rest === '>') {
       data[key!] = cont.map((l) => l.trim()).join(' ').replace(/\s+$/, '');
     } else if (rest === '|' || rest === '|-') {
       data[key!] = cont.map((l) => l.replace(/^\s+/, '')).join('\n');
     } else if (rest === '') {
-      const items = cont.map((l) => l.match(/^\s+-\s+(.*)$/)?.[1]).filter(Boolean) as string[];
+      const items = cont.map((l) => l.match(/^\s*-\s+(.*)$/)?.[1]).filter(Boolean) as string[];
       if (items.length) data[key!] = items;
       else data[key!] = '';
     } else {
@@ -225,7 +231,7 @@ export function renderSkillsBlock(): string {
       // UNTRUSTED 标记（同 memory 写入前的中和思路），防伪造开/闭标记扰乱边界语义
       neutralizeMarkers(s.description, [UNTRUSTED_OPEN, UNTRUSTED_CLOSE]),
       withDigest ? neutralizeMarkers(s.digest, [UNTRUSTED_OPEN, UNTRUSTED_CLOSE]) : '',
-      `完整文档：\`${s.dir}/SKILL.md\`（用 skill_doc 读取）`,
+      `完整文档：\`${path.join(s.dir, 'SKILL.md')}\`（用 skill_doc 读取）`,
     ]
       .filter(Boolean)
       .join('\n\n');

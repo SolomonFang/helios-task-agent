@@ -23,7 +23,7 @@ import {
   buildRetryPrompt,
   DIAGNOSIS_CARD_MAX_CHARS,
 } from '../src/kanban/failure-diagnosis';
-import { buildWatchEventCard, buildDiagnosisCard } from '../src/channels/feishu-cards';
+import { buildWatchEventCard, buildDiagnosisCard } from '../src/bot/cards';
 import { createBotHandlers } from '../src/bot/handler';
 import { SessionRouter } from '../src/agent/session-router';
 import { ConfirmationManager } from '../src/agent/confirm';
@@ -237,6 +237,45 @@ async function main(): Promise<void> {
       assert.ok(card.header.title.content.includes('久未更新'));
     } finally {
       await stopServer(server);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- KanbanWatcher：stop 后在途推送逐条跳过 ----------
+  await checkAsync('KanbanWatcher：stop 后 deliverPending 跳过剩余推送，未送达组合保留待重投', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-stale-stop-'));
+    try {
+      const sent: string[] = [];
+      const logs: string[] = [];
+      const watcher = new KanbanWatcher({
+        kanbanUrl: 'http://127.0.0.1:1',
+        statePath: path.join(tmp, 'watch-state.json'),
+        owners: () => ['o1', 'o2'],
+        notify: async () => {},
+        notifyOwner: async (_e, owner) => {
+          sent.push(owner);
+          if (owner === 'o1') await watcher.stop(); // 第一条送达后即停：后续推送应全部跳过
+        },
+        log: (msg) => logs.push(msg),
+      });
+      const deliver = (
+        watcher as unknown as {
+          deliverPending: (
+            events: Array<{ id: string; event: WatchEvent }>,
+            prev: undefined,
+          ) => Promise<{ pending: Record<string, { delivered: string[] }>; failed: number }>;
+        }
+      ).deliverPending.bind(watcher);
+      const mk = (id: string): { id: string; event: WatchEvent } => ({ id, event: { kind: 'done', title: id, text: id } });
+      const r = await deliver([mk('e1'), mk('e2')], undefined);
+      assert.deepEqual(sent, ['o1'], `stop 后不应再有推送，实际：${sent.join(',')}`);
+      assert.deepEqual(r.pending.e1?.delivered, ['o1'], '已送达进度应保留');
+      assert.ok(r.pending.e2, '未送达事件应保留待重投');
+      assert.ok(
+        logs.some((l) => l.includes('已停止')),
+        `跳过剩余推送应记日志，实际：${logs.join(' | ')}`,
+      );
+    } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

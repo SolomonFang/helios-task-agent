@@ -29,9 +29,8 @@ import {
   CONFIRM_BATCH_RE,
   CONFIRM_NO_RE,
   isConfirmWord,
-  hasPendingConfirmation,
 } from '../src/agent/confirm';
-import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from '../src/channels/feishu-cards';
+import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from '../src/bot/cards';
 import { isLoopbackUrl } from '../src/infra/url-utils';
 import { sanitizeToolPairs, trimHistory, runAgentTurn, MAX_HISTORY_MESSAGES } from '../src/agent/llm';
 import { createAccessChecker, FeishuChannel, parsePostContent, splitText } from '../src/channels/feishu';
@@ -1997,6 +1996,19 @@ async function run(): Promise<void> {
     );
   })());
 
+  check('minimalChildEnv：win32 放行匹配大小写不敏感（Path 原键名保留），POSIX 仍精确匹配', (() => {
+    const base = { Path: 'C:\\Windows', llm_api_key: 'sk-leak', lc_all: 'zh_CN' };
+    const win = minimalChildEnv({}, base, 'win32');
+    const posix = minimalChildEnv({}, base, 'linux');
+    return (
+      win.Path === 'C:\\Windows' && // 原键名写入，不改成 PATH
+      !('llm_api_key' in win) && // 敏感变量即使小写也不放行
+      win.lc_all === 'zh_CN' && // win32 下 LC_ 前缀同样大小写不敏感
+      !('Path' in posix) && // POSIX 下 Path 不匹配 PATH 放行项
+      !('lc_all' in posix) // POSIX 下 lc_all 不匹配 LC_ 前缀
+    );
+  })());
+
   await checkAsync('findOcrCommand：PATH 无 ocr 时回退 npx（异步探测）', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-ocrpath-'));
     const cmd = await findOcrCommand({ PATH: tmp });
@@ -3130,10 +3142,10 @@ async function run(): Promise<void> {
     assert.match(stderr, /invalid --limit/);
   });
 
-  // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
+  // ---------- npx 包规格：kanban 与 ocr 均钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
-      kanbanPackageSpec({}) === 'helios-kanban@latest' &&
+      /^helios-kanban@\d+\.\d+\.\d+$/.test(kanbanPackageSpec({})) &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36' &&
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&
@@ -3264,6 +3276,19 @@ async function run(): Promise<void> {
     const crlf = parseFrontmatter('---\r\nname: win\r\ndescription: d\r\n---\r\n\r\n# Body\r\n');
     assert.equal(crlf.data.name, 'win');
     assert.equal(crlf.body.trim(), '# Body');
+  });
+
+  await checkAsync('parseFrontmatter：标量 key 后的缩进行不被吞并；列表项支持顶格写法', async () => {
+    // 标量 key（name: foo）后的缩进行与该 key 无关：不得当续行消费丢弃
+    const scalar = parseFrontmatter('---\nname: foo\n  这行不属于 name\ndescription: d\n---\n# B\n');
+    assert.equal(scalar.data.name, 'foo', '标量 key 不得吞并后续缩进行');
+    assert.equal(scalar.data.description, 'd', '后续 key 应正常解析（不被误吞）');
+    // 列表项顶格写法（合法 YAML）与缩进写法等价
+    const flat = parseFrontmatter('---\nname: x\ndescription: d\ndigest_sections:\n- Quick workflow\n- Safety rules\n---\n# B\n');
+    assert.deepEqual(flat.data.digest_sections, ['Quick workflow', 'Safety rules'], '顶格列表项应解析为数组');
+    // 块标量（>-/|）的续行吞并不受影响
+    const block = parseFrontmatter('---\nname: x\ndescription: >-\n  a\n  b\n---\n# B\n');
+    assert.equal(block.data.description, 'a b');
   });
 
   await checkAsync('技能加载：description + digest_sections 声明的章节进入摘要', async () => {
@@ -3434,7 +3459,7 @@ async function run(): Promise<void> {
     ]);
   });
 
-  await checkAsync('闸门 batchKey：lark 写操作按命令路径 + 对象归类（可同类免问）并标记破坏性', async () => {
+  await checkAsync('闸门 batchKey：lark 写操作按命令路径 + 对象归类（可同类免问）并标记破坏性；无对象实参 fail-closed 不提供免问', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-larkbatch-'));
     const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined; destructive: boolean | undefined }> = [];
     const { handlers } = buildTools({
@@ -3454,8 +3479,9 @@ async function run(): Promise<void> {
     assert.deepEqual(seen, [
       { batchKey: 'lark:im send:ou_x', batchScope: 'object', destructive: true },
       { batchKey: 'lark:task create:t', batchScope: 'object', destructive: true },
-      // 无对象实参时 key 退化为命令路径，粒度同步降为类级——卡片不再广告「同对象免问」
-      { batchKey: 'lark:im send', batchScope: 'kind', destructive: true },
+      // 无对象实参时 fail-closed 不提供免问（每次必问）：退化为类级 key 会把一次批准
+      // 静默放行成发往任意接收人的同类操作（与 kanban-mcp 缺对象 id 同口径）
+      { batchKey: undefined, batchScope: 'kind', destructive: true },
     ]);
   });
 
@@ -3522,16 +3548,30 @@ async function run(): Promise<void> {
     assert.equal(await p2, 'batch');
   });
 
-  // ---------- hasPendingConfirmation：跨实例查询有无挂起确认 ----------
-  await checkAsync('hasPendingConfirmation：有/无 pending 两态', async () => {
+  // ---------- hasPending：实例级查询有无挂起确认（原全局 hasPendingConfirmation 已移除） ----------
+  await checkAsync('hasPending：有/无 pending 两态', async () => {
     const mgr = new ConfirmationManager(async () => undefined);
-    assert.equal(hasPendingConfirmation('u-pending'), false); // 无 pending
+    assert.equal(mgr.hasPending('u-pending'), false); // 无 pending
     const p = mgr.request('u-pending', { kind: 'kanban', summary: 's', detail: 'd' });
-    assert.equal(hasPendingConfirmation('u-pending'), true); // 有 pending
-    assert.equal(hasPendingConfirmation('u-other'), false); // 他人不受影响
+    assert.equal(mgr.hasPending('u-pending'), true); // 有 pending
+    assert.equal(mgr.hasPending('u-other'), false); // 他人不受影响
     mgr.resolveFromText('u-pending', '确认');
     await p;
-    assert.equal(hasPendingConfirmation('u-pending'), false); // 裁决后清除
+    assert.equal(mgr.hasPending('u-pending'), false); // 裁决后清除
+  });
+
+  // ---------- bot 文本裁决剔除单字母 y/n（随口应答别的对话不得放行写操作）；完整词不受影响 ----------
+  await checkAsync('确认管理器：bot 文本裁决忽略单字母 y/n，CLI 词表仍保留', async () => {
+    const mgr = new ConfirmationManager(async () => undefined);
+    const p1 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(mgr.resolveFromText('u1', 'y'), 'ignored', '单字母 y 不得裁决批准');
+    assert.equal(mgr.resolveFromText('u1', 'n'), 'ignored', '单字母 n 不得裁决拒绝');
+    assert.equal(mgr.resolveFromText('u1', 'yes'), 'approved', '完整词 yes 仍批准');
+    assert.equal(await p1, 'once');
+    const p2 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(mgr.resolveFromText('u1', 'no'), 'denied', '完整词 no 仍拒绝');
+    assert.equal(await p2, false);
+    assert.ok(CONFIRM_YES_RE.test('y') && CONFIRM_NO_RE.test('n'), 'CLI 交互式确认保留单字母');
   });
 
   // ---------- kind 枚举 → 用户可见中文 ----------

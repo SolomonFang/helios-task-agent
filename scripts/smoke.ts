@@ -16,7 +16,7 @@ import { MemoryStore } from '../src/agent/memory';
 import { classifyHk, classifyLark, classifyMcp, withBatchApproval, type ConfirmRequest } from '../src/agent/guard';
 import { SourceRegistry, extractSourceUrls } from '../src/agent/source-registry';
 import { ConfirmationManager } from '../src/agent/confirm';
-import { buildResolvedCard } from '../src/channels/feishu-cards';
+import { buildResolvedCard } from '../src/bot/cards';
 import { createAccessChecker, splitText, parsePostContent } from '../src/channels/feishu';
 import { runAgentTurn } from '../src/agent/llm';
 import { checkLarkCli } from '../src/infra/deps';
@@ -93,7 +93,12 @@ async function main(): Promise<void> {
       'required' in create.function.parameters
         ? (create.function.parameters as { required?: string[] }).required
         : [];
-    check('kanban_create_task 可用', Boolean(create), create ? JSON.stringify(required || []) : '');
+    // required 纳入断言本体：创建任务的工具若声明零必填参数，等于服务端 schema 退化
+    check(
+      'kanban_create_task 可用且声明必填参数',
+      Boolean(create) && Array.isArray(required) && required.length > 0,
+      create ? JSON.stringify(required || []) : '',
+    );
 
     const listProjects = [...handlers.keys()].find((k) => k.includes('list_projects'));
     if (listProjects) {

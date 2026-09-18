@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 来源查重粒度细化到「来源 URL + 项目」：同一来源文档涉及多个项目（如中控/APP/后端）时每个项目可各建一个任务，不再被整体去重拦截——只有同 URL + 同项目才判定重复；无项目参数的旧调用与旧格式盘上数据统一挂在空项目键下兼容，无项目参数时保守视为重复拦截（`src/agent/source-registry.ts`、`src/agent/tools/gated-write.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/tools/kanban-mcp.ts`）
+
+## [1.0.37] - 2026-09-15
+
 ### Fixed
 
 - 多角度深度审查修复（安全/并发/bot 链路/看板集成/配置启动/报告定时/agent 核心/测试工程八个角度）：
@@ -22,12 +28,43 @@
 
 - 配置向导支持单独配置 AI 审查（open-code-review）模型：首次启动或 `/config` 重配时，看板默认值之后新增可选步骤——可为 AI 审查/失败诊断单独设置模型、Base URL（展示与输入均为 base 形态，写入时补全为 `…/chat/completions` 完整端点，与 `buildOcrEnv` 派生口径一致；http 明文端点沿用显式确认闸门，重输提示带场景名、可选字段回车可放弃）与专用 API Key（独立询问：只隔离 key 不必先配模型，与首次审查安全提示的首推用法对齐；掩码提示融入单括号），全部可回车跳过；与看板可选字段同一口径（有当前值回车保留、输入 `-` 清除，清除模型后残留的 URL/key 覆盖项仍会逐项出示可一并清除）；覆盖项含显式 URL/key 时联网预检（全复用则跳过不重复打扰），失败可按项修改重试、保存必须显式输入 `s`；选择写入 `OCR_LLM_MODEL` / `OCR_LLM_URL` / `OCR_LLM_TOKEN`（`writeEnv` 新增第三参 `OcrLlmOverrides`：字段缺席不动现有值、空串清除该项，换绑/飞书写入路径不传参即不触及 OCR 键）；保存确认如实标注单独配置的审查模型（`src/config/config-wizard.ts`、`src/config/config.ts`、`src/types.ts`）
 
+## [1.0.36] - 2026-09-08
+
+### Changed
+
+- Windows 平台适配：内置看板客户端由 bash 版 `hk.sh` 重写为零依赖 Node 版 `hk.mjs`（不再依赖 bash/jq/curl，安装文档同步更新）；新增跨平台进程执行层 `src/infra/proc.ts`（win32 下经 cross-spawn 走 cmd.exe，npx/npm/lark-cli 等 .cmd shim 可正常启动，错误/超时语义与 execFile 对齐），依赖探测、看板拉起、MCP 连接、更新检查等子进程路径统一改走该层；文档与测试同步适配（`skills/helios-kanban-remote/`、`src/infra/proc.ts`、`src/infra/deps.ts`、`src/infra/proc-env.ts` 等）
+
+## [1.0.35] - 2026-09-07
+
+### Fixed
+
+- 技能脚本「同类免问」失效修复：`skill_exec` 的免问 key 从「脚本 + 参数」放宽为「脚本」——此前换参数（如批量换 issue-number 查询）每次都重复弹确认，与回执文案承诺的免问口径矛盾；回执文案同步更正为「同一脚本本会话内免问（不限参数）」（`src/agent/tools/skill-tools.ts`、`src/agent/guard.ts`）
+
+## [1.0.34] - 2026-09-07
+
+### Fixed
+
+- 修复 GitHub Actions 构建异常（package-lock 依赖锁定同步），无行为变更
+
+## [1.0.33] - 2026-09-04
+
+### Added
+
 - 自然语言定时提醒 `reminder_set` / `reminder_list` / `reminder_cancel`（CLI 与 bot 共用）：「30 分钟后提醒我站会」「明天早上 9 点提醒我盯一下构建」即可创建——相对时长传分钟数、绝对时刻传本地时间字符串（「HH:mm」当天已过顺延次日、「今天/明天/后天/今晚/明晚 HH:mm」、口语「9 点/9 点半」、「YYYY-MM-DD HH:mm」、带时区标准串），解析全部在工具内完成，模型无需自己推算日期；过去时间与超 30 天期限拒绝，单用户待触发上限 20 条；提醒按用户分桶（bot 为 open_id、终端为 local）落盘 `reminders.json`（原子写 0600），两形态共享同一文件与调度核心（读-改-写合并，避免跨进程盲写覆盖）。到点投递：bot 经飞书私聊推送、终端在 agent 轮次结束后输出（进行中不打断，排队补提示）；每条提醒独立标记——投递成功落盘 delivered（重启不重复推），失败按 1→2→4… 分钟指数退避（封顶 30 分钟）落盘重试窗口，进程重启后到点未投的首次检查即补投；创建/取消与 memory_* 同口径过确认闸门（取消按对象绑定「同对象免问」），查询只读不过闸；系统提示词加入提醒能力说明与时间传参约定，并要求模型创建后向用户复述确认的时刻（`src/agent/reminder.ts`、`src/agent/tools/reminder-tools.ts`、`src/agent/tools/defs.ts`、`src/agent/guard.ts`、`src/agent/prompt.ts`、`src/cli.ts`、`src/bot-main.ts`）
 - 个人工作日报工具 `daily_report`（CLI 与 bot 共用）：「帮我写今天/昨天的日报」时采集当日看板活动——今日完成（状态已完成且最后更新时间在当日，与周报「本周完成」同一口径并如实标注）、进行中（不限更新日期，供「明日计划」推断）、今日失败、今日新待审阅、当日改动统计（看板未提供时如实说明，不编造）；返回结构化素材供 LLM 按「今日完成 / 进行中 / 风险与阻塞 / 明日计划」组织日报，并复用报告静态服务托管一份自包含 HTML 日报（reports/，token 文件名，30 天清理，bot 场景推 HTTP 链接并附可达性提示）；支持日期参数（今天/昨天/YYYY-MM-DD）与 `html:false` 只取素材；四类计数为全量口径（不受 50 条清单截断影响），截断时注明样本口径；只读不写看板，不触发确认闸门（`src/kanban/summary.ts`、`src/report/daily-report.ts`、`src/agent/tools/personal-daily.ts`）
 - 迭代复盘报告工具 `iteration_retro`（CLI 与 bot 共用）：「复盘一下这个迭代」时基于 work-summary 采集生成自包含 HTML 复盘（reports/，同一托管与清理策略）+ 文本摘要供 LLM 解读——迭代概览（任务总数、五状态分布、完成率=已完成÷总数含已取消）、吞吐（本周完成/累计完成，最后更新时间口径）、失败归因（对失败摘要做确定性关键词规则归类：合并冲突/测试失败/构建错误/执行超时/环境或依赖/其他，首中优先，不调 LLM，报告注明非模型判读；每类列计数与代表任务）、改动统计汇总；各项口径在报告「口径说明」如实标注，任务超 50 条截断时区分全量计数与样本口径，空范围完成率显示「—」而非 0%；未配置且未指定迭代时覆盖全部任务并标注口径；只读不写看板，不触发确认闸门（`src/report/retro.ts`、`src/agent/tools/iteration-retro.ts`）
 - 停滞任务提醒（bot，`HTA_STALE_NUDGE_HOURS=N` 小时，默认关）：「进行中」任务超过 N 小时无更新时推送提醒卡片（项目名、任务标题、已停滞时长、任务链接）；判定依据为任务行 `updated_at`（看板无更细粒度执行心跳字段，文案口径相应为「久未更新」而非「停滞/卡死」，无法解析时不判定）；同一停滞阶段只提醒一次，之后每 24 小时至多再提醒一次（常量可调），任务有更新或状态流转后重置；提醒状态落盘（`stale-nudge-state.json`，原子私有写 0600），进程重启不重复轰炸；提醒事件复用 watcher 的 (事件, owner) 粒度送达/重投管线，非法配置值启动时告警并关闭（`src/kanban/stale-nudge.ts`、`src/kanban/watcher.ts`、`src/channels/feishu-cards.ts`、`src/bot-main.ts`）
 - 失败任务 AI 诊断 + 一键重试（bot）：失败推送卡片新增「🔍 AI 诊断」按钮——采集该任务失败 attempt 的可用信息（任务描述、失败摘要、diff 统计，以看板 REST 实际返回为准）调 LLM 生成中文诊断（失败原因归类 + 关键证据摘要 + 建议修复方向）并推诊断卡片、注入会话上下文；LLM 配置与 AI 审查同一派生口径（`OCR_LLM_*` 逐项优先、缺项回退机器人主模型配置），整体超时 6 分钟，LLM 不可用/超时推送明确中文失败提示；诊断卡片带「↻ 按诊断结论重试」按钮，点击即把诊断结论（失败原因 + 修复建议）作为 follow-up 指令发给执行 Agent 重启任务（点击即显式授权，与审批/AI 审查按钮同一语义，不再二次确认；卡片回调沿用白名单与 action 校验）。防重语义：同一 attempt 只诊断一次、重试发起后诊断卡片原地置为无按钮终态（参照确认卡片终态模式）、重复点击给明确回执（`src/kanban/failure-diagnosis.ts`、`src/bot/handler.ts`、`src/channels/feishu-cards.ts`、`src/channels/feishu.ts`）
 - 定时周报（bot，`HTA_WEEKLY_BRIEF=HH:MM`，默认关）：每周到点向白名单用户（owner）推送本周迭代进展——头部为迭代全量计数（进行中/待办/待审阅/已完成/失败），正文为「本周完成 / 待审阅积压 / 失败」三个分组；`HTA_WEEKLY_BRIEF_DAY=1-7` 指定推送星期（默认 5 周五，非法值告警并按默认处理）；「本周完成」按任务最后更新时间落在本周（周一起，本地时区）统计（看板无「完成时间」字段，`updated_at` 为最接近口径，无法解析时保守不计入）；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部任务。可靠性语义与晨报对齐：推送日期落盘（`weekly-brief-state.json`），重启当周当天不重复推；到点前进程未启动当天可补推；看板不可达/推送失败跳过并按 1→2→4…分钟指数退避重试（封顶 30 分钟）；owner 未认领不推；按 owner 粒度补投（`src/bot/weekly-brief.ts`、`src/bot-main.ts`）
+
+### Fixed
+
+- agent 核心多角度审查修复：写闸门确认等待接入轮次级中断信号（/stop 或墙钟看门狗 abort 时按拒绝收尾，不再卡到确认超时）、记忆、会话路由/存储、技能契约、来源注册表等模块的边界与稳健性加固（`src/agent/`）
+- bot/CLI 交互链路多角度审查修复：失败诊断重试回执、jq/curl 探测改调用时实时探测（不再沿用启动时的陈旧结果）、消息路由与卡片回调、CLI 闸门与向导交互等（`src/bot/`、`src/cli.ts`、`src/commands.ts` 等）
+
+### Changed
+
+- 看板技能文档与上游 helios-kanban 同步（新增技能 README 等）（`skills/helios-kanban-remote/`）
 
 ## [1.0.32] - 2026-08-25
 

@@ -316,13 +316,15 @@ function diagnosisMdSafe(s: string): string {
 /**
  * 失败诊断结果卡片：正文为 LLM 中文诊断（超长截断，完整结论已注入会话），
  * 带「↻ 按诊断结论重试」按钮（点击即显式授权，bot 以诊断结论作 follow-up 重启任务）。
- * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）。
+ * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）；
+ * followUpExcerpt 为已发送的 follow-up 指令摘要（双向截断，handler 侧生成）——
+ * 重试指令直发执行方用户原本看不到，终态卡片留一份可见记录。
  */
 export function buildDiagnosisCard(
   title: string,
   diagnosis: string,
   taskId: string,
-  opts?: { settledAt?: string },
+  opts?: { settledAt?: string; followUpExcerpt?: string },
 ): Record<string, unknown> {
   const text = diagnosisMdSafe(
     diagnosis.length > DIAGNOSIS_CARD_MAX_CHARS
@@ -335,6 +337,13 @@ export function buildDiagnosisCard(
   ];
   if (opts?.settledAt) {
     elements.push({ tag: 'hr' });
+    if (opts.followUpExcerpt) {
+      // 外部内容（LLM 诊断复述）用 plain_text，不经 lark_md 渲染
+      elements.push({
+        tag: 'div',
+        text: { tag: 'plain_text', content: `已发送的跟进指令：\n${opts.followUpExcerpt}` },
+      });
+    }
     elements.push({
       tag: 'note',
       elements: [{ tag: 'plain_text', content: `已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送。` }],

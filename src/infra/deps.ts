@@ -112,10 +112,12 @@ export const OCR_INSTALL_HINT = [
 export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';
 
 /**
- * 运行时 npx 拉取的 helios-kanban 包规格，默认 @latest 跟随最新版；
- * 需要钉版本时用 HELIOS_KANBAN_PACKAGE 覆盖（如 helios-kanban@0.1.39）。
+ * 运行时 npx 拉取的 helios-kanban 包规格：钉到具体版本（供应链风险收口，@latest 会把
+ * 任意新发布版直接拉进本机执行），与下方 OCR 钉版同口径；HELIOS_KANBAN_PACKAGE 可覆盖。
+ * kanban-ensure.ts 的自动拉起与 config.ts 的 MCP stdio 默认参数都经 kanbanPackageSpec
+ * 取本常量，发布 helios-kanban 新版本时需同步 bump。
  */
-export const DEFAULT_KANBAN_PACKAGE = 'helios-kanban@latest';
+export const DEFAULT_KANBAN_PACKAGE = 'helios-kanban@0.1.48';
 
 export function kanbanPackageSpec(env: NodeJS.ProcessEnv = process.env): string {
   return env.HELIOS_KANBAN_PACKAGE || DEFAULT_KANBAN_PACKAGE;

@@ -8,7 +8,7 @@
 // 6. config 安全与解析对齐：cwd .env 高危键大小写不敏感过滤 + npm_config_ 前缀拒绝、
 //    parseEnvFile 与 dotenv 对齐（# 行内注释 / export 前缀）、serializeEnvValue 单引号包裹的对称性
 // 7. cli 首次向导 Esc 取消的退出口径（伪装 TTY 的包装入口注入 ESC 字节，端到端验证灰字 + 退出码 0）
-//    + 看板存活判定复用 infra/proc.processTreeAlive（win32 不再恒 false）
+//    + infra/proc 进程组探活与杀树行为（win32 不再因负数 pid 恒 false）
 // 8. kanban-ensure 拉起失败分支按树杀（PATH 桩 npx 留 sleep 孙进程，验证不留孤儿）
 // 仅用 loopback mock 服务与 PATH 桩，离线可跑。Run: npx tsx scripts/unit-coverage.ts
 
@@ -35,6 +35,7 @@ import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
 import { friendlyNetError } from '../src/config/net-error';
+import { killProcessTree, processTreeAlive } from '../src/infra/proc';
 import type { AgentConfig } from '../src/types';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { check, checkAsync, finish, modeOk } from './testkit';
@@ -1185,10 +1186,23 @@ async function run(): Promise<void> {
 
   // ================= 盲区 7：cli 退出口径与看板存活判定 =================
 
-  check('cli：看板存活判定复用 infra/proc.processTreeAlive（win32 不再因负数 pid 恒 false）', (() => {
-    const src = fs.readFileSync(path.join(repoRoot, 'src', 'cli.ts'), 'utf8');
-    return src.includes("from './infra/proc'") && src.includes('processTreeAlive') && !src.includes('process.kill(-');
-  })());
+  await checkAsync('proc：processTreeAlive 按进程组探活，killProcessTree 杀树后探活转 false', async () => {
+    // 旧实现是「读 cli.ts 源码查字符串」（重构改名即假失败且证明不了行为），改为直接验证
+    // 探活/杀树语义；cli 对本函数的接线由 typecheck 约束 import（tsconfig.typecheck 全量覆盖）
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      // POSIX 下 detached 使子进程自成进程组组长，processTreeAlive/killProcessTree 的组语义才生效
+      detached: process.platform !== 'win32',
+      stdio: 'ignore',
+    });
+    const pid = child.pid!;
+    try {
+      await waitFor(() => processTreeAlive(pid), '子进程存活探活');
+      killProcessTree(pid, 'SIGKILL');
+      await waitFor(() => !processTreeAlive(pid), '杀树后探活转 false');
+    } finally {
+      killProcessTree(pid, 'SIGKILL'); // 断言中途失败也要收尸，不留 60s 孤儿
+    }
+  });
 
   // Esc 取消依赖 TTY 判定的 selectList（keypress 拒成 '已取消'）：生成一个伪装 TTY 的包装入口
   // （isTTY 置真 + setRawMode 桩，管道 stdin 即可注入 ESC 字节），端到端验证首次向导取消的口径。

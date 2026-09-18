@@ -298,6 +298,24 @@ async function run(): Promise<void> {
     }
   });
 
+  await checkAsync('采集 enrich：changedFilesTotal 取 filesChanged 与文件列表长度较大者（看板截断列表不少报）', async () => {
+    // 看板独立字段 files_changed=12 但 changed_files 列表只给了 2 条（看板侧截断）：
+    // 「等 +N 个」应以 12 为总数，不能按列表长度显示 +0
+    const kanban = await startMockKanban({
+      tasks: [{ id: 't1', title: '截断列表', status: 'done', updated_at: at(y, m, d, 9) }],
+      attemptStats: [{ workspace_id: 'att-1', files_changed: 12, additions: 5, deletions: 1, changed_files: ['a.ts', 'b.ts'] }],
+      taskAttempts: { t1: [{ id: 'att-1', created_at: '2026-01-01' }] },
+    });
+    try {
+      const data = await collectDailyData({ kanbanUrl: kanban.url, date: todayStr });
+      const t = data.tasks[0]!;
+      assert.equal(t.changedFilesTotal, 12, `changedFilesTotal 实际：${t.changedFilesTotal}`);
+      assert.deepEqual(t.changedFiles, ['a.ts', 'b.ts']);
+    } finally {
+      await stopServer(kanban.server);
+    }
+  });
+
   // ================= 3. 无数据诚实文案 =================
 
   await checkAsync('日报素材：空看板时如实说明无数据、提示不要编造', async () => {
@@ -431,6 +449,13 @@ async function run(): Promise<void> {
     // totals.doneThisWeek（采集侧截断前全量）优先于样本计数，与周报同一口径
     const withTotals = buildRetroModel({ ...data, totals: { ...data.totals, doneThisWeek: 9 } }, retroNow);
     assert.equal(withTotals.doneThisWeek, 9, 'totals.doneThisWeek 存在时应优先全量口径，不数截断样本');
+
+    // 范围内有未知状态任务：totals 五键和 ≤ tasks.length，截断判定须用采集侧透传的 scopedTotal（截断前行数）
+    const unknownStatus = buildRetroModel({ ...data, scopedTotal: 7 }, retroNow);
+    assert.equal(unknownStatus.truncated, true, 'scopedTotal > tasks.length 应判截断（含未知状态任务时 total 会漏报）');
+    // 旧采集结果缺 scopedTotal：回退五状态全量和口径
+    const legacy = buildRetroModel({ ...data, totals: { ...data.totals, done: 40 } }, retroNow);
+    assert.equal(legacy.truncated, true);
   });
 
   // ================= 6. HTML 生成与 token 文件名 =================

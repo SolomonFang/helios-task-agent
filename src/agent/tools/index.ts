@@ -3,19 +3,11 @@ import type { MemoryStore } from '../memory';
 import type { OpenAiTool, ToolHandlers } from '../../types';
 import type { ConfirmFn } from '../guard';
 import { SourceRegistry } from '../source-registry';
-import { LOCAL_TOOLS, MEMORY_TOOLS } from './defs';
+import { LOCAL_TOOL_SPECS, MEMORY_TOOLS, REMINDER_TOOLS, type LocalToolDeps } from './defs';
 import { makeGatedWriter, type CreateCounter } from './gated-write';
 import { makeKanbanMcpHandler } from './kanban-mcp';
-import { makeLarkCliHandler } from './lark-cli';
-import { makeHkCliHandler } from './hk-cli';
-import { makeRepoFsHandler } from './repo-fs';
-import { makeSkillDocHandler, makeSkillExecHandler } from './skill-tools';
-import { makeWorkSummaryHandler } from './work-summary';
-import { makeDailyReportHandler } from './personal-daily';
-import { makeIterationRetroHandler } from './iteration-retro';
 import { makeMemoryHandlers } from './memory-tools';
 import { makeReminderHandlers } from './reminder-tools';
-import { REMINDER_TOOLS } from './defs';
 import type { ReminderStore } from '../reminder';
 
 export { summarizeBothEnds } from './shared';
@@ -126,26 +118,22 @@ export function buildTools({
     }
   }
 
-  handlers.set('lark_cli', makeLarkCliHandler({ uid, confirm, auditHome }));
-  handlers.set(
-    'hk_cli',
-    makeHkCliHandler({ kanbanUrl, kanbanProjectId, kanbanRepoId, kanbanIteration, runGatedWrite }),
-  );
-  handlers.set('repo_fs', makeRepoFsHandler({ uid, kanbanUrl, auditHome }));
-  handlers.set('skill_doc', makeSkillDocHandler());
-  handlers.set('skill_exec', makeSkillExecHandler({ uid, confirm, auditHome }));
-  handlers.set(
-    'work_summary',
-    makeWorkSummaryHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl }),
-  );
-  handlers.set(
-    'daily_report',
-    makeDailyReportHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl, channel }),
-  );
-  handlers.set(
-    'iteration_retro',
-    makeIterationRetroHandler({ kanbanUrl, kanbanProjectId, kanbanIteration, reportLinkBaseUrl, channel }),
-  );
+  // 本地工具：单源注册表驱动（def/summary/handler 同条登记于 defs.ts），不存在「有 def 无 handler」的漏注册态
+  const localDeps: LocalToolDeps = {
+    uid,
+    confirm,
+    auditHome,
+    kanbanUrl,
+    kanbanProjectId,
+    kanbanRepoId,
+    kanbanIteration,
+    runGatedWrite,
+    reportLinkBaseUrl,
+    channel,
+  };
+  for (const spec of LOCAL_TOOL_SPECS) {
+    handlers.set(spec.tool.function.name, spec.makeHandler(localDeps));
+  }
 
   if (memory) {
     for (const [name, handler] of makeMemoryHandlers({ uid, memory, confirm, auditHome, onMemoryChange })) {
@@ -161,6 +149,6 @@ export function buildTools({
     openAiTools.push(...REMINDER_TOOLS);
   }
 
-  openAiTools.push(...LOCAL_TOOLS);
+  openAiTools.push(...LOCAL_TOOL_SPECS.map((s) => s.tool));
   return { openAiTools, handlers };
 }

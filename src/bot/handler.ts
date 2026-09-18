@@ -1,31 +1,21 @@
 /**
- * 飞书 bot 消息路由：斜杠命令、写操作确认应答、排队回执、敲键盘表情、
- * AI 审查按钮回调。bootstrap（向导/看板拉起/长连接建立）留在 bot.ts。
+ * 飞书 bot 消息路由：斜杠命令、写操作确认应答、排队回执、敲键盘表情、卡片按钮分发。
+ * bootstrap（向导/看板拉起/长连接建立）留在 bot-main.ts；
+ * AI 审查/失败诊断/按诊断重试的作业生命周期在 review-jobs.ts；
+ * 进度占位/心跳/回复投递在 progress-reporter.ts。
  */
 
 import {
   FeishuChannel,
   ImageTooLargeError,
-  splitText,
   type FeishuCardAction,
   type FeishuInboundMessage,
 } from '../channels/feishu';
 import { SessionRouter } from '../agent/session-router';
 import type { AgentSession } from '../agent/session';
-import { ConfirmationManager, hasPendingConfirmation, isConfirmWord } from '../agent/confirm';
-import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
-import {
-  runFailureDiagnosis,
-  sendDiagnosisFollowUp,
-  latestAttemptId,
-  buildRetryPrompt,
-  DIAGNOSIS_TIMEOUT_MS,
-} from '../kanban/failure-diagnosis';
-import { buildAiReviewCard, buildDiagnosisCard } from '../channels/feishu-cards';
-import { isAllPass, writeReviewReport } from '../report/review-report';
-import type { ReportServer } from '../report/report-server';
+import { ConfirmationManager, isConfirmWord } from '../agent/confirm';
 import { checkLarkCliAsync, checkOcrCliAsync } from '../infra/deps';
-import { batchAckText, wrapUntrusted, type ConfirmKind } from '../agent/guard';
+import { batchAckText, type ConfirmKind } from '../agent/guard';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -37,24 +27,21 @@ import {
   llmFailureParts,
   parseCommand,
   plainPaint,
-  toolActionLabel,
 } from '../commands';
-import type { AgentConfig, InboundMessage, InlineImage, ProgressInfo } from '../types';
+import type { AgentConfig, InboundMessage, InlineImage } from '../types';
 import type { KanbanMcp } from '../kanban/mcp';
 import type { McpSupervisor } from './supervisor';
+import type { ReportServer } from '../report/report-server';
 import { errMessage } from '../infra/err';
+import { safeNotify } from './notify';
+import { createReviewJobs, type ReviewJobs } from './review-jobs';
+import { createProgressKit } from './progress-reporter';
+import { runtimeFlags } from '../config/runtime-flags';
+import type { runAiReview } from '../kanban/ai-review';
+import type { runFailureDiagnosis, sendDiagnosisFollowUp } from '../kanban/failure-diagnosis';
 
 /** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */
 type CardAction = FeishuCardAction;
-
-/** AI 审查全局并发上限：每个审查是最长 15 分钟的子进程，不同 attempt 叠加会拖垮机器。 */
-const AI_REVIEW_MAX_CONCURRENT = 2;
-
-/** 失败诊断全局并发上限：单次 LLM 调用（最长 6 分钟），与 AI 审查同量级控制。 */
-const DIAGNOSIS_MAX_CONCURRENT = 2;
-
-/** 进程级诊断状态表上限：只增不减会无界累积，超上限整体清空（代价只是同键可再诊断/重试一次）。 */
-const DIAGNOSIS_STATE_MAX_ENTRIES = 1000;
 
 /** 单条用户消息长度上限：超长消息直接拒答，不送入 LLM（上下文爆炸 / 网关 400）。 */
 export const MAX_USER_MESSAGE_CHARS = 8000;
@@ -138,13 +125,26 @@ export interface BotHandlers {
 }
 
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
-  const { channel, router, confirmations, cfg, mcp, supervisor, reportServer } = deps;
-  const runReview = deps.aiReviewRunner ?? runAiReview;
-  const runDiagnosis = deps.diagnosisRunner ?? runFailureDiagnosis;
-  const sendFollowUp = deps.followUpSender ?? sendDiagnosisFollowUp;
-  const progressHeartbeatMs = deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS;
+  const { channel, router, confirmations, cfg, mcp, supervisor } = deps;
   const fetchImage: ImageFetcher =
     deps.imageFetcher ?? ((mid, key) => channel.downloadImage(mid, key, MAX_IMAGE_BYTES));
+
+  // AI 审查/失败诊断/按诊断重试：队列外长耗时作业的生命周期（并发上限/去重/中断/投递降级）
+  const reviewJobs: ReviewJobs = createReviewJobs({
+    channel,
+    cfg,
+    router,
+    reportServer: deps.reportServer,
+    aiReviewRunner: deps.aiReviewRunner,
+    diagnosisRunner: deps.diagnosisRunner,
+    followUpSender: deps.followUpSender,
+  });
+  // 进度占位/静默心跳/最终回复投递
+  const progress = createProgressKit({
+    channel,
+    heartbeatMs: deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS,
+    hasPendingConfirm: (openId) => confirmations.hasPending(openId),
+  });
 
   /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
   const running = new Map<string, AbortController>();
@@ -152,273 +152,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   let reactionUnsupported = false;
   /** 每用户尚未移除的敲键盘表情（/stop 丢弃排队消息时回调不会执行，需兜底清理）。 */
   const pendingTyping = new Map<string, { messageId: string; reactionId: string }[]>();
-  /** 进行中的 AI 审查（按 attempt 去重，防止连点按钮）；携带发起人与 AbortController，/stop 可中断。 */
-  const aiReviewRunning = new Map<string, { openId: string; ctl: AbortController }>();
-  /** 进行中的失败诊断（按 task 去重，防止连点按钮）；携带发起人与 AbortController，/stop 可中断。 */
-  const diagnosisRunning = new Map<string, { openId: string; ctl: AbortController }>();
-  /** 已完成诊断的 (task, attempt) 键：同一 attempt 只诊断一次（进程内语义，与 AI 审查去重一致）。 */
-  const diagnosedKeys = new Set<string>();
-  /** 每个任务最近一次诊断结论（「↻ 重试」按钮的 follow-up 材料；键为 taskId）。 */
-  const diagnosisResults = new Map<string, { attemptId?: string; text: string; cardMessageId?: string }>();
-  /** 已发起过重试的 (task, attempt) 键：重试发起后按钮置终态，重复点击不再发起。 */
-  const retryLaunched = new Set<string>();
-  /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
-  let aiReviewLlmNoticed = false;
   /** 挂起确认期间已提醒过「请回复确认/取消」的用户（每份确认只提醒一次，避免刷屏）。 */
   const confirmShortReplyReminded = new Set<string>();
-
-  /** 执行 AI 审查（open-code-review）并把结果推回飞书；同时注入会话上下文便于追问/修复。 */
-  const handleAiReview = async (openId: string, attemptId: string, title: string): Promise<void> => {
-    if (aiReviewRunning.has(attemptId)) {
-      await channel.notifyOpenId(openId, `🤖 《${title}》的 AI 审查正在进行中，请稍候…`).catch(() => {});
-      return;
-    }
-    // 全局并发上限：超出时拒收并提示稍后再试（按 attempt 去重挡不住不同 attempt 的叠加）
-    if (aiReviewRunning.size >= AI_REVIEW_MAX_CONCURRENT) {
-      await channel
-        .notifyOpenId(
-          openId,
-          `🤖 同时进行的 AI 审查已达上限（${AI_REVIEW_MAX_CONCURRENT} 个）：《${title}》本次未开始。请等现有审查完成后，重新点击看板通知卡片上的「AI 审查」。`,
-        )
-        .catch(() => {});
-      return;
-    }
-    const ctl = new AbortController();
-    aiReviewRunning.set(attemptId, { openId, ctl });
-    try {
-      // 首次触发时告知：AI 审查由第三方工具执行，会用到模型 API key（只提示一次，不刷屏）
-      // （仅在实际会派生主 key 时提示；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
-      let llmNotice = '';
-      if (!aiReviewLlmNoticed && ocrWillDeriveBotLlm()) {
-        aiReviewLlmNoticed = true;
-        llmNotice =
-          '\n⚠️ 安全提示：AI 审查由第三方工具执行，会使用你的模型 API key。' +
-          '如需隔离，可以为它单独配置一个专用 key（在配置文件中设置 OCR_LLM_TOKEN，详见 README）。';
-      }
-      await channel.notifyOpenId(
-        openId,
-        `🤖 AI 审查已开始：《${title}》\n正在调用代码审查工具（open-code-review）分析改动，完成后推送结果（首次使用需自动下载，耗时稍长）。${llmNotice}`,
-      );
-      // /stop 可中断：竞速胜出后立即向用户收尾返回；signal 同时透传给 runAiReview，
-      // 底层 ocr 子进程随 abort 被 execFile 立即 kill，不必等自身 15 分钟超时。
-      // （Promise.race 已给 runAiReview 挂上反应，其后续 settle 不会成未处理 rejection。）
-      const result = await Promise.race([
-        runReview({
-          kanbanUrl: cfg.kanbanUrl,
-          attemptId,
-          title,
-          llm: { baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.llmModel },
-          signal: ctl.signal,
-        }),
-        new Promise<never>((_, reject) => {
-          ctl.signal.addEventListener('abort', () => reject(new Error('已中断')), { once: true });
-        }),
-      ]);
-      // 投递段（报告写盘 / 卡片推送）与审查执行分开兜底：投递失败不是「AI 审查失败」，
-      // 审查结果本身也不丢——降级为文本推送（截断 + 注明失败原因）
-      try {
-        if (reportServer) {
-          // 完整结果写入 HTML 报告，飞书推卡片（按钮直达静态报告页，进程存活期间有效）
-          const name = writeReviewReport({
-            title,
-            attemptId,
-            generatedAt: new Date().toLocaleString('zh-CN'),
-            text: result,
-          });
-          const url = `${reportServer.baseUrl}/${name}`;
-          await channel.notifyCardOpenId(openId, buildAiReviewCard(title, url, isAllPass(result)));
-        } else {
-          await channel.notifyOpenId(openId, `🤖 AI 审查结果：《${title}》\n${result}`);
-        }
-      } catch (deliverErr) {
-        const dmsg = errMessage(deliverErr);
-        // 原始错误（英文 fs/网络原文 + 宿主机绝对路径）只进日志，不落用户面
-        console.error(`[review] 报告写盘/卡片推送失败，降级文本推送: ${dmsg}`);
-        const excerpt = result.length > 3000 ? `${result.slice(0, 3000)}\n…（结果过长已截断）` : result;
-        await channel
-          .notifyOpenId(
-            openId,
-            `🤖 AI 审查结果：《${title}》\n⚠️ 审查报告生成或推送失败，改为文本推送：\n${excerpt}`,
-          )
-          .catch((e) => {
-            // 降级文本也失败：结果无法送达，只能落日志（不再往外抛，避免误报「AI 审查失败」）
-            console.error(`[review] 降级文本推送也失败: ${errMessage(e)}`);
-          });
-      }
-      // 注入会话：用户追问「按审查意见修一下」时 agent 有上下文
-      // （审查结果含被审仓库代码，属外部内容，UNTRUSTED 包裹；注入发生在轮边界）
-      try {
-        router
-          .getOrCreate(openId)
-          .injectSystemNote(
-            `[AI 审查完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${wrapUntrusted(result.slice(0, 1500))}`,
-          );
-      } catch {
-        /* ignore */
-      }
-    } catch (err) {
-      if (ctl.signal.aborted) {
-        await channel.notifyOpenId(openId, `⏹ AI 审查已中断：《${title}》`).catch(() => {});
-      } else {
-        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/人工审查）时不重复追加重试后缀
-        const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重试', '重新发起', '人工审查'].some((w) => message.includes(w));
-        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击卡片上的「AI 审查」重试。';
-        await channel.notifyOpenId(openId, `⚠️ AI 审查失败：《${title}》\n${message}${retryHint}`).catch(() => {});
-      }
-    } finally {
-      aiReviewRunning.delete(attemptId);
-    }
-  };
-
-  /** 执行失败诊断（采集失败信息 → LLM 中文诊断）并推结果卡片（带「↻ 重试」按钮）；同时注入会话上下文。 */
-  const handleDiagnosis = async (openId: string, taskId: string, attemptId: string, title: string): Promise<void> => {
-    title = title.trim() || '未命名任务';
-    const dedupeKey = `${taskId}:${attemptId || 'latest'}`;
-    if (diagnosedKeys.has(dedupeKey)) {
-      // 指引按结果实际形态分支：诊断卡片推送失败走文本降级时没有卡片按钮可点
-      const tip = diagnosisResults.get(taskId)?.cardMessageId
-        ? '结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。'
-        : '结果见上方消息；回复「重试这个任务」可按结论重启。';
-      await channel.notifyOpenId(openId, `🔍 《${title}》这次失败已诊断过，${tip}`).catch(() => {});
-      return;
-    }
-    if (diagnosisRunning.has(taskId)) {
-      await channel.notifyOpenId(openId, `🔍 《${title}》的 AI 诊断正在进行中，请稍候…`).catch(() => {});
-      return;
-    }
-    // 全局并发上限：超出时拒收并提示稍后再试（按 task 去重挡不住不同任务的叠加）
-    if (diagnosisRunning.size >= DIAGNOSIS_MAX_CONCURRENT) {
-      await channel
-        .notifyOpenId(
-          openId,
-          `🔍 同时进行的 AI 诊断已达上限（${DIAGNOSIS_MAX_CONCURRENT} 个）：《${title}》本次未开始。请等现有诊断完成后，重新点击失败卡片上的「AI 诊断」。`,
-        )
-        .catch(() => {});
-      return;
-    }
-    const ctl = new AbortController();
-    diagnosisRunning.set(taskId, { openId, ctl });
-    try {
-      await channel.notifyOpenId(
-        openId,
-        `🔍 AI 诊断已开始：《${title}》\n正在采集失败信息并调用模型分析（约几分钟内完成），完成后推送诊断结果。`,
-      );
-      const { text, attemptId: diagnosedAttemptId } = await runDiagnosis({
-        kanbanUrl: cfg.kanbanUrl,
-        taskId,
-        title,
-        llm: { baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.llmModel },
-        timeoutMs: DIAGNOSIS_TIMEOUT_MS,
-        signal: ctl.signal,
-      });
-      // 同一 attempt 只诊断一次：按钮与诊断采集到的真实 attempt 两个键都记（按钮 attempt 可能滞后）。
-      // 拿不到真实 attempt（attempts 端点异常）时不落键：否则 task:latest 永久占位，
-      // 之后的新失败会被谎称「已诊断过」并导向一张旧卡片
-      const realAttemptId = diagnosedAttemptId || attemptId;
-      if (realAttemptId) {
-        if (diagnosedKeys.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosedKeys.clear();
-        diagnosedKeys.add(`${taskId}:${realAttemptId}`);
-        if (attemptId) diagnosedKeys.add(dedupeKey);
-      }
-      const result: { attemptId?: string; text: string; cardMessageId?: string } = { text };
-      if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
-      if (diagnosisResults.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosisResults.clear();
-      diagnosisResults.set(taskId, result);
-      // 结果推送与诊断执行分开兜底：推送失败降级为文本（含重试指引），不谎报「诊断失败」
-      try {
-        const messageId = await channel.notifyCardOpenId(openId, buildDiagnosisCard(title, text, taskId));
-        if (messageId) result.cardMessageId = messageId;
-      } catch (deliverErr) {
-        console.error(`[diagnosis] 诊断卡片推送失败，降级文本推送: ${errMessage(deliverErr)}`);
-        const excerpt = text.length > 3000 ? `${text.slice(0, 3000)}\n…（结果过长已截断）` : text;
-        await channel
-          .notifyOpenId(openId, `🔍 AI 失败诊断：《${title}》\n${excerpt}\n\n要按诊断结论重试，回复「重试这个任务」。`)
-          .catch((e) => {
-            // 降级文本也失败：结果未送达，摘除去重键允许重新诊断——否则用户再点「AI 诊断」
-            // 会被谎指「已诊断过，结果见上方消息」，而上方什么都没有
-            diagnosedKeys.delete(`${taskId}:${realAttemptId}`);
-            diagnosedKeys.delete(dedupeKey);
-            console.error(`[diagnosis] 降级文本推送也失败: ${errMessage(e)}`);
-          });
-      }
-      // 注入会话：用户追问「按诊断结论修一下」时 agent 有上下文
-      try {
-        router
-          .getOrCreate(openId)
-          .injectSystemNote(
-            `[AI 失败诊断完成 ${new Date().toLocaleString('zh-CN')}]\n《${title}》\n${wrapUntrusted(text.slice(0, 1500))}`,
-          );
-      } catch {
-        /* ignore */
-      }
-    } catch (err) {
-      if (ctl.signal.aborted) {
-        await channel.notifyOpenId(openId, `⏹ AI 诊断已中断：《${title}》`).catch(() => {});
-      } else {
-        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/配置不完整联系部署者）时不重复追加重试后缀
-        const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重试', '重新发起', '配置不完整'].some((w) => message.includes(w));
-        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击失败卡片上的「AI 诊断」重试。';
-        await channel.notifyOpenId(openId, `⚠️ AI 诊断失败：《${title}》\n${message}${retryHint}`).catch(() => {});
-      }
-    } finally {
-      diagnosisRunning.delete(taskId);
-    }
-  };
-
-  /** 「↻ 按诊断结论重试」：以诊断结论作为 follow-up 指令重启任务（点击即显式授权，不再二次确认）。 */
-  const handleDiagnosisRetry = async (openId: string, taskId: string, title: string): Promise<void> => {
-    title = title.trim() || '未命名任务';
-    const result = diagnosisResults.get(taskId);
-    if (!result) {
-      await channel
-        .notifyOpenId(openId, `⚠️ 找不到《${title}》的诊断结论（机器人可能已重启）。请重新点击失败卡片上的「AI 诊断」后再重试。`)
-        .catch(() => {});
-      return;
-    }
-    try {
-      // 诊断时没采到 attempt（attempts 端点异常）这里补拉一次；仍没有则无法定位会话
-      const attemptId = result.attemptId ?? (await latestAttemptId(cfg.kanbanUrl, taskId).catch(() => undefined));
-      if (!attemptId) {
-        await channel
-          .notifyOpenId(openId, `⚠️ 重试未发起：《${title}》找不到可重试的执行记录（可能已被看板清理），请到看板手动重新发起该任务。`)
-          .catch(() => {});
-        return;
-      }
-      const retryKey = `${taskId}:${attemptId}`;
-      if (retryLaunched.has(retryKey)) {
-        await channel
-          .notifyOpenId(openId, `↻ 《${title}》的重试已发起过，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。`)
-          .catch(() => {});
-        return;
-      }
-      // 落键提到首个 await 前：连点竞态时第二次点击已在集合内被拦；发起失败摘键回补，允许再点
-      if (retryLaunched.size >= DIAGNOSIS_STATE_MAX_ENTRIES) retryLaunched.clear();
-      retryLaunched.add(retryKey);
-      try {
-        await sendFollowUp(cfg.kanbanUrl, attemptId, buildRetryPrompt(title, result.text));
-      } catch (err) {
-        retryLaunched.delete(retryKey);
-        throw err;
-      }
-      // 按钮置终态：诊断卡片原地替换为无按钮终态（参照确认卡片终态更新模式），失败不阻断
-      if (result.cardMessageId) {
-        const settledAt = new Date().toLocaleString('zh-CN', { hour12: false });
-        await channel
-          .updateCard(result.cardMessageId, buildDiagnosisCard(title, result.text, taskId, { settledAt }))
-          .catch((e) => console.error(`[diagnosis] 诊断卡片终态更新失败: ${errMessage(e)}`));
-      }
-      await channel
-        .notifyOpenId(openId, `↻ 已按诊断结论发起重试：《${title}》\n已把失败原因与修复建议作为跟进指令发给任务执行方，任务进展会继续推送。`)
-        .catch(() => {});
-    } catch (err) {
-      const message = errMessage(err).slice(0, 200);
-      const hasOwnWayOut = ['重试', '重新发起', '手动', '已被看板清理'].some((w) => message.includes(w));
-      const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击诊断卡片上的「↻ 按诊断结论重试」。';
-      await channel.notifyOpenId(openId, `⚠️ 重试发起失败：《${title}》\n${message}${retryHint}`).catch(() => {});
-    }
-  };
+  /** 每用户入队串行链：「排队检查 + 回执 + 敲键盘表情 + router.enqueue」串行执行，保持 handle 调用顺序（见 enqueueMessage）。 */
+  const enqueueChains = new Map<string, Promise<void>>();
 
   const onCardAction = (action: CardAction): void => {
     const openId = action.operator?.open_id || '';
@@ -426,16 +163,16 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (!openId) return;
     // 「AI 审查」按钮：异步执行并立即返回（ocr 审查耗时可达数分钟，回调需快速 ACK）
     if (value.hta_review) {
-      void handleAiReview(openId, String(value.hta_review), String(value.title || ''));
+      void reviewJobs.handleAiReview(openId, String(value.hta_review), String(value.title || ''));
       return;
     }
     // 「AI 诊断」/「按诊断结论重试」按钮：同为异步长耗时操作，立即返回
     if (value.hta_diagnose) {
-      void handleDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), String(value.title || ''));
+      void reviewJobs.handleDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), String(value.title || ''));
       return;
     }
     if (value.hta_retry) {
-      void handleDiagnosisRetry(openId, String(value.hta_retry), String(value.title || ''));
+      void reviewJobs.handleDiagnosisRetry(openId, String(value.hta_retry), String(value.title || ''));
       return;
     }
     if (!value.hta_confirm) return;
@@ -443,26 +180,26 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const result = confirmations.resolveFromCard(openId, confirmId, String(value.decision || ''));
     // 卡片裁决落地后同样复位短应答提醒：下一份确认可再提醒一次
     if (result !== 'ignored') confirmShortReplyReminded.delete(openId);
-    if (result === 'approved') void channel.notifyOpenId(openId, '✅ 已批准，正在执行…').catch(() => {});
+    if (result === 'approved') void safeNotify(channel, openId, '✅ 已批准，正在执行…');
     else if (result === 'approved_batch')
-      void channel
-        // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
-        .notifyOpenId(openId, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`)
-        .catch(() => {});
-    else if (result === 'denied') void channel.notifyOpenId(openId, '已取消，操作未执行。').catch(() => {});
+      // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
+      void safeNotify(
+        channel,
+        openId,
+        `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`,
+      );
+    else if (result === 'denied') void safeNotify(channel, openId, '已取消，操作未执行。');
     else {
       // 区分「这不是你的确认」与「确认已处理或已过期」：多白名单用户场景下 B 点 A 的卡片，
-      // resolveFromCard 按 B 查不到 pending 返回 'ignored'，不能谎称已处理（防御性只读窥视，同 pendingConfirmForm）
-      const pendings = (confirmations as unknown as { pendings?: Map<string, { id?: string }> }).pendings;
-      const foreignPending = [...(pendings?.values() ?? [])].some((p) => p.id === confirmId);
-      void channel
-        .notifyOpenId(
-          openId,
-          foreignPending
-            ? '这是其他用户发起的写操作确认，只有发起人可以裁决，请等待对方处理。'
-            : '该确认已处理或已过期，无需重复操作。',
-        )
-        .catch(() => {});
+      // resolveFromCard 按 B 查不到 pending 返回 'ignored'，不能谎称已处理
+      const foreignPending = confirmations.isPendingConfirmId(confirmId);
+      void safeNotify(
+        channel,
+        openId,
+        foreignPending
+          ? '这是其他用户发起的写操作确认，只有发起人可以裁决，请等待对方处理。'
+          : '该确认已处理或已过期，无需重复操作。',
+      );
     }
   };
 
@@ -471,22 +208,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const ctl = running.get(msg.senderId);
     const gateCancelled = confirmations.cancel(msg.senderId);
     const dropped = router.cancelQueued(msg.senderId);
-    // AI 审查在串行队列外运行（卡片回调触发），单独登记单独中断
-    let reviewsAborted = 0;
-    for (const r of aiReviewRunning.values()) {
-      if (r.openId === msg.senderId && !r.ctl.signal.aborted) {
-        r.ctl.abort();
-        reviewsAborted++;
-      }
-    }
-    // 失败诊断同样在队列外运行，一并中断（各有带标题的逐条收尾通知）
-    let diagnosisAborted = 0;
-    for (const r of diagnosisRunning.values()) {
-      if (r.openId === msg.senderId && !r.ctl.signal.aborted) {
-        r.ctl.abort();
-        diagnosisAborted++;
-      }
-    }
+    // AI 审查/失败诊断在串行队列外运行（卡片回调触发），单独登记单独中断（各有带标题的逐条收尾通知）
+    const { reviews: reviewsAborted, diagnoses: diagnosisAborted } = reviewJobs.abortForUser(msg.senderId);
     // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
     const stray = pendingTyping.get(msg.senderId);
     if (stray?.length) {
@@ -498,7 +221,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       running.delete(msg.senderId);
     }
     const stopped: string[] = [];
-    // 被中断的 AI 审查各有带标题的逐条通知（见 handleAiReview 的中断收尾），这里不再计数组播
+    // 被中断的 AI 审查各有带标题的逐条通知（见 review-jobs 的中断收尾），这里不再计数组播
     if (gateCancelled) stopped.push('待确认的写操作已一并取消');
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
     if (ctl) {
@@ -549,7 +272,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         larkOk,
         extra: [
           `代码审查工具：${ocrOk ? '正常' : '未安装（首次点「AI 审查」时自动下载，耗时稍长）'}`,
-          `看板推送：${process.env.KANBAN_WATCH === '0' ? '关' : '开'}`,
+          `看板推送：${runtimeFlags().kanbanWatch ? '开' : '关'}`,
           `飞书长连接：${wsState ? (WS_STATE_LABEL[wsState] ?? wsState) : '未启动'}，最近事件 ${
             lastEventAt ? new Date(lastEventAt).toLocaleString('zh-CN') : '暂无'
           }`,
@@ -607,17 +330,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     return true;
   };
 
-  /**
-   * 挂起确认的展示形态（短应答提醒/排队回执分支用）：确认管理器未暴露只读查询，
-   * 这里做防御性只读窥视（与 unit-handler 的 pendings 窥视同款）；结构漂移时回退「无卡片、无免问」。
-   */
-  const pendingConfirmForm = (openId: string): { hasCard: boolean; batchKey: boolean } => {
-    const pendings = (confirmations as unknown as {
-      pendings?: Map<string, { req?: { batchKey?: string }; cardMessageId?: string }>;
-    }).pendings;
-    const p = pendings?.get(openId);
-    return { hasCard: Boolean(p?.cardMessageId), batchKey: Boolean(p?.req?.batchKey) };
-  };
+  /** 挂起确认的展示形态（短应答提醒/排队回执分支用）：走 ConfirmationManager 的只读访问器。 */
+  const pendingConfirmForm = (openId: string): { hasCard: boolean; batchKey: boolean } => confirmations.pendingForm(openId);
 
   /** 写操作确认的文字应答：已裁决/确认词兜底/挂起期短应答提醒均终结消息（返回 true），不再进入队列。 */
   const handleConfirmationReply = async (msg: InboundMessage, text: string): Promise<boolean> => {
@@ -645,7 +359,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 挂起确认期间的未命中短应答（「好的/可以」等，≤10 字符）：不当新对话发给模型让确认
     // 静默挂起，提醒一次如何裁决（每份确认只提醒一次，再发短句照常入队，避免刷屏）。
     // 斜杠命令与「恢复确认」除外——它们须放行给后面的即时命令分发。
-    if (hasPendingConfirmation(msg.senderId)) {
+    if (confirmations.hasPending(msg.senderId)) {
       if (
         text.length <= 10 &&
         !text.startsWith('/') &&
@@ -713,128 +427,6 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     };
   };
 
-  /** 进度占位消息：发送失败仅记日志，最终回复回退 reply 直发。 */
-  const sendPlaceholder = async (msg: InboundMessage): Promise<string | undefined> => {
-    try {
-      return await channel.sendText(msg.sessionId, '⏳ 处理中…');
-    } catch (err) {
-      const message = errMessage(err);
-      console.error(`[feishu] 占位消息发送失败: ${message}`);
-      return undefined;
-    }
-  };
-
-  /** 进度反馈：占位消息随工具调用节流更新（飞书消息更新限流，2 秒内合并）；activity 供静默期心跳判断。 */
-  const createProgressReporter = (
-    progressId: string | undefined,
-    activity: { lastEventAt: number },
-  ): ((info: ProgressInfo) => void) => {
-    let lastPush = 0;
-    return (info: ProgressInfo) => {
-      activity.lastEventAt = Date.now();
-      if (!progressId) return;
-      const now = activity.lastEventAt;
-      if (now - lastPush < 2000) return; // 飞书消息更新限流
-      lastPush = now;
-      const text = info.type === 'tool' ? `⏳ 处理中…（${toolActionLabel(info.name)}）` : '⏳ 思考中…';
-      void channel.updateText(progressId, text).catch(() => {});
-    };
-  };
-
-  /**
-   * 静默期心跳：LLM 长思考期间没有任何工具事件，占位消息原地不动，用户分不清「在想」还是「死了」。
-   * 每 intervalMs 检查一次，静默超阈值则刷新占位并附已等待秒数；回复就绪即停（clearHeartbeat 在投递前调用）。
-   */
-  const startProgressHeartbeat = (
-    progressId: string | undefined,
-    activity: { lastEventAt: number },
-    openId: string,
-  ): (() => void) => {
-    if (!progressId) return () => {};
-    const startedAt = Date.now();
-    const timer = setInterval(() => {
-      if (Date.now() - activity.lastEventAt < progressHeartbeatMs) return;
-      // 确认挂起期间实际在等用户裁决，「仍在处理」是谎称
-      const text = confirmations.hasPending(openId)
-        ? '⏳ 等待你处理上方的写操作确认…'
-        : `⏳ 仍在处理…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒；/stop 可中断）`;
-      void channel.updateText(progressId, text).catch(() => {});
-    }, progressHeartbeatMs);
-    timer.unref();
-    return () => clearInterval(timer);
-  };
-
-  /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。 */
-  const deliverReply = async (
-    msg: InboundMessage,
-    progressId: string | undefined,
-    reply: string,
-    interleaved = false,
-  ): Promise<void> => {
-    const chunks = splitText(reply || '（无回复）');
-    if (progressId && interleaved) {
-      // 轮次中插入了确认卡片等独立消息：占位停在它们上方，原地改文案会时序颠倒。
-      // 占位收尾为短终态（中性措辞：正文可能是「已中止」等，不宜恒称「已完成」），正文另发新消息落在时间线末尾（分段各自兜底，同下方续发策略）。
-      await channel
-        .updateText(progressId, '处理结束，结果见下方 ⬇️')
-        .catch((err) => console.error(`[feishu] 占位收尾更新失败: ${errMessage(err)}`));
-      let chunkFailed = false;
-      for (const chunk of chunks) {
-        try {
-          await channel.sendText(msg.sessionId, chunk);
-        } catch (err) {
-          chunkFailed = true;
-          console.error(`[feishu] 回复分段失败（后续分段继续投递）: ${errMessage(err)}`);
-        }
-      }
-      if (chunkFailed) {
-        await channel
-          .sendText(msg.sessionId, '⚠️ 上方回复有部分内容发送失败，可能不完整，可再问一次。')
-          .catch((err) => console.error(`[feishu] 分段失败提示也未送达: ${errMessage(err)}`));
-      }
-      return;
-    }
-    if (progressId) {
-      let firstDelivered = false;
-      try {
-        await channel.updateText(progressId, chunks[0]!);
-        firstDelivered = true;
-      } catch (err) {
-        console.error(`[feishu] 首段更新占位消息失败，尝试直接发送: ${errMessage(err)}`);
-        try {
-          await channel.sendText(msg.sessionId, chunks[0]!);
-          firstDelivered = true;
-          // 直发兜底成功：占位还停在「⏳ 处理中…」（心跳已清不再刷新），best-effort 收尾为终态
-          await channel.updateText(progressId, '✅ 已完成，结果见下方 ⬇️').catch(() => {});
-        } catch (err2) {
-          console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
-        }
-      }
-      // 续发逐段独立兜底：一段失败记日志继续发后续段，不再让剩余段静默丢失；
-      // 任一段失败后最后补发一条提示，否则用户拿到残文却不知情
-      let chunkFailed = false;
-      for (const chunk of chunks.slice(1)) {
-        try {
-          await channel.sendText(msg.sessionId, chunk);
-        } catch (err) {
-          chunkFailed = true;
-          console.error(`[feishu] 回复续发分段失败（后续分段继续投递）: ${errMessage(err)}`);
-        }
-      }
-      if (chunkFailed) {
-        await channel
-          .sendText(msg.sessionId, '⚠️ 上方回复有部分内容发送失败，可能不完整，可再问一次。')
-          .catch((err) => console.error(`[feishu] 分段失败提示也未送达: ${errMessage(err)}`));
-      }
-      if (!firstDelivered) {
-        // 首段彻底失败：占位消息还停在「处理中」，尽量更新为失败提示，别让用户干等
-        await channel.updateText(progressId, '⚠️ 回复投递失败，请重试或稍后再问。').catch(() => {});
-      }
-    } else {
-      await channel.reply(msg, reply || '（无回复）');
-    }
-  };
-
   /** 单个 agent 轮次：占位/进度/中断登记/回复投递/异常分级（中断与 LLM 失败文案不同）。 */
   const runAgentRound = async (
     msg: InboundMessage,
@@ -850,16 +442,16 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const ctl = new AbortController();
     running.set(openId, ctl);
     // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
-    const progressId = await sendPlaceholder(msg);
+    const progressId = await progress.sendPlaceholder(msg);
     const activity = { lastEventAt: Date.now() };
-    const onProgress = createProgressReporter(progressId, activity);
-    const clearHeartbeat = startProgressHeartbeat(progressId, activity, openId);
+    const onProgress = progress.createProgressReporter(progressId, activity);
+    const clearHeartbeat = progress.startProgressHeartbeat(progressId, activity, openId);
     // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）
     await supervisor.enterTurn();
     try {
       const reply = await session.handleUserMessage(text, onProgress, ctl.signal, image);
       clearHeartbeat(); // 投递前停心跳：避免回复已就绪却被心跳刷回「仍在处理」
-      await deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
+      await progress.deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
     } catch (err) {
       clearHeartbeat();
       // 「占位即终态」：异常路径先把「处理中」占位收尾为终态文案，占位缺失/更新失败才回退 reply。
@@ -882,7 +474,10 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
             .updateText(progressId, '⚠️ 处理失败，详见下方')
             .catch(() => {});
         }
-        await channel.reply(msg, failText);
+        // 失败文案投递本身再失败：用户端完全静默，至少落日志（不再往外抛）
+        await channel
+          .reply(msg, failText)
+          .catch((e) => console.error(`[feishu] 失败文案投递也未送达: ${errMessage(e)}`));
       }
     } finally {
       supervisor.exitTurn();
@@ -924,48 +519,66 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   ): Promise<void> => {
     const msg: InboundMessage = fmsg;
     const openId = msg.senderId;
-    // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
-    if (router.queueFull(openId)) {
-      await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或 /stop 中断当前任务并清空排队）。');
-      return;
-    }
-    // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
-    if (confirmations.hasPending(openId)) {
-      // 指引按本次确认的实际形态分支：文本降级（无卡片）不提按钮；支持免问的确认补「免问」应答词
-      const form = pendingConfirmForm(openId);
-      const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
-      await channel.reply(
-        msg,
-        form.hasCard
-          ? `⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复${answers}，超时自动拒绝）。本条消息已排队，会按顺序处理。`
-          : `⚠️ 有未处理的写操作确认：请回复${answers}（超时自动拒绝）。本条消息已排队，会按顺序处理。`,
+    // 每用户入队串行链：飞书对同用户的多条消息独立并发派发，而「排队检查 → 回执 → 敲键盘表情 →
+    // router.enqueue」之间隔着网络往返（trackTypingReaction），谁先 resolve 谁先入队，
+    // 快速连发会颠倒执行顺序；且 queueFull 检查与入队分离存在 TOCTOU（上限可被并发突破）。
+    // 串行化到 per-user promise 链上：链节点只覆盖到「已入队」为止，不持有任务执行期，
+    // 后续消息的回执不会被前面的长任务堵住。
+    let taskDone: Promise<void> | undefined;
+    const prev = enqueueChains.get(openId) ?? Promise.resolve();
+    const step = prev.then(async () => {
+      // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
+      if (router.queueFull(openId)) {
+        await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或 /stop 中断当前任务并清空排队）。');
+        return;
+      }
+      // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
+      if (confirmations.hasPending(openId)) {
+        // 指引按本次确认的实际形态分支：文本降级（无卡片）不提按钮；支持免问的确认补「免问」应答词
+        const form = pendingConfirmForm(openId);
+        const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
+        await channel.reply(
+          msg,
+          form.hasCard
+            ? `⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复${answers}，超时自动拒绝）。本条消息已排队，会按顺序处理。`
+            : `⚠️ 有未处理的写操作确认：请回复${answers}（超时自动拒绝）。本条消息已排队，会按顺序处理。`,
+        );
+      } else if (router.busy(openId)) {
+        // 回执带排队位置：queuedCount 为已排在前面的条数（不含正在执行的那条，由后半句覆盖）
+        const ahead = router.queuedCount(openId);
+        await channel.reply(
+          msg,
+          ahead > 0
+            ? `📥 已收到并排队（前面还有 ${ahead} 条），当前任务完成后依次处理。`
+            : '📥 已收到并排队，当前任务完成后依次处理。',
+        );
+      }
+      // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
+      // 排在队列里时表情先行，用户立刻知道消息已被收到。
+      const cleanupTyping = await trackTypingReaction(fmsg, openId);
+      taskDone = router.enqueue(
+        openId,
+        async () => {
+          try {
+            await runQueuedMessage(msg, text, cmd, openId, image);
+          } finally {
+            await cleanupTyping();
+          }
+        },
+        // 被 /stop 代际丢弃的消息不会执行上面的回调，其敲键盘表情由这个钩子即时清理
+        // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
+        () => void cleanupTyping(),
       );
-    } else if (router.busy(openId)) {
-      // 回执带排队位置：queuedCount 为已排在前面的条数（不含正在执行的那条，由后半句覆盖）
-      const ahead = router.queuedCount(openId);
-      await channel.reply(
-        msg,
-        ahead > 0
-          ? `📥 已收到并排队（前面还有 ${ahead} 条），当前任务完成后依次处理。`
-          : '📥 已收到并排队，当前任务完成后依次处理。',
-      );
-    }
-    // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
-    // 排在队列里时表情先行，用户立刻知道消息已被收到。
-    const cleanupTyping = await trackTypingReaction(fmsg, openId);
-    await router.enqueue(
-      openId,
-      async () => {
-        try {
-          await runQueuedMessage(msg, text, cmd, openId, image);
-        } finally {
-          await cleanupTyping();
-        }
-      },
-      // 被 /stop 代际丢弃的消息不会执行上面的回调，其敲键盘表情由这个钩子即时清理
-      // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
-      () => void cleanupTyping(),
-    );
+    });
+    // 链上只挂 catch 占位节点：单步失败（回执发送抛错等）不折断后续消息的入队；
+    // 节点 settle 后若仍是链尾则摘除，Map 不随消息数无界增长
+    const tracked = step.catch(() => {});
+    enqueueChains.set(openId, tracked);
+    void tracked.then(() => {
+      if (enqueueChains.get(openId) === tracked) enqueueChains.delete(openId);
+    });
+    await step; // 入队阶段的错误照常冒泡给 handle（与串行化前口径一致）
+    await taskDone; // handle 的完成语义不变：resolve 时本条消息已处理完
   };
 
   /**
@@ -1062,6 +675,19 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
     const cmd = parseCommand(text);
     if (await dispatchInstantCommand(msg, text, cmd)) return;
+
+    // 「重试这个任务」确定性分支：诊断去重回执/文本降级推送向用户承诺过这个短语，
+    // 不能仅靠模型自觉（pendingNotes 上限/LRU 淘汰/历史裁剪后承诺会失效）——
+    // 有诊断结论时直接复用按钮的重试逻辑，没有则如实告知
+    if (text === '重试这个任务') {
+      const last = reviewJobs.lastDiagnosis(msg.senderId);
+      if (last) {
+        await reviewJobs.handleDiagnosisRetry(msg.senderId, last.taskId, last.title);
+      } else {
+        await channel.reply(msg, '没有找到可重试的诊断结论（机器人可能已重启）。请到失败卡片上重新点「AI 诊断」后再重试。');
+      }
+      return;
+    }
 
     // 未知斜杠命令即时答复：进串行队列会排在长任务（最长 30 分钟）之后，用户等太久才知道打错了
     if (cmd && cmd !== '/memory' && cmd !== '/clear') {

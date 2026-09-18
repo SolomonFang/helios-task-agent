@@ -142,6 +142,7 @@ export async function ensureKanbanRunning(
     // 自成进程组（POSIX）：stopKanbanChild 按组杀，npx 拉起的看板孙进程（真正的监听者）才能一并退出；
     // win32 上 detached 无害（清理走 taskkill /T 整树杀，见 proc.ts killProcessTree）
     detached: true,
+    windowsHide: true,
   });
   onSpawn?.(child);
 

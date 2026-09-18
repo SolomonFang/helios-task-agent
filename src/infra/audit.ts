@@ -27,13 +27,15 @@ const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 /**
  * 写操作 resultSnippet / detail 落盘前的轻量脱敏：工具输出若含 token/密钥字段，
- * 不应原样留在审计日志。启发式覆盖三类常见形态——
+ * 不应原样留在审计日志。启发式覆盖以下常见形态——
  * 1. JSON 键值对：键名含 token/secret/key/password/authorization 的值替换为 ***；
  * 2. Bearer 认证头：Bearer xxx → Bearer ***；
  * 3. CLI 标志参数：--token xxx / --app-secret=xxx → --token ***（detail 含完整命令行，如 auth login --token xxx）；
  * 4. URL query 参数：?access_token=xxx / &app_secret=xxx（工具输出含回调/分享链接时）；
  * 5. 裸环境赋值：FOO_API_KEY=xxx cmd（区别于 --flag 形态；仅匹配大写键名，避免误伤
- *    普通文本里的 password=x 这类小写叙述）。
+ *    普通文本里的 monkey=x 这类小写叙述）；
+ * 6. 小写敏感键名的保守形态：password=xxx / access_token=xxx 等少量明确键名（detail 含
+ *    完整命令行，`curl ... password=xxx` 这类小写赋值不应明文落盘；仅限枚举键名防误伤）。
  * 不保证完备（只是缓解），读路径本就不记读回内容（见上面的 kind 约定）。
  */
 export function redactSnippet(text: string): string {
@@ -45,7 +47,8 @@ export function redactSnippet(text: string): string {
     .replace(/\bBearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer ***')
     .replace(/(--?[\w-]*(?:token|secret|key|password)[\w-]*)([ =])[^\s]+/gi, '$1$2***')
     .replace(/([?&][\w-]*(?:token|secret|key|password)[\w-]*=)[^\s&]+/gi, '$1***')
-    .replace(/\b(\w*(?:TOKEN|SECRET|KEY|PASSWORD))=\S+/g, '$1=***');
+    .replace(/\b(\w*(?:TOKEN|SECRET|KEY|PASSWORD))=\S+/g, '$1=***')
+    .replace(/\b(password|passwd|token|secret|api_key|apikey|access_token|app_secret)=[^\s&]+/g, '$1=***');
 }
 
 /** Append one JSONL record to <home>/audit.log（超 5MB 先轮转）。Never throws — audit must not break the gate. */
@@ -67,7 +70,8 @@ export function auditLog(entry: AuditEntry, homeDir?: string): void {
         entry.resultSnippet === undefined ? undefined : redactSnippet(entry.resultSnippet).slice(0, 500),
     };
     appendFilePrivateSync(file, JSON.stringify(record) + '\n');
-  } catch {
-    /* ignore */
+  } catch (err) {
+    // 不阻断主流程的契约不变，但磁盘持续故障时留 debug 级痕迹（默认静默）
+    if (process.env.HTA_DEBUG) console.error('[audit] 落盘失败:', err);
   }
 }

@@ -21,9 +21,8 @@ import { SessionRouter } from './agent/session-router';
 import { SessionHistoryStore } from './agent/session-store';
 import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
 import { ConfirmationManager } from './agent/confirm';
-import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from './channels/feishu-cards';
+import { buildConfirmCard, buildResolvedCard, buildWatchEventCard } from './bot/cards';
 import { KanbanWatcher, type WatchEvent } from './kanban/watcher';
-import { parseStaleNudgeHours } from './kanban/stale-nudge';
 import { isLoopbackUrl } from './infra/url-utils';
 import { reviewsDir } from './report/review-report';
 import { reportsDir } from './report/report';
@@ -31,14 +30,16 @@ import { startReportServer, type ReportServer } from './report/report-server';
 import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
 import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
 import { batchAckText, batchScopeWord, wrapUntrusted, type ConfirmKind } from './agent/guard';
-import { checkForUpdate, promptVersionUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
+import { checkForUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
+import { createGracefulExit, handleWizardCancel, installCrashGuards, maybePromptUpdate } from './infra/process-lifecycle';
 import { connectMcp } from './kanban/mcp';
 import { TRY_EXAMPLES } from './commands';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
 import { WsAlerter } from './bot/ws-alerter';
-import { DailyBrief, parseDailyBriefTime, type DailyBriefTime } from './bot/daily-brief';
-import { WeeklyBrief, parseWeeklyBriefTime, parseWeeklyBriefDay, type WeeklyBriefTime } from './bot/weekly-brief';
+import { DailyBrief } from './bot/daily-brief';
+import { WeeklyBrief } from './bot/weekly-brief';
+import { runtimeFlags } from './config/runtime-flags';
 import { ReminderRunner, ReminderStore } from './agent/reminder';
 import { createBotHandlers, createRoundNoticeTracker } from './bot/handler';
 import { errMessage } from './infra/err';
@@ -189,24 +190,13 @@ async function main(): Promise<void> {
     reminderRunner: ReminderRunner | null;
     historyStore: SessionHistoryStore | null;
   } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null };
-  let shuttingDown = false;
   /**
-   * 优雅退出：exitCode 由触发路径决定——正常信号（SIGINT/SIGTERM）传 0；
-   * uncaughtException 传 1：崩溃被 launchd/systemd 当成干净停止（退出码 0）时不会自动重启。
-   * 注意异常路径触发后若卡在清理里被 forceTimer 强退，退出码会是 1（与传入一致兜底见下）。
+   * 优雅退出（实现见 infra/process-lifecycle.ts）：exitCode 由触发路径决定——正常信号
+   * （SIGINT/SIGTERM）传 0；uncaughtException 传 1（崩溃以 0 退出会被进程管理器当成干净停止）。
    */
-  const shutdown = async (exitCode = 0): Promise<void> => {
-    if (shuttingDown) return; // 幂等：二次 Ctrl+C / SIGINT+SIGTERM 不重入
-    shuttingDown = true;
-    // 整体超时兜底：channel.stop / mcp.close 挂住时强制退出，避免进程永不退。
-    // 强退用 1 而非透传 exitCode：挂住本身是异常状态，干净停止（0）不该出现在超时路径
-    const forceTimer = setTimeout(() => {
-      console.error(c.err('退出清理超时，强制结束进程'));
-      process.exit(1);
-    }, 8000);
-    forceTimer.unref();
-    console.log('\n' + c.gray('正在退出…'));
-    try {
+  const shutdown = createGracefulExit({
+    onStart: () => console.log('\n' + c.gray('正在退出…')),
+    cleanup: async () => {
       // 先等在途重连结束再 close MCP：connect 中途完成会残留无人持有的子进程
       await cleanup.supervisor?.stop();
       cleanup.wsAlerter?.stop();
@@ -220,29 +210,12 @@ async function main(): Promise<void> {
       await cleanup.channel?.stop();
       await cleanup.mcp?.close();
       await stopKanbanChild(cleanup.kanbanChild);
-    } catch {
-      /* 尽力清理，任何一步失败都继续退出 */
-    }
-    clearTimeout(forceTimer);
-    process.exit(exitCode);
-  };
+    },
+  });
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
-  // 长驻进程兜底：漏网 rejection 只记日志不退出（保持进程可用）；
-  // uncaughtException 说明状态已不可信，记日志后复用 shutdown 优雅退出（8s 强退兜底仍在）——
-  // 退出码必须非 0：以 0 退出会被 launchd/systemd 当成干净停止而不触发自动重启。
-  // handler 自身不得再抛异常（否则绕过清理直接 crash），故只做同步日志 + 幂等 shutdown。
-  process.on('unhandledRejection', (reason) => {
-    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
-    console.error(`[bot] 未处理的 Promise rejection（进程保持运行）: ${msg}`);
-  });
-  process.on('uncaughtException', (err) => {
-    console.error(`[bot] 未捕获异常，执行优雅退出: ${err.stack || err.message}`);
-    void shutdown(1);
-  });
-  // 测试钩子（HTA_TEST_CRASH=1）：让子进程测试能真实触发 uncaughtException 路径，
-  // 验证崩溃退出码为 1（setImmediate 抛出才走 uncaughtException，同步 throw 只会 reject main）
-  if (process.env.HTA_TEST_CRASH) setImmediate(() => { throw new Error('HTA_TEST_CRASH'); });
+  // 长驻进程兜底 + HTA_TEST_CRASH 测试钩子：见 infra/process-lifecycle.ts
+  installCrashGuards(shutdown, { tag: '[bot]' });
 
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
@@ -266,13 +239,11 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     close();
-    const message = errMessage(err);
     // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 CLI /config 口径一致：不打红、不以失败码退出
-    if (message === '已取消') {
-      console.log(c.gray('已取消，配置未变更'));
+    if (handleWizardCancel(err)) {
       process.exit(0);
     }
-    console.error(c.err(`配置失败：${message}`));
+    console.error(c.err(`配置失败：${errMessage(err)}`));
     process.exit(1);
   }
   close();
@@ -287,8 +258,7 @@ async function main(): Promise<void> {
     if (info) {
       const { ask: upAsk, close: upClose } = createAsk();
       try {
-        // 与 CLI 对齐传 log：跳过/失败时给用户可见反馈（不传则静默跳过，分不清是没识别还是已跳过）
-        const outcome = await promptVersionUpdate({ info, ask: upAsk, log: (m) => console.log(c.gray(m)) });
+        const outcome = await maybePromptUpdate(info, upAsk);
         if (outcome === 'updated') {
           console.log(c.ok('请重新运行 helios-task-agent bot 使用新版本。'));
           process.exit(0);
@@ -558,16 +528,13 @@ async function main(): Promise<void> {
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
 
+  // 运行期开关统一解析（非法值告警集中在 config/runtime-flags.ts）
+  const flags = runtimeFlags((m) => console.warn(c.warn(m)));
+
   // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
-  if (process.env.KANBAN_WATCH !== '0') {
-    const intervalSec = Math.max(15, Number(process.env.KANBAN_WATCH_INTERVAL_SEC || 60) || 60);
-    // 停滞任务提醒：HTA_STALE_NUDGE_HOURS=N（小时）开启，默认关闭；非法值告警并关闭
-    let staleNudgeHours: number | null = null;
-    try {
-      staleNudgeHours = parseStaleNudgeHours(process.env.HTA_STALE_NUDGE_HOURS);
-    } catch (err) {
-      console.warn(c.warn(`${errMessage(err)}，停滞任务提醒已关闭`));
-    }
+  if (flags.kanbanWatch) {
+    const intervalSec = flags.kanbanWatchIntervalSec;
+    const staleNudgeHours = flags.staleNudgeHours;
     // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
     // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
     const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
@@ -629,18 +596,13 @@ async function main(): Promise<void> {
     if (staleNudgeHours) {
       console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${staleNudgeHours} 小时无更新时提醒）`));
     }
-  } else if (process.env.HTA_STALE_NUDGE_HOURS) {
+  } else if (flags.staleNudgeHours) {
     // 停滞任务提醒依赖看板推送（watcher）驱动：watch 整体关闭时静默失效会误导部署者
     console.warn(c.warn('停滞任务提醒依赖看板推送，已随 KANBAN_WATCH=0 一并关闭'));
   }
 
-  // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭
-  let dailyBriefTime: DailyBriefTime | null = null;
-  try {
-    dailyBriefTime = parseDailyBriefTime(process.env.HTA_DAILY_BRIEF);
-  } catch (err) {
-    console.warn(c.warn(`${errMessage(err)}，定时晨报已关闭`));
-  }
+  // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭
+  const dailyBriefTime = flags.dailyBriefTime;
   if (dailyBriefTime) {
     const brief = new DailyBrief({
       time: dailyBriefTime,
@@ -659,20 +621,10 @@ async function main(): Promise<void> {
     console.log(c.gray(`定时晨报已开启（每天 ${hh}:${mm} 推送）`));
   }
 
-  // 定时周报：HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭；非法值告警并关闭。
-  // HTA_WEEKLY_BRIEF_DAY=1-7 指定周几推送（默认 5 周五），非法值告警并按默认处理（不关闭功能）
-  let weeklyBriefTime: WeeklyBriefTime | null = null;
-  try {
-    weeklyBriefTime = parseWeeklyBriefTime(process.env.HTA_WEEKLY_BRIEF);
-  } catch (err) {
-    console.warn(c.warn(`${errMessage(err)}，定时周报已关闭`));
-  }
-  let weeklyBriefDay = parseWeeklyBriefDay(undefined);
-  try {
-    weeklyBriefDay = parseWeeklyBriefDay(process.env.HTA_WEEKLY_BRIEF_DAY);
-  } catch (err) {
-    console.warn(c.warn(`${errMessage(err)}，按默认周五推送`));
-  }
+  // 定时周报：HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭。
+  // HTA_WEEKLY_BRIEF_DAY=1-7 指定周几推送（默认 5 周五）
+  const weeklyBriefTime = flags.weeklyBriefTime;
+  const weeklyBriefDay = flags.weeklyBriefDay;
   if (weeklyBriefTime) {
     const brief = new WeeklyBrief({
       time: weeklyBriefTime,

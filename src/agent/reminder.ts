@@ -86,8 +86,9 @@ function validDate(d: Date): boolean {
 function parseAbsoluteAt(raw: string, now: Date): number {
   const s = raw.trim();
   // 「今天/明天/后天/今晚/明晚 HH:mm」与裸「HH:mm」（全角冒号兼容；也接受「9 点」「9 点 5 分」「9 点半」口语形态；
-  // 可带「早上/凌晨/上午/中午/下午/晚上」修饰，下午/晚上且小时 <12 自动 +12；边界：「中午 1-6 点」按 13-18 点、
-  // 「凌晨 12 点」按当天 0 点、「晚上 12 点」按次日 0 点（口语指当天结束的半夜）处理）
+  // 可带「早上/凌晨/上午/中午/下午/晚上」修饰，下午/晚上且小时 <12 自动 +12；带修饰时小时须 ≤12——
+  // 「晚上 13 点」「上午 15 点」这类与 24 小时制混用的矛盾输入直接拒绝，让模型/用户重述；
+  // 边界：「中午 1-6 点」按 13-18 点、「凌晨 12 点」按当天 0 点、「晚上 12 点」按次日 0 点（口语指当天结束的半夜）处理）
   const cn =
     /^(今天|明天|后天|今晚|明晚)?\s*(?:(早上|凌晨|上午|中午|下午|晚上)\s*)?(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|(半))?)$/u.exec(
       s,
@@ -101,6 +102,9 @@ function parseAbsoluteAt(raw: string, now: Date): number {
     else minute = 0;
     const modifier = cn[2] || (cn[1] === '今晚' || cn[1] === '明晚' ? '晚上' : undefined);
     let extraDay = 0;
+    if (modifier && hour > 12) {
+      throw new Error(`时间「${raw}」非法：带「${modifier}」修饰时小时须为 1-12（如「下午 3 点」，或直接用 24 小时制「15:00」）`);
+    }
     if ((modifier === '下午' || modifier === '晚上') && hour < 12) hour += 12;
     else if (modifier === '晚上' && hour === 12) {
       hour = 0;

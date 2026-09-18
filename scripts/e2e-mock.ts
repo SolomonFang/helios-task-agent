@@ -56,6 +56,8 @@ interface MockState {
   deletedOk: boolean;
   larkOk: boolean;
   error: string | null;
+  /** 收到的 tool 结果序列（tool_call_id + 内容摘要），剧本脱轨时打印便于定位 */
+  toolLog: string[];
 }
 
 function startMockServer(): Promise<{ server: http.Server; state: MockState; port: number }> {
@@ -67,45 +69,68 @@ function startMockServer(): Promise<{ server: http.Server; state: MockState; por
     deletedOk: false,
     larkOk: false,
     error: null,
+    toolLog: [],
   };
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
       state.calls++;
-      const parsed = JSON.parse(body) as { messages?: Array<{ role: string; content?: string }> };
+      const parsed = JSON.parse(body) as {
+        messages?: Array<{ role: string; content?: string; tool_call_id?: string }>;
+      };
+      // 按「请求里已带哪个工具的结果」推进状态机，而不是按第几次调用：
+      // agent 循环多产生一次合法调用（如重查任务）不再让剧本脱轨、报错指向错误根因。
+      // tool_call_id 由本 mock 生成（call_<工具名>），agent 原样回传，可据此识别上一步
       const lastTool = (parsed.messages || []).filter((m) => m.role === 'tool').pop();
+      if (lastTool) {
+        state.toolLog.push(
+          `${lastTool.tool_call_id ?? '?'}: ${(lastTool.content || '').slice(0, 60).replace(/\n/g, ' ')}`,
+        );
+      }
 
       let payload: unknown;
       try {
-        if (state.calls === 1) {
-          payload = toolCall('kanban_list_projects', {});
-        } else if (state.calls === 2) {
-          state.projectId = extractUuid(lastTool?.content);
-          if (!state.projectId) throw new Error('list_projects 结果中未找到 project_id: ' + lastTool?.content);
-          payload = toolCall('kanban_create_task', {
-            project_id: state.projectId,
-            title: TEST_TITLE,
-            description: '由 scripts/e2e-mock.ts 自动创建，验证后会自动删除。',
-          });
-        } else if (state.calls === 3) {
-          const content = lastTool?.content || '';
-          state.taskId = extractUuid(content);
-          if (!state.taskId) throw new Error('create_task 结果中未找到 task_id: ' + content);
-          payload = toolCall('kanban_get_task', { task_id: state.taskId });
-        } else if (state.calls === 4) {
-          const content = lastTool?.content || '';
-          state.createdOk = content.includes(TEST_TITLE);
-          payload = toolCall('kanban_delete_task', { task_id: state.taskId });
-        } else if (state.calls === 5) {
-          const content = lastTool?.content || '';
-          state.deletedOk = Boolean(state.taskId && content.includes(state.taskId));
-          payload = toolCall('lark_cli', { args: ['--version'] });
-        } else {
-          const content = lastTool?.content || '';
-          // 与 smoke.ts 口径一致：只要求输出版本号语义，不绑定 lark-cli 的具体输出格式（防外部工具改格式时假 FAIL）
-          if (/\d+\.\d+\.\d+|version/i.test(content)) state.larkOk = true;
-          payload = finalReply();
+        switch (lastTool?.tool_call_id) {
+          case undefined:
+            payload = toolCall('kanban_list_projects', {});
+            break;
+          case 'call_kanban_list_projects': {
+            state.projectId = extractUuid(lastTool.content);
+            if (!state.projectId) throw new Error('list_projects 结果中未找到 project_id: ' + lastTool.content);
+            payload = toolCall('kanban_create_task', {
+              project_id: state.projectId,
+              title: TEST_TITLE,
+              description: '由 scripts/e2e-mock.ts 自动创建，验证后会自动删除。',
+            });
+            break;
+          }
+          case 'call_kanban_create_task': {
+            const content = lastTool.content || '';
+            state.taskId = extractUuid(content);
+            if (!state.taskId) throw new Error('create_task 结果中未找到 task_id: ' + content);
+            payload = toolCall('kanban_get_task', { task_id: state.taskId });
+            break;
+          }
+          case 'call_kanban_get_task': {
+            if ((lastTool.content || '').includes(TEST_TITLE)) state.createdOk = true;
+            payload = toolCall('kanban_delete_task', { task_id: state.taskId });
+            break;
+          }
+          case 'call_kanban_delete_task': {
+            if (state.taskId && (lastTool.content || '').includes(state.taskId)) state.deletedOk = true;
+            payload = toolCall('lark_cli', { args: ['--version'] });
+            break;
+          }
+          case 'call_lark_cli': {
+            // 与 smoke.ts 口径一致：只要求输出版本号语义，不绑定 lark-cli 的具体输出格式（防外部工具改格式时假 FAIL）
+            if (/\d+\.\d+\.\d+|version/i.test(lastTool.content || '')) state.larkOk = true;
+            payload = finalReply();
+            break;
+          }
+          default:
+            // 剧本外的工具结果（agent 自主多调了别的工具）：直接收尾，缺失步骤由断言区报告
+            payload = finalReply();
         }
       } catch (err) {
         state.error = errMessage(err);
@@ -219,6 +244,8 @@ async function main(): Promise<void> {
     if (failures.length) {
       console.error('E2E 失败:');
       for (const f of failures) console.error('  - ' + f);
+      console.error(`\nmock 共收到 ${state.calls} 次 LLM 请求，已收到的 tool 结果序列：`);
+      for (const t of state.toolLog) console.error('  - ' + t);
       console.error('\n--- agent stdout ---\n' + stdout);
       exitCode = 1;
     } else {

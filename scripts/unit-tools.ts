@@ -312,8 +312,8 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- lark_cli batchKey：带值 flag 排在对象前时成对跳过，未知 flag fail-closed 退化类级 ----------
-  await checkAsync('lark_cli 批量免问 key：--msg-type text 等带值 flag 不误绑为对象，未知 flag 退化类级 key', async () => {
+  // ---------- lark_cli batchKey：带值 flag 排在对象前时成对跳过，未知 flag fail-closed 不提供免问 ----------
+  await checkAsync('lark_cli 批量免问 key：--msg-type text 等带值 flag 不误绑为对象，未知 flag 不提供免问（每次必问）', async () => {
     const tmp = tmpHome('larkflag');
     try {
       const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
@@ -335,8 +335,8 @@ async function main(): Promise<void> {
         [
           { batchKey: 'lark:im send:ou_alice', batchScope: 'object' },
           { batchKey: 'lark:im send:ou_bob', batchScope: 'object' },
-          // 解析不可靠：退化类级 key 且粒度如实降为 kind（不借 ou_carol 之名放大授权）
-          { batchKey: 'lark:im send', batchScope: 'kind' },
+          // 解析不可靠：不提供 batchKey（每次必问）——退化为类级 key 会借一次批准放行发往任意接收人
+          { batchKey: undefined, batchScope: 'kind' },
         ],
         `实际 seen=${JSON.stringify(seen)}`,
       );

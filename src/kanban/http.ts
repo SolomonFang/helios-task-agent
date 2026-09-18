@@ -146,7 +146,12 @@ export function sortTaskAttempts(list: unknown): TaskAttemptRow[] {
   const rows = list.filter((a): a is TaskAttemptRow => Boolean(a && typeof a === 'object' && (a as TaskAttemptRow).id));
   const live = rows.filter((a) => !a.archived);
   const pool = live.length ? live : rows;
-  pool.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+  // Date.parse 数值比较（混合时区偏移时字典序与真实时刻相反）；无法解析的按最早排前，稳定排序兜底
+  const ts = (a: TaskAttemptRow): number => {
+    const t = Date.parse(String(a.created_at || ''));
+    return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+  };
+  pool.sort((a, b) => ts(a) - ts(b));
   return pool;
 }
 

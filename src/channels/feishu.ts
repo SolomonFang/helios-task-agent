@@ -630,7 +630,8 @@ export class FeishuChannel implements AgentChannel {
 
   /**
    * 下载消息内的图片资源（私聊 image 消息），内存聚合为 Buffer 返回（不落盘）。
-   * SDK 该接口返回二进制流 + 响应头；MIME 取 content-type，缺失/非 image/* 时回退 jpeg。
+   * SDK 该接口返回二进制流 + 响应头；MIME 取 content-type，缺失/非 image/* 时回退 jpeg——
+   * 但响应体形似 JSON 错误体（{ 开头含 "code"）时按下载失败抛错，不把错误内容当图片送出。
    * maxBytes 提供流式熔断：累计超限立即抛 ImageTooLargeError 中止读取，
    * 避免超大资源先全量入内存再被拒。
    * timeoutMs 提供整体超时：SDK 的 axios timeout 只覆盖到响应头，for-await 读 body
@@ -673,9 +674,19 @@ export class FeishuChannel implements AgentChannel {
     }
     const headers = (res.headers ?? {}) as Record<string, unknown>;
     const rawType = headers['content-type'] ?? headers['Content-Type'];
-    const mimeType =
-      typeof rawType === 'string' && rawType.startsWith('image/') ? rawType.split(';')[0]!.trim() : 'image/jpeg';
-    return { data: Buffer.concat(chunks), mimeType };
+    const imageType =
+      typeof rawType === 'string' && rawType.startsWith('image/') ? rawType.split(';')[0]!.trim() : undefined;
+    const data = Buffer.concat(chunks);
+    if (!imageType) {
+      // 接口出错时可能返回 JSON 错误体而非图片流：形似 JSON（{ 开头含 "code"）按下载失败抛错，
+      // 避免错误内容被 base64 当图片送 LLM；其余非 image/* 响应维持回退 jpeg 的兼容行为
+      const head = data.subarray(0, 256).toString('utf8').trimStart();
+      if (head.startsWith('{') && head.includes('"code"')) {
+        console.error(`[feishu] 图片下载返回 JSON 错误体而非图片: ${head.slice(0, 200)}`);
+        throw new Error('图片下载失败：接口返回错误响应而非图片内容');
+      }
+    }
+    return { data, mimeType: imageType ?? 'image/jpeg' };
   }
 
   async reply(msg: InboundMessage, text: string): Promise<void> {

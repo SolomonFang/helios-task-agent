@@ -36,8 +36,8 @@ const LARK_VALUE_FLAGS = new Set([
 /**
  * 「同类免问」key 的对象实参解析：跳过带值 flag 及其值（--flag value 成对、--flag=value 占一位），
  * 取命令路径后第一个位置实参（接收对象/资源 id）。遇到未知 flag 时无法判断它带不带值，
- * 继续解析可能把 flag 值误绑成对象（授权放大）——fail-closed 返回 undefined，
- * 调用方退化为类级 key（batchScope 同步降为 'kind'）。
+ * 继续解析可能把 flag 值误绑成对象（授权放大）——fail-closed 返回 undefined；
+ * 调用方据此不提供 batchKey（每次必问），不得退化为类级免问（与 kanban-mcp 缺对象 id 同口径）。
  */
 function larkTargetArg(args: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
@@ -76,15 +76,16 @@ export function makeLarkCliHandler({
       const summary = action ?? '飞书写操作';
       const detail = summarizeBothEnds(`lark-cli ${argv.join(' ')}`);
       // 「同类免问」按命令路径 + 对象归类（如 lark:im send:ou_x）：子命令后第一个位置实参
-      // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；带值 flag 成对跳过，
-      // 解析不可靠（未知 flag 排在对象前）或无该实参时退化为命令路径，
-      // 粒度同步降为类级（batchScope 须与 key 的实际粒度一致，卡片文案才不失实）。
+      // （接收对象/资源 id）纳入 key，否则免问会放大到任意接收人；带值 flag 成对跳过。
+      // 解析不可靠（未知 flag 排在对象前）或无该实参时 fail-closed 不提供 batchKey（每次必问）——
+      // 退化为类级 key 会把一次「发给 ou_x」的批准静默放行成发往任意接收人的同类操作
+      // （与 kanban-mcp 缺对象 id 时不提供免问同口径）。
       // 飞书写整体按破坏性对待（超时放宽）
       const sub = argv[1] && !argv[1].startsWith('-') ? ` ${argv[1]}` : '';
       const target = larkTargetArg(argv.slice(sub ? 2 : 1));
-      const batchKey = target ? `lark:${argv[0]}${sub}:${target}` : `lark:${argv[0]}${sub}`;
+      const batchKey = target ? `lark:${argv[0]}${sub}:${target}` : undefined;
       const gate = await passGate(
-        // 对象级免问：key 绑接收对象/资源 id，批准发给 ou_x 不授权发给 ou_y；无对象则类级
+        // 对象级免问：key 绑接收对象/资源 id，批准发给 ou_x 不授权发给 ou_y；无对象则不提供免问
         { kind: 'lark', summary, detail, batchKey, batchScope: target ? 'object' : 'kind', destructive: true },
         confirm,
         ctx?.signal,

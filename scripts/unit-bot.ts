@@ -12,7 +12,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseBotArgs } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
 import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS } from '../src/channels/feishu';
-import { buildAiReviewCard } from '../src/channels/feishu-cards';
+import { buildAiReviewCard } from '../src/bot/cards';
 import { check, checkAsync, finish } from './testkit';
 
 // ---------- 退出码子进程测试的共用装置 ----------
@@ -209,6 +209,26 @@ async function main(): Promise<void> {
     const r = await ch.downloadImage('m1', 'k1');
     assert.equal(r.data.toString(), 'abcd');
     assert.equal(r.mimeType, 'image/png');
+  });
+
+  await checkAsync('downloadImage：非 image/* 且 body 形似 JSON 错误体时按下载失败抛错（不把错误内容当图片送 LLM）', async () => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    stubImageGet(ch, async () => ({
+      getReadableStream: () => Readable.from([Buffer.from('{"code": 234001, "msg": "not found"}')]),
+      headers: { 'content-type': 'application/json' },
+    }));
+    await assert.rejects(ch.downloadImage('m1', 'k1'), /下载失败/);
+  });
+
+  await checkAsync('downloadImage：content-type 缺失且 body 非 JSON 时仍回退 image/jpeg', async () => {
+    const ch = new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
+    stubImageGet(ch, async () => ({
+      getReadableStream: () => Readable.from([Buffer.from([0xff, 0xd8, 0xff])]),
+      headers: {},
+    }));
+    const r = await ch.downloadImage('m1', 'k1');
+    assert.equal(r.mimeType, 'image/jpeg');
+    assert.equal(r.data.length, 3);
   });
 
   await checkAsync('downloadImage：body 停滞有整体超时，超时销毁流并抛错（走「下载失败」路径）', async () => {

@@ -1077,6 +1077,55 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- pending 期间单字母 y 不算裁决（可能在回答别的对话）：给一次裁决引导，确认不受影响 ----------
+    await checkAsync('handler：pending 期间单字母 y 不裁决，落入短应答裁决引导', async () => {
+      const f = setup(llm.baseUrl);
+      const verdict = f.confirmations.request('u1', { kind: 'kanban', summary: '创建任务', detail: 'create_task x' });
+      await f.handlers.handle(mkMsg('u1', 'y'));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('请回复「确认」或「取消」')),
+        `单字母 y 应给裁决引导而非批准，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      assert.ok(
+        !f.channel.replies.some((r) => r.text.includes('已批准')),
+        '单字母 y 不得批准写操作',
+      );
+      f.confirmations.resolveFromText('u1', '确认');
+      assert.equal(await verdict, 'once');
+      cleanup(f);
+    });
+
+    // ---------- 「重试这个任务」文本：确定性分支复用诊断重试逻辑（不靠模型自觉） ----------
+    await checkAsync('handler：回复「重试这个任务」确定性发起诊断重试，回执展示跟进指令摘要', async () => {
+      const followUps: string[] = [];
+      const f = setup(llm.baseUrl, 'http://localhost:1', {
+        diagnosisRunner: async () => ({ text: '诊断结论：配置缺失', attemptId: 'att-1' }),
+        followUpSender: async (_url, _attempt, prompt) => {
+          followUps.push(prompt);
+        },
+      });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
+      await f.handlers.handle(mkMsg('u1', '重试这个任务'));
+      assert.equal(followUps.length, 1, '应确定性发起一次重试 follow-up');
+      const receipt = f.channel.notifies.find((n) => n.text.includes('已按诊断结论发起重试'));
+      assert.ok(receipt, '应有重试发起回执');
+      assert.ok(receipt!.text.includes('诊断结论：配置缺失'), '回执应展示将发送的 follow-up 摘要');
+      cleanup(f);
+    });
+
+    await checkAsync('handler：无诊断结论时回复「重试这个任务」如实告知，不发给模型', async () => {
+      const f = setup(llm.baseUrl);
+      const base = llm.requestCount; // 计数跨用例累计，取基线
+      await f.handlers.handle(mkMsg('u1', '重试这个任务'));
+      assert.ok(
+        f.channel.replies.some((r) => r.text.includes('没有找到可重试的诊断结论')),
+        `无诊断结论时应如实告知，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      assert.equal(llm.requestCount, base, '不得落入队列发给模型');
+      cleanup(f);
+    });
+
     // ---------- 卡片回调：非本机器人 payload / 无操作者静默忽略，未知 id 兜底，有效 id 裁决 ----------
     // （open_id 白名单在 feishu.ts WS 层，由 unit-feishu-filter.ts 覆盖；本用例测 handler 层入口过滤）
     await checkAsync('handler：卡片回调入口过滤（非本机器人/无操作者）与确认裁决', async () => {

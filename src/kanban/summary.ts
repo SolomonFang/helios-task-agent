@@ -65,6 +65,9 @@ export interface WorkSummaryData {
   sinceLabel: string;
   tasks: WorkSummaryTask[];
   totals: WorkSummaryTotals;
+  /** 截断前（MAX_TASKS 切片前）的范围内任务行数：totals 只计五个已知状态键，
+   *  含未知状态任务时 total ≤ tasks.length，截断判定必须用本字段与 tasks.length 比较。 */
+  scopedTotal?: number;
 }
 
 export interface CollectWorkSummaryOptions {
@@ -92,6 +95,15 @@ interface DiffStats {
 const MAX_TASKS = 50;
 /** 任务详情并发上限。 */
 const CONCURRENCY = 5;
+
+/** updated_at 倒序（新在前）：Date.parse 数值比较（混合时区偏移时字典序与真实时刻相反），无法解析的排最后。 */
+function compareUpdatedAtDesc(a: string, b: string): number {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isFinite(ta)) return Number.isFinite(tb) ? 1 : 0;
+  if (!Number.isFinite(tb)) return -1;
+  return tb - ta;
+}
 
 /** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
 function pickAttemptSummary(detail: unknown): string | undefined {
@@ -286,7 +298,9 @@ async function enrichTask(
       if (stats.additions !== undefined) task.additions = stats.additions;
       if (stats.deletions !== undefined) task.deletions = stats.deletions;
       if (stats.changedFiles?.length) {
-        task.changedFilesTotal = stats.changedFiles.length;
+        // filesChanged 可能来自看板独立字段（pickDiffStats 优先 files_changed）：看板自身截断
+        // 文件列表时 changedFiles.length 少报，取两者较大者保证「等 +N 个」不显示 +0
+        task.changedFilesTotal = Math.max(stats.filesChanged ?? 0, stats.changedFiles.length);
         task.changedFiles = stats.changedFiles.slice(0, 10);
       }
       break;
@@ -332,7 +346,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     return true;
   });
   filtered.sort((a, b) =>
-    String(b.row.updated_at || '').localeCompare(String(a.row.updated_at || '')),
+    compareUpdatedAtDesc(String(a.row.updated_at || ''), String(b.row.updated_at || '')),
   );
   const targets = filtered.slice(0, MAX_TASKS);
 
@@ -388,6 +402,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     sinceLabel,
     tasks,
     totals,
+    scopedTotal: filtered.length,
   };
 }
 
@@ -467,7 +482,7 @@ export async function collectDailyData(opts: CollectDailyOptions): Promise<Daily
     if (inDate || status === 'inprogress') candidates.push(item);
   }
   candidates.sort((a, b) =>
-    String(b.row.updated_at || '').localeCompare(String(a.row.updated_at || '')),
+    compareUpdatedAtDesc(String(a.row.updated_at || ''), String(b.row.updated_at || '')),
   );
   const truncated = candidates.length > MAX_TASKS;
   const tasks = await enrichBatch(kanbanUrl, statsLookup, candidates.slice(0, MAX_TASKS));

@@ -1,0 +1,13 @@
+# 统一文本文件行尾为 LF：Windows 上以 core.autocrlf=true 提交时，
+# bin/*.js 的 shebang 若变 CRLF，POSIX 上直接 bad interpreter。
+* text=auto eol=lf
+bin/* text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

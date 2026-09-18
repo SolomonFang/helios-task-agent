@@ -1,190 +1,284 @@
-import type { OpenAiTool } from '../../types';
+import type { OpenAiTool, ToolHandler } from '../../types';
+import type { ConfirmFn } from '../guard';
+import type { GatedWrite } from './gated-write';
+import { makeLarkCliHandler } from './lark-cli';
+import { makeHkCliHandler } from './hk-cli';
+import { makeRepoFsHandler } from './repo-fs';
+import { makeSkillDocHandler, makeSkillExecHandler } from './skill-tools';
+import { makeWorkSummaryHandler } from './work-summary';
+import { makeDailyReportHandler } from './personal-daily';
+import { makeIterationRetroHandler } from './iteration-retro';
 
-export const LOCAL_TOOLS: OpenAiTool[] = [
+/** buildTools 注入的本地工具依赖：LOCAL_TOOL_SPECS 的 makeHandler 统一从这里取参。 */
+export interface LocalToolDeps {
+  uid: string;
+  confirm?: ConfirmFn;
+  auditHome?: string;
+  kanbanUrl: string;
+  kanbanProjectId?: string;
+  kanbanRepoId?: string;
+  kanbanIteration?: string;
+  runGatedWrite: GatedWrite;
+  reportLinkBaseUrl?: string;
+  channel?: 'cli' | 'bot';
+}
+
+/**
+ * 本地工具单源注册表：def（对 LLM 的声明）+ summary（/tools 展示）+ makeHandler（执行体）
+ * 同条登记，buildTools 直接遍历本表注册——此前 def/handlers.set/summary 三处手工同步，
+ * 漏注册 handler 时工具照常出现在 openAiTools 里、LLM 调用后运行时才报错。
+ */
+export interface LocalToolSpec {
+  tool: OpenAiTool;
+  /** /tools 展示的一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
+  summary: string;
+  makeHandler: (deps: LocalToolDeps) => ToolHandler;
+}
+
+export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
   {
-    type: 'function',
-    function: {
-      name: 'lark_cli',
-      description:
-        '执行本机 lark-cli 命令以获取/操作飞书内容（消息、群聊、文档、日历、任务、多维表格等）。' +
-        '用于：读取群消息、读取文档正文、搜索聊天等。参数为命令行参数数组，例如 ["im","--help"]。' +
-        '拿不准用法时先执行 ["--help"] 或 ["<skill>","--help"] 自发现，禁止臆造子命令。' +
-        '只读命令直接执行；写命令（发消息、创建、修改、删除等）会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          args: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '传给 lark-cli 的参数数组',
+    summary: '飞书读写：任务 / 文档 / 群消息等',
+    makeHandler: (d) => makeLarkCliHandler({ uid: d.uid, confirm: d.confirm, auditHome: d.auditHome }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'lark_cli',
+        description:
+          '执行本机 lark-cli 命令以获取/操作飞书内容（消息、群聊、文档、日历、任务、多维表格等）。' +
+          '用于：读取群消息、读取文档正文、搜索聊天等。参数为命令行参数数组，例如 ["im","--help"]。' +
+          '拿不准用法时先执行 ["--help"] 或 ["<skill>","--help"] 自发现，禁止臆造子命令。' +
+          '只读命令直接执行；写命令（发消息、创建、修改、删除等）会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            args: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '传给 lark-cli 的参数数组',
+            },
           },
-        },
-        required: ['args'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'hk_cli',
-      description:
-        '执行 helios-kanban-remote 技能的 hk.mjs（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
-        '例如 ["health"]、["projects"]、["projects","update",id,"--description","…"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
-        '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。写操作会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          args: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '传给 hk.mjs 的参数数组',
-          },
-        },
-        required: ['args'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'repo_fs',
-      description:
-        '在 helios-kanban 关联仓库的本机 path 下只读浏览代码（list / read / grep）。' +
-        '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否 start 由用户决定。' +
-        '必须提供 root（绝对路径，且必须是看板已注册仓库或其子目录）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
-        '禁止用于写文件或访问仓库外路径。',
-      parameters: {
-        type: 'object',
-        properties: {
-          action: {
-            type: 'string',
-            enum: ['list', 'read', 'grep'],
-            description: 'list 列目录；read 读文件；grep 在目录内搜索正则',
-          },
-          repo_id: { type: 'string', description: 'kanban 仓库 UUID；与 root 二选一' },
-          root: { type: 'string', description: '本机仓库绝对路径；与 repo_id 二选一' },
-          path: {
-            type: 'string',
-            description: '相对仓库根的路径；list/grep 默认为 .；read 必填文件路径',
-          },
-          pattern: { type: 'string', description: 'grep 时的正则（忽略大小写）' },
-          glob: {
-            type: 'string',
-            description: '可选文件过滤，如 *.ts 或 src/',
-          },
-        },
-        required: ['action'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'skill_doc',
-      description:
-        '读取已安装技能（SKILL.md）的完整文档，按需取用细节。' +
-        '省略 name 则列出全部已安装技能及其 description；指定 name 返回该技能全文。' +
-        '系统提示词里只有技能摘要，需要完整命令表/规则时用这个工具读取，不要臆造。只读，不触发确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: '技能名（如 helios-kanban-remote）；省略则列出全部技能' },
+          required: ['args'],
         },
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'skill_exec',
-      description:
-        '运行已安装技能目录内的脚本（node/shell/python 等）。技能文档（skill_doc 读取）里说明的脚本用法通过此工具执行。' +
-        'script 为相对技能目录的路径（如 scripts/foo.py）；按扩展名自动选择解释器（.sh→bash、.js/.mjs/.cjs→node、.py→python3），' +
-        '其他扩展名需显式传 interpreter（bash/sh/node/python3/python）。' +
-        '执行任意脚本无法预判读写，每次调用都会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          skill: { type: 'string', description: '技能名（如 helios-kanban-remote）' },
-          script: { type: 'string', description: '相对技能目录的脚本路径，如 scripts/run.sh' },
-          args: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '传给脚本的参数数组',
+    summary: '看板备用通道（看板连接异常时兜底与补充）',
+    makeHandler: (d) =>
+      makeHkCliHandler({
+        kanbanUrl: d.kanbanUrl,
+        kanbanProjectId: d.kanbanProjectId,
+        kanbanRepoId: d.kanbanRepoId,
+        kanbanIteration: d.kanbanIteration,
+        runGatedWrite: d.runGatedWrite,
+      }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'hk_cli',
+        description:
+          '执行 helios-kanban-remote 技能的 hk.mjs（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
+          '例如 ["health"]、["projects"]、["projects","update",id,"--description","…"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
+          '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。写操作会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            args: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '传给 hk.mjs 的参数数组',
+            },
           },
-          interpreter: {
-            type: 'string',
-            description: '可选；显式解释器（bash/sh/node/python3/python），缺省按扩展名推断',
-          },
-        },
-        required: ['skill', 'script'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'work_summary',
-      description:
-        '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
-        '数据来自 helios-kanban 任务及其 diff 统计（改动文件、增删行数、attempt 摘要）。只读，不写看板。',
-      parameters: {
-        type: 'object',
-        properties: {
-          scope: {
-            type: 'string',
-            enum: ['iteration', 'today', 'all'],
-            description:
-              '统计范围：iteration 按迭代（配置了默认迭代时为默认）、today 今天有更新的、all 全部任务',
-          },
-          iteration: { type: 'string', description: '可选；覆盖默认迭代号' },
-          format: {
-            type: 'string',
-            enum: ['both', 'html', 'md'],
-            description: '输出格式，默认 both',
-          },
+          required: ['args'],
         },
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'daily_report',
-      description:
-        '生成个人工作日报素材（+ HTML 日报文件），用于「帮我写今天的日报」「昨天的日报」类请求。' +
-        '采集当日看板活动：今日完成（状态已完成且最后更新时间在当日，与周报「本周完成」同一口径）、进行中、今日失败、今日新待审阅、改动统计。' +
-        '只读，不写看板。返回结构化素材与报告链接；回复时按「今日完成 / 进行中 / 风险与阻塞 / 明日计划」组织日报——' +
-        '明日计划仅依据进行中任务推断，素材没有的维度如实说明无数据，不要编造。',
-      parameters: {
-        type: 'object',
-        properties: {
-          date: {
-            type: 'string',
-            description: '目标日期：「今天」（默认）/「昨天」/ YYYY-MM-DD（如 2026-09-01）',
+    summary: '看板关联仓库代码只读浏览',
+    makeHandler: (d) => makeRepoFsHandler({ uid: d.uid, kanbanUrl: d.kanbanUrl, auditHome: d.auditHome }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'repo_fs',
+        description:
+          '在 helios-kanban 关联仓库的本机 path 下只读浏览代码（list / read / grep）。' +
+          '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否 start 由用户决定。' +
+          '必须提供 root（绝对路径，且必须是看板已注册仓库或其子目录）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
+          '禁止用于写文件或访问仓库外路径。',
+        parameters: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['list', 'read', 'grep'],
+              description: 'list 列目录；read 读文件；grep 在目录内搜索正则',
+            },
+            repo_id: { type: 'string', description: 'kanban 仓库 UUID；与 root 二选一' },
+            root: { type: 'string', description: '本机仓库绝对路径；与 repo_id 二选一' },
+            path: {
+              type: 'string',
+              description: '相对仓库根的路径；list/grep 默认为 .；read 必填文件路径',
+            },
+            pattern: { type: 'string', description: 'grep 时的正则（忽略大小写）' },
+            glob: {
+              type: 'string',
+              description: '可选文件过滤，如 *.ts 或 src/',
+            },
           },
-          iteration: { type: 'string', description: '可选；覆盖默认迭代号（未配置默认迭代时范围为全部任务）' },
-          html: { type: 'boolean', description: '是否生成 HTML 日报文件，默认 true' },
+          required: ['action'],
         },
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'iteration_retro',
-      description:
-        '生成迭代复盘报告（HTML 文件），用于「复盘一下这个迭代」类请求。' +
-        '指标：迭代概览（任务总数、五状态分布、完成率）、吞吐（本周完成、累计完成，按最后更新时间口径）、' +
-        '失败归因（对失败摘要做确定性规则归类：合并冲突/测试失败/构建错误/执行超时/环境或依赖/其他，非模型判读）、改动统计汇总。' +
-        '数据来自 helios-kanban，只读，不写看板。回复时给报告链接与概览要点，解读失败归因时注明是规则归类结果。',
-      parameters: {
-        type: 'object',
-        properties: {
-          iteration: {
-            type: 'string',
-            description: '可选；覆盖默认迭代号。均未提供时范围为全部任务，报告会注明口径',
+    summary: '生成工作总结报告（网页/文档）',
+    makeHandler: (d) =>
+      makeWorkSummaryHandler({
+        kanbanUrl: d.kanbanUrl,
+        kanbanProjectId: d.kanbanProjectId,
+        kanbanIteration: d.kanbanIteration,
+        reportLinkBaseUrl: d.reportLinkBaseUrl,
+      }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'work_summary',
+        description:
+          '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
+          '数据来自 helios-kanban 任务及其 diff 统计（改动文件、增删行数、attempt 摘要）。只读，不写看板。',
+        parameters: {
+          type: 'object',
+          properties: {
+            scope: {
+              type: 'string',
+              enum: ['iteration', 'today', 'all'],
+              description:
+                '统计范围：iteration 按迭代（配置了默认迭代时为默认）、today 今天有更新的、all 全部任务',
+            },
+            iteration: { type: 'string', description: '可选；覆盖默认迭代号' },
+            format: {
+              type: 'string',
+              enum: ['both', 'html', 'md'],
+              description: '输出格式，默认 both',
+            },
           },
+        },
+      },
+    },
+  },
+  {
+    summary: '生成个人工作日报（素材 + 网页报告）',
+    makeHandler: (d) =>
+      makeDailyReportHandler({
+        kanbanUrl: d.kanbanUrl,
+        kanbanProjectId: d.kanbanProjectId,
+        kanbanIteration: d.kanbanIteration,
+        reportLinkBaseUrl: d.reportLinkBaseUrl,
+        channel: d.channel,
+      }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'daily_report',
+        description:
+          '生成个人工作日报素材（+ HTML 日报文件），用于「帮我写今天的日报」「昨天的日报」类请求。' +
+          '采集当日看板活动：今日完成（状态已完成且最后更新时间在当日，与周报「本周完成」同一口径）、进行中、今日失败、今日新待审阅、改动统计。' +
+          '只读，不写看板。返回结构化素材与报告链接；回复时按「今日完成 / 进行中 / 风险与阻塞 / 明日计划」组织日报——' +
+          '明日计划仅依据进行中任务推断，素材没有的维度如实说明无数据，不要编造。',
+        parameters: {
+          type: 'object',
+          properties: {
+            date: {
+              type: 'string',
+              description: '目标日期：「今天」（默认）/「昨天」/ YYYY-MM-DD（如 2026-09-01）',
+            },
+            iteration: { type: 'string', description: '可选；覆盖默认迭代号（未配置默认迭代时范围为全部任务）' },
+            html: { type: 'boolean', description: '是否生成 HTML 日报文件，默认 true' },
+          },
+        },
+      },
+    },
+  },
+  {
+    summary: '生成迭代复盘报告（网页）',
+    makeHandler: (d) =>
+      makeIterationRetroHandler({
+        kanbanUrl: d.kanbanUrl,
+        kanbanProjectId: d.kanbanProjectId,
+        kanbanIteration: d.kanbanIteration,
+        reportLinkBaseUrl: d.reportLinkBaseUrl,
+        channel: d.channel,
+      }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'iteration_retro',
+        description:
+          '生成迭代复盘报告（HTML 文件），用于「复盘一下这个迭代」类请求。' +
+          '指标：迭代概览（任务总数、五状态分布、完成率）、吞吐（本周完成、累计完成，按最后更新时间口径）、' +
+          '失败归因（对失败摘要做确定性规则归类：合并冲突/测试失败/构建错误/执行超时/环境或依赖/其他，非模型判读）、改动统计汇总。' +
+          '数据来自 helios-kanban，只读，不写看板。回复时给报告链接与概览要点，解读失败归因时注明是规则归类结果。',
+        parameters: {
+          type: 'object',
+          properties: {
+            iteration: {
+              type: 'string',
+              description: '可选；覆盖默认迭代号。均未提供时范围为全部任务，报告会注明口径',
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    summary: '按需读取已安装技能的完整使用文档',
+    makeHandler: () => makeSkillDocHandler(),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'skill_doc',
+        description:
+          '读取已安装技能（SKILL.md）的完整文档，按需取用细节。' +
+          '省略 name 则列出全部已安装技能及其 description；指定 name 返回该技能全文。' +
+          '系统提示词里只有技能摘要，需要完整命令表/规则时用这个工具读取，不要臆造。只读，不触发确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: '技能名（如 helios-kanban-remote）；省略则列出全部技能' },
+          },
+        },
+      },
+    },
+  },
+  {
+    summary: '运行技能目录内脚本（每次需用户确认）',
+    makeHandler: (d) => makeSkillExecHandler({ uid: d.uid, confirm: d.confirm, auditHome: d.auditHome }),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'skill_exec',
+        description:
+          '运行已安装技能目录内的脚本（node/shell/python 等）。技能文档（skill_doc 读取）里说明的脚本用法通过此工具执行。' +
+          'script 为相对技能目录的路径（如 scripts/foo.py）；按扩展名自动选择解释器（.sh→bash、.js/.mjs/.cjs→node、.py→python3），' +
+          '其他扩展名需显式传 interpreter（bash/sh/node/python3/python）。' +
+          '执行任意脚本无法预判读写，每次调用都会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            skill: { type: 'string', description: '技能名（如 helios-kanban-remote）' },
+            script: { type: 'string', description: '相对技能目录的脚本路径，如 scripts/run.sh' },
+            args: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '传给脚本的参数数组',
+            },
+            interpreter: {
+              type: 'string',
+              description: '可选；显式解释器（bash/sh/node/python3/python），缺省按扩展名推断',
+            },
+          },
+          required: ['skill', 'script'],
         },
       },
     },
@@ -192,16 +286,10 @@ export const LOCAL_TOOLS: OpenAiTool[] = [
 ];
 
 /** /tools 展示的本地工具一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
-export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = [
-  { name: 'lark_cli', summary: '飞书读写：任务 / 文档 / 群消息等' },
-  { name: 'hk_cli', summary: '看板备用通道（看板连接异常时兜底与补充）' },
-  { name: 'repo_fs', summary: '看板关联仓库代码只读浏览' },
-  { name: 'work_summary', summary: '生成工作总结报告（网页/文档）' },
-  { name: 'daily_report', summary: '生成个人工作日报（素材 + 网页报告）' },
-  { name: 'iteration_retro', summary: '生成迭代复盘报告（网页）' },
-  { name: 'skill_doc', summary: '按需读取已安装技能的完整使用文档' },
-  { name: 'skill_exec', summary: '运行技能目录内脚本（每次需用户确认）' },
-];
+export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = LOCAL_TOOL_SPECS.map((s) => ({
+  name: s.tool.function.name,
+  summary: s.summary,
+}));
 
 /**
  * 按 memory 启用标志拼接摘要：memory_* 工具仅在实际注册（buildTools 传入 memory）时列出，

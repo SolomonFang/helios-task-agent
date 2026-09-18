@@ -296,10 +296,24 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     stdout = out.stdout || '';
     stderr = out.stderr || '';
   } catch (err) {
-    const e = err as { killed?: boolean; stdout?: string; stderr?: string; message?: string };
+    // execFileCompat 三种路径都置 killed=true（见 proc.ts 注释）：须先查 bufferExceeded、
+    // 再查调用方中断，最后才按超时定性
+    const e = err as {
+      killed?: boolean;
+      bufferExceeded?: 'stdout' | 'stderr';
+      stdout?: string;
+      stderr?: string;
+      message?: string;
+    };
     // 完整输出只进日志，不倾倒给终端用户；用户面给中文定性 + 自救指引
     const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
     if (full) console.error(`[ai-review] 代码审查工具完整输出：\n${full}`);
+    if (e.bufferExceeded) {
+      throw new Error('AI 审查输出过大已终止（可能变更范围过大），请到看板缩小审查范围后重试。');
+    }
+    if (opts.signal?.aborted) {
+      throw new Error('已中断');
+    }
     if (e.killed) {
       // 重试指引由 handler 统一追加，这里不再自带，避免两句重复
       throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);

@@ -16,8 +16,14 @@ import type {
 const MAX_TOOL_ROUNDS = 25;
 /** Max tool invocations per user turn (covers「最多展开 10 条链接」with headroom). */
 const MAX_TOOL_CALLS = 100;
-/** 单轮对话墙钟上限（分钟，默认 30）：bot 无人值守时防止超长工具链阻塞该用户的串行队列。 */
-const TURN_WALL_CLOCK_MS = Math.max(1, Number(process.env.HTA_TURN_TIMEOUT_MIN || 30) || 30) * 60_000;
+/**
+ * 单轮对话墙钟上限（分钟，默认 30）：bot 无人值守时防止超长工具链阻塞该用户的串行队列。
+ * 惰性读取：两个入口都在 main() 内才 ensureEnvLoaded()，模块加载期求值会静默忽略
+ * .env 里的 HTA_TURN_TIMEOUT_MIN（与 paths.ts defaultDataHome 的惰性读法同思路）。
+ */
+function turnWallClockMs(): number {
+  return Math.max(1, Number(process.env.HTA_TURN_TIMEOUT_MIN || 30) || 30) * 60_000;
+}
 /** Keep system + this many subsequent messages (tool-call chains trimmed intact). */
 export const MAX_HISTORY_MESSAGES = 40;
 /**
@@ -179,7 +185,7 @@ export async function runAgentTurn({
   onProgress,
   signal,
   image,
-  wallClockMs = TURN_WALL_CLOCK_MS,
+  wallClockMs = turnWallClockMs(),
 }: {
   client: OpenAiClient;
   model: string;

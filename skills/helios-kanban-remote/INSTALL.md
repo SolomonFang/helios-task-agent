@@ -25,6 +25,8 @@ The skill ships **inside the `helios-task-agent` npm package** (`files` includes
 
 ## Agent instructions — follow in order
 
+> **Shell 前提**：下文所有命令块均为 POSIX shell（bash/zsh）写法（`uname`、`export`、`rm -rf`、`cp`、`grep` 等）。Windows 上的 agent 请在 Git Bash / WSL 中执行，或自行翻译成 PowerShell 等价命令（如 `export K=V` → `$env:K="V"`、`rm -rf` → `Remove-Item -Recurse -Force`、`cp -r` → `Copy-Item -Recurse`）。
+
 ```
 Install progress:
 - [ ] Step 1: Detect environment
@@ -148,7 +150,18 @@ grep -q 'HELIOS_KANBAN_URL' "$PROFILE" 2>/dev/null || \
 Kanban server (separate host) must be running:
 
 ```bash
+# macOS / Linux（POSIX shell）
 HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
+```
+
+Windows（env 前缀语法不可用，按 shell 二选一）：
+
+```cmd
+set HOST=0.0.0.0 && set PORT=7964 && npx -y helios-kanban@latest
+```
+
+```powershell
+$env:HOST="0.0.0.0"; $env:PORT=7964; npx -y helios-kanban@latest
 ```
 
 > ⚠️ The kanban Web UI / API has **no authentication**. `HOST=0.0.0.0` exposes it to the whole network — only bind `0.0.0.0` on a trusted network (LAN / Tailscale); otherwise keep the default `127.0.0.1`.

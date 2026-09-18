@@ -1,10 +1,11 @@
 name: CI
 
-# PR / tag push 级检查：typecheck + 单元测试 + 生产依赖 audit
+# 主分支 push / PR / tag push 级检查：typecheck + 单元测试 + 生产依赖 audit + build 与 bin 接线验证
 # smoke / e2e 依赖本机 helios-kanban，不在 CI 跑
-# 普通分支 push 不跑 CI；只在 PR 和打 tag（git push --follow-tags）时构建
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   pull_request:
@@ -35,5 +36,33 @@ jobs:
       # 纯逻辑单元测试：无 LLM / kanban 依赖，CI 可直接跑
       - run: npm test
 
+      # 构建产物 + bin 接线验证（两个入口的 --version 都不依赖外部服务，可直接断言）
+      - run: npm run build
+      - run: node bin/helios-task-agent.js --version
+      - run: node bin/helios-task-agent-bot.js --version
+
       # 生产依赖高危漏洞拦截（npmmirror 无 audit 端点，须显式指定官方 registry）
       - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+  # win32 专属路径（taskkill 杀进程树、.cmd shim、cross-spawn 转义）只在 Windows 上真正走到，
+  # Linux 上跑不出来；单测均为纯逻辑 + loopback mock / PATH 桩，无外部服务依赖，Windows 可直接跑。
+  # 若未来某套件在 win 上大面积 SKIP/失败，可减为只跑 typecheck + 纯逻辑套件。
+  test-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test

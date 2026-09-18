@@ -50,15 +50,22 @@ const PASS_THROUGH_VARS = [
   'ProgramData',
 ];
 
-/** 组装子进程环境：base 中的放行清单 + extra（后者覆盖前者）。 */
+/** win32 环境块键大小写不敏感（PATH 惯例拼写为 Path），放行匹配用小写化比较。 */
+const PASS_THROUGH_VARS_LOWER = new Set(PASS_THROUGH_VARS.map((k) => k.toLowerCase()));
+
+/** 组装子进程环境：base 中的放行清单 + extra（后者覆盖前者）。platform 仅供测试注入。 */
 export function minimalChildEnv(
   extra: NodeJS.ProcessEnv = {},
   base: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
+  const win32 = platform === 'win32';
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined) continue;
-    if (PASS_THROUGH_VARS.includes(key) || key.startsWith('LC_')) out[key] = value;
+    // win32 下保留原键名写入输出（Path 不改成 PATH），仅匹配时忽略大小写
+    const listed = win32 ? PASS_THROUGH_VARS_LOWER.has(key.toLowerCase()) : PASS_THROUGH_VARS.includes(key);
+    if (listed || key.startsWith('LC_') || (win32 && key.toUpperCase().startsWith('LC_'))) out[key] = value;
   }
   for (const [key, value] of Object.entries(extra)) {
     if (value === undefined) delete out[key];

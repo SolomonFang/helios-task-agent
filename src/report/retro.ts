@@ -150,7 +150,9 @@ export function buildRetroModel(data: WorkSummaryData, now = new Date()): RetroM
       additions: totals.additions,
       deletions: totals.deletions,
     },
-    truncated: total > data.tasks.length,
+    // 截断判定用采集侧透传的截断前行数：totals 只计五个已知状态键，范围内有未知状态任务时
+    // total ≤ tasks.length 会漏报截断；旧采集结果缺 scopedTotal 时回退五状态全量和
+    truncated: (data.scopedTotal ?? total) > data.tasks.length,
     sampleSize: data.tasks.length,
   };
 }

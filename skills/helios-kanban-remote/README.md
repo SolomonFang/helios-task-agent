@@ -29,8 +29,11 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 依赖：仅需 Node >= 20（hk.mjs 为零依赖 Node 脚本）。Kanban 服务需可达（建议 Tailscale，Web/API 无鉴权，仅在可信网络绑定 `0.0.0.0`）：
 
 ```bash
+# macOS / Linux（POSIX shell）
 HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
 ```
+
+Windows 上 env 前缀语法不可用，按 shell 二选一：cmd 用 `set HOST=0.0.0.0 && set PORT=7964 && npx -y helios-kanban@latest`；PowerShell 用 `$env:HOST="0.0.0.0"; $env:PORT=7964; npx -y helios-kanban@latest`。
 
 ## 配置
 

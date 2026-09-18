@@ -109,6 +109,15 @@ async function main(): Promise<void> {
     assert.equal(parseTriggerAt({ at: '明天凌晨 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
   });
 
+  await checkAsync('parseTriggerAt：时段修饰与 24 小时制混用（「晚上 13 点」「上午 15 点」）拒绝', () => {
+    for (const bad of ['晚上 13 点', '下午 13:00', '上午 15 点', '中午 13 点', '明晚 20 点', '凌晨 13:00']) {
+      assert.throws(() => parseTriggerAt({ at: bad }, NOW), /小时须为 1-12/, `应拒绝「${bad}」`);
+    }
+    // 对照：无修饰的 24 小时制与 ≤12 的修饰写法照常接受
+    assert.equal(parseTriggerAt({ at: '15:00' }, NOW), new Date(2026, 8, 4, 15, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '下午 3 点' }, NOW), new Date(2026, 8, 4, 15, 0).getTime());
+  });
+
   await checkAsync('parseTriggerAt：「YYYY-MM-DD HH:mm」与带时区标准串；非法日期拒绝', () => {
     assert.equal(parseTriggerAt({ at: '2026-09-20 09:00' }, NOW), new Date(2026, 8, 20, 9, 0).getTime());
     assert.equal(parseTriggerAt({ at: '2026-09-20T09:00' }, NOW), new Date(2026, 8, 20, 9, 0).getTime());

@@ -109,7 +109,7 @@ function pickDiffStatsFor(raw: unknown, attemptId: string): FailureContext['diff
 
 /** 采集失败上下文：任务详情 + 最新 attempt + diff 统计；后两者失败不阻断（有多少用多少）。 */
 export async function collectFailureContext(kanbanUrl: string, taskId: string): Promise<FailureContext> {
-  const detail = await apiGet(kanbanUrl, `/tasks/${taskId}`); // 任务详情拿不到没法诊断，错误照常上抛
+  const detail = await apiGet(kanbanUrl, `/tasks/${encodeURIComponent(taskId)}`); // 任务详情拿不到没法诊断，错误照常上抛
   const { description, attemptSummary } = pickTaskFields(detail);
   const title =
     detail && typeof detail === 'object' && typeof (detail as Record<string, unknown>).title === 'string'
@@ -293,12 +293,16 @@ export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string
     throw followUpRequestError(err);
   }
   const list = Array.isArray(raw) ? raw : [];
-  // /sessions 返回顺序不保证：按 created_at 升序取末位（最新）会话；
-  // 无该字段的行按空串排前，原相对顺序作为兜底（稳定排序）
+  // /sessions 返回顺序不保证：按 created_at 升序取末位（最新）会话；Date.parse 数值比较
+  // （混合时区偏移时字典序与真实时刻相反），无法解析的按最早排前，原相对顺序兜底（稳定排序）
+  const sessionTs = (s: Record<string, unknown>): number => {
+    const t = Date.parse(String(s.created_at || ''));
+    return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+  };
   const sessions = list
     .map((s) => (s && typeof s === 'object' ? (s as Record<string, unknown>) : null))
     .filter((s): s is Record<string, unknown> => Boolean(s && s.id))
-    .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+    .sort((a, b) => sessionTs(a) - sessionTs(b));
   const sessionId = sessions.length ? String(sessions[sessions.length - 1]!.id) : '';
   if (!sessionId) {
     throw new Error('找不到该任务的执行会话（可能已被看板清理），无法自动重试。请到看板手动重新发起该任务。');

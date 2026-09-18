@@ -69,7 +69,7 @@ export const WATCH_HINT_FAILED_LOG = '请到看板查看日志定位问题。';
 export const WATCH_HINT_STALE = '如仍在正常推进可忽略本提醒；要催一下或查看进度，直接回复即可。';
 
 /**
- * 本机链接可达性注记（watcher 纯文本版事件与 feishu-cards 卡片注脚同源）：
+ * 本机链接可达性注记（watcher 纯文本版事件与 bot/cards.ts 卡片注脚同源）：
  * 卡片发送失败降级为纯文本时用户必然踩「localhost 打不开」的坑，链接行必须带同口径注记。
  * loopback（localhost/127.x/::1）连同一局域网都不可达，需与「本机所在网络可达」区分；
  * 失效主语写明是机器人重启，避免「重启后失效」不知所指。
@@ -139,6 +139,8 @@ export class KanbanWatcher {
   private readonly opts: KanbanWatcherOptions;
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
+  /** stop() 后置位：在途 tick 的推送循环逐条检查，已停即跳过剩余推送（避免打到已关闭的 channel）。 */
+  private stopped = false;
   private state: WatchState | null;
   /** 最近一次落盘快照的序列化结果（tasks/approvals）：tick 里比较与写盘复用它，不再每轮重复 stringify。 */
   private lastSnapshotJson: { tasks: string; approvals: string } | null;
@@ -164,6 +166,7 @@ export class KanbanWatcher {
   }
 
   start(): void {
+    this.stopped = false;
     const interval = Math.max(15000, this.opts.intervalMs ?? 60000);
     void this.tick();
     this.timer = setInterval(() => void this.tick(), interval);
@@ -175,6 +178,7 @@ export class KanbanWatcher {
    * 仍可能向已关闭的 channel 推送。
    */
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     const deadline = Date.now() + (this.opts.stopTimeoutMs ?? 5000);
@@ -238,8 +242,9 @@ export class KanbanWatcher {
       );
       this.lastSnapshotJson = snapshotJson;
       this.lastPendingJson = pendingJson;
-    } catch {
-      /* best-effort */
+    } catch (err) {
+      // best-effort：落盘失败不阻断主流程（重启后由旧快照 diff 兜底重推），HTA_DEBUG 下留信号
+      if (process.env.HTA_DEBUG) console.error(`[watcher] state 落盘失败：${errMessage(err)}`);
     }
   }
 
@@ -464,9 +469,16 @@ export class KanbanWatcher {
       return { pending, pendingTouched: Object.keys(pending).length > 0, failed: 0 };
     }
     let failed = 0;
-    for (const [pid, p] of Object.entries(pending)) {
+    let stoppedMidDeliver = false;
+    outer: for (const [pid, p] of Object.entries(pending)) {
       for (const owner of ownerList) {
         if (p.delivered.includes(owner)) continue;
+        // stop() 等满兜底超时后本循环仍在跑：逐条检查，已停即跳过剩余推送，
+        // 未送达组合留在 pending 里下轮（或重启后）重投，不往已关闭的 channel 打
+        if (this.stopped) {
+          stoppedMidDeliver = true;
+          break outer;
+        }
         try {
           if (perOwner) await this.opts.notifyOwner!(p.event, owner, pid);
           else await this.opts.notify(p.event, pid);
@@ -482,6 +494,9 @@ export class KanbanWatcher {
     const pendingOut: Record<string, PendingWatchEvent> = {};
     for (const [id, p] of Object.entries(pending)) {
       if (!ownerList.every((o) => p.delivered.includes(o))) pendingOut[id] = p;
+    }
+    if (stoppedMidDeliver) {
+      this.opts.log?.(`watcher 已停止，跳过剩余推送（${Object.keys(pendingOut).length} 条事件未全员送达，保留待重投）`);
     }
     return {
       pending: pendingOut,

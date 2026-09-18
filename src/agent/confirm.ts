@@ -36,6 +36,8 @@ interface Pending {
 // 收窄的确认词：「好/可以/ok」这类随口应答不算批准，避免 pending 期间误放行写操作。
 // 单字「都」/「b」不在词表：随口一个字就批准长期免问太危险；「以后都」「都允许」「batch」仍覆盖该意图。
 // 词表为 CLI（readline 逐行）与飞书 bot（文本消息）共用：两端匹配方式可不同，词表必须一致。
+// 但单字母 y/n 只在 CLI 交互式确认里生效（终端无误触风险）：bot 文本裁决（resolveFromText）
+// 剔除单字母——确认挂起期间用户随口回「y/n」可能是在回答别的对话，不能据此放行写操作。
 export const CONFIRM_YES_WORDS = ['确认', '确认执行', '同意', '批准', '执行', 'y', 'yes'];
 export const CONFIRM_BATCH_WORDS = ['都允许', '同类免问', '同对象免问', '批量允许', '以后都', '免问', 'batch', '一直允许', '始终允许', 'always'];
 export const CONFIRM_NO_WORDS = ['取消', '算了', '不用', '否', '拒绝', 'n', 'no'];
@@ -62,17 +64,6 @@ export function isConfirmWord(text: string): boolean {
   const t = text.trim();
   if (t.length <= 1) return false;
   return CONFIRM_EXCLUSIVE_RE.test(t);
-}
-
-/** 全部确认管理器实例：hasPendingConfirmation 跨实例查询用。 */
-const managers = new Set<ConfirmationManager>();
-
-/** 查询该用户当前是否有挂起的写操作确认（bot handler 用）。 */
-export function hasPendingConfirmation(userKey: string): boolean {
-  for (const m of managers) {
-    if (m.hasPending(userKey)) return true;
-  }
-  return false;
 }
 
 export class ConfirmationManager {
@@ -103,9 +94,7 @@ export class ConfirmationManager {
       /** 确认卡片与文本降级都发送失败时回调（用户无法裁决）：bot 层借此走最后可达路径告知用户。 */
       onSendFailed?: (openId: string, req: ConfirmRequest, error: string) => void;
     } = {},
-  ) {
-    managers.add(this); // hasPendingConfirmation 跨实例查询
-  }
+  ) {}
 
   /** Remember the user's chat so the confirm card can be delivered later. */
   noteChat(openId: string, chatId: string): void {
@@ -114,6 +103,18 @@ export class ConfirmationManager {
 
   hasPending(openId: string): boolean {
     return this.pendings.has(openId);
+  }
+
+  /** 只读查询：该用户挂起确认的展示形态（bot 回执文案按有无卡片/是否支持免问分支用）。 */
+  pendingForm(openId: string): { hasCard: boolean; batchKey: boolean } {
+    const p = this.pendings.get(openId);
+    return { hasCard: Boolean(p?.cardMessageId), batchKey: Boolean(p?.req.batchKey) };
+  }
+
+  /** 只读查询：confirmId 是否属于某个挂起确认（可能是他人发起；区分「不是你的确认」与「已处理/过期」）。 */
+  isPendingConfirmId(confirmId: string): boolean {
+    for (const p of this.pendings.values()) if (p.id === confirmId) return true;
+    return false;
   }
 
   private timeoutFor(req: ConfirmRequest): number {
@@ -250,6 +251,10 @@ export class ConfirmationManager {
     const p = this.pendings.get(openId);
     if (!p) return 'ignored';
     const t = text.trim();
+    // 单字母（y/n）在 bot 文本路径一律不算裁决：确认挂起期间随手回的「y」很可能是在回答
+    // 别的对话，不能据此放行写操作；完整词（yes/no/确认/取消…）不受影响。
+    // CLI 交互式确认仍保留单字母（终端无误触风险），那边直接用 CONFIRM_YES_RE/CONFIRM_NO_RE。
+    if (t.length <= 1) return 'ignored';
     if (CONFIRM_BATCH_RE.test(t) && p.req.batchKey) {
       this.finish(openId, p, 'batch');
       return 'approved_batch';

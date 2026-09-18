@@ -28,7 +28,15 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 
 1. **Helios Kanban running** on a reachable host:
    ```bash
+   # macOS / Linux（POSIX shell）
    HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
+   ```
+   Windows（env 前缀语法在 cmd/PowerShell 不可用，按 shell 二选一）：
+   ```cmd
+   set HOST=0.0.0.0 && set PORT=7964 && npx -y helios-kanban@latest
+   ```
+   ```powershell
+   $env:HOST="0.0.0.0"; $env:PORT=7964; npx -y helios-kanban@latest
    ```
    Security note: the kanban Web/API has **no authentication** — `HOST=0.0.0.0` exposes task/code operations to the whole LAN. Only do this on a trusted network (Tailscale recommended, see below); for same-machine use bind loopback `HOST=127.0.0.1` instead. `@latest` matches helios-task-agent's built-in default (`HELIOS_KANBAN_PACKAGE`); pin a version there if you pin one here.
 2. **Network**: bot host can reach the server (Tailscale recommended).
