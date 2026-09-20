@@ -629,22 +629,26 @@ async function run(): Promise<void> {
     for (const id of toolCallIds(messages)) assert.ok(answered.has(id), `缺少 ${id} 的 tool 响应`);
   });
 
-  await checkAsync('runAgentTurn 轮次上限与调用次数上限文案区分', async () => {
+  await checkAsync('runAgentTurn 无轮次上限：超过 25 轮仍可继续', async () => {
     const handlers = new Map([['noop', async () => 'ok']]);
-    // 轮次上限：每轮 1 个工具调用，25 轮耗尽（共 25 次调用，不触 100 次上限）
+    // 每轮 1 个工具调用，连跑 30 轮（旧 25 轮上限之外）后正常收尾
     const messages1: ChatMessage[] = [
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'hi' },
     ];
+    const script: Array<Record<string, unknown>> = Array.from({ length: 30 }, (_, i) =>
+      assistantWithCalls([[`c${i}`, 'noop', '{}']]),
+    );
+    script.push(finalText('跑完 30 轮'));
     const reply1 = await runAgentTurn({
-      client: mockClient([assistantWithCalls([['c0', 'noop', '{}']])]),
+      client: mockClient(script),
       model: 'm',
       messages: messages1,
       tools: [],
       handlers,
     });
-    assert.ok(reply1.includes('轮次已达上限 25 轮'), reply1);
-    assert.ok(!reply1.includes('100 次'), reply1);
+    assert.equal(reply1, '跑完 30 轮', reply1);
+    assert.ok(!reply1.includes('上限'), reply1);
     // 调用次数上限：单轮 101 个调用，耗尽于第 101 个
     const calls: ToolCallSpec[] = Array.from({ length: 101 }, (_, i) => [`c${i}`, 'noop', '{}']);
     const messages2: ChatMessage[] = [
@@ -659,7 +663,6 @@ async function run(): Promise<void> {
       handlers,
     });
     assert.ok(reply2.includes('工具调用已达上限 100 次'), reply2);
-    assert.ok(!reply2.includes('轮次'), reply2);
   });
 
   await checkAsync('runAgentTurn 墙钟超时：工具执行中到点，剩余调用补占位响应', async () => {
@@ -3142,10 +3145,10 @@ async function run(): Promise<void> {
     assert.match(stderr, /invalid --limit/);
   });
 
-  // ---------- npx 包规格：kanban 与 ocr 均钉版本，env 均可覆盖 ----------
+  // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
-      /^helios-kanban@\d+\.\d+\.\d+$/.test(kanbanPackageSpec({})) &&
+      kanbanPackageSpec({}) === 'helios-kanban@latest' &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36' &&
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&

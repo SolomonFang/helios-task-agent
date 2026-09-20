@@ -12,8 +12,10 @@ import type {
   ToolHandlers,
 } from '../types';
 
-/** Backstop on LLM rounds; real limit is on tool-call count below. */
-const MAX_TOOL_ROUNDS = 25;
+/**
+ * 轮次不设上限：长任务不应被硬性轮数掐断；失控回路由下方工具调用次数上限与
+ * 墙钟超时（HTA_TURN_TIMEOUT_MIN）兜底。
+ */
 /** Max tool invocations per user turn (covers「最多展开 10 条链接」with headroom). */
 const MAX_TOOL_CALLS = 100;
 /**
@@ -38,7 +40,7 @@ export function createClient(cfg: LlmClientConfig): OpenAiClient {
     apiKey: cfg.llmApiKey,
     timeout: 120000,
     // SDK 内建指数退避（0.5s→1s→2s，封顶 8s）已覆盖 408/409/429/5xx 与连接错误：
-    // 长工具链（最多 25 轮）中途的瞬时限流/抖动自动重试，不再整轮报废。
+    // 长工具链（轮次不设上限）中途的瞬时限流/抖动自动重试，不再整轮报废。
     // abort 信号不走重试（APIUserAbortError），/stop 仍即时生效。
     maxRetries: 3,
   });
@@ -220,7 +222,7 @@ export async function runAgentTurn({
   const turnSignal = watchdog.signal;
   const timeoutText = `（本轮处理已超过 ${Math.max(1, Math.round(wallClockMs / 60000))} 分钟时间上限，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
   try {
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    for (let round = 0; ; round++) {
       if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
       if (timedOut) return timeoutText;
       if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
@@ -353,7 +355,6 @@ export async function runAgentTurn({
         });
       }
     }
-    return `（本轮对话轮次已达上限 ${MAX_TOOL_ROUNDS} 轮，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', forwardAbort);

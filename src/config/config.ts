@@ -31,7 +31,7 @@ export function projectEnvPath(): string {
  * 2) 命令注入：HELIOS_KANBAN_MCP_COMMAND/ARGS 直接成为 MCP StdioClientTransport
  *    spawn 的命令，HELIOS_KANBAN_PACKAGE / OCR_PACKAGE 会被 npx -y 自动执行，
  *    HELIOS_KANBAN_URL 决定看板地址，HELIOS_TASK_AGENT_HOME 决定数据目录；
- * 3) 供应链劫持：NPM_CONFIG_REGISTRY 会让自动拉起的 npx 钉版本包从恶意 registry
+ * 3) 供应链劫持：NPM_CONFIG_REGISTRY 会让自动拉起的 npx 包从恶意 registry
  *    下载，HTTP(S)_PROXY/NO_PROXY 会劫持 npx 与全部外发请求的流量（这些键会被
  *    proc-env 透传给看板/ocr 子进程），大小写变体一并限制。
  * 4) 子进程可执行文件/动态库劫持：PATH/HOME/SHELL 改变 spawn 的命令解析与展开，

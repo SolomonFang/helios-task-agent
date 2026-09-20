@@ -601,10 +601,10 @@ async function main() {
     return ok.every(isValidGitRef) && bad.every((r) => !isValidGitRef(r));
   })());
 
-  // ---------- helios-kanban 默认包规格钉版本 ----------
+  // ---------- helios-kanban 默认包规格跟随 @latest ----------
   check(
-    'DEFAULT_KANBAN_PACKAGE 默认钉到具体版本（非 @latest），HELIOS_KANBAN_PACKAGE 可覆盖',
-    /^helios-kanban@\d+\.\d+\.\d+$/.test(DEFAULT_KANBAN_PACKAGE) &&
+    'DEFAULT_KANBAN_PACKAGE 默认 @latest 跟随最新版，HELIOS_KANBAN_PACKAGE 可覆盖钉版本',
+    DEFAULT_KANBAN_PACKAGE === 'helios-kanban@latest' &&
       kanbanPackageSpec({}) === DEFAULT_KANBAN_PACKAGE &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36',
     DEFAULT_KANBAN_PACKAGE,

@@ -8,6 +8,10 @@
 
 ### Changed
 
+- LLM 单轮对话取消 25 轮轮次上限：长任务不再被硬性轮数掐断，失控回路仍由工具调用次数上限（100 次）与墙钟超时（默认 30 分钟，`HTA_TURN_TIMEOUT_MIN` 可覆盖）兜底（`src/agent/llm.ts`）
+
+- helios-kanban 默认包规格改回 `helios-kanban@latest` 跟随最新版（不再默认钉 `0.1.48`）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖为指定版本（`src/infra/deps.ts`）
+
 - 来源查重粒度细化到「来源 URL + 项目」：同一来源文档涉及多个项目（如中控/APP/后端）时每个项目可各建一个任务，不再被整体去重拦截——只有同 URL + 同项目才判定重复；无项目参数的旧调用与旧格式盘上数据统一挂在空项目键下兼容，无项目参数时保守视为重复拦截（`src/agent/source-registry.ts`、`src/agent/tools/gated-write.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/tools/kanban-mcp.ts`）
 
 ## [1.0.37] - 2026-09-15
