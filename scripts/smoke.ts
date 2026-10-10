@@ -262,9 +262,9 @@ async function main(): Promise<void> {
   await new Promise((r) => setImmediate(r));
   check(
     '卡片回调「同类免问」+ 过期卡片忽略',
-    cm2.resolveFromCard('u1', cardId, 'batch') === 'approved_batch' &&
+    cm2.resolveFromCard('u1', cardId, 'batch').answer === 'approved_batch' &&
       (await pr3) === 'batch' &&
-      cm2.resolveFromCard('u1', cardId, 'batch') === 'ignored',
+      cm2.resolveFromCard('u1', cardId, 'batch').answer === 'ignored',
   );
   const cm3 = new ConfirmationManager(async () => undefined, { timeoutMs: 30, destructiveTimeoutMs: 30 });
   check('确认超时自动拒绝', (await cm3.request('u2', { kind: 'hk', summary: 's', detail: 'd' })) === false);

@@ -1,6 +1,6 @@
 // Coverage gap unit tests: 补四个审查发现的测试盲区——
 // 1. kanban/summary collectWorkSummary 采集层（日期过滤 / attempt 挑选 / diff 统计合并）
-// 2. handler hta_review 按钮全链路（分发 → handleAiReview → runAiReview，PATH 桩伪造 ocr）
+// 2. handler hta_review 按钮全链路（分发 → tryStartAiReview 受理 → runAiReview，PATH 桩伪造 ocr）
 // 3. cli askWithAbort 三路竞态（正常回答 / Ctrl+C abort / 超时自动拒绝；createAskWithAbort 已抽出可测）
 //    + abort/超时收尾取消挂起 waiter（fake reader 注入 waiter 语义，验证中断后输入不被吞）
 // 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径 + net-error 的 err.cause 解包映射
@@ -55,6 +55,7 @@ async function stopServer(server: http.Server): Promise<void> {
 }
 
 // --- fake channel：hta_review 链路只发 notifyOpenId / notifyCardOpenId ---
+// （sendCard/updateCard 为进度占位链路的接口面，本套件不触发，占位满足 ProgressChannel 收窄后的类型）
 
 class FakeChannel {
   notifies: { openId: string; text: string }[] = [];
@@ -65,6 +66,10 @@ class FakeChannel {
   async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<void> {
     this.cards.push({ openId, card });
   }
+  async sendCard(_chatId: string, _card: Record<string, unknown>): Promise<string | undefined> {
+    return undefined;
+  }
+  async updateCard(_messageId: string, _card: Record<string, unknown>): Promise<void> {}
 }
 
 // --- fake line reader：对齐 cli createLineReader 的 waiter/队列语义（line 优先喂挂起的 waiter，

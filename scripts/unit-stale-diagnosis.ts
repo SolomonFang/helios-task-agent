@@ -71,6 +71,7 @@ async function startStaleMockKanban(state: { status: string; updatedAt: string }
 const tickOf = (w: KanbanWatcher) => (w as unknown as { tick: () => Promise<void> }).tick.bind(w);
 
 // --- fake channel：诊断/重试链路发 notifyOpenId / notifyCardOpenId / updateCard ---
+// （sendCard 为进度占位链路的接口面，本套件不触发，占位满足 ProgressChannel 收窄后的类型）
 class FakeChannel {
   notifies: { openId: string; text: string }[] = [];
   cards: { openId: string; card: Record<string, unknown> }[] = [];
@@ -85,6 +86,9 @@ class FakeChannel {
   }
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
     this.updatedCards.push({ messageId, card });
+  }
+  async sendCard(_chatId: string, _card: Record<string, unknown>): Promise<string | undefined> {
+    return undefined;
   }
 }
 
@@ -538,7 +542,7 @@ async function main(): Promise<void> {
     return settledHeader.includes('已按诊断结论重试');
   })());
 
-  check('buildWatchEventCard：失败卡片带「🔍 AI 诊断」按钮（hta_diagnose + attempt）', (() => {
+  check('buildWatchEventCard：失败卡片带「🔍 AI 诊断」按钮（hta_diagnose + attempt + url）', (() => {
     const card = buildWatchEventCard({
       kind: 'failed',
       title: '任务X',
@@ -549,7 +553,8 @@ async function main(): Promise<void> {
     });
     const vals = buttonValues(card);
     const diag = vals.find((v) => v.hta_diagnose);
-    return Boolean(diag && diag.hta_diagnose === 'task-1' && diag.attempt === 'att-9');
+    // url 随按钮 value 带上：点击后换成的「进行中」卡片据此保留「查看任务」入口
+    return Boolean(diag && diag.hta_diagnose === 'task-1' && diag.attempt === 'att-9' && diag.url === 'http://localhost:7964/x');
   })());
 
   // ---------- handler 集成：hta_diagnose / hta_retry 路由、防重、follow-up 内容、失败路径 ----------

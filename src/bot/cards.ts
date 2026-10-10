@@ -1,6 +1,8 @@
 /**
  * 飞书交互卡片（legacy card schema）构建统一收口：
  * - 写操作确认卡片 / 确认终态卡片（buildConfirmCard / buildResolvedCard）
+ * - 进度占位卡片 / 结果卡片 / 进度终态卡片（buildProgressCard / buildResultCard / buildProgressTerminalCard）
+ * - AI 审查/诊断/重试「进行中」卡片（buildJobProcessingCard，按钮点击后同步换卡，按钮即时消失）
  * - 看板事件通知卡片（buildWatchEventCard，含停滞提醒与失败「AI 诊断」按钮）
  * - AI 审查结果卡片（buildAiReviewCard）
  * - 失败诊断结果卡片（buildDiagnosisCard，含「按诊断结论重试」按钮与重试后终态）
@@ -143,6 +145,146 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
   };
 }
 
+/**
+ * 结果卡片正文的字节上限：飞书卡片请求体上限约 30KB（按字节计），取保守值；
+ * 超长回复不进卡片，走「卡片收尾为 seeBelow 终态 + 文本分段」路径（内容不丢）。
+ */
+export const RESULT_CARD_MAX_BYTES = 28000;
+
+/** 进度卡片展示的最近步骤数上限：长任务的步骤轨迹不无限变长。 */
+const PROGRESS_CARD_MAX_STEPS = 5;
+
+/** 进度卡片状态：步骤轨迹（已完成 ✓ / 当前 ⏳）+ 已等待秒数；waitingConfirm 为写操作确认挂起变体。 */
+export interface ProgressCardState {
+  /** 已完成步骤（工具动作标签，按发生顺序；卡片内只展示最近 PROGRESS_CARD_MAX_STEPS 步）。 */
+  steps: string[];
+  /** 当前进行中的步骤；无 = 等待/思考中。 */
+  current?: string;
+  /** 已等待秒数（心跳刷新注脚用）；缺省不展示。 */
+  elapsedSec?: number;
+  /** 写操作确认挂起变体：橙头如实提示等用户裁决（此时「仍在处理」是谎称）；停止按钮保留。 */
+  waitingConfirm?: boolean;
+  /**
+   * 停止按钮的轮次令牌（占位消息 id）：回调据此校验按钮属于当前轮次，
+   * 重启后的旧卡片/上一轮的停止按钮杀不到新轮次；占位初帧尚无 id 时缺省（点击静默忽略）。
+   */
+  stopToken?: string;
+}
+
+/**
+ * 进度占位卡片（替代纯文本「⏳ 处理中…」）：蓝头 + 步骤轨迹，随工具调用原地更新；
+ * 「⏹ 停止」按钮经 card.action.trigger 同步中断当前轮次（hta_stop）。
+ */
+export function buildProgressCard(state: ProgressCardState): Record<string, unknown> {
+  const recent = state.steps.slice(-PROGRESS_CARD_MAX_STEPS);
+  // 步骤标签来自 toolActionLabel 的内部文案，过 mdSafe 仅为纵深防御
+  const lines = recent.map((s) => `✓ ${mdSafe(s)}`);
+  if (state.current) lines.push(`⏳ ${mdSafe(state.current)}`);
+  const note = state.waitingConfirm
+    ? '请先点上方确认卡片的按钮（或回复「确认」/「取消」）· 回复 /stop 也可中断'
+    : typeof state.elapsedSec === 'number'
+      ? `已等待 ${state.elapsedSec} 秒 · 回复 /stop 也可中断`
+      : '回复 /stop 也可中断';
+  return {
+    config: baseCardConfig(),
+    header: {
+      template: state.waitingConfirm ? 'orange' : 'blue',
+      title: { tag: 'plain_text', content: state.waitingConfirm ? '⏳ 等待你处理上方的写操作确认' : '⏳ 处理中' },
+    },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: lines.length ? lines.join('\n') : '⏳ 正在理解需求…' } },
+      {
+        tag: 'action',
+        actions: [{ tag: 'button', text: { tag: 'plain_text', content: '⏹ 停止' }, value: { hta_stop: state.stopToken ?? '' } }],
+      },
+      { tag: 'note', elements: [{ tag: 'plain_text', content: note }] },
+    ],
+  };
+}
+
+/**
+ * 结果卡片（绿头）：正文为 LLM 回复的 lark_md 渲染——最小中和（同 diagnosisMdSafe 口径：
+ * < > 全角化、~~ 中和；加粗/列表/代码块等排版保留）。
+ * legacy lark_md 只支持部分 Markdown：`#` 标题、`>` 引用、行内代码、表格等会原样显示
+ * （可接受，不丢内容；不要指望它们被渲染）。
+ */
+export function buildResultCard(reply: string, meta?: { elapsedSec?: number }): Record<string, unknown> {
+  const elements: Array<Record<string, unknown>> = [
+    { tag: 'div', text: { tag: 'lark_md', content: diagnosisMdSafe(reply || '（无回复）') } },
+  ];
+  if (meta?.elapsedSec !== undefined) {
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `总用时约 ${meta.elapsedSec} 秒` }] });
+  }
+  return {
+    config: baseCardConfig(),
+    header: { template: 'green', title: { tag: 'plain_text', content: '✅ 已完成' } },
+    elements,
+  };
+}
+
+/**
+ * 进度占位的终态卡片（无按钮，原地替换进度卡片）：
+ * aborted = 用户中断；failed = 处理失败（详情另发消息）；seeBelow = 已完成但结果较长/轮次中有插入消息，正文在下方分段；
+ * deliverFailed = 结果投递彻底失败（下方什么都没有，不得谎称「见下方」）；
+ * stale = 陈旧进度卡片（机器人重启/上一轮次）被点到停止按钮时顺手收尾，不烂尾在「处理中」。
+ */
+export function buildProgressTerminalCard(kind: 'aborted' | 'failed' | 'seeBelow' | 'deliverFailed' | 'stale'): Record<string, unknown> {
+  const meta = {
+    aborted: { template: 'grey', title: '⏹ 已中断', note: '未完成的操作未执行，可继续对话。' },
+    failed: { template: 'red', title: '⚠️ 处理失败', note: '失败详情见下方消息，可修正后重试。' },
+    seeBelow: { template: 'green', title: '✅ 已完成，结果见下方 ⬇️', note: '完整内容见下方消息。' },
+    deliverFailed: { template: 'red', title: '⚠️ 回复投递失败', note: '请重试或稍后再问。' },
+    stale: { template: 'grey', title: '⏹ 该轮次已结束', note: '机器人可能已重启；如需中断当前任务，请用最新进度卡片上的「⏹ 停止」或回复 /stop。' },
+  }[kind];
+  return {
+    config: baseCardConfig(),
+    header: { template: meta.template, title: { tag: 'plain_text', content: meta.title } },
+    elements: [{ tag: 'note', elements: [{ tag: 'plain_text', content: meta.note }] }],
+  };
+}
+
+/**
+ * AI 审查/诊断/重试的「进行中」卡片：按钮点击后同步原地替换（按钮即时消失，不依赖异步 REST）。
+ * 标题取自按钮 value（外部看板数据），header 用 plain_text 不经 markdown 解析；
+ * url 存在时保留「📋 查看任务」链接按钮（进行中期间仍可跳转看板）。
+ */
+export function buildJobProcessingCard(
+  title: string,
+  kind: 'review' | 'diagnosis' | 'retry',
+  url?: string,
+): Record<string, unknown> {
+  const meta = {
+    review: { heading: '🤖 AI 审查进行中', note: '正在调用代码审查工具分析改动，完成后推送审查结果。' },
+    diagnosis: { heading: '🔍 AI 诊断进行中', note: '正在采集失败信息并调用模型分析，完成后推送诊断结果。' },
+    retry: { heading: '↻ 正在按诊断结论重试', note: '重试指令发送中，任务进展会继续推送。' },
+  }[kind];
+  const elements: Array<Record<string, unknown>> = [
+    // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底，别让用户死等卡片
+    { tag: 'div', text: { tag: 'lark_md', content: `${meta.note}\n结果或失败通知会以新消息推送。` } },
+  ];
+  if (url) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '📋 查看任务' },
+          type: 'primary',
+          url,
+          multi_url: { url, android_url: url, ios_url: url, pc_url: url },
+        },
+      ],
+    });
+    // 看板链接跑在本机：注明可达范围（与 buildWatchEventCard 同口径）
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: linkReachNote(url) }] });
+  }
+  return {
+    config: baseCardConfig(),
+    header: { template: 'blue', title: { tag: 'plain_text', content: `${meta.heading}：《${title}》` } },
+    elements,
+  };
+}
+
 /** 看板事件通知的飞书卡片（legacy schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
 export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
   const meta: Record<WatchEventKind, { template: string; title: string }> = {
@@ -205,8 +347,9 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
         actions.push({
           tag: 'button',
           text: { tag: 'plain_text', content: '🤖 AI 审查' },
-          // 标题超 50 字符截断时补省略号，下游《标题》展示不至于残缺得无声无息
-          value: { hta_review: e.attemptId, title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title },
+          // 标题超 50 字符截断时补省略号，下游《标题》展示不至于残缺得无声无息；
+          // url 一并带上：点击后换成的「进行中」卡片据此保留「查看任务」入口
+          value: { hta_review: e.attemptId, title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title, url: e.url },
         });
       }
       // AI 诊断：回传按钮，bot 侧采集失败信息调 LLM 生成中文诊断（按钮语义同 AI 审查，点击即授权）
@@ -218,6 +361,7 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
             hta_diagnose: e.taskId,
             attempt: e.attemptId,
             title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title,
+            url: e.url,
           },
         });
       }
@@ -308,6 +452,7 @@ function buttonTitle(title: string): string {
  * 诊断结论（LLM 输出）进 lark_md 前的最小中和：诊断材料含失败日志/任务描述等外部可控数据，
  * 经 LLM 复述后 <font color>/<at id> 类标签与 ~~ 删除线会真实渲染（可伪造警示或钓鱼样式），
  * < > 全角化、~~ 中和；星号/括号等正常 markdown 排版保留（诊断三段式排版依赖加粗与列表）。
+ * 注意 legacy lark_md 只支持部分 Markdown：`#` 标题、`>` 引用、行内代码、表格等会原样显示。
  */
 function diagnosisMdSafe(s: string): string {
   return s.replace(/</g, '＜').replace(/>/g, '＞').replace(/~~/g, '～～');

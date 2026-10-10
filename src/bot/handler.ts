@@ -8,6 +8,7 @@
 import {
   FeishuChannel,
   ImageTooLargeError,
+  type CardActionResponse,
   type FeishuCardAction,
   type FeishuInboundMessage,
 } from '../channels/feishu';
@@ -15,7 +16,7 @@ import { SessionRouter } from '../agent/session-router';
 import type { AgentSession } from '../agent/session';
 import { ConfirmationManager, isConfirmWord } from '../agent/confirm';
 import { checkLarkCliAsync, checkOcrCliAsync } from '../infra/deps';
-import { batchAckText, type ConfirmKind } from '../agent/guard';
+import { batchAckText, batchScopeWord, type ConfirmKind } from '../agent/guard';
 import {
   buildMemoryLines,
   buildStatusLines,
@@ -36,11 +37,12 @@ import { errMessage } from '../infra/err';
 import { safeNotify } from './notify';
 import { createReviewJobs, type ReviewJobs } from './review-jobs';
 import { createProgressKit } from './progress-reporter';
+import { buildJobProcessingCard, buildProgressTerminalCard, buildResolvedCard } from './cards';
 import { runtimeFlags } from '../config/runtime-flags';
 import type { runAiReview } from '../kanban/ai-review';
-import type { runFailureDiagnosis, sendDiagnosisFollowUp } from '../kanban/failure-diagnosis';
+import type { latestAttemptId, runFailureDiagnosis, sendDiagnosisFollowUp } from '../kanban/failure-diagnosis';
 
-/** 卡片按钮回调载荷（确认卡片 / AI 审查）。 */
+/** 卡片按钮回调载荷（确认卡片 / AI 审查 / 进度卡片停止）。 */
 type CardAction = FeishuCardAction;
 
 /** 单条用户消息长度上限：超长消息直接拒答，不送入 LLM（上下文爆炸 / 网关 400）。 */
@@ -107,6 +109,8 @@ export interface BotHandlerDeps {
   diagnosisRunner?: typeof runFailureDiagnosis;
   /** 测试注入用：替换重试 follow-up 发送（默认 sendDiagnosisFollowUp 走看板 REST）。 */
   followUpSender?: typeof sendDiagnosisFollowUp;
+  /** 测试注入用：替换重试时的 attemptId 补拉（默认 latestAttemptId 走看板 REST）。 */
+  attemptIdFetcher?: typeof latestAttemptId;
   /** 测试注入用：静默期心跳间隔（默认 PROGRESS_HEARTBEAT_MS）。 */
   progressHeartbeatMs?: number;
   /** 测试注入用：图片下载器（默认 channel.downloadImage 走飞书 SDK）。 */
@@ -120,8 +124,8 @@ export interface BotHandlerDeps {
 export interface BotHandlers {
   /** 私聊消息入口（传给 channel.start；通道为飞书实现，直接收 FeishuInboundMessage）。 */
   handle: (msg: FeishuInboundMessage) => Promise<void>;
-  /** 卡片按钮回调（确认卡片 / AI 审查）。 */
-  onCardAction: (action: CardAction) => void;
+  /** 卡片按钮回调（确认卡片 / AI 审查 / 进度卡片停止）；返回值作为同步响应即时生效（toast + 原地换卡）。 */
+  onCardAction: (action: CardAction) => CardActionResponse | void;
 }
 
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
@@ -138,6 +142,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     aiReviewRunner: deps.aiReviewRunner,
     diagnosisRunner: deps.diagnosisRunner,
     followUpSender: deps.followUpSender,
+    attemptIdFetcher: deps.attemptIdFetcher,
   });
   // 进度占位/静默心跳/最终回复投递
   const progress = createProgressKit({
@@ -146,8 +151,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     hasPendingConfirm: (openId) => confirmations.hasPending(openId),
   });
 
-  /** 每用户当前运行中的 agent 轮次（/stop 中断用）。 */
-  const running = new Map<string, AbortController>();
+  /** 每用户当前运行中的 agent 轮次；progressId 为轮次令牌（/stop 与卡片「⏹ 停止」中断用，令牌校验陈旧卡片杀不到新轮次）。 */
+  const running = new Map<string, { ctl: AbortController; progressId?: string }>();
   /** 敲键盘表情回执是否因权限等原因不可用（失败后不再重试，降级为仅占位消息）。 */
   let reactionUnsupported = false;
   /** 每用户尚未移除的敲键盘表情（/stop 丢弃排队消息时回调不会执行，需兜底清理）。 */
@@ -157,80 +162,145 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   /** 每用户入队串行链：「排队检查 + 回执 + 敲键盘表情 + router.enqueue」串行执行，保持 handle 调用顺序（见 enqueueMessage）。 */
   const enqueueChains = new Map<string, Promise<void>>();
 
-  const onCardAction = (action: CardAction): void => {
+  /**
+   * /stop 与进度卡片「⏹ 停止」共用的中断清理：取消确认闸口、丢弃排队消息、中断该用户的
+   * AI 审查/诊断、兜底清理敲键盘表情、中断当前轮次。返回各项处置结果供调用方拼回执。
+   */
+  const stopUserWork = (
+    openId: string,
+  ): { hadRound: boolean; gateCancelled: boolean; dropped: number; reviewsAborted: number; diagnosesAborted: number } => {
+    const rec = running.get(openId);
+    // 工具可能正挂在确认等待上：闸口随轮次一并取消（按拒绝收尾并留痕）
+    const gateCancelled = confirmations.cancel(openId);
+    const dropped = router.cancelQueued(openId);
+    // AI 审查/失败诊断在串行队列外运行（卡片回调触发），单独登记单独中断（各有带标题的逐条收尾通知）
+    const { reviews: reviewsAborted, diagnoses: diagnosesAborted } = reviewJobs.abortForUser(openId);
+    // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
+    const stray = pendingTyping.get(openId);
+    if (stray?.length) {
+      pendingTyping.delete(openId);
+      for (const r of stray) void channel.removeReaction(r.messageId, r.reactionId).catch(() => {});
+    }
+    if (rec) {
+      rec.ctl.abort();
+      running.delete(openId);
+    }
+    return { hadRound: Boolean(rec), gateCancelled, dropped, reviewsAborted, diagnosesAborted };
+  };
+
+  const onCardAction = (action: CardAction): CardActionResponse | void => {
     const openId = action.operator?.open_id || '';
     const value = action.action?.value || {};
     if (!openId) return;
-    // 「AI 审查」按钮：异步执行并立即返回（ocr 审查耗时可达数分钟，回调需快速 ACK）
-    if (value.hta_review) {
-      void reviewJobs.handleAiReview(openId, String(value.hta_review), String(value.title || ''));
-      return;
+    // 进度卡片「⏹ 停止」：value 是占位消息 id（轮次令牌）。校验通过才中断（语义同 /stop 的清理段）；
+    // 令牌不匹配 = 陈旧卡片（重启/上一轮次）或已收尾后的竞态点击，不得误杀新轮次、不得覆盖已落地的结果卡。
+    // 判键存在性而非真值：令牌注入帧失败时按钮带空令牌，空串不能静默吞掉（用户点了停止却无任何反馈）
+    if ('hta_stop' in value) {
+      const token = String(value.hta_stop || '');
+      if (!token) {
+        return { toast: { type: 'info', content: '停止按钮暂不可用，请回复 /stop 中断' } };
+      }
+      if (running.get(openId)?.progressId === token && progress.isActiveProgress(token)) {
+        const { dropped } = stopUserWork(openId);
+        return {
+          toast: { type: 'info', content: dropped ? `已中断，并丢弃 ${dropped} 条排队消息` : '已中断' },
+          card: { type: 'raw', data: buildProgressTerminalCard('aborted') },
+        };
+      }
+      // 结果/终态已落地的竞态点击：结果卡就在这张卡片的位置，只 toast 不换卡（不把结果覆盖成「已中断」）
+      if (progress.isSettledProgress(token)) {
+        return { toast: { type: 'info', content: '该轮次已结束' } };
+      }
+      // 陈旧卡片（机器人重启/上一轮次）：顺手收成终态，不烂尾在「处理中」
+      return {
+        toast: { type: 'info', content: '该轮次已结束或已重启' },
+        card: { type: 'raw', data: buildProgressTerminalCard('stale') },
+      };
     }
-    // 「AI 诊断」/「按诊断结论重试」按钮：同为异步长耗时操作，立即返回
+    // 「AI 审查」按钮：受理判定（去重/并发上限）在 review-jobs 同步完成——只有 accepted 才换「进行中」卡片，
+    // 否则按钮保留（早退场景换卡会把指引文案变死路）；作业为异步长耗时，回调需快速 ACK
+    if (value.hta_review) {
+      const title = String(value.title || '');
+      const r = reviewJobs.tryStartAiReview(openId, String(value.hta_review), title);
+      if (r.status !== 'accepted') return { toast: { type: 'info', content: r.toast } };
+      return {
+        toast: { type: 'info', content: 'AI 审查已开始，完成后推送结果' },
+        card: { type: 'raw', data: buildJobProcessingCard(title, 'review', value.url) },
+      };
+    }
+    // 「AI 诊断」/「按诊断结论重试」按钮：同一受理判定口径
     if (value.hta_diagnose) {
-      void reviewJobs.handleDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), String(value.title || ''));
-      return;
+      const title = String(value.title || '');
+      const r = reviewJobs.tryStartDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), title);
+      if (r.status !== 'accepted') return { toast: { type: 'info', content: r.toast } };
+      return {
+        toast: { type: 'info', content: 'AI 诊断已开始，完成后推送结果' },
+        card: { type: 'raw', data: buildJobProcessingCard(title, 'diagnosis', value.url) },
+      };
     }
     if (value.hta_retry) {
-      void reviewJobs.handleDiagnosisRetry(openId, String(value.hta_retry), String(value.title || ''));
-      return;
+      const title = String(value.title || '');
+      const r = reviewJobs.tryStartRetry(openId, String(value.hta_retry), title);
+      if (r.status !== 'accepted') return { toast: { type: 'info', content: r.toast } };
+      return {
+        toast: { type: 'info', content: '正在发起重试…' },
+        card: { type: 'raw', data: buildJobProcessingCard(title, 'retry', value.url) },
+      };
     }
     if (!value.hta_confirm) return;
     const confirmId = String(value.hta_confirm);
-    const result = confirmations.resolveFromCard(openId, confirmId, String(value.decision || ''));
+    // resolveFromCard 是同步调用：拿到结算信息后同步返回 toast + 终态卡片（按钮即时消失）；
+    // onSettled 的异步 updateCard 保留作兜底（内容相同、幂等），原有文本回执（safeNotify）也保留
+    const { answer, settlement } = confirmations.resolveFromCard(openId, confirmId, String(value.decision || ''));
     // 卡片裁决落地后同样复位短应答提醒：下一份确认可再提醒一次
-    if (result !== 'ignored') confirmShortReplyReminded.delete(openId);
-    if (result === 'approved') void safeNotify(channel, openId, '✅ 已批准，正在执行…');
-    else if (result === 'approved_batch')
+    if (answer !== 'ignored') confirmShortReplyReminded.delete(openId);
+    const settledCard: CardActionResponse['card'] | undefined = settlement
+      ? { type: 'raw', data: buildResolvedCard(settlement.req, settlement.settle) }
+      : undefined;
+    if (answer === 'approved') {
+      void safeNotify(channel, openId, '✅ 已批准，正在执行…');
+      return { toast: { type: 'success', content: '✅ 已批准，正在执行' }, card: settledCard };
+    }
+    if (answer === 'approved_batch') {
       // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
       void safeNotify(
         channel,
         openId,
         `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`,
       );
-    else if (result === 'denied') void safeNotify(channel, openId, '已取消，操作未执行。');
-    else {
-      // 区分「这不是你的确认」与「确认已处理或已过期」：多白名单用户场景下 B 点 A 的卡片，
-      // resolveFromCard 按 B 查不到 pending 返回 'ignored'，不能谎称已处理
-      const foreignPending = confirmations.isPendingConfirmId(confirmId);
-      void safeNotify(
-        channel,
-        openId,
-        foreignPending
-          ? '这是其他用户发起的写操作确认，只有发起人可以裁决，请等待对方处理。'
-          : '该确认已处理或已过期，无需重复操作。',
-      );
+      return {
+        toast: { type: 'success', content: `✅ 已批准（${batchScopeWord(confirmations.lastBatchScope(openId))}免问）` },
+        card: settledCard,
+      };
     }
+    if (answer === 'denied') {
+      void safeNotify(channel, openId, '已取消，操作未执行。');
+      return { toast: { type: 'info', content: '已取消，操作未执行' }, card: settledCard };
+    }
+    // 区分「这不是你的确认」与「确认已处理或已过期」：多白名单用户场景下 B 点 A 的卡片，
+    // resolveFromCard 按 B 查不到 pending 返回 'ignored'，不能谎称已处理；ignored 只 toast 不换卡
+    const foreignPending = confirmations.isPendingConfirmId(confirmId);
+    const tip = foreignPending
+      ? '这是其他用户发起的写操作确认，只有发起人可以裁决，请等待对方处理。'
+      : '该确认已处理或已过期，无需重复操作。';
+    void safeNotify(channel, openId, tip);
+    return { toast: { type: 'warning', content: tip } };
   };
 
   /** /stop：中断当前轮次与 AI 审查、取消写操作闸门、丢弃排队消息并兜底清理其敲键盘表情。 */
   const handleStop = async (msg: InboundMessage): Promise<void> => {
-    const ctl = running.get(msg.senderId);
-    const gateCancelled = confirmations.cancel(msg.senderId);
-    const dropped = router.cancelQueued(msg.senderId);
-    // AI 审查/失败诊断在串行队列外运行（卡片回调触发），单独登记单独中断（各有带标题的逐条收尾通知）
-    const { reviews: reviewsAborted, diagnoses: diagnosisAborted } = reviewJobs.abortForUser(msg.senderId);
-    // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
-    const stray = pendingTyping.get(msg.senderId);
-    if (stray?.length) {
-      pendingTyping.delete(msg.senderId);
-      for (const r of stray) void channel.removeReaction(r.messageId, r.reactionId).catch(() => {});
-    }
-    if (ctl) {
-      ctl.abort();
-      running.delete(msg.senderId);
-    }
+    const { hadRound, gateCancelled, dropped, reviewsAborted, diagnosesAborted } = stopUserWork(msg.senderId);
     const stopped: string[] = [];
     // 被中断的 AI 审查各有带标题的逐条通知（见 review-jobs 的中断收尾），这里不再计数组播
     if (gateCancelled) stopped.push('待确认的写操作已一并取消');
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
-    if (ctl) {
+    if (hadRound) {
       // 回执与被中断轮次的占位终态同一文案：措辞不一会被读成两个事件
       const extra = stopped.length ? `\n${stopped.join('，')}。` : '';
       await channel.reply(msg, `⏹ 已中断（未完成的操作未执行，可继续对话）。${extra}`);
     } else if (stopped.length) {
       await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
-    } else if (reviewsAborted || diagnosisAborted) {
+    } else if (reviewsAborted || diagnosesAborted) {
       // 仅 AI 审查/失败诊断被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
       await channel.reply(msg, '⏹ 已中断进行中的 AI 审查/诊断。');
     } else {
@@ -440,28 +510,35 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 中断登记先于占位发送：否则 sendPlaceholder 的 await 窗口内 /stop 查不到本轮，
     // 回「没有正在执行的任务」但任务其实在跑且无法中断（失败路径清理由 finally 的 running.delete 兜底）
     const ctl = new AbortController();
-    running.set(openId, ctl);
+    const round: { ctl: AbortController; progressId?: string } = { ctl };
+    running.set(openId, round);
     // 进度反馈：占位消息随工具调用更新，完成后替换为最终回复（超长自动拆分）
     const progressId = await progress.sendPlaceholder(msg);
+    // 轮次令牌回填（hta_stop 校验用）：占位发送窗口内可能已被 /stop 中断（记录已删），存活才回填
+    if (progressId && running.get(openId) === round) round.progressId = progressId;
     const activity = { lastEventAt: Date.now() };
     const onProgress = progress.createProgressReporter(progressId, activity);
     const clearHeartbeat = progress.startProgressHeartbeat(progressId, activity, openId);
-    // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）
-    await supervisor.enterTurn();
     try {
+      // 登记轮次：MCP supervisor 重连前必须等轮次归零（close 会杀 in-flight 工具调用）。
+      // 放在 try 内：enterTurn 抛异常时走下面的失败收尾（清心跳、占位收终态），不泄漏心跳与卡片轨迹
+      await supervisor.enterTurn();
       const reply = await session.handleUserMessage(text, onProgress, ctl.signal, image);
       clearHeartbeat(); // 投递前停心跳：避免回复已就绪却被心跳刷回「仍在处理」
-      await progress.deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
+      // 中断后 session 不抛错、以「⏹ 已中断」文案正常收尾（llm.ts 的优雅口径）：
+      // 占位须按中断终态收尾，否则卡片模式会把它包成绿头「已完成」结果卡片（自相矛盾）
+      if (ctl.signal.aborted) {
+        await progress.finalizeAborted(progressId, msg, '⏹ 已中断（未完成的操作未执行，可继续对话）。');
+      } else {
+        await progress.deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
+      }
     } catch (err) {
       clearHeartbeat();
-      // 「占位即终态」：异常路径先把「处理中」占位收尾为终态文案，占位缺失/更新失败才回退 reply。
+      // 「占位即终态」：异常路径先把「处理中」占位收尾为终态（卡片模式换终态卡片、文本模式改文案，
+      // 见 progress.finalizeAborted/finalizeFailed），占位缺失/更新失败才回退 reply。
       // /stop 的回执已由 handleStop 发出（「⏹ 已中断（未完成的操作未执行，可继续对话）。」），这里只收尾占位，不重复回复。
       if (ctl.signal.aborted) {
-        if (progressId) {
-          await channel
-            .updateText(progressId, '⏹ 已中断（未完成的操作未执行，可继续对话）。')
-            .catch(() => channel.reply(msg, '⏹ 已中断（未完成的操作未执行，可继续对话）。').catch(() => {}));
-        }
+        await progress.finalizeAborted(progressId, msg, '⏹ 已中断（未完成的操作未执行，可继续对话）。');
       } else {
         const message = errMessage(err);
         // 图片轮次：尾注引用原配文（无配文不引用内部占位「[图片]」），重试指引为「可重发图片」
@@ -469,11 +546,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           ? llmFailureParts(message, text.startsWith('[图片] ') ? text.slice('[图片] '.length) : '图片', 'bot', '可重发图片')
           : llmFailureParts(message, text, 'bot');
         const failText = [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n');
-        if (progressId) {
-          await channel
-            .updateText(progressId, '⚠️ 处理失败，详见下方')
-            .catch(() => {});
-        }
+        await progress.finalizeFailed(progressId);
         // 失败文案投递本身再失败：用户端完全静默，至少落日志（不再往外抛）
         await channel
           .reply(msg, failText)
@@ -682,7 +755,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (text === '重试这个任务') {
       const last = reviewJobs.lastDiagnosis(msg.senderId);
       if (last) {
-        await reviewJobs.handleDiagnosisRetry(msg.senderId, last.taskId, last.title);
+        // 受理判定同步完成（去重/无结论会如实通知），返回值此处无需使用
+        reviewJobs.tryStartRetry(msg.senderId, last.taskId, last.title);
       } else {
         await channel.reply(msg, '没有找到可重试的诊断结论（机器人可能已重启）。请到失败卡片上重新点「AI 诊断」后再重试。');
       }

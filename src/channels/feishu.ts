@@ -38,10 +38,24 @@ export interface FeishuCardAction {
       hta_diagnose?: string;
       /** 「按诊断结论重试」按钮：失败任务 id（诊断结论由 bot 侧按 taskId 查）。 */
       hta_retry?: string;
+      /** 进度卡片「⏹ 停止」按钮：中断当前轮次（值恒为 '1'，字段存在即语义）。 */
+      hta_stop?: string;
       attempt?: string;
       title?: string;
+      /** 看板任务链接（watch 卡片按钮随 value 带上）：「进行中」卡片据此保留「查看任务」入口。 */
+      url?: string;
     };
   };
+}
+
+/**
+ * 卡片回调的同步响应：SDK 的 WS 路径会把 handler 返回值打进响应帧（即时生效，不等异步 REST）。
+ * toast 为点击即时提示；card（type:'raw'）原地替换被点击的卡片——legacy 卡片无原生 disabled
+ * 按钮属性，「置灰」按项目约定整卡替换为终态/进行中静态卡片。
+ */
+export interface CardActionResponse {
+  toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };
+  card?: { type: 'raw'; data: Record<string, unknown> };
 }
 
 export type AccessDecision = 'allow' | 'claim' | 'deny';
@@ -378,8 +392,8 @@ export class FeishuChannel implements AgentChannel {
   private groupMentionReplied = new Map<string, number>();
   /** owner 绑定写盘失败的用户（fail-closed）：重启前按拒绝处理，避免每条消息重试写盘。 */
   private claimBlocked = new Set<string>();
-  /** Card button callback (card.action.trigger); set by the bot layer. */
-  onCardAction?: (data: FeishuCardAction) => void;
+  /** Card button callback (card.action.trigger); set by the bot layer. 返回值作为同步响应打进 WS 响应帧（toast + 原地换卡）。 */
+  onCardAction?: (data: FeishuCardAction) => CardActionResponse | void;
   /** WS 长连接状态变化钩子（进入重连/重连成功/重连耗尽），由 bot 层接告警。 */
   onWsStateChange?: (state: 'reconnecting' | 'reconnected' | 'failed', err?: Error) => void;
   /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer.
@@ -530,7 +544,8 @@ export class FeishuChannel implements AgentChannel {
               return;
             }
             this.lastEventAtMs = Date.now();
-            this.onCardAction?.(data);
+            // 返回值透传给 SDK 打进响应帧：toast + 原地换卡即时生效（undefined = 无同步响应，现状行为）
+            return this.onCardAction?.(data);
           } catch (err) {
             const msg = errMessage(err);
             console.error(`[feishu] card action error: ${msg}`);
