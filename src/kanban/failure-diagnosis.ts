@@ -188,9 +188,7 @@ const SYSTEM_PROMPT =
  * 看板不可达/超时给中文定性，英文原文（fetch failed / The operation timed out…）由调用方收 HTA_DEBUG。
  */
 function collectFailureMessage(err: unknown): string {
-  if (err instanceof KanbanHttpError) {
-    return err.status === 404 ? '该任务在看板上已不存在（可能已被清理）' : '看板接口暂时异常';
-  }
+  if (err instanceof KanbanHttpError) return '看板接口暂时异常';
   const cause = (err as { cause?: { code?: unknown; message?: unknown } } | null)?.cause;
   const s = [errMessage(err), cause?.code, cause?.message]
     .filter(Boolean)
@@ -212,7 +210,11 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
   } catch (err) {
     if (opts.signal?.aborted) throw new Error('已中断');
     if (process.env.HTA_DEBUG) console.error(`[diagnosis] 失败上下文采集原文：${errMessage(err).slice(0, 300)}`);
-    throw new Error(`采集该任务的失败信息失败（${collectFailureMessage(err)}），请稍后重试。`);
+    if (err instanceof KanbanHttpError && err.status === 404) {
+      // 404 是确定性终态：出路不含「重试」，用「重新发起」命中 review-jobs 抑制词以免被追加必败的重试后缀
+      throw new Error('该任务在看板上已不存在（可能已被清理），请到看板确认任务状态，必要时重新发起任务。');
+    }
+    throw new Error(`获取该任务的失败信息失败：${collectFailureMessage(err)}，请稍后重试。`);
   }
   const title = ctx.title || opts.title || '';
   const prompt = buildDiagnosisPrompt(ctx, title);
@@ -259,7 +261,7 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
       throw new Error(`AI 诊断超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
     }
     if (message.includes('模型配置不完整') || message.includes('模型未返回诊断内容')) throw err;
-    throw new Error('模型调用失败，请稍后重新点击卡片上的「AI 诊断」重试；持续失败请联系部署者检查模型配置。');
+    throw new Error('模型调用失败，可回复「为什么失败」重新发起诊断；持续失败请联系部署者检查模型配置。');
   }
 }
 

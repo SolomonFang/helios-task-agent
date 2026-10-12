@@ -60,7 +60,7 @@ export function installCrashGuards(shutdown: (exitCode?: number) => Promise<void
   const tag = opts.tag ? `${opts.tag} ` : '';
   process.on('unhandledRejection', (reason) => {
     const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
-    console.error(c.err(`${tag}未处理的 Promise rejection（进程保持运行）：${msg}`));
+    console.error(c.err(`${tag}未处理的异步错误（进程保持运行）：${msg}`));
   });
   process.on('uncaughtException', (err) => {
     console.error(c.err(`${tag}未捕获异常，执行优雅退出：${err.stack || err.message}`));

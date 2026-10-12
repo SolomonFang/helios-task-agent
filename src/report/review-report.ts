@@ -360,7 +360,7 @@ function zhElapsed(raw: string): string {
   return parts.join(' ');
 }
 
-/** [ocr] Summary 原文 → 统计 chips；解析不到时原样展示。 */
+/** [ocr] Summary 原文 → 统计 chips；解析不到时不落原文（多为英文整句），原文收日志。 */
 function summaryChips(summary: string | undefined): string {
   if (!summary) return '';
   const defs: Array<[RegExp, string, (v: string) => string]> = [
@@ -375,7 +375,12 @@ function summaryChips(summary: string | undefined): string {
       return m ? `<span class="chip"><b>${escapeHtml(fmt(m[1]!))}</b> ${label}</span>` : '';
     })
     .filter(Boolean);
-  return chips.length ? chips.join('') : `<span class="chip">${escapeHtml(summary)}</span>`;
+  if (!chips.length) {
+    // 上游 Summary 格式变化导致正则全不命中：概览卡不渲染原文 chip，原文留日志供部署者排查
+    console.error(`[review-report] ocr Summary 统计解析失败，原文：${summary.slice(0, 200)}`);
+    return '';
+  }
+  return chips.join('');
 }
 
 /** 结构化渲染：概览卡（严重度分布 + ocr 统计）+ 逐条意见卡片。 */

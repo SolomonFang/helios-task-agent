@@ -382,7 +382,7 @@ async function main(): Promise<void> {
         }),
       /AI 诊断超时（5 分钟），已终止。/,
     );
-    // 其他 LLM 错误 → 通用中文定性 + 重试出路，不透英文原文
+    // 其他 LLM 错误 → 通用中文定性 + 文本可达的重试出路，不透英文原文
     await assert.rejects(
       () =>
         runFailureDiagnosis({
@@ -394,7 +394,7 @@ async function main(): Promise<void> {
             throw new Error('mock HTTP 500 internal error');
           },
         }),
-      /模型调用失败，请稍后重新点击/,
+      /模型调用失败，可回复「为什么失败」重新发起诊断/,
     );
   });
 
@@ -763,7 +763,12 @@ async function main(): Promise<void> {
         }),
       (err: unknown) => {
         const m = err instanceof Error ? err.message : String(err);
-        return m.includes('看板不可达') && !m.includes('fetch failed');
+        return (
+          m.startsWith('获取该任务的失败信息失败') &&
+          m.includes('看板不可达') &&
+          !m.includes('fetch failed') &&
+          !/（[^（）]*（/.test(m)
+        );
       },
     );
     await assert.rejects(
@@ -778,7 +783,15 @@ async function main(): Promise<void> {
         }),
       (err: unknown) => {
         const m = err instanceof Error ? err.message : String(err);
-        return m.includes('已不存在') && !m.includes('HTTP 404');
+        // 404 是确定性终态：出路为看板确认 + 重新发起，不得带「重试」字样（重试必败；
+        // 「重新发起」同时命中 review-jobs 抑制词，避免被追加必败的重试后缀）
+        return (
+          m.includes('已不存在') &&
+          m.includes('请到看板确认任务状态') &&
+          m.includes('重新发起') &&
+          !m.includes('重试') &&
+          !m.includes('HTTP 404')
+        );
       },
     );
   });

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
+import { HISTORY_TRUNCATED_NOTE } from './llm';
 import type { ChatMessage } from '../types';
 
 /** 目录内会话历史文件总数上限：超出按 mtime 删最老，防长驻 bot 无界增长。 */
@@ -49,7 +50,7 @@ interface SessionHistoryFile {
   version: number;
   userId: string;
   updatedAt: string;
-  /** 仅 user/assistant/tool；system prompt 与注入的 system note 不落盘。 */
+  /** 仅 user/assistant/tool 与历史裁剪注记；system prompt 与其余注入的 system note 不落盘。 */
   messages: ChatMessage[];
 }
 
@@ -78,10 +79,16 @@ function isValidToolCall(tc: unknown): boolean {
   return !!fn && typeof fn === 'object' && typeof fn.name === 'string';
 }
 
-/** 宽容校验：只接受结构基本合法的 user/assistant/tool 消息，坏条目直接丢弃。 */
+/** 宽容校验：只接受结构基本合法的 user/assistant/tool 消息与历史裁剪注记，坏条目直接丢弃。 */
 function isPersistable(m: unknown): m is ChatMessage {
   if (!m || typeof m !== 'object') return false;
   const msg = m as { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+  if (msg.role === 'system') {
+    // 只放行历史裁剪注记：落盘丢失它会让重启恢复的被裁历史看起来完整，模型据此编造；
+    // 恢复后它落在 system prompt 之后（llm.insertTruncationNote 的同一位置），不重复注入。
+    // 其余注入的 system note（看板事件等）重启后已过期、由 watcher 重推，仍不落盘。
+    return msg.content === HISTORY_TRUNCATED_NOTE;
+  }
   if (msg.role === 'user') return typeof msg.content === 'string';
   if (msg.role === 'tool') return typeof msg.tool_call_id === 'string' && typeof msg.content === 'string';
   if (msg.role === 'assistant') {
@@ -94,8 +101,9 @@ function isPersistable(m: unknown): m is ChatMessage {
 
 /**
  * 会话历史落盘：数据目录下 sessions/ 每用户一个文件（0600，目录 0700）。
- * 只持久化 user/assistant/tool：system prompt 每次启动重建；注入的 system note
- * （看板事件/AI 审查结果等 UNTRUSTED 外部内容）重启后已过期、会由 watcher 重推，不落盘。
+ * 只持久化 user/assistant/tool 与历史裁剪注记（HISTORY_TRUNCATED_NOTE）：system prompt
+ * 每次启动重建；其余注入的 system note（看板事件/AI 审查结果等 UNTRUSTED 外部内容）
+ * 重启后已过期、会由 watcher 重推，不落盘。
  *
  * 多实例权衡（有意简化，区别于 memory.ts 的 journal 合并）：假设同一用户的会话同一时刻
  * 只在一个实例（CLI 或 bot）里活跃，因此采用「启动时加载 + 最后写入胜出」。并发写同一

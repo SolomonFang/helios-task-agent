@@ -40,6 +40,13 @@ export async function verifyLlmConfig(
         message: `模型服务异常（HTTP ${res.status}），请稍后重试。`,
       };
     }
+    if (res.status === 404) {
+      return {
+        ok: false,
+        uncertain: true,
+        message: '找不到该路径（HTTP 404），请检查 Base URL 是否完整（如是否漏了 /v1）。确认地址无误可输入 s 仍然保存。',
+      };
+    }
     return {
       ok: false,
       uncertain: true,

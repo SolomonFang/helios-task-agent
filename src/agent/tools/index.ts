@@ -110,7 +110,7 @@ export function buildTools({
         type: 'function',
         function: {
           name,
-          description: `[helios-kanban MCP] ${tool.description || tool.name}`,
+          description: `[看板] ${tool.description || tool.name}`,
           parameters: sanitizeMcpInputSchema(name, tool.inputSchema ?? EMPTY_SCHEMA),
         },
       });

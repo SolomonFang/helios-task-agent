@@ -2,7 +2,7 @@
  * 会话历史持久化单测（SessionHistoryStore + AgentSession 接线）：
  * 落盘→重建恢复；坏 JSON 宽容；版本不符视为无历史；畸形 tool_calls 条目丢弃；
  * /clear 清盘（与在途 save 共用串行队列）；文件名穿越防护与折叠碰撞 hash；目录文件数上限清理；
- * rename 失败 tmp 清理与过期孤儿 tmp prune；system note 不落盘；
+ * rename 失败 tmp 清理与过期孤儿 tmp prune；system note 不落盘（历史裁剪注记除外，随落盘保留）；
  * 失败轮次的 user 消息不落盘；成功轮次落盘（happy path，异步 fire-and-forget）；
  * prune 节流；SessionRouter 透传接线。
  * 运行：tsx scripts/unit-session-store.ts
@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
 import { SessionHistoryStore } from '../src/agent/session-store';
+import { HISTORY_TRUNCATED_NOTE } from '../src/agent/llm';
 import { AgentSession } from '../src/agent/session';
 import { SessionRouter } from '../src/agent/session-router';
 import { MemoryStore } from '../src/agent/memory';
@@ -114,6 +115,33 @@ async function main(): Promise<void> {
       assert.ok(modeOk(file, 0o600));
       // 目录 0700 权限
       assert.ok(modeOk(path.join(tmp, 'sessions'), 0o700));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 历史裁剪注记（HISTORY_TRUNCATED_NOTE）随落盘保留：重启恢复被裁历史后模型仍知晓历史不完整 ----------
+  await checkAsync('save→load 往返：历史裁剪注记保留，其余 system note 仍被过滤', async () => {
+    const tmp = tmpHome('truncnote');
+    try {
+      const store = new SessionHistoryStore(tmp);
+      const messages: ChatMessage[] = [
+        { role: 'system', content: '系统提示词' }, // system prompt 不落盘
+        { role: 'system', content: HISTORY_TRUNCATED_NOTE }, // 裁剪注记落盘
+        { role: 'user', content: '较早轮之后的问题' },
+        { role: 'assistant', content: '回答' },
+        { role: 'system', content: '[看板事件通知] 任务完成' }, // 注入的 system note 不落盘
+      ];
+      await store.save('ou_note', messages);
+      const restored = new SessionHistoryStore(tmp).load('ou_note');
+      assert.deepEqual(
+        restored.map((m) => [m.role, String(m.content)]),
+        [
+          ['system', HISTORY_TRUNCATED_NOTE],
+          ['user', '较早轮之后的问题'],
+          ['assistant', '回答'],
+        ],
+      );
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

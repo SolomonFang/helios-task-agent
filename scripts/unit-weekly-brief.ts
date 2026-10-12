@@ -402,6 +402,36 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- 推送失败日志脱敏 ----------
+  await checkAsync('WeeklyBrief：推送失败日志 owner 脱敏（不裸写完整 open_id）且全角冒号', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));
+    try {
+      const logs: string[] = [];
+      const brief = new WeeklyBrief({
+        time: { hour: 18, minute: 0 },
+        day: 5,
+        statePath: path.join(tmp, 'weekly-brief-state.json'),
+        kanbanUrl: 'http://unused',
+        owners: () => ['ou_abc123def456ghi789'],
+        notifyOwner: async () => {
+          throw new Error('boom');
+        },
+        now: () => at(18, 10),
+        healthCheck: async () => true,
+        collect: async () => fakeSummary([]),
+        log: (m) => logs.push(m),
+      });
+      await tickOf(brief)();
+      const failLog = logs.find((l) => l.includes('周报推送失败'));
+      assert.ok(failLog, `应有推送失败日志: ${logs}`);
+      assert.ok(!failLog.includes('ou_abc123def456ghi789'), `不应裸写完整 open_id: ${failLog}`);
+      assert.ok(failLog.includes('ou_a…89'), `应脱敏为头尾摘要: ${failLog}`);
+      assert.ok(failLog.includes('）：'), `应全角冒号: ${failLog}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---------- 失败指数退避 ----------
   await checkAsync('WeeklyBrief：连续失败按 1→2 分钟退避（退避窗口内不采集不推送）', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));

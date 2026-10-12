@@ -731,13 +731,16 @@ async function main() {
     }
   });
 
-  // ---------- 「同类免问」回执：memory/reminder 不再落「该对象」兜底（T33） ----------
-  check('batchAckText：memory/reminder 按 scope 如实措辞', (() => {
+  // ---------- 「同类免问」回执：memory/reminder 不再落「该对象」兜底（T33）；lark 对象级不统称「接收人」 ----------
+  check('batchAckText：memory/reminder 按 scope 如实措辞，lark 对象级如实泛指对象', (() => {
     return (
       batchAckText('object', 'memory') === '对同一记忆键的写操作本会话内免问' &&
       batchAckText('object', 'reminder') === '对同一条提醒的同类操作本会话内免问' &&
       batchAckText('kind', 'reminder') === '创建提醒类操作本会话内免问' &&
-      batchAckText(undefined, 'reminder') === '创建提醒类操作本会话内免问'
+      batchAckText(undefined, 'reminder') === '创建提醒类操作本会话内免问' &&
+      // lark 对象级 key 绑的是接收人/文档/日程等，不得谎称「发往同一接收人」
+      batchAckText('object', 'lark') === '对同一对象（接收人/文档/日程等）的同类操作本会话内免问' &&
+      batchAckText('kind', 'lark') === '飞书写操作本会话内免问'
     );
   })());
 
@@ -799,7 +802,7 @@ async function main() {
     assert.equal(got, ctl.signal, 'ConfirmFn 应收到透传的 signal');
   });
 
-  // ---------- kanbanTaskExists：turn signal 与 8s 超时组合，abort 立即返回（保守拦截语义） ----------
+  // ---------- kanbanTaskExists：turn signal 与 8s 超时组合，abort 立即返回（无法确认按 unknown 上报） ----------
   await checkAsync('kanbanTaskExists：在途 fetch 随 turn signal 中断，不等 8s 超时', async () => {
     const server = http.createServer(() => {
       /* 永不响应：只能被 signal 掐断 */
@@ -813,7 +816,7 @@ async function main() {
       setTimeout(() => ctl.abort(), 50);
       const exists = await p;
       assert.ok(Date.now() - started < 3000, `abort 应立即结束 fetch，实际耗时 ${Date.now() - started}ms`);
-      assert.equal(exists, true, '中断按保守语义返回 true（保持拦截）');
+      assert.equal(exists, 'unknown', '中断无法确认存活，应返回 unknown（调用方按看板连接异常拦截）');
     } finally {
       server.closeAllConnections?.();
       await new Promise<void>((r) => server.close(() => r()));
@@ -1016,7 +1019,7 @@ async function main() {
       const write = makeGatedWriter({
         uid: 'u1',
         registry,
-        kanbanUrl: 'http://localhost:1', // 不可达：kanbanTaskExists 保守视为存在 → 命中映射即拦截
+        kanbanUrl: 'http://localhost:1', // 不可达：kanbanTaskExists 返回 unknown → 命中映射按「看板连接异常」暂缓
         confirm: async () => 'once',
         auditHome: tmp,
         createCounter: { count: 0 },
@@ -1040,14 +1043,79 @@ async function main() {
       assert.ok(!first.includes('已同步过'), `首次创建应放行，实际：${first}`);
       assert.equal(registry.lookup('u1', 'https://a.feishu.cn/docx/multi1', 'proj-zk')?.taskId, '11111111-1111-1111-1111-111111111111');
       const dupSame = await create('proj-zk');
-      assert.ok(dupSame.includes('已同步过'), `同 URL 同项目应拦截，实际：${dupSame}`);
+      // 看板不可达（unknown）：如实告知连接异常并暂缓，不谎称「已同步过…请先删除原任务」（删除/更新同样不可达）
+      assert.ok(
+        dupSame.includes('看板连接异常') && dupSame.includes('已暂缓') && !dupSame.includes('请先在「看板」中删除原任务'),
+        `同 URL 同项目且看板不可达应按连接异常暂缓，实际：${dupSame}`,
+      );
       const otherProj = await create('proj-app');
-      assert.ok(!otherProj.includes('已同步过'), `同 URL 不同项目应放行，实际：${otherProj}`);
+      assert.ok(!otherProj.includes('已同步过') && !otherProj.includes('看板连接异常'), `同 URL 不同项目应放行，实际：${otherProj}`);
       const noProj = await create(undefined);
-      assert.ok(noProj.includes('已同步过'), `无项目参数应保守拦截（URL 已有记录），实际：${noProj}`);
+      assert.ok(noProj.includes('看板连接异常'), `无项目参数应保守拦截（URL 已有记录），实际：${noProj}`);
       const audit = fs.readFileSync(path.join(tmp, 'audit.log'), 'utf8');
       assert.equal(audit.split('\n').filter((l) => l.includes('blocked_dup')).length, 2, `应有 2 条 blocked_dup 审计，实际：${audit}`);
     } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- runGatedWrite：看板可达时按核验结果分流——任务仍在拦截（含删除/更新指引），已删除清理映射放行 ----------
+  await checkAsync('runGatedWrite：看板可达——任务仍在按「已同步过」拦截，已删除（404）清理映射后放行', async () => {
+    const alive = new Set(['t-alive']);
+    const server = http.createServer((req, res) => {
+      const id = decodeURIComponent((req.url || '').replace(/^\/api\/tasks\//, ''));
+      if (alive.has(id)) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } else {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: false }));
+      }
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const kanbanUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-safety-gated-tristate-'));
+    try {
+      const registry = new SourceRegistry(tmp);
+      registry.record('u1', 'https://a.feishu.cn/docx/alive1', { taskId: 't-alive', title: '在', createdAt: '2026-01-01T00:00:00.000Z' });
+      registry.record('u1', 'https://a.feishu.cn/docx/gone1', { taskId: 't-gone', title: '删', createdAt: '2026-01-01T00:00:00.000Z' });
+      const write = makeGatedWriter({
+        uid: 'u1',
+        registry,
+        kanbanUrl,
+        confirm: async () => 'once',
+        auditHome: tmp,
+        createCounter: { count: 0 },
+      });
+      const create = (url: string) =>
+        write({
+          kind: 'kanban',
+          summary: '创建任务',
+          detail: () => 'kanban_create_task',
+          isCreate: true,
+          isStart: false,
+          urls: [url],
+          title: '任务A',
+          batchKey: 'kanban:create_task',
+          batchScope: 'kind',
+          destructive: false,
+          execute: async () => '{"success":true,"data":{"id":"22222222-2222-2222-2222-222222222222"}}',
+        });
+      const blocked = await create('https://a.feishu.cn/docx/alive1');
+      assert.ok(
+        blocked.includes('已同步过') && blocked.includes('请先在「看板」中删除原任务'),
+        `任务仍在应按「已同步过」拦截并给可行指引，实际：${blocked}`,
+      );
+      assert.ok(
+        registry.lookup('u1', 'https://a.feishu.cn/docx/alive1')?.taskId === 't-alive',
+        '仍在任务映射不得被清理',
+      );
+      const allowed = await create('https://a.feishu.cn/docx/gone1');
+      assert.ok(!allowed.includes('已同步过') && !allowed.includes('看板连接异常'), `任务已删除应放行，实际：${allowed}`);
+      assert.equal(registry.lookup('u1', 'https://a.feishu.cn/docx/gone1', '')?.taskId, '22222222-2222-2222-2222-222222222222', '放行后应记录新映射');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>((r) => server.close(() => r()));
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

@@ -240,6 +240,6 @@ export async function promptVersionUpdate(deps: PromptUpdateDeps): Promise<Updat
     log(`✅ 已更新到 ${info.latest}`);
     return 'updated';
   }
-  log(`更新失败，可稍后手动执行：npm i -g ${PKG_NAME}@${info.tag}`);
+  log(`更新失败，可稍后手动执行：npm i -g ${PKG_NAME}@${info.tag}（若为权限不足 EACCES，请改用 sudo 执行或调整 npm 全局目录后重试）`);
   return 'failed';
 }

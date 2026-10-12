@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
@@ -82,6 +83,7 @@ import {
   checkLarkCliStatus,
   probeLarkCliAuth,
   kanbanPackageSpec,
+  kanbanManualStartHint,
   ocrPackageSpec,
   LARK_CLI_AUTH_HINT,
   MCP_FALLBACK_TEXT,
@@ -110,7 +112,7 @@ import {
   CLEARED_TEXT,
   clearedText,
 } from '../src/commands';
-import { renderReply, printBanner } from '../src/infra/ui';
+import { renderReply, printBanner, Spinner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { statusLabel, type WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
@@ -973,7 +975,7 @@ async function run(): Promise<void> {
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
       const ok = await kanbanTaskExists(base, '../../admin');
-      assert.equal(ok, true, '看板应答 success 时应视为存在');
+      assert.equal(ok, 'exists', '看板应答 success 时应视为存在');
       assert.ok(seenUrl.includes(encodeURIComponent('../../admin')), `taskId 应被编码，实际 URL：${seenUrl}`);
       assert.ok(!seenUrl.includes('/api/tasks/../../admin'), '原始路径段不应进入 URL');
     } finally {
@@ -1725,6 +1727,10 @@ async function run(): Promise<void> {
     assert.equal(no, 'skipped');
     const fail = await promptVersionUpdate({ info, ask: async () => 'y', runUpdate: async () => false });
     assert.equal(fail, 'failed');
+    // 失败指引须给 EACCES 权限失败的分诊出路（直接重试必败）
+    let failLog = '';
+    await promptVersionUpdate({ info, ask: async () => 'y', runUpdate: async () => false, log: (m) => (failLog = m) });
+    assert.ok(failLog.includes('EACCES') && failLog.includes('sudo'), `失败指引应含权限分诊，实际：${failLog}`);
   });
 
   // ---------- LLM 错误友好化 ----------
@@ -1755,8 +1761,9 @@ async function run(): Promise<void> {
       '2026-07-29T02:22:26Z DEBUG utils::port_file: Reading port from "/var/folders/…/vibe-kanban/vibe-kanban.port"\nError: No such file or directory (os error 2)';
     const hint = diagnoseMcpFailure(portFileStderr);
     assert.ok(hint!.includes('端口记录文件'), '诊断应点明端口文件');
-    assert.ok(hint!.includes('重新运行本程序'), '诊断应给出可操作的恢复动作');
-    assert.ok(hint!.includes('（会同时重启看板）。'), '重启说明应独立成句（不与备用通道说明叠成双括号）');
+    assert.ok(hint!.includes('重启看板服务'), '诊断主指引应为重启看板服务（看板独立运行时重启本程序不能恢复）');
+    assert.ok(hint!.includes('重新运行本程序'), '诊断应保留看板由本程序拉起时的恢复动作');
+    assert.ok(!hint!.includes('（会同时重启看板）'), '不应再承诺重启本程序会同时重启看板');
     assert.ok(hint!.includes(MCP_FALLBACK_TEXT), '诊断应带备用通道口径（hk.mjs 无外部依赖，备用通道始终可用）');
     assert.equal(diagnoseMcpFailure('Error: spawn npx ENOENT'), null, '其他启动错误不误诊');
     assert.equal(diagnoseMcpFailure(''), null, '空 stderr 返回 null');
@@ -2157,6 +2164,16 @@ async function run(): Promise<void> {
     return !page.includes('class="pass-banner"') && !page.includes('<header class="hero pass">');
   })());
 
+  check('renderReviewHtml：Summary 统计解析失败时概览卡不落英文原文（原文收日志）', (() => {
+    const page = renderReviewHtml({
+      title: 't',
+      attemptId: 'a1',
+      generatedAt: '2026/7/30 12:00:00',
+      text: ['[ocr] Summary: done without stats', '─── src/a.js:1 ───', '[bug · low] 小问题'].join('\n'),
+    });
+    return !page.includes('done without stats') && page.includes('共 1 条审查意见');
+  })());
+
   // ---------- AI 审查：报告静态服务 ----------
   await checkAsync('report-server：服务 reviews 目录 html / 拒绝路径穿越与非 html', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-report-'));
@@ -2185,6 +2202,11 @@ async function run(): Promise<void> {
         const res = await fetch(`${server.baseUrl}${bad}`);
         assert.equal(res.status, 404, bad);
       }
+      // 404 页出路：通用指引回飞书重新发指令；仅 AI 审查报告（review- 前缀）追加卡片按钮入口
+      const nf = await (await fetch(`${server.baseUrl}/nope.html`)).text();
+      assert.ok(nf.includes('请回到飞书重新发送指令') && !nf.includes('重新点击'), nf);
+      const nfReview = await (await fetch(`${server.baseUrl}/review-nope.html`)).text();
+      assert.ok(nfReview.includes('重新点击卡片上的「AI 审查」'), nfReview);
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3146,6 +3168,35 @@ async function run(): Promise<void> {
     assert.match(stderr, /invalid --limit/);
   });
 
+  await checkAsync('hk.mjs：网络失败解包 err.cause，输出错误码与目标地址（非裸 fetch failed）', async () => {
+    const hk = path.resolve(__dirname, '..', 'skills', 'helios-kanban-remote', 'scripts', 'hk.mjs');
+    // 先占用再释放一个回环端口，拿到确定无人监听的端口（fetch 会拦截 1/9 等保留端口，报 bad port 而非 ECONNREFUSED）
+    const freePort = await new Promise<number>((resolve, reject) => {
+      const srv = net.createServer();
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const port = (srv.address() as AddressInfo).port;
+        srv.close(() => resolve(port));
+      });
+    });
+    let code = 0;
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, [hk, 'health'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, HELIOS_KANBAN_URL: `http://127.0.0.1:${freePort}` },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stderr?: string };
+      code = e.status ?? -1;
+      stderr = String(e.stderr || '');
+    }
+    assert.notEqual(code, 0, '连接被拒应非零退出');
+    assert.match(stderr, /ECONNREFUSED/, '应解包 err.cause 的错误码');
+    assert.ok(stderr.includes(`http://127.0.0.1:${freePort}`), '应带目标地址');
+  });
+
   // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
@@ -3221,7 +3272,25 @@ async function run(): Promise<void> {
     // 已授权 + MCP 正常 → 无警示文案
     const ok = capture(() => printBanner({ ...base, mcp: 'ok', mcpToolCount: 3, larkOk: true, larkAuthed: true }));
     assert.ok(ok.includes('可用（飞书内容获取）') && !ok.includes('连接失败'));
+    // 底部指引须如实覆盖 /config 可改看板地址（/help 与向导均支持）
+    assert.ok(ok.includes('/config 重新配置模型 / 看板地址'), `banner 底部指引应含看板地址，实际：${ok}`);
   });
+
+  // ---------- Spinner：非 TTY 时首行与 setText 以普通行打印（等待期不零输出） ----------
+  check('Spinner：非 TTY 时 start/setText 各打印一行', (() => {
+    if (process.stdout.isTTY) return true; // 手动在 TTY 下跑时跳过（CI/管道为非 TTY）
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    try {
+      const sp = new Spinner('检查 helios-kanban…').start();
+      sp.setText('仍在等待看板就绪…');
+      sp.stop();
+    } finally {
+      console.log = orig;
+    }
+    return logs.includes('检查 helios-kanban…') && logs.includes('仍在等待看板就绪…');
+  })());
 
   // ---------- /status 状态行：lark 三态与备用通道 ----------
   await checkAsync('buildStatusLines：lark 未授权/未安装/ok 与备用通道状态行', async () => {
@@ -3363,6 +3432,27 @@ async function run(): Promise<void> {
     }
   });
 
+  await checkAsync('技能摘要超上限：按章节边界丢弃末节并追加省略标记，契约校验给出警告', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skilltrunc-'));
+    try {
+      const dir = path.join(tmp, 'fat-skill');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'SKILL.md'),
+        `---\nname: fat-skill\ndescription: 超长摘要技能\ndigest_sections:\n  - Alpha\n  - Beta\n---\n\n## Alpha\n\n${'a'.repeat(3200)}\n\n## Beta\n\nBETA-MARKER ${'b'.repeat(400)}\n`,
+      );
+      const loaded = loadSkill(dir, 'fat-skill');
+      assert.ok(loaded, '应加载成功');
+      assert.ok(loaded!.digest.digest.includes('## Alpha'), '首节应保留');
+      assert.ok(!loaded!.digest.digest.includes('BETA-MARKER'), '超上限时末节应整节丢弃（不截断在句中）');
+      assert.ok(loaded!.digest.digest.includes('末节已省略'), '应追加省略标记');
+      assert.ok(loaded!.digest.digest.length <= 3500, '摘要总长不应超上限');
+      assert.ok(loaded!.problems.some((p) => p.includes('超过 3500 字符上限')), `契约校验应警告超上限：${loaded!.problems}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('技能安全：SKILL.md 符号链接拒绝读取/迁移；name 与目录名不一致记契约问题', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-skillsec-'));
     const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
@@ -3500,6 +3590,7 @@ async function run(): Promise<void> {
       CONFIRM_BATCH_RE.test('免问') &&
       !CONFIRM_BATCH_RE.test('b') && // 单字母「b」随口误批准长期免问，已移除
       CONFIRM_NO_RE.test('取消') &&
+      CONFIRM_NO_RE.test('否') && // 单字「否」是词表内合法裁决词
       CONFIRM_NO_RE.test('拒绝') &&
       !CONFIRM_YES_RE.test('好') &&
       !CONFIRM_YES_RE.test('可以') &&
@@ -3570,6 +3661,20 @@ async function run(): Promise<void> {
     assert.ok(CONFIRM_YES_RE.test('y') && CONFIRM_NO_RE.test('n'), 'CLI 交互式确认保留单字母');
   });
 
+  // ---------- bot 文本裁决：中文单字「否」（词表内）不得被单字母护栏误伤（与 CLI 端一致拒绝） ----------
+  await checkAsync('确认管理器：bot 文本「否」裁决拒绝（单字母护栏只挡 ASCII）', async () => {
+    const mgr = new ConfirmationManager(async () => undefined);
+    const settled: string[] = [];
+    const mgr2 = new ConfirmationManager(async () => undefined, { onSettled: (_o, _r, s) => settled.push(s) });
+    const p1 = mgr.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(mgr.resolveFromText('u1', '否'), 'denied', '中文单字「否」应裁决拒绝');
+    assert.equal(await p1, false);
+    const p2 = mgr2.request('u2', { kind: 'kanban', summary: 's', detail: 'd' });
+    assert.equal(mgr2.resolveFromText('u2', ' 否 '), 'denied', '带空白「否」同样裁决拒绝');
+    assert.equal(await p2, false);
+    assert.deepEqual(settled, ['denied']);
+  });
+
   // ---------- kind 枚举 → 用户可见中文 ----------
   check('kindLabel：hk/kanban→看板，lark→飞书，memory→记忆，未知回退原值', (() => {
     return (
@@ -3629,13 +3734,40 @@ async function run(): Promise<void> {
       totals: { done: 1, inreview: 0, inprogress: 2, todo: 0, cancelled: 0, filesChanged: 3, additions: 10, deletions: 4 },
     } as unknown as WorkSummaryData;
     const paths = { htmlPath: '/home/u/.helios-task-agent/reports/work-summary-2026-07-31.html', mdPath: '/home/u/.helios-task-agent/reports/work-summary-2026-07-31.md' };
-    const bot = summarizeForChat(data, paths, { linkBaseUrl: 'http://127.0.0.1:51234' });
+    const bot = summarizeForChat(data, paths, { linkBaseUrl: 'http://127.0.0.1:51234', channel: 'bot' });
     const cli = summarizeForChat(data, paths);
+    const botNoLink = summarizeForChat(data, paths, { channel: 'bot' });
     return (
       bot.includes('http://127.0.0.1:51234/work-summary-2026-07-31.html') &&
       !bot.includes('/home/u/.helios-task-agent/reports/work-summary-2026-07-31.html') &&
       cli.includes(paths.htmlPath) &&
-      !cli.includes('51234')
+      !cli.includes('51234') &&
+      // bot 场景报告服务不可用（无链接基地址）：本机路径是死链且泄露部署机目录，省略只给文本摘要
+      !botNoLink.includes('/home/u') &&
+      botNoLink.includes('工作总结报告已生成')
+    );
+  })());
+
+  check('summarizeForChat：截断指引与上方实际入口一致（md-only 无链接时回落「直接问我」）', (() => {
+    const data = {
+      scope: 'today',
+      generatedAt: '2026-07-31T00:00:00Z',
+      sinceLabel: '2026-07-31 今天',
+      tasks: Array.from({ length: 7 }, (_, i) => ({ title: `任务${i}`, status: 'done' })),
+      totals: { done: 7, inreview: 0, inprogress: 0, todo: 0, cancelled: 0, filesChanged: 0, additions: 0, deletions: 0 },
+    } as unknown as WorkSummaryData;
+    const withLink = summarizeForChat(data, { htmlPath: '/r/s.html' }, { linkBaseUrl: 'http://127.0.0.1:51234', channel: 'bot' });
+    const mdOnlyBot = summarizeForChat(data, { mdPath: '/r/s.md' }, { linkBaseUrl: 'http://127.0.0.1:51234', channel: 'bot' });
+    const mdOnlyCli = summarizeForChat(data, { mdPath: '/r/s.md' }, { channel: 'cli' });
+    const botNoLink = summarizeForChat(data, { htmlPath: '/r/s.html', mdPath: '/r/s.md' }, { channel: 'bot' });
+    return (
+      withLink.includes('其余 2 条，见上方报告链接') &&
+      mdOnlyBot.includes('其余 2 条，完整清单可直接问我') &&
+      !mdOnlyBot.includes('/r/s.md') &&
+      mdOnlyCli.includes('其余 2 条，见报告文件') &&
+      mdOnlyCli.includes('- Markdown：/r/s.md') &&
+      botNoLink.includes('其余 2 条，完整清单可直接问我') &&
+      !botNoLink.includes('/r/s')
     );
   })());
 
@@ -3970,6 +4102,32 @@ async function run(): Promise<void> {
       bot.tail.includes('可修改后重发') &&
       !bot.tail.includes('…') &&
       img.tail === '你的上一条消息未处理：「[图片]」，可重发图片。'
+    );
+  })());
+
+  check('llmFailureParts：未命中已知模式时兜底按通道分岔（bot 指向部署者不提 HTA_DEBUG，CLI 保留 HTA_DEBUG 提示）', (() => {
+    const cli = llmFailureParts('llm exploded: kaboom', '短消息', 'cli');
+    const bot = llmFailureParts('llm exploded: kaboom', '短消息', 'bot');
+    return (
+      cli.friendly === null &&
+      bot.friendly === null &&
+      cli.head.startsWith('请求失败。') &&
+      bot.head.startsWith('请求失败。') &&
+      cli.head.includes('HTA_DEBUG') &&
+      !bot.head.includes('HTA_DEBUG') &&
+      bot.head.includes('部署者')
+    );
+  })());
+
+  check('kanbanManualStartHint：命令与说明分行，整行复制命令不混入括注', (() => {
+    const spec = kanbanPackageSpec();
+    const lines = kanbanManualStartHint({ port: 7964 }).split('\n');
+    const cmd = process.platform === 'win32' ? `set PORT=7964 && npx -y ${spec}` : `PORT=7964 npx -y ${spec}`;
+    return (
+      lines.includes(cmd) &&
+      !cmd.includes('（') &&
+      lines[0]!.includes('可手动执行') &&
+      (process.platform !== 'win32' || lines.includes(`$env:PORT=7964; npx -y ${spec}`))
     );
   })());
 

@@ -148,7 +148,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const progress = createProgressKit({
     channel,
     heartbeatMs: deps.progressHeartbeatMs ?? PROGRESS_HEARTBEAT_MS,
-    hasPendingConfirm: (openId) => confirmations.hasPending(openId),
+    // 挂起确认的展示形态一并下传：心跳/占位文案按有无卡片、是否支持免问分支（文本降级不提按钮）
+    hasPendingConfirm: (openId) => (confirmations.hasPending(openId) ? confirmations.pendingForm(openId) : null),
   });
 
   /** 每用户当前运行中的 agent 轮次；progressId 为轮次令牌（/stop 与卡片「⏹ 停止」中断用，令牌校验陈旧卡片杀不到新轮次）。 */
@@ -231,7 +232,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 「AI 诊断」/「按诊断结论重试」按钮：同一受理判定口径
     if (value.hta_diagnose) {
       const title = String(value.title || '');
-      const r = reviewJobs.tryStartDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), title);
+      // url 随诊断结论留存：诊断结果卡片的「↻ 重试」按钮与重试「进行中」卡片的「查看任务」入口都靠它
+      const r = reviewJobs.tryStartDiagnosis(openId, String(value.hta_diagnose), String(value.attempt || ''), title, value.url);
       if (r.status !== 'accepted') return { toast: { type: 'info', content: r.toast } };
       return {
         toast: { type: 'info', content: 'AI 诊断已开始，完成后推送结果' },
@@ -751,14 +753,17 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
     // 「重试这个任务」确定性分支：诊断去重回执/文本降级推送向用户承诺过这个短语，
     // 不能仅靠模型自觉（pendingNotes 上限/LRU 淘汰/历史裁剪后承诺会失效）——
-    // 有诊断结论时直接复用按钮的重试逻辑，没有则如实告知
-    if (text === '重试这个任务') {
+    // 有诊断结论时直接复用按钮的重试逻辑，没有则如实告知。
+    // 匹配前剥掉尾部标点与空白：用户随手敲成「重试这个任务。」不能静默降级为模型闲聊
+    const retryPhrase = text.replace(/[\s。！？!?，,．.…~～]+$/u, '');
+    if (retryPhrase === '重试这个任务') {
       const last = reviewJobs.lastDiagnosis(msg.senderId);
       if (last) {
         // 受理判定同步完成（去重/无结论会如实通知），返回值此处无需使用
         reviewJobs.tryStartRetry(msg.senderId, last.taskId, last.title);
       } else {
-        await channel.reply(msg, '没有找到可重试的诊断结论（机器人可能已重启）。请到失败卡片上重新点「AI 诊断」后再重试。');
+        // 原失败卡片的「AI 诊断」按钮点击后已随「进行中」卡片消失，出路走文本回复
+        await channel.reply(msg, '没有找到可重试的诊断结论（机器人可能已重启）。可回复「为什么失败」重新诊断后再重试。');
       }
       return;
     }

@@ -21,6 +21,9 @@ export function userSkillsDir(): string {
 /** 单个技能注入系统提示词的摘要长度上限（避免每个回合倾倒全文）。 */
 const DIGEST_MAX_LEN = 3500;
 
+/** 摘要超上限时追加的省略标记：明示末节被丢弃，避免悬空半句；完整文档始终可 skill_doc 读取。 */
+const DIGEST_OMITTED_MARK = '（摘要超长，末节已省略；完整内容用 skill_doc 读取）';
+
 export interface SkillDigest {
   /** 技能名：frontmatter name，缺省回退目录名。 */
   name: string;
@@ -70,7 +73,7 @@ export function parseFrontmatter(raw: string): { data: Record<string, string | s
   return { data, body: text.slice(m[0].length) };
 }
 
-/** 按声明的章节名（大小写不敏感的子串匹配）摘取 `## ` 章节。 */
+/** 按声明的章节名（大小写不敏感的子串匹配）摘取 `## ` 章节；超上限时按章节边界丢弃末节并追加省略标记（不截断在句中）。 */
 function digestSkillBody(body: string, sections: string[]): string {
   if (!sections.length) return '';
   const keep: string[] = [];
@@ -78,7 +81,16 @@ function digestSkillBody(body: string, sections: string[]): string {
     const title = ((sec.match(/^## (.+)/) || [])[1] || '').toLowerCase();
     if (sections.some((s) => title.includes(s.toLowerCase()))) keep.push(sec.trim());
   }
-  return keep.join('\n\n').slice(0, DIGEST_MAX_LEN);
+  let digest = keep.join('\n\n');
+  if (digest.length <= DIGEST_MAX_LEN) return digest;
+  const budget = DIGEST_MAX_LEN - DIGEST_OMITTED_MARK.length - 2;
+  while (keep.length > 1 && digest.length > budget) {
+    keep.pop();
+    digest = keep.join('\n\n');
+  }
+  // 单节仍超预算（极端情况）才退回硬截断
+  if (digest.length > budget) digest = digest.slice(0, budget);
+  return `${digest}\n\n${DIGEST_OMITTED_MARK}`;
 }
 
 /** 加载单个技能目录（SKILL.md → 摘要 + 契约问题）；无 SKILL.md 返回 null。 */
@@ -112,6 +124,8 @@ export function loadSkill(absDir: string, dirName: string): { digest: SkillDiges
   if (!description) problems.push(`技能「${dirName}」配置问题：frontmatter 缺少 description（技能路由将不可靠）；文件：${skillFile}`);
   const sections = Array.isArray(data.digest_sections) ? data.digest_sections : [];
   const digest = digestSkillBody(body, sections);
+  if (digest.endsWith(DIGEST_OMITTED_MARK))
+    problems.push(`技能「${dirName}」配置问题：digest_sections 摘要超过 ${DIGEST_MAX_LEN} 字符上限（末节已省略注入，请精简摘要章节内容）；文件：${skillFile}`);
   for (const s of sections) {
     if (!new RegExp(`^## .*${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'im').test(body)) {
       problems.push(`技能「${dirName}」配置问题：digest_sections「${s}」未匹配到任何章节（拼写或章节已改名？）；文件：${skillFile}`);

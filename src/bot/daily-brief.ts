@@ -98,7 +98,7 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
       const parts: string[] = [];
       if (data.totals.cancelled) parts.push(`已取消 ${data.totals.cancelled} 个`);
       const unknown = data.tasks.filter((t) => !isKnownStatus(t.status)).length;
-      if (unknown) parts.push(`其它状态 ${unknown} 个`);
+      if (unknown) parts.push(`其他状态 ${unknown} 个`);
       if (parts.length) lines.push('', parts.join(' · '));
     }
   }
@@ -138,6 +138,11 @@ export interface DailyBriefOptions {
   /** stop() 等待在途 tick 的兜底超时（默认 5s）。 */
   stopTimeoutMs?: number;
   log?: (msg: string) => void;
+}
+
+/** 推送日志的 owner open_id 脱敏（与 confirm.ts logSettle 同口径）：头尾保留、中间打码；短 id 整体打码。 */
+function maskOwner(openId: string): string {
+  return openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
 }
 
 export class DailyBrief {
@@ -239,7 +244,7 @@ export class DailyBrief {
             });
       } catch (err) {
         this.markFailure(now.getTime());
-        this.opts.log?.(`晨报采集失败，本次跳过: ${errMessage(err)}`);
+        this.opts.log?.(`晨报采集失败，本次跳过：${errMessage(err)}`);
         return;
       }
       const text = buildDailyBriefText(data, now);
@@ -251,7 +256,7 @@ export class DailyBrief {
           sent.push(owner);
         } catch (err) {
           failed++;
-          this.opts.log?.(`晨报推送失败（${owner}）: ${errMessage(err)}`);
+          this.opts.log?.(`晨报推送失败（${maskOwner(owner)}）：${errMessage(err)}`);
         }
       }
       this.state = { date: today, delivered: sent };
@@ -265,7 +270,7 @@ export class DailyBrief {
         this.opts.log?.(`晨报已送达 ${targets.length} 个 owner`);
       }
     } catch (err) {
-      this.opts.log?.(`晨报检查失败: ${errMessage(err)}`);
+      this.opts.log?.(`晨报检查失败：${errMessage(err)}`);
     } finally {
       this.running = false;
     }

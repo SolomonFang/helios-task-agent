@@ -122,12 +122,13 @@ export function makeHkCliHandler({
     const summary = isCreate
       ? `创建看板任务${title ? `「${title}」` : ''}`
       : hkActionLabel(argv) ?? '看板写操作';
-    // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）
+    // start 分支补全会改写 argv，detail 取 getter 在闸门/审计时按最终命令重算（确认卡片须展示实际执行的命令）。
+    // 「hk」是缩写形态：实际以 node 运行技能脚本 hk.mjs（真实路径只进审计），卡片上标注以免用户照敲 hk 命令
     const { key: batchKey, scope: batchScope } = batchKeyForHk(argv);
     return runGatedWrite({
       kind: 'hk',
       summary,
-      detail: () => summarizeBothEnds(`hk ${argv.join(' ')}`),
+      detail: () => summarizeBothEnds(`hk ${argv.join(' ')}（「hk」为缩写形态，实际以 node 运行 hk.mjs）`),
       isCreate,
       isStart,
       urls: isCreate ? extractSourceUrls(argv.join(' ')) : [],
@@ -157,7 +158,7 @@ export function makeHkCliHandler({
                   signal: ctx?.signal,
                   noRepoError:
                     '无法启动工作区：本次未指定目标分支，且未配置默认仓库。\n' +
-                    '创建任务时直接告诉我使用哪个分支（如 develop），或联系部署者配置默认仓库。',
+                    '直接告诉我使用哪个分支（如 develop），或联系部署者配置默认仓库。',
                 });
               }
             } else if (!argv.includes('--branch')) {

@@ -195,9 +195,11 @@ export async function ensureKanbanRunning(
           `[kanban] 进程退出（退出码 ${child.exitCode}）${stderrBuf.trim() ? `，stderr 尾部：\n${stderrBuf.slice(-800)}` : ''}`,
         );
       }
-      throw new Error(
-        'helios-kanban 启动后退出，常见原因是端口被占用。可设 HTA_DEBUG=1 重新运行查看详细报错。',
-      );
+      const debugHint =
+        process.platform === 'win32'
+          ? '可先在 cmd 中执行 set HTA_DEBUG=1，或在 PowerShell 中执行 $env:HTA_DEBUG=1，再重新运行本程序查看详细报错。'
+          : '可设 HTA_DEBUG=1 重新运行查看详细报错。';
+      throw new Error(`helios-kanban 启动后退出，常见原因是端口被占用。${debugHint}`);
     }
     // 等待期间每 ~10 秒补一行进度，避免启动阶段长时间无反馈
     if (Date.now() - lastBeatAt >= 10000) {

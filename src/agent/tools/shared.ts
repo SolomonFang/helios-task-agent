@@ -93,10 +93,17 @@ export function run(
         }
         if (error && !stdout) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            // 缺失指引按平台分档：Windows 官方 Python 只有 python（无 python3），也没有内置 bash/sh，
+            // 「安装 bash」无操作路径，改指可执行的替代形态（.mjs 走 node、.py 走 python）
+            const isWin = process.platform === 'win32';
             const hint =
               command === 'lark-cli'
                 ? LARK_CLI_INSTALL_HINT
-                : `请先在部署机器上安装 ${command} 后重试；如不会操作，请联系部署者。`;
+                : isWin && command === 'python3'
+                  ? 'Windows 官方 Python 的命令名是 python（没有 python3）：请改用 python 运行该脚本，或联系部署者处理。'
+                  : isWin && (command === 'bash' || command === 'sh')
+                    ? 'Windows 没有内置 bash/sh：请把脚本改成 .mjs（node 运行）或 .py（python 运行）后重试，或联系部署者处理。'
+                    : `请先在部署机器上安装 ${command} 后重试；如不会操作，请联系部署者。`;
             resolve(`未找到可执行命令「${command}」。\n${hint}`);
             return;
           }

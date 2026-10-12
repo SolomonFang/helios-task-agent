@@ -38,7 +38,7 @@ export function makeSkillExecHandler({
     }
     const argv = (raw.args as string[] | undefined) || [];
     const dir = resolveSkillDir(skill);
-    if (!dir) return `未找到技能「${skill}」。先用 skill_doc（空 name）列出已安装技能。`;
+    if (!dir) return `未找到技能「${skill}」。先让我列出已安装技能，再从列表里选一个重试。`;
     if (path.isAbsolute(script)) return `参数错误：script 必须是相对技能目录的路径：「${script}」`;
     // 防路径逃逸：realpath 后必须仍在技能目录内（覆盖 ../ 与符号链接两种形态）
     const rootReal = fs.realpathSync(dir);
@@ -59,7 +59,7 @@ export function makeSkillExecHandler({
     } else {
       interpreter = SCRIPT_INTERPRETERS[path.extname(scriptReal).toLowerCase()] || '';
       if (!interpreter) {
-        return `参数错误：无法按扩展名推断「${script}」的解释器，请显式传 interpreter（bash/sh/node/python3/python）`;
+        return `参数错误：无法按扩展名推断「${script}」的解释器，请告诉我要用哪种解释器运行（bash、sh、node、python3、python 之一）`;
       }
     }
     const summary = `执行技能脚本：${skill}/${script}`;

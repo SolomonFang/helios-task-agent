@@ -14,7 +14,7 @@ import { errMessage } from '../infra/err';
 export interface RuntimeFlags {
   /** 看板状态主动推送（KANBAN_WATCH=0 关闭，默认开）。 */
   kanbanWatch: boolean;
-  /** 看板推送轮询间隔（秒）：默认 60、下限 15；非法值告警并按默认。 */
+  /** 看板推送轮询间隔（秒）：默认 60、下限 15（低于下限告警并抬升）；非法值告警并按默认。 */
   kanbanWatchIntervalSec: number;
   /** 停滞任务提醒阈值（小时；null=关闭；非法值告警并关闭）。依赖看板推送（watcher）驱动。 */
   staleNudgeHours: number | null;
@@ -35,6 +35,10 @@ export function readRuntimeFlags(env: NodeJS.ProcessEnv, warn: (msg: string) => 
     const n = Number(rawInterval);
     if (Number.isFinite(n) && n > 0) intervalSec = n;
     else warn(`KANBAN_WATCH_INTERVAL_SEC 值非法：${JSON.stringify(env.KANBAN_WATCH_INTERVAL_SEC)}（应为正数秒，如 60），已按默认 60 秒`);
+  }
+  if (intervalSec < 15) {
+    warn(`KANBAN_WATCH_INTERVAL_SEC=${intervalSec} 低于下限 15 秒，已按 15 秒执行`);
+    intervalSec = 15;
   }
 
   let staleNudgeHours: number | null = null;
@@ -66,7 +70,7 @@ export function readRuntimeFlags(env: NodeJS.ProcessEnv, warn: (msg: string) => 
 
   return {
     kanbanWatch,
-    kanbanWatchIntervalSec: Math.max(15, intervalSec),
+    kanbanWatchIntervalSec: intervalSec,
     staleNudgeHours,
     dailyBriefTime,
     weeklyBriefTime,

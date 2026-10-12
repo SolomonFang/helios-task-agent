@@ -58,20 +58,27 @@ function combinedFetchSignal(signal: AbortSignal | undefined, timeoutMs: number)
   return ctl.signal;
 }
 
+/**
+ * 看板任务存活核验三态：'exists' = 任务仍在；'missing' = 已被删除（404 或应答 success=false，
+ * 映射可清理后放行）；'unknown' = 看板不可达/非 404 失败，无法确认——调用方须如实告知
+ * 「看板连接异常」，不得沿用「已同步过」文案（删除/更新指引在看板不可达时是死胡同）。
+ */
+export type KanbanTaskState = 'exists' | 'missing' | 'unknown';
+
 /** Existence check before honoring a recorded mapping (self-heals after manual deletes). */
-export async function kanbanTaskExists(kanbanUrl: string, taskId: string, signal?: AbortSignal): Promise<boolean> {
+export async function kanbanTaskExists(kanbanUrl: string, taskId: string, signal?: AbortSignal): Promise<KanbanTaskState> {
   try {
     const base = kanbanUrl.replace(/\/+$/, '');
     // taskId 来自盘上文件（可能被手改），编码后才拼进 URL，防止注入路径段
     const res = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}`, {
       signal: combinedFetchSignal(signal, 8000),
     });
-    if (res.status === 404) return false;
-    if (!res.ok) return true; // unknown → conservative: keep blocking
+    if (res.status === 404) return 'missing';
+    if (!res.ok) return 'unknown';
     const json: unknown = await res.json();
-    return Boolean(json && typeof json === 'object' && (json as { success?: unknown }).success === true);
+    return json && typeof json === 'object' && (json as { success?: unknown }).success === true ? 'exists' : 'missing';
   } catch {
-    return true; // kanban unreachable → conservative: keep blocking
+    return 'unknown'; // kanban unreachable → 无法确认
   }
 }
 

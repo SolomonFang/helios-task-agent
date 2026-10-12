@@ -162,13 +162,29 @@ export interface ProgressCardState {
   current?: string;
   /** 已等待秒数（心跳刷新注脚用）；缺省不展示。 */
   elapsedSec?: number;
-  /** 写操作确认挂起变体：橙头如实提示等用户裁决（此时「仍在处理」是谎称）；停止按钮保留。 */
-  waitingConfirm?: boolean;
+  /**
+   * 写操作确认挂起变体：橙头如实提示等用户裁决（此时「仍在处理」是谎称）；停止按钮保留。
+   * 携带挂起确认的展示形态（confirm.pendingForm）：文本降级（无卡片）的确认指引不能提按钮，
+   * 支持免问的确认补「免问」应答词；true 为兼容写法，按有卡片、无免问处理。
+   */
+  waitingConfirm?: boolean | { hasCard: boolean; batchKey: boolean };
   /**
    * 停止按钮的轮次令牌（占位消息 id）：回调据此校验按钮属于当前轮次，
    * 重启后的旧卡片/上一轮的停止按钮杀不到新轮次；占位初帧尚无 id 时缺省（点击静默忽略）。
    */
   stopToken?: string;
+}
+
+/**
+ * 等确认注脚按确认的实际展示形态分支：文本降级（无卡片）不提按钮（没有可点的卡片）；
+ * 支持免问的确认补「免问」应答词（与排队回执/短应答提醒同口径）。
+ */
+function waitingConfirmNote(form: { hasCard: boolean; batchKey: boolean }): string {
+  const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
+  const how = form.hasCard
+    ? `请先点上方确认卡片的按钮（或回复${answers}）`
+    : `请回复${answers}（本次确认以文本方式发送，没有卡片按钮）`;
+  return `${how} · 回复 /stop 也可中断`;
 }
 
 /**
@@ -180,8 +196,9 @@ export function buildProgressCard(state: ProgressCardState): Record<string, unkn
   // 步骤标签来自 toolActionLabel 的内部文案，过 mdSafe 仅为纵深防御
   const lines = recent.map((s) => `✓ ${mdSafe(s)}`);
   if (state.current) lines.push(`⏳ ${mdSafe(state.current)}`);
-  const note = state.waitingConfirm
-    ? '请先点上方确认卡片的按钮（或回复「确认」/「取消」）· 回复 /stop 也可中断'
+  const confirmForm = state.waitingConfirm === true ? { hasCard: true, batchKey: false } : state.waitingConfirm;
+  const note = confirmForm
+    ? waitingConfirmNote(confirmForm)
     : typeof state.elapsedSec === 'number'
       ? `已等待 ${state.elapsedSec} 秒 · 回复 /stop 也可中断`
       : '回复 /stop 也可中断';
@@ -203,8 +220,9 @@ export function buildProgressCard(state: ProgressCardState): Record<string, unkn
 }
 
 /**
- * 结果卡片（绿头）：正文为 LLM 回复的 lark_md 渲染——最小中和（同 diagnosisMdSafe 口径：
+ * 结果卡片：正文为 LLM 回复的 lark_md 渲染——最小中和（同 diagnosisMdSafe 口径：
  * < > 全角化、~~ 中和；加粗/列表/代码块等排版保留）。
+ * 头部措辞中性（「处理结束」）：正文可能是「（无回复）」「已达上限」等非成功内容，恒称「已完成」是谎称（T31 口径）。
  * legacy lark_md 只支持部分 Markdown：`#` 标题、`>` 引用、行内代码、表格等会原样显示
  * （可接受，不丢内容；不要指望它们被渲染）。
  */
@@ -217,7 +235,7 @@ export function buildResultCard(reply: string, meta?: { elapsedSec?: number }): 
   }
   return {
     config: baseCardConfig(),
-    header: { template: 'green', title: { tag: 'plain_text', content: '✅ 已完成' } },
+    header: { template: 'green', title: { tag: 'plain_text', content: '处理结束' } },
     elements,
   };
 }
@@ -232,8 +250,8 @@ export function buildProgressTerminalCard(kind: 'aborted' | 'failed' | 'seeBelow
   const meta = {
     aborted: { template: 'grey', title: '⏹ 已中断', note: '未完成的操作未执行，可继续对话。' },
     failed: { template: 'red', title: '⚠️ 处理失败', note: '失败详情见下方消息，可修正后重试。' },
-    seeBelow: { template: 'green', title: '✅ 已完成，结果见下方 ⬇️', note: '完整内容见下方消息。' },
-    deliverFailed: { template: 'red', title: '⚠️ 回复投递失败', note: '请重试或稍后再问。' },
+    seeBelow: { template: 'green', title: '处理结束，结果见下方 ⬇️', note: '完整内容见下方消息。' },
+    deliverFailed: { template: 'red', title: '⚠️ 回复投递失败', note: '请把刚才的问题再发一次。' },
     stale: { template: 'grey', title: '⏹ 该轮次已结束', note: '机器人可能已重启；如需中断当前任务，请用最新进度卡片上的「⏹ 停止」或回复 /stop。' },
   }[kind];
   return {
@@ -256,11 +274,18 @@ export function buildJobProcessingCard(
   const meta = {
     review: { heading: '🤖 AI 审查进行中', note: '正在调用代码审查工具分析改动，完成后推送审查结果。' },
     diagnosis: { heading: '🔍 AI 诊断进行中', note: '正在采集失败信息并调用模型分析，完成后推送诊断结果。' },
-    retry: { heading: '↻ 正在按诊断结论重试', note: '重试指令发送中，任务进展会继续推送。' },
+    retry: { heading: '↻ 正在按诊断结论重试', note: '重试指令发送中，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。' },
   }[kind];
   const elements: Array<Record<string, unknown>> = [
-    // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底，别让用户死等卡片
-    { tag: 'div', text: { tag: 'lark_md', content: `${meta.note}\n结果或失败通知会以新消息推送。` } },
+    // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底，别让用户死等卡片；
+    // 作业是进程内状态，机器人重启后静默消亡，卡片不能永久谎称「进行中」
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，若长时间无结果请重新发起。`,
+      },
+    },
   ];
   if (url) {
     elements.push({
@@ -464,12 +489,13 @@ function diagnosisMdSafe(s: string): string {
  * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）；
  * followUpExcerpt 为已发送的 follow-up 指令摘要（双向截断，handler 侧生成）——
  * 重试指令直发执行方用户原本看不到，终态卡片留一份可见记录。
+ * url 为看板任务链接（随诊断结果留存）：重试按钮带上它，点击后换成的「进行中」卡片据此保留「查看任务」入口。
  */
 export function buildDiagnosisCard(
   title: string,
   diagnosis: string,
   taskId: string,
-  opts?: { settledAt?: string; followUpExcerpt?: string },
+  opts?: { settledAt?: string; followUpExcerpt?: string; url?: string },
 ): Record<string, unknown> {
   const text = diagnosisMdSafe(
     diagnosis.length > DIAGNOSIS_CARD_MAX_CHARS
@@ -491,7 +517,7 @@ export function buildDiagnosisCard(
     }
     elements.push({
       tag: 'note',
-      elements: [{ tag: 'plain_text', content: `已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送。` }],
+      elements: [{ tag: 'plain_text', content: `已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。` }],
     });
   } else {
     elements.push({
@@ -501,7 +527,7 @@ export function buildDiagnosisCard(
           tag: 'button',
           text: { tag: 'plain_text', content: '↻ 按诊断结论重试' },
           type: 'primary',
-          value: { hta_retry: taskId, title: buttonTitle(title) },
+          value: { hta_retry: taskId, title: buttonTitle(title), ...(opts?.url ? { url: opts.url } : {}) },
         },
       ],
     });

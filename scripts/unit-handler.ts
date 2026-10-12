@@ -810,9 +810,13 @@ async function main(): Promise<void> {
       const p = f.handlers.handle(mkMsg('u1', '这个问题请认真想一会儿再回答'));
       await waitFor(() => llm.requestCount === base + 1, '消息进入 LLM');
       await waitFor(
-        () => f.channel.updatedTexts().some((t) => t.includes('等待你处理上方的写操作确认')),
-        '确认挂起期间心跳应提示等待处理确认',
+        // 该 fixture 的确认以文本降级发送（无卡片）：等确认注脚不得指引点「上方确认卡片的按钮」
+        () => f.channel.updatedTexts().some((t) => t.includes('没有卡片按钮')),
+        '确认挂起期间心跳应按文本降级形态提示（不提卡片按钮）',
       );
+      const waitingText = f.channel.updatedTexts().find((t) => t.includes('没有卡片按钮'))!;
+      assert.ok(waitingText.includes('「确认」/「取消」'), `应告知应答方式，实际：${waitingText}`);
+      assert.ok(waitingText.includes('/stop'), `等确认心跳不得丢 /stop 中断指引，实际：${waitingText}`);
       assert.ok(
         !f.channel.updatedTexts().some((t) => t.includes('仍在处理')),
         '确认挂起期间不得刷「仍在处理」（实际在等用户裁决）',
@@ -1113,8 +1117,8 @@ async function main(): Promise<void> {
       await new Promise((r) => setTimeout(r, 50)); // 等第二次点击的异步流程走完
       assert.equal(followUps, 1, '连点竞态不得发起两次重试');
       assert.ok(
-        f.channel.notifies.some((n) => n.text.includes('重试已发起过')),
-        '第二次点击应给「已发起过」回执',
+        f.channel.notifies.some((n) => n.text.includes('重试正在发起中')),
+        '第二次点击（发起中窗口）应如实回执「正在发起中」，不得谎称「已发起过」',
       );
       const launched = f.channel.notifies.find((n) => n.text.includes('已按诊断结论发起重试'))!;
       assert.ok(launched.text.includes('任务执行方'), `中英混排「执行 Agent」应统一为「任务执行方」，实际：${launched.text}`);
@@ -1193,6 +1197,14 @@ async function main(): Promise<void> {
       assert.ok(
         f.channel.replies.some((r) => r.text.includes('没有找到可重试的诊断结论')),
         `无诊断结论时应如实告知，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
+      );
+      // 带标点/空白变体同样命中确定性分支（用户随手敲的「重试这个任务。」不能降级为模型闲聊）
+      await f.handlers.handle(mkMsg('u1', '重试这个任务。'));
+      await f.handlers.handle(mkMsg('u1', '重试这个任务！'));
+      assert.equal(
+        f.channel.replies.filter((r) => r.text.includes('没有找到可重试的诊断结论')).length,
+        3,
+        '标点变体应走同一确定性分支',
       );
       assert.equal(llm.requestCount, base, '不得落入队列发给模型');
       cleanup(f);
@@ -1360,8 +1372,8 @@ async function main(): Promise<void> {
       }
     });
 
-    // ---------- deliverReply：首段更新失败但直发成功时，占位 best-effort 收尾为终态（不烂尾在「处理中」） ----------
-    await checkAsync('handler：首段更新失败但直发成功时占位收尾为「已完成」，不烂尾在「处理中」', async () => {
+    // ---------- deliverReply：首段更新失败但直发成功时，占位 best-effort 收尾为中性终态（不烂尾在「处理中」） ----------
+    await checkAsync('handler：首段更新失败但直发成功时占位收尾为「处理结束」，不烂尾在「处理中」', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failSendCard = true; // 同上：本条用例覆盖文本占位的降级链
       const origErr = console.error;
@@ -1371,8 +1383,8 @@ async function main(): Promise<void> {
         await f.handlers.handle(mkMsg('u1', '你好'));
         assert.ok(f.channel.sent.includes('好的，已收到'), '首段应直发兜底成功');
         assert.ok(
-          f.channel.updated.includes('✅ 已完成，结果见下方 ⬇️'),
-          `占位应 best-effort 收尾为终态，实际：${f.channel.updated.join(' | ')}`,
+          f.channel.updated.includes('处理结束，结果见下方 ⬇️'),
+          `占位应 best-effort 收尾为中性终态（不恒称「已完成」），实际：${f.channel.updated.join(' | ')}`,
         );
         assert.ok(
           !f.channel.updated.some((t) => t.includes('回复投递失败')),
@@ -1398,7 +1410,7 @@ async function main(): Promise<void> {
       const result = f.channel.updatedCards.at(-1)!;
       assert.equal(result.messageId, pid, '结果卡片应原地替换占位卡片');
       const t = cardText(result.card);
-      assert.ok(t.includes('✅ 已完成') && t.includes('好的，已收到'), `结果卡片应含回复正文，实际：${t}`);
+      assert.ok(t.includes('处理结束') && t.includes('好的，已收到'), `结果卡片应含回复正文，实际：${t}`);
       assert.ok(!f.channel.sent.includes('好的，已收到'), '短回复不应再分段发文本');
       cleanup(f);
     });
@@ -1458,7 +1470,7 @@ async function main(): Promise<void> {
     // ---------- progress：卡片占位随工具事件节流更新步骤轨迹 ----------
     await checkAsync('progress：卡片占位随工具事件节流更新为步骤轨迹卡片', async () => {
       const channel = new FakeChannel();
-      const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+      const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
       const msg = mkMsg('u1', 'x');
       const id = await kit.sendPlaceholder(msg);
       assert.ok(id?.startsWith('card-'), '占位应为卡片');
@@ -1482,7 +1494,7 @@ async function main(): Promise<void> {
     await checkAsync('progress：卡片模式心跳刷新等待秒数，确认挂起时换等待确认变体', async () => {
       const channel = new FakeChannel();
       let pending = false;
-      const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => pending });
+      const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => (pending ? { hasCard: true, batchKey: false } : null) });
       const id = await kit.sendPlaceholder(mkMsg('u1', 'x'));
       const activity = { lastEventAt: Date.now() - 1000 }; // 已静默超阈值
       const stop = kit.startProgressHeartbeat(id, activity, 'u1');
@@ -1505,19 +1517,19 @@ async function main(): Promise<void> {
     await checkAsync('progress：deliverReply 卡片模式短回复换结果卡片，超长收尾 seeBelow 并分段', async () => {
       const msg = mkMsg('u1', 'x');
       const c1 = new FakeChannel();
-      const kit1 = createProgressKit({ channel: c1, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+      const kit1 = createProgressKit({ channel: c1, heartbeatMs: 60_000, hasPendingConfirm: () => null });
       const id1 = await kit1.sendPlaceholder(msg);
       await kit1.deliverReply(msg, id1, '**加粗** 与 `代码`');
       const resultUpdate = c1.updatedCards.at(-1)!;
       const t1 = cardText(resultUpdate.card);
-      assert.ok(t1.includes('✅ 已完成') && t1.includes('**加粗** 与 `代码`'), `结果卡片应保留 markdown 排版，实际：${t1}`);
+      assert.ok(t1.includes('处理结束') && t1.includes('**加粗** 与 `代码`'), `结果卡片应保留 markdown 排版，实际：${t1}`);
       assert.equal(resultUpdate.messageId, id1, '结果卡片应原地替换占位');
       assert.equal(c1.sent.length, 0, '短回复不应另发文本');
       assert.ok(kit1.isSettledProgress(id1!), '投递完成后占位应标记已收尾');
       assert.ok(!kit1.isActiveProgress(id1!), '投递完成后占位不再是活跃轮次');
 
       const c2 = new FakeChannel();
-      const kit2 = createProgressKit({ channel: c2, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+      const kit2 = createProgressKit({ channel: c2, heartbeatMs: 60_000, hasPendingConfirm: () => null });
       const id2 = await kit2.sendPlaceholder(msg);
       // 超长判定按字节（飞书卡片请求体上限按字节计）：ascii 字符数即字节数
       await kit2.deliverReply(msg, id2, 'a'.repeat(RESULT_CARD_MAX_BYTES + 100));
@@ -1528,7 +1540,7 @@ async function main(): Promise<void> {
 
       // 多字节反例：9500 字符 < 28000，但 28500 字节超限——钉住字节口径（按字符数比较的回退实现会在这里暴露）
       const c3 = new FakeChannel();
-      const kit3 = createProgressKit({ channel: c3, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+      const kit3 = createProgressKit({ channel: c3, heartbeatMs: 60_000, hasPendingConfirm: () => null });
       const id3 = await kit3.sendPlaceholder(msg);
       await kit3.deliverReply(msg, id3, '汉'.repeat(9500));
       assert.ok(
@@ -1546,7 +1558,7 @@ async function main(): Promise<void> {
       const origErr = console.error;
       console.error = () => {}; // 降级会记日志，测试期间静音
       try {
-        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
         const msg = mkMsg('u1', 'x');
         const id = await kit.sendPlaceholder(msg);
         await kit.deliverReply(msg, id, '回复正文 内容');
@@ -1566,7 +1578,7 @@ async function main(): Promise<void> {
       let releaseGate!: () => void;
       // 心跳卡片（含「已等待」）的 updateCard 被人为卡住，模拟在途延迟
       channel.updateCardGate = { match: '已等待', promise: new Promise<void>((r) => (releaseGate = r)) };
-      const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => false });
+      const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => null });
       const msg = mkMsg('u1', 'x');
       const id = await kit.sendPlaceholder(msg);
       const activity = { lastEventAt: Date.now() - 1000 }; // 已静默超阈值
@@ -1603,7 +1615,7 @@ async function main(): Promise<void> {
       const origErr = console.error;
       console.error = () => {}; // 降级会记日志，测试期间静音
       try {
-        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => false });
+        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
         const msg = mkMsg('u1', 'x');
         const id = await kit.sendPlaceholder(msg);
         await kit.deliverReply(msg, id, '正文内容 全文');
@@ -1864,6 +1876,7 @@ async function main(): Promise<void> {
           await gate; // 挂起：留出「进行中」窗口测连点
           return { text: '诊断结论', attemptId: 'att-1' };
         },
+        followUpSender: async () => {},
       });
       const click = () =>
         f.handlers.onCardAction({
@@ -1882,6 +1895,15 @@ async function main(): Promise<void> {
       assert.equal(calls, 1, '连点不得重复诊断');
       releaseDiagnosis();
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
+      // url 随诊断结论留存：诊断卡片的重试按钮带上它，重试「进行中」卡片据此保留「查看任务」入口
+      const retryValue = buttonValues(f.channel.cards[0]!.card).find((v) => v.hta_retry === 't1');
+      assert.equal(retryValue?.url, 'http://kb.local/t/1', '诊断卡片重试按钮应随 value 带上任务链接');
+      const retryResp = f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: retryValue as never } });
+      assert.ok(
+        retryResp?.card?.data && JSON.stringify(retryResp.card.data).includes('http://kb.local/t/1'),
+        '重试进行中卡片应保留「查看任务」链接',
+      );
+      await waitFor(() => f.channel.notifies.some((n) => n.text.includes('已按诊断结论发起重试')), '重试发起回执');
       const again = click(); // 已诊断过：只 toast 不换卡，不再调 LLM
       assert.ok(again?.toast?.content.includes('已诊断过'), `实际：${again?.toast?.content}`);
       assert.ok(!again?.card, '已诊断过不应换卡');
@@ -1913,8 +1935,8 @@ async function main(): Promise<void> {
       const r1 = clickRetry();
       assert.ok(r1?.card?.data, '首次重试应换进行中卡片');
       assert.ok(r1?.toast?.content.includes('正在发起重试'), `实际：${r1?.toast?.content}`);
-      const r2 = clickRetry(); // 连点：retryLaunching 同步挡住
-      assert.ok(!r2?.card && r2?.toast?.content.includes('重试已发起过'), `实际：${r2?.toast?.content}`);
+      const r2 = clickRetry(); // 连点：retryLaunching 同步挡住（发起中窗口如实回执，不谎称「已发起过」）
+      assert.ok(!r2?.card && r2?.toast?.content.includes('重试正在发起中'), `实际：${r2?.toast?.content}`);
       releaseFollowUp();
       await waitFor(() => f.channel.notifies.some((n) => n.text.includes('已按诊断结论发起重试')), '重试发起回执');
       await new Promise((r) => setTimeout(r, 50)); // 等连点的异步流程走完
@@ -1984,6 +2006,16 @@ async function main(): Promise<void> {
       assert.equal((waiting.header as { template: string }).template, 'orange');
       assert.ok(cardText(waiting).includes('等待你处理上方的写操作确认'));
       assert.equal(buttonValues(waiting)[0]?.hta_stop, 'card-9', '等待确认变体保留停止按钮与令牌');
+      // 等确认注脚按确认实际形态分支：文本降级不提卡片按钮，支持免问补「免问」应答词
+      const waitingText = cardText(buildProgressCard({ steps: [], waitingConfirm: { hasCard: false, batchKey: true } }));
+      assert.ok(!waitingText.includes('点上方确认卡片的按钮'), `无卡片不得指引点按钮，实际：${waitingText}`);
+      assert.ok(waitingText.includes('「免问」'), `支持免问应补「免问」应答词，实际：${waitingText}`);
+      assert.ok(waitingText.includes('/stop'), `等确认注脚应保留 /stop 中断指引，实际：${waitingText}`);
+      const waitingCard = cardText(buildProgressCard({ steps: [], waitingConfirm: { hasCard: true, batchKey: true } }));
+      assert.ok(
+        waitingCard.includes('点上方确认卡片的按钮') && waitingCard.includes('「免问」'),
+        `有卡片且支持免问：按钮与免问都应提示，实际：${waitingCard}`,
+      );
       // 结果卡片：绿头 + lark_md 保留加粗，标签/删除线最小中和
       const result = buildResultCard('**加粗** <font color="red">x</font> ~~删~~');
       assert.equal((result.header as { template: string }).template, 'green');
@@ -2004,14 +2036,17 @@ async function main(): Promise<void> {
         assert.ok(cardText(c).includes(want), `${kind} 文案`);
         assert.equal(buttonValues(c).length, 0, `${kind} 终态卡片不得有按钮`);
       }
-      // deliverFailed 不得谎称「见下方」（下方什么都没有）
-      assert.ok(!cardText(buildProgressTerminalCard('deliverFailed')).includes('见下方'));
+      // deliverFailed 不得谎称「见下方」（下方什么都没有），出路为具体可执行的「再发一次」
+      const deliverFailedText = cardText(buildProgressTerminalCard('deliverFailed'));
+      assert.ok(!deliverFailedText.includes('见下方'));
+      assert.ok(deliverFailedText.includes('请把刚才的问题再发一次'), `实际：${deliverFailedText}`);
       // 进行中卡片：蓝头 + 标题 + 失败兜底说明；有 url 保留「查看任务」链接，无 url 无按钮
       const job = buildJobProcessingCard('任务X', 'review', 'http://kb.local/t/1');
       assert.equal((job.header as { template: string }).template, 'blue');
       const jt = cardText(job);
       assert.ok(jt.includes('AI 审查进行中') && jt.includes('任务X'), `实际：${jt}`);
       assert.ok(jt.includes('以新消息推送'), '进行中卡片应如实说明结果以新消息推送（作业失败卡片不会自己再变）');
+      assert.ok(jt.includes('机器人重启会使本次作业中断且不通知'), '进行中卡片应如实说明重启后作业静默消亡');
       assert.ok(JSON.stringify(job).includes('http://kb.local/t/1'), '有 url 时应保留查看任务按钮');
       const jobNoUrl = buildJobProcessingCard('任务X', 'diagnosis');
       assert.ok(cardText(jobNoUrl).includes('AI 诊断进行中'));

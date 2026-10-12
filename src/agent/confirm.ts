@@ -261,10 +261,10 @@ export class ConfirmationManager {
     const p = this.pendings.get(openId);
     if (!p) return 'ignored';
     const t = text.trim();
-    // 单字母（y/n）在 bot 文本路径一律不算裁决：确认挂起期间随手回的「y」很可能是在回答
-    // 别的对话，不能据此放行写操作；完整词（yes/no/确认/取消…）不受影响。
+    // ASCII 单字母（y/n）在 bot 文本路径一律不算裁决：确认挂起期间随手回的「y」很可能是在回答
+    // 别的对话，不能据此放行写操作；完整词（yes/no/确认/取消…）与中文单字（词表内的「否」）不受影响。
     // CLI 交互式确认仍保留单字母（终端无误触风险），那边直接用 CONFIRM_YES_RE/CONFIRM_NO_RE。
-    if (t.length <= 1) return 'ignored';
+    if (/^[a-z]$/i.test(t)) return 'ignored';
     if (CONFIRM_BATCH_RE.test(t) && p.req.batchKey) {
       this.finish(openId, p, 'batch');
       return 'approved_batch';

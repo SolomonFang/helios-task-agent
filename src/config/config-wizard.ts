@@ -35,13 +35,13 @@ export function makeNeed(
   ask: AskFn,
   askSecret?: AskFn | null,
 ): { need: (promptText: string) => Promise<string>; needSecret: (promptText: string) => Promise<string>; secretSuffix: string } {
-  // EOF/中断：bot 两阶段流程模型配置可能已先落盘，文案如实说明断点续跑；
+  // EOF/中断：writeEnv 在向导末尾才执行，中途退出不会落盘，文案不承诺断点续跑；
   // 非 TTY（systemd/Docker）重跑向导必然同样 EOF，出路是给配置文件的确切路径。
   const eofError = (): Error =>
     new Error(
       process.stdin.isTTY
-        ? '输入已结束（已完成的步骤已保存，重新运行可从断点继续）'
-        : `输入已结束（已完成的步骤已保存，重新运行可从断点继续；无交互终端时请直接编辑 ${userEnvPath()}）`,
+        ? '输入已结束（本次未保存的输入需重新填写；此前已保存的配置不受影响）'
+        : `输入已结束（本次未保存的输入需重新填写；此前已保存的配置不受影响；无交互终端时请直接编辑 ${userEnvPath()}）`,
     );
   const need = async (promptText: string): Promise<string> => {
     const ans = await ask(promptText);
@@ -62,14 +62,30 @@ export function makeNeed(
 /**
  * 飞书白名单合并决策（纯函数，向导交互外可测）：
  * 输入 `-`（仅换绑场景 allowClear）= 清除；输入新列表 = 覆盖；回车 = 保留现状。
+ * 非换绑场景列表中的 `-` 忽略（误当字面 open_id 存下会全员被拒）。
  */
 export function resolveAllowedOpenIds(raw: string, existing: string[], allowClear: boolean): string[] {
   if (allowClear && raw === '-') return [];
-  return raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : existing;
+  if (!raw) return existing;
+  const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!list.length) return list;
+  // 非换绑场景不支持清除：`-` 忽略而非当字面 open_id 存下（否则会全员被拒）
+  const filtered = allowClear ? list : list.filter((s) => s !== '-');
+  return filtered.length ? filtered : existing;
+}
+
+/** 必填项：空输入原地重问（与非法数字、缺协议头同一口径），误按一次回车不中止整个向导。 */
+async function needRequired(io: ReturnType<typeof makeNeed>, promptText: string, secret = false): Promise<string> {
+  for (;;) {
+    const v = secret ? await io.needSecret(promptText) : await io.need(promptText);
+    if (v) return v;
+    console.log(c.err('输入不能为空，请重新输入。'));
+  }
 }
 
 async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
-  const { need, needSecret, secretSuffix } = makeNeed(ask, askSecret);
+  const io = makeNeed(ask, askSecret);
+  const { need, needSecret, secretSuffix } = io;
 
   /**
    * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
@@ -80,12 +96,12 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   const ensureSecureBaseUrl = async (url: string, opts: { label?: string; allowEmpty?: boolean } = {}): Promise<string> => {
     const label = opts.label ?? 'Base URL';
     const reprompt = async (): Promise<string> => {
-      const v = await need(`${label}（如 https://api.deepseek.com/v1）: `);
-      if (!v) {
+      for (;;) {
+        const v = await need(`${label}（如 https://api.deepseek.com/v1）: `);
+        if (v) return v;
         if (opts.allowEmpty) return '';
-        throw new Error(`${label} 不能为空`);
+        console.log(c.err(`${label} 不能为空，请重新输入。`));
       }
-      return v;
     };
     let u = url;
     for (;;) {
@@ -102,7 +118,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       console.log(
         c.err(`⚠️ 警告：${label} 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
       );
-      const ok = (await need('确认继续使用该明文端点？（输入 YES 继续 / 回车 = 重新输入）: ')).toUpperCase();
+      const ok = (await need('确认继续使用该明文端点？（输入 YES = 继续，回车 = 重新输入）: ')).toUpperCase();
       if (ok === 'YES' || ok === 'Y') return u;
       u = await reprompt();
       if (!u) return '';
@@ -163,12 +179,13 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
       baseUrl = await ensureSecureBaseUrl(baseUrl);
     }
-    const apiKeyInput = await needSecret(`API Key${secretSuffix}: `);
-    if (!apiKeyInput) throw new Error('API Key 不能为空');
+    const apiKeyInput = await needRequired(io, `API Key${secretSuffix}: `, true);
     apiKey = apiKeyInput;
-    const modelInput = await need(preset.model ? `模型名（默认 ${preset.model}）: ` : '模型名（必填，如 gpt-4o）: ');
-    model = modelInput || preset.model;
-    if (!model) throw new Error('模型名不能为空');
+    if (preset.model) {
+      model = (await need(`模型名（默认 ${preset.model}）: `)) || preset.model;
+    } else {
+      model = await needRequired(io, '模型名（必填，如 gpt-4o）: ');
+    }
 
     // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
     // 两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
@@ -184,18 +201,15 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       } else {
         console.log(c.err(`模型配置校验失败：${check.message}`));
       }
-      const act = (await need('回车 = 直接重试；输入 k 改 API Key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
+      const act = (await need('回车 = 直接重试；输入 k = 改 API Key、b = 改 Base URL、m = 改模型名、s = 仍然保存: ')).toLowerCase();
       if (act === 's' || act === 'save' || act === '保存') break;
       if (act === 'b' || act === 'base' || act === 'url') {
-        baseUrl = await need(`Base URL（当前 ${baseUrl}）: `);
-        if (!baseUrl) throw new Error('Base URL 不能为空');
+        baseUrl = await needRequired(io, `Base URL（当前 ${baseUrl}）: `);
         baseUrl = await ensureSecureBaseUrl(baseUrl);
       } else if (act === 'm' || act === 'model') {
-        model = await need(`模型名（当前 ${model}）: `);
-        if (!model) throw new Error('模型名不能为空');
+        model = await needRequired(io, `模型名（当前 ${model}）: `);
       } else if (act === 'k' || act === 'key') {
-        apiKey = await needSecret(`API Key${secretSuffix}: `);
-        if (!apiKey) throw new Error('API Key 不能为空');
+        apiKey = await needRequired(io, `API Key${secretSuffix}: `, true);
       }
       // 其余输入（含回车）= 不修改，用当前配置直接重试
     }
@@ -248,7 +262,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
   const ocrNow = ocrLlmOverrides();
   const ocr: OcrLlmOverrides = {};
   const ocrModelRaw = await need(
-    `AI 审查模型（可选${ocrNow.model ? `，回车 = 保留当前 ${ocrNow.model}，输入 - 清除` : `，回车 = 与上方一致（${model}）`}）: `,
+    `AI 审查模型（可选${ocrNow.model ? `，回车 = 保留当前 ${ocrNow.model}，输入 - 清除` : `，回车 = 与上方一致，即 ${model}`}）: `,
   );
   if (ocrModelRaw) ocr.model = ocrModelRaw === '-' ? '' : ocrModelRaw;
   let ocrModel = ocrModelRaw === '-' ? '' : ocrModelRaw || ocrNow.model;
@@ -273,11 +287,12 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
 
   /**
    * OCR 配置联网预检：仅当覆盖项含显式 URL/key 时——端点与 key 全复用时主流程刚校验过，
-   * 不重复打扰。交互与主模型校验循环同一口径：回车 = 重试，保存必须显式输入 s。
+   * 不重复打扰。预检走 /models，不依赖模型名：「只隔离专用 key、不换模型」同样校验，
+   * 抄错 key 不会在向导里静默通过。交互与主模型校验循环同一口径：回车 = 重试，保存必须显式输入 s。
    */
   let effOcrUrl = ocr.url !== undefined ? ocr.url : ocrNow.url;
   let effOcrToken = ocr.token !== undefined ? ocr.token : ocrNow.token;
-  if (ocrModel && (effOcrUrl || effOcrToken)) {
+  if (effOcrUrl || effOcrToken) {
     for (;;) {
       console.log(c.gray('正在联网校验 AI 审查模型配置…'));
       const check = await verifyLlmConfig(effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl, effOcrToken || apiKey);
@@ -290,20 +305,20 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       } else {
         console.log(c.err(`AI 审查模型配置校验失败：${check.message}`));
       }
-      const act = (await need('回车 = 直接重试；输入 k 改专用 key、b 改 Base URL、m 改模型名；输入 s = 仍然保存: ')).toLowerCase();
+      const act = (await need('回车 = 直接重试；输入 k = 改专用 key、b = 改 Base URL、m = 改模型名、s = 仍然保存: ')).toLowerCase();
       if (act === 's' || act === 'save' || act === '保存') break;
       if (act === 'b' || act === 'base' || act === 'url') {
-        const raw = await need(`AI 审查 Base URL（当前 ${effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl}）: `);
-        if (raw) {
+        const raw = await need(`AI 审查 Base URL（当前 ${effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl}，输入 - = 清除覆盖项）: `);
+        if (raw === '-') ocr.url = '';
+        else if (raw) {
           const u = await ensureSecureBaseUrl(raw, { label: 'AI 审查 Base URL', allowEmpty: true });
           if (u) ocr.url = toOcrEndpoint(u);
         }
       } else if (act === 'm' || act === 'model') {
-        const m = await need(`AI 审查模型（当前 ${ocrModel}）: `);
+        const m = await need(`AI 审查模型（当前 ${ocrModel || model}）: `);
         if (m) {
           ocr.model = m === '-' ? '' : m;
           ocrModel = m === '-' ? '' : m;
-          if (!ocrModel) break; // 模型已清除，没有可预检的对象
         }
       } else if (act === 'k' || act === 'key') {
         const t = await needSecret(`AI 审查专用 API Key${secretSuffix}: `);
@@ -343,14 +358,15 @@ export async function ensureConfig(
 /**
  * 收集并校验飞书机器人凭证（联网校验失败可重输）。
  * allowClear 用于换绑场景：白名单可输入 `-` 清除（换新应用后旧 open_id 可能失效）。
+ * showChecklist 控制是否打印开放平台开通清单：换绑（--rebind）用户已完成过一次性步骤，跳过不重复打扰。
  */
 async function promptFeishuConfig(
   io: ReturnType<typeof makeNeed>,
   existing: FeishuBotConfig,
-  { allowClear = false }: { allowClear?: boolean } = {},
+  { allowClear = false, showChecklist = true }: { allowClear?: boolean; showChecklist?: boolean } = {},
 ): Promise<FeishuBotConfig> {
-  const { need, needSecret, secretSuffix } = io;
-  printFeishuSetupChecklist();
+  const { need, secretSuffix } = io;
+  if (showChecklist) printFeishuSetupChecklist();
   console.log(c.strong('配置飞书机器人凭证：\n'));
   let appId = '';
   let appSecret = '';
@@ -359,10 +375,8 @@ async function promptFeishuConfig(
   let reenter = true;
   for (;;) {
     if (reenter) {
-      appId = await need('FEISHU_APP_ID（cli_...）: ');
-      if (!appId) throw new Error('App ID 不能为空');
-      appSecret = await needSecret(`FEISHU_APP_SECRET${secretSuffix}: `);
-      if (!appSecret) throw new Error('App Secret 不能为空');
+      appId = await needRequired(io, 'FEISHU_APP_ID（cli_...）: ');
+      appSecret = await needRequired(io, `FEISHU_APP_SECRET${secretSuffix}: `, true);
     }
     console.log(c.gray('正在联网校验凭证…'));
     const check = await verifyFeishuApp(appId, appSecret);
@@ -380,6 +394,9 @@ async function promptFeishuConfig(
     ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join('、')}${allowClear ? '；输入 - 清除' : ''}）: `
     : `允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id${allowClear ? '' : '；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突）'}）: `;
   const allowedRaw = await need(allowedPrompt);
+  if (!allowClear && allowedRaw.split(',').some((s) => s.trim() === '-')) {
+    console.log(c.warn('「-」是换绑（bot --rebind）场景清除白名单的写法，本次配置不支持清除，已忽略该输入项。'));
+  }
   const allowedOpenIds = resolveAllowedOpenIds(allowedRaw, existing.allowedOpenIds, allowClear);
   return { appId, appSecret, allowedOpenIds };
 }
@@ -396,7 +413,7 @@ export async function rebindFeishuBot(
   if (existing.appId) {
     console.log(c.gray(`当前绑定 App ID：${existing.appId}，输入新机器人的凭证即完成换绑。`));
   }
-  const feishu = await promptFeishuConfig(makeNeed(ask, askSecret), existing, { allowClear: true });
+  const feishu = await promptFeishuConfig(makeNeed(ask, askSecret), existing, { allowClear: true, showChecklist: false });
   const envPath = writeEnv(currentConfig(), feishu);
   console.log(c.ok(`\n飞书机器人已换绑，配置保存到 ${envPath}\n`));
   return { feishu, envPath };

@@ -6,7 +6,7 @@ import { extractUuid } from './shared';
 
 /** 单次会话创建任务数上限（代码层强制，不只靠 prompt 自觉）。 */
 const MAX_CREATES_PER_SESSION = 50;
-const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，系统安全限制）。请如实告知用户；如需更多，建议 /clear 后再创建。`;
+const CREATE_CAP_MESSAGE = `单次会话最多创建 ${MAX_CREATES_PER_SESSION} 个看板任务（已达上限，系统安全限制）。请如实告知用户；如需更多，建议 /clear 后再创建（/clear 会清空当前对话上下文）。`;
 
 /**
  * 会话级创建计数：由 AgentSession 持有并经 options 传入 buildTools。
@@ -97,8 +97,15 @@ export function makeGatedWriter({
         registry.remove(uid, url, found.projectKey);
         continue;
       }
-      const exists = await kanbanTaskExists(kanbanUrl, hit.taskId, signal);
-      if (exists) {
+      const state = await kanbanTaskExists(kanbanUrl, hit.taskId, signal);
+      if (state === 'unknown') {
+        // 看板不可达：「已同步过」文案引导的删除/更新都做不到（死胡同），如实告知连接异常并暂缓
+        return (
+          `看板连接异常，无法确认该来源是否已同步过，为避免重复建任务已暂缓：\n- 来源：${url}\n` +
+          '请待看板恢复后重试；恢复后如该来源未同步过，会正常创建。'
+        );
+      }
+      if (state === 'exists') {
         // 存储层保持 ISO 不动（source-registry 持久化格式）；展示转本地时区（同 report 层做法）
         const createdShort = new Date(hit.createdAt).toLocaleString('zh-CN', { hour12: false });
         return (

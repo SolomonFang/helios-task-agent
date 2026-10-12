@@ -59,11 +59,19 @@ function noticePage(title: string, lines: string[]): string {
     '</div></body></html>';
 }
 
-/** 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效），并给出找回报告的出路。 */
-const NOT_FOUND_HTML = noticePage('报告不存在或已过期', [
-  '报告保留 30 天，机器人重启后旧链接也会失效。',
-  '请回到飞书重新发送指令，或重新点击卡片上的「AI 审查」，生成新报告。',
-]);
+/**
+ * 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效），并给出找回报告的出路。
+ * 本服务同时托管审查/日报/复盘/工作总结报告：通用出路是回飞书重新发指令；
+ * 仅 AI 审查报告（review- 前缀文件名）还可重新点击卡片上的「AI 审查」生成。
+ */
+function notFoundHtml(name: string): string {
+  const lines = [
+    '报告保留 30 天，机器人重启后旧链接也会失效。',
+    '请回到飞书重新发送指令，生成新报告。',
+  ];
+  if (name.startsWith('review-')) lines.push('AI 审查报告也可以重新点击卡片上的「AI 审查」重新生成。');
+  return noticePage('报告不存在或已过期', lines);
+}
 
 /** 400/405 统一中文说明：请求本身没法处理时，告诉用户回飞书重新拿链接。 */
 const BAD_REQUEST_HTML = noticePage('链接无法处理', [
@@ -83,13 +91,13 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
       const name = pathname.replace(/^\/+/, '');
       // 仅允许根目录下的单层 .html 文件名，杜绝路径穿越
       if (!/^[\w.-]+\.html$/.test(name)) {
-        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(NOT_FOUND_HTML);
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(notFoundHtml(name));
         return;
       }
       // 命中任一报告目录即服务；均不存在则 404
       const file = roots.map((root) => path.join(root, name)).find((f) => fs.existsSync(f));
       if (!file) {
-        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(NOT_FOUND_HTML);
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(notFoundHtml(name));
         return;
       }
       // existsSync 与读流之间有竞态（报告可能恰好被 prune 删掉）：error 无监听者会以

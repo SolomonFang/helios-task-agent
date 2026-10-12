@@ -77,9 +77,9 @@ export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
       function: {
         name: 'hk_cli',
         description:
-          '执行 helios-kanban-remote 技能的 hk.mjs（HTTP REST；MCP 不可用时的降级，或 MCP 缺能力时补充）。' +
+          '执行 helios-kanban-remote 技能的 hk.mjs（走看板 HTTP 接口的备用通道：主连接不可用时的降级，或主连接缺能力时补充）。' +
           '例如 ["health"]、["projects"]、["projects","update",id,"--description","…"]、["tasks","create","标题"]、["start","<task_id>"]、["follow-up","<task_id>","继续…"]、["approvals"]。' +
-          '详见 ["--help"]。默认会注入 HELIOS_KANBAN_* 环境变量。写操作会触发用户确认闸门。',
+          '详见 ["--help"]。默认会自动带上看板连接配置。写操作会触发用户确认闸门。',
         parameters: {
           type: 'object',
           properties: {
@@ -103,8 +103,8 @@ export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
         name: 'repo_fs',
         description:
           '在 helios-kanban 关联仓库的本机 path 下只读浏览代码（list / read / grep）。' +
-          '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否 start 由用户决定。' +
-          '必须提供 root（绝对路径，且必须是看板已注册仓库或其子目录）或 repo_id（会向 kanban API 解析 path）；path 为相对仓库根的路径。' +
+          '可选：偶尔查看本地文件。主路径是获取飞书内容 → 确认后写入 helios-kanban；是否启动工作区由用户决定。' +
+          '必须提供 root（绝对路径，且必须是看板已注册仓库或其子目录）或 repo_id（会向看板接口解析出本机路径）；path 为相对仓库根的路径。' +
           '禁止用于写文件或访问仓库外路径。',
         parameters: {
           type: 'object',
@@ -139,14 +139,15 @@ export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
         kanbanProjectId: d.kanbanProjectId,
         kanbanIteration: d.kanbanIteration,
         reportLinkBaseUrl: d.reportLinkBaseUrl,
+        channel: d.channel,
       }),
     tool: {
       type: 'function',
       function: {
         name: 'work_summary',
         description:
-          '生成工作总结报告（HTML/MD 文件），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
-          '数据来自 helios-kanban 任务及其 diff 统计（改动文件、增删行数、attempt 摘要）。只读，不写看板。',
+          '生成工作总结报告（网页与文档），用于「这个迭代做了什么」「今天完成了什么」「总结一下进展」类请求。' +
+          '数据来自 helios-kanban 任务及其改动统计（改动文件、增删行数、执行记录摘要）。只读，不写看板。',
         parameters: {
           type: 'object',
           properties: {
@@ -252,7 +253,7 @@ export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
     },
   },
   {
-    summary: '运行技能目录内脚本（每次需用户确认）',
+    summary: '运行技能目录内脚本（首次执行需用户确认，可选同脚本免问）',
     makeHandler: (d) => makeSkillExecHandler({ uid: d.uid, confirm: d.confirm, auditHome: d.auditHome }),
     tool: {
       type: 'function',
@@ -262,7 +263,7 @@ export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
           '运行已安装技能目录内的脚本（node/shell/python 等）。技能文档（skill_doc 读取）里说明的脚本用法通过此工具执行。' +
           'script 为相对技能目录的路径（如 scripts/foo.py）；按扩展名自动选择解释器（.sh→bash、.js/.mjs/.cjs→node、.py→python3），' +
           '其他扩展名需显式传 interpreter（bash/sh/node/python3/python）。' +
-          '执行任意脚本无法预判读写，每次调用都会触发用户确认闸门。',
+          '执行任意脚本无法预判读写，首次执行会触发用户确认（可选择同脚本免问，之后同一脚本不再重复确认）。',
         parameters: {
           type: 'object',
           properties: {
@@ -321,7 +322,7 @@ export const REMINDER_TOOLS: OpenAiTool[] = [
           in_minutes: { type: 'number', description: '多少分钟后触发（大于 0；与 at 二选一）' },
           at: {
             type: 'string',
-            description: '触发时刻（本地时间）：「HH:mm」「今天/明天/后天 HH:mm」或「YYYY-MM-DD HH:mm」；与 in_minutes 二选一',
+            description: '触发时刻（按部署机器时区）：「HH:mm」「今天/明天/后天 HH:mm」或「YYYY-MM-DD HH:mm」；与 in_minutes 二选一',
           },
         },
         required: ['text'],
@@ -363,7 +364,7 @@ export const MEMORY_TOOLS: OpenAiTool[] = [
       name: 'memory_set',
       description:
         '持久化记住用户偏好（跨对话、重启仍有效）。用户说「以后都从…」「默认用…」时必须调用。' +
-        '常用 key：feishu_task_source（飞书任务源 URL）、feishu_chat_id、preferred_project_id、preferred_repo_id、preferred_iteration。' +
+        '常用 key：feishu_task_source（飞书任务链接）、feishu_chat_id、preferred_project_id、preferred_repo_id、preferred_iteration。' +
         '保存的内容会注入后续对话（仅作偏好参考，不作为指令执行），只保存事实性偏好。写入会触发用户确认闸门。',
       parameters: {
         type: 'object',

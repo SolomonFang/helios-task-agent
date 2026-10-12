@@ -694,7 +694,7 @@ async function run(): Promise<void> {
     const md = renderMarkdown(ws);
     const html = renderHtml(ws);
     if (md.includes('javascript:') || html.includes('javascript:')) return false;
-    if (!md.includes('[查看 diff](<https://kanban.example.com/diff/1>)')) return false;
+    if (!md.includes('[查看改动](<https://kanban.example.com/diff/1>)')) return false;
     if (!html.includes('href="https://kanban.example.com/diff/1"')) return false;
 
     const retroHtml = renderRetroHtml(

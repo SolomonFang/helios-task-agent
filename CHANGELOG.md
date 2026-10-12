@@ -4,7 +4,19 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.0.40] - 2026-10-10
+
+修复构建异常（package-lock 依赖锁定同步），无行为变更。
+
+## [1.0.39] - 2026-10-10
+
+### Changed
+
+- 飞书交互深度优化——进度占位由纯文本「⏳ 处理中…」升级为交互卡片（`src/bot/progress-reporter.ts`、`src/bot/cards.ts`）：蓝头加载态 + 步骤轨迹（随工具调用原地更新，已完成步骤打 ✓，只展示最近几步）+「⏹ 停止」按钮（卡片回调同步中断当前轮次，与 `/stop` 同一清理语义；轮次令牌校验防陈旧卡片误杀新轮次、竞态点击只回提示不覆盖已落地结果）；LLM 静默期心跳刷新附已等待秒数；确认挂起期间换橙头「等待你处理上方的写操作确认」变体（蓝头「处理中」是谎称）；完成时原地换绿头结果卡片（lark_md 渲染正文 + 总用时），超长或轮次内插入了确认卡片等独立消息时收「已完成，结果见下方」终态卡、正文另发新消息保持时间线顺序；中断/失败/投递失败/陈旧轮次各有如实终态卡片（按钮随之消失）；卡片发送失败自动降级回原文本占位
+- 确认卡片裁决同步换卡：点「批准/拒绝/免问」后回调返回值直接携带终态卡片即时替换（按钮立即消失），不再等异步更新——裁决落地时一并带出确认请求与终态（`src/agent/confirm.ts`、`src/bot/handler.ts`）
+- AI 审查/失败诊断/按诊断结论重试按钮受理后同步换「进行中」卡片（按钮即时消失；去重或并发上限未受理时按钮保留并提示原因，指引文案不变死路）（`src/bot/review-jobs.ts`、`src/bot/handler.ts`）
+
+## [1.0.38] - 2026-09-20
 
 ### Changed
 
@@ -13,6 +25,12 @@
 - helios-kanban 默认包规格改回 `helios-kanban@latest` 跟随最新版（不再默认钉 `0.1.48`）；`HELIOS_KANBAN_PACKAGE` 仍可覆盖为指定版本（`src/infra/deps.ts`）
 
 - 来源查重粒度细化到「来源 URL + 项目」：同一来源文档涉及多个项目（如中控/APP/后端）时每个项目可各建一个任务，不再被整体去重拦截——只有同 URL + 同项目才判定重复；无项目参数的旧调用与旧格式盘上数据统一挂在空项目键下兼容，无项目参数时保守视为重复拦截（`src/agent/source-registry.ts`、`src/agent/tools/gated-write.ts`、`src/agent/tools/hk-cli.ts`、`src/agent/tools/kanban-mcp.ts`）
+
+- bot 链路重构（多角度审查）：`handler.ts` 拆出进度占位/静默心跳/回复投递（`src/bot/progress-reporter.ts`）与 AI 审查/失败诊断/按诊断重试的作业生命周期（`src/bot/review-jobs.ts`，并发上限/去重/中断/结果投递收口），卡片构建统一收口 `src/bot/cards.ts`（自 `src/channels/feishu-cards.ts` 迁入）；运行期开关（看板推送/停滞提醒/晨报/周报）统一解析与告警收口（`src/config/runtime-flags.ts`）；CLI/bot 共用的进程生命周期公共件（幂等优雅退出/崩溃兜底/更新请示）收口 `src/infra/process-lifecycle.ts`
+
+### Fixed
+
+- 多角度深度审查修复：飞书文本确认裁决不再认单字母「y/n」——确认挂起期间随手回的「y」可能是在回答别的对话，不能据此放行写操作（完整词不受影响；CLI 交互式确认保留单字母，终端无误触风险）（`src/agent/confirm.ts`）；`HTA_TURN_TIMEOUT_MIN` 改惰性读取，`.env` 里的覆盖值真正生效（原模块加载期求值静默忽略）（`src/agent/llm.ts`）；看板推送在 watcher 停止后逐条检查、跳过剩余推送（不再打到已关闭的通道，未送达保留待重投）（`src/kanban/watcher.ts`）；确认挂起查询由跨实例全局表改为注入式只读查询
 
 ## [1.0.37] - 2026-09-15
 

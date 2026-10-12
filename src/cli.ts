@@ -236,10 +236,13 @@ export async function main(): Promise<void> {
         kanbanChild.stdout?.destroy();
         kanbanChild.stderr?.destroy();
         kanbanChild.unref();
-        // win32 无进程组 kill：taskkill /T 杀整棵进程树，/F 强制
+        // win32 无进程组 kill：taskkill /T 杀整棵进程树，/F 强制；
+        // 注解前移到命令前（整行复制时粘在行尾的注解会污染命令）
         const stopHint =
-          process.platform === 'win32' ? `taskkill /PID ${kanbanChild.pid} /T /F` : `kill -- -${kanbanChild.pid}（进程组）`;
-        console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），停止：${stopHint}`));
+          process.platform === 'win32'
+            ? `停止（杀进程树）：taskkill /PID ${kanbanChild.pid} /T /F`
+            : `停止（杀进程组）：kill -- -${kanbanChild.pid}`;
+        console.log(c.gray(`看板服务保留运行（${cfg.kanbanUrl}），${stopHint}`));
       }
       rl.close();
     },
@@ -393,6 +396,26 @@ export async function main(): Promise<void> {
   /** MCP 实例绑定的看板地址：/config 改地址后 MCP 不会重连，/status 据此持续警示，直到重启。 */
   const mcpBoundKanbanUrl = cfg.kanbanUrl;
 
+  /**
+   * 看板连接的轻量存活探测：connectMcp 的 mcpOk 是启动时一次性快照，会话中看板重启/崩溃后
+   * 快照不失效会谎称「正常」，/status 与 /tools 调用时现测（ping 短超时，CLI 无重连机制）。
+   */
+  const probeMcpAlive = async (): Promise<boolean> => {
+    if (!mcpOk || !mcp.connected) return false;
+    try {
+      await Promise.race([
+        mcp.ping(),
+        new Promise<never>((_resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('probe timeout')), 3000);
+          t.unref();
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   // 发现新版本则请示是否更新（用户选 y 会执行 npm i -g；更新后需重启生效，复用 cleanup 的看板处置）
   if (pendingUpdate) {
     const info = await pendingUpdate;
@@ -456,15 +479,18 @@ export async function main(): Promise<void> {
         }
         console.log('');
       } else if (cmd === '/tools') {
+        const mcpAlive = await probeMcpAlive();
         for (const l of buildToolsLines(
           {
-            mcpOk,
+            mcpOk: mcpAlive,
             mcpTools: mcp.tools,
             // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册；reminder_* 同理恒注册
             memoryEnabled: true,
             reminderEnabled: true,
             kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
-            downNote: c.warn(`看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`),
+            downNote: mcpOk
+              ? c.warn('看板连接已断开，看板工具暂不可用；退出并重新运行本程序即可恢复（/exit 退出）。')
+              : c.warn(`看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`),
             localHeader: c.strong('本地工具：'),
             bullet: '  ',
           },
@@ -486,13 +512,16 @@ export async function main(): Promise<void> {
           console.log(l);
         }
       } else if (cmd === '/status') {
+        const mcpAlive = await probeMcpAlive();
         const lines = await buildStatusLines(
           {
             model: cfg.llmModel,
             kanbanUrl: cfg.kanbanUrl,
-            mcpOk,
+            mcpOk: mcpAlive,
             mcpToolCount: mcp.tools.length,
-            mcpDownNote: '连接失败，已切换为备用通道',
+            mcpDownNote: mcpOk
+              ? '连接已断开，退出并重新运行本程序即可恢复（/exit 退出）'
+              : '连接失败，已切换为备用通道',
             larkOk: larkStatus !== 'missing',
             // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启；
             // MCP 从未连上时不存在「旧连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
@@ -538,6 +567,9 @@ export async function main(): Promise<void> {
           // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，不打成红色「配置失败」
           if (!handleWizardCancel(err)) console.error(c.err(`配置失败：${errMessage(err)}`));
         }
+      } else if (cmd === '/stop') {
+        // bot 帮助教用户 /stop；同一用户到 CLI 输入 /stop 时给出本端等价操作，不报「未知命令」
+        console.log(c.gray('CLI 中按 Ctrl+C 中断当前任务（/exit 退出）。'));
       } else {
         console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));
       }

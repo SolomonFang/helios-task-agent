@@ -237,7 +237,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 **Terminal**: `/help` `/config` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` (`/confirm on` legacy alias) `/exit` `/quit` (Ctrl+C interrupts a turn; during a confirm prompt it rejects that write)
 
-**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages). Instant: `/help` `/stop` `/confirm` `/status` `/tools` `/skills`. Queued: `/memory` `/clear` and normal chat.
+**Feishu**: `/help` `/status` `/tools` `/skills` `/memory` `/clear` `/confirm` `/confirm revoke` `/stop` (aborts the running task, cancels pending write confirms, and discards queued messages; the 「⏹ 停止」 button on the progress card does the same). Instant: `/help` `/stop` `/confirm` `/status` `/tools` `/skills`. Queued: `/memory` `/clear` and normal chat.
 
 **Examples**:
 
@@ -251,7 +251,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 - "Remind me about the standup in 30 minutes / remind me to watch the build at 9am tomorrow" (scheduled reminders)
 - "Retrospect this iteration" / "write my daily report for today" (iteration retro / personal daily report)
 
-Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); with `LLM_VISION=1` you can also send image messages (analyzed by the model with that single request — never written to disk or history, 10MB cap); other types rejected. Replies split ~3000 chars; the progress placeholder updates on tool calls (throttled ~2s) and heartbeats every 10s during silent LLM thinking (with elapsed seconds). Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt. Conversation history is persisted per user (`sessions/`) and restored after restart; `/clear` wipes it from disk too.
+Bot accepts text and rich-text messages (links/@/images/files/code blocks are converted to plain text); with `LLM_VISION=1` you can also send image messages (analyzed by the model with that single request — never written to disk or history, 10MB cap); other types rejected. Replies split ~3000 chars; while working, the bot posts a progress card (blue loading header + a step trail that updates in place on tool calls, throttled ~2s), heartbeats every 10s during silent LLM thinking with elapsed seconds, and honestly switches to an orange "waiting for your write-operation confirmation above" variant while a confirm is pending; the card's 「⏹ 停止」 button aborts the current turn like `/stop`. On completion the card is replaced in place by a green result card (with total elapsed time); over-long replies or turns with interleaved messages (e.g. confirm cards) settle to a "done, see below" terminal card with the body sent as new messages; if the card can't be sent it falls back to the plain text placeholder (same behavior as before). Per-user serial queue; `message_id` dedupe 10 minutes. New messages arriving while busy or while a confirm is pending get a queued/hint receipt. Conversation history is persisted per user (`sessions/`) and restored after restart; `/clear` wipes it from disk too.
 
 Memory tools: `memory_set` / `get` / `delete` / `note` (notes keep roughly the latest 50 entries). Keys: `feishu_task_source`, `feishu_chat_id`, `preferred_*`, `last_sync_at`.
 

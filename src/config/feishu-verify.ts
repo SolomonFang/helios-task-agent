@@ -30,6 +30,10 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
       signal: AbortSignal.timeout(timeoutMs),
     });
+    // 先判 HTTP 状态：飞书侧 5xx 也可能带 JSON body，不能落入「凭证无效」误诊
+    if (!res.ok) {
+      return { ok: false, message: `飞书服务异常（HTTP ${res.status}），请稍后重试。` };
+    }
     const json = (await res.json()) as { code?: number; msg?: string; tenant_access_token?: string };
     if (json.code !== 0 || !json.tenant_access_token) {
       return {
@@ -50,6 +54,9 @@ export async function verifyFeishuApp(appId: string, appSecret: string, timeoutM
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (!res.ok) {
+      return { ok: false, message: `飞书服务异常（HTTP ${res.status}），请稍后重试。` };
+    }
     const json = (await res.json()) as { code?: number; msg?: string; bot?: { app_name?: string } };
     if (json.code !== 0) {
       return {

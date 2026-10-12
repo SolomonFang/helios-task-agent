@@ -147,7 +147,7 @@ function parseAbsoluteAt(raw: string, now: Date): number {
     if (!Number.isNaN(ms)) return ms;
   }
   throw new Error(
-    `无法识别的时间「${raw}」：支持「HH:mm」「今天/明天/后天 HH:mm」「YYYY-MM-DD HH:mm」（均为本地时间），相对时长直接说「30 分钟后」即可`,
+    `无法识别的时间「${raw}」：支持「HH:mm」「今天/明天/后天 HH:mm」「YYYY-MM-DD HH:mm」（均按部署机器时区），相对时长直接说「30 分钟后」即可`,
   );
 }
 
@@ -392,6 +392,11 @@ export interface ReminderRunnerOptions {
  * 指数退避（封顶 30 分钟）落盘 nextRetryAt，窗口过后补投——进程重启后到点未投的
  * 首次 tick 即补投，已投的不重复。deliverable 按 uid 分流跨形态桶（CLI/bot 互不截胡）。
  */
+/** 投递日志的 uid 脱敏（与 confirm.ts logSettle 同口径）：头尾保留、中间打码；短 id 整体打码。 */
+function maskUserId(userId: string): string {
+  return userId.length > 8 ? `${userId.slice(0, 4)}…${userId.slice(-2)}` : '***';
+}
+
 export class ReminderRunner {
   private readonly opts: ReminderRunnerOptions;
   private timer: NodeJS.Timeout | null = null;
@@ -438,16 +443,16 @@ export class ReminderRunner {
         try {
           await this.opts.deliver(userId, buildReminderText(reminder));
           if (this.opts.store.markDelivered(userId, reminder.id, nowMs)) {
-            this.opts.log?.(`提醒已送达（${userId}）：${reminder.text.slice(0, 50)}`);
+            this.opts.log?.(`提醒已送达（${maskUserId(userId)}）：${reminder.text.slice(0, 50)}`);
           } else {
             this.deliveredUnpersisted.add(dedupeKey);
-            this.opts.log?.(`提醒已送达但落盘失败（${userId}），存储恢复前不再重复推送：${reminder.text.slice(0, 50)}`);
+            this.opts.log?.(`提醒已送达但落盘失败（${maskUserId(userId)}），存储恢复前不再重复推送：${reminder.text.slice(0, 50)}`);
           }
         } catch (err) {
           if (this.opts.store.markFailed(userId, reminder.id, nowMs)) {
-            this.opts.log?.(`提醒投递失败（${userId}），退避后补投: ${errMessage(err)}`);
+            this.opts.log?.(`提醒投递失败（${maskUserId(userId)}），退避后补投: ${errMessage(err)}`);
           } else {
-            this.opts.log?.(`提醒投递失败且退避落盘失败（${userId}），存储恢复前将每轮立即重试: ${errMessage(err)}`);
+            this.opts.log?.(`提醒投递失败且退避落盘失败（${maskUserId(userId)}），存储恢复前将每轮立即重试: ${errMessage(err)}`);
           }
         }
       }

@@ -137,7 +137,7 @@ export function printBanner(status: BannerStatus): void {
     '  ' + c.gray('●') + ` 模型             ${c.strong(status.model)} ${c.gray('(' + status.baseUrl + ')')}`,
     '  ' + c.gray('●') + ` 看板地址         ${status.kanbanUrl}`,
     '',
-    c.gray('  输入 /help 查看命令，/config 重新配置模型，/exit 退出'),
+    c.gray('  输入 /help 查看命令，/config 重新配置模型 / 看板地址，/exit 退出'),
     '',
   ];
   console.log(box(lines, { width: 66 }));
@@ -155,7 +155,11 @@ export class Spinner {
 
   start(text?: string): this {
     if (text) this.text = text;
-    if (!process.stdout.isTTY) return this;
+    if (!process.stdout.isTTY) {
+      // 非 TTY 转圈不可见：首行文本与后续每次 setText 以普通行打印一次，等待期（最长约 90 秒）不零输出
+      console.log(this.text);
+      return this;
+    }
     this.stop();
     this.timer = setInterval(() => {
       const frame = c.info(this.frames[(this.i = (this.i + 1) % this.frames.length)]);
@@ -166,6 +170,7 @@ export class Spinner {
 
   setText(text: string): this {
     this.text = text;
+    if (!process.stdout.isTTY) console.log(text);
     return this;
   }
 

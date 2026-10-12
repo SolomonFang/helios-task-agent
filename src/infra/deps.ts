@@ -135,10 +135,12 @@ export function kanbanManualStartHint(opts?: { port?: string | number; autoStart
   const lines =
     process.platform === 'win32'
       ? [
-          `可手动执行（cmd）：set PORT=${port} && npx -y ${spec}（多数情况是首次下载慢，重新运行即可）`,
-          `或 PowerShell：$env:PORT=${port}; npx -y ${spec}`,
+          '可手动执行（多数情况是首次下载慢，重新运行即可）。cmd：',
+          `set PORT=${port} && npx -y ${spec}`,
+          '或 PowerShell：',
+          `$env:PORT=${port}; npx -y ${spec}`,
         ]
-      : [`可手动执行：PORT=${port} npx -y ${spec}（多数情况是首次下载慢，重新运行即可）`];
+      : ['可手动执行（多数情况是首次下载慢，重新运行即可）：', `PORT=${port} npx -y ${spec}`];
   if (opts?.autoStart !== false) {
     lines.push('或设置 HELIOS_KANBAN_AUTO_START=0 并自行保证服务已运行。');
   }

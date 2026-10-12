@@ -185,6 +185,11 @@ export interface WeeklyBriefOptions {
   log?: (msg: string) => void;
 }
 
+/** 推送日志的 owner open_id 脱敏（与 confirm.ts logSettle 同口径）：头尾保留、中间打码；短 id 整体打码。 */
+function maskOwner(openId: string): string {
+  return openId.length > 8 ? `${openId.slice(0, 4)}…${openId.slice(-2)}` : '***';
+}
+
 export class WeeklyBrief {
   private readonly opts: WeeklyBriefOptions;
   private timer: NodeJS.Timeout | null = null;
@@ -286,7 +291,7 @@ export class WeeklyBrief {
             });
       } catch (err) {
         this.markFailure(now.getTime());
-        this.opts.log?.(`周报采集失败，本次跳过: ${errMessage(err)}`);
+        this.opts.log?.(`周报采集失败，本次跳过：${errMessage(err)}`);
         return;
       }
       const text = buildWeeklyBriefText(data, now);
@@ -298,7 +303,7 @@ export class WeeklyBrief {
           sent.push(owner);
         } catch (err) {
           failed++;
-          this.opts.log?.(`周报推送失败（${owner}）: ${errMessage(err)}`);
+          this.opts.log?.(`周报推送失败（${maskOwner(owner)}）：${errMessage(err)}`);
         }
       }
       this.state = { date: today, delivered: sent };
@@ -312,7 +317,7 @@ export class WeeklyBrief {
         this.opts.log?.(`周报已送达 ${targets.length} 个 owner`);
       }
     } catch (err) {
-      this.opts.log?.(`周报检查失败: ${errMessage(err)}`);
+      this.opts.log?.(`周报检查失败：${errMessage(err)}`);
     } finally {
       this.running = false;
     }

@@ -262,6 +262,29 @@ async function main(): Promise<void> {
     }
   });
 
+  // ---------- Runner：投递日志脱敏——open_id 只留头尾摘要，不完整落日志（与 confirm 裁决日志同口径） ----------
+  await checkAsync('ReminderRunner：投递日志的 open_id 头尾保留中间打码', async () => {
+    const tmp = tmpHome('masklog');
+    try {
+      const openId = 'ou_1234567890abcdef1234';
+      const store = new ReminderStore(tmp);
+      store.add(openId, '脱敏验证', NOW_MS - 1000); // 已到点
+      const logs: string[] = [];
+      const runner = new ReminderRunner({
+        store,
+        deliver: async () => undefined,
+        now: () => new Date(NOW_MS),
+        log: (m) => logs.push(m),
+      });
+      await tickOf(runner)();
+      assert.ok(logs.some((m) => m.includes('提醒已送达')), `应有送达日志：${logs.join(' | ')}`);
+      assert.ok(logs.every((m) => !m.includes(openId)), `日志不得含完整 open_id：${logs.join(' | ')}`);
+      assert.ok(logs.some((m) => m.includes('ou_1…34')), `应保留头尾摘要：${logs.join(' | ')}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('ReminderRunner：投递失败指数退避（1→2 分钟），窗口内不重试、窗口后补投', async () => {
     const tmp = tmpHome('backoff');
     try {

@@ -25,6 +25,8 @@ const TASK_TYPE_LABELS: Record<string, string> = {
 function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
   if (!/create/i.test(toolName)) return summarizeBothEnds(`kanban_${toolName}(${JSON.stringify(args)})`);
   const title = typeof args.title === 'string' ? args.title : '';
+  // create_project 的名称在 args.name（无 title 字段）
+  const name = typeof args.name === 'string' ? args.name : '';
   const desc = typeof args.description === 'string' ? args.description : '';
   const project = String(args.project_id ?? args.projectId ?? '');
   const priorityLabel = typeof args.priority === 'string' ? PRIORITY_LABELS[args.priority] : undefined;
@@ -32,7 +34,9 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
   const taskTypeLabel = taskType ? TASK_TYPE_LABELS[taskType] : undefined;
   const preview = desc ? `描述预览：\n${summarizeBothEnds(desc, 200, 100)}` : '';
   return [
-    `标题：${title}`,
+    // 空标题省略整行，不渲染裸「标题：」
+    title ? `标题：${title}` : '',
+    name ? `名称：${name}` : '',
     project ? `项目 ID：${project}` : '',
     // 未命中中文映射时省略该行，不把英文枚举透传到确认卡片
     priorityLabel ? `优先级：${priorityLabel}` : '',
@@ -107,11 +111,16 @@ function mcpFailureText(toolName: string, args: Record<string, unknown>, err: un
   let reason: string;
   if (/[一-龥]/.test(message)) {
     reason = message;
-  } else if (/not found|does not exist|invalid/i.test(message)) {
-    // 确定性失败（任务不存在/参数非法）重试必败，不带「稍后重试」
+  } else if (/not found|does not exist/i.test(message)) {
+    // 确定性失败（任务不存在）重试必败，不带「稍后重试」
     reason = '看板拒绝了该操作，请核对任务是否存在、参数是否正确后重新发起';
+  } else if (/invalid|unauthorized|forbidden|credential|token|auth/i.test(message)) {
+    // 「invalid」收窄到本档：凭证失效类（invalid token/credentials 等）不能误诊为
+    // 「核对任务是否存在」——重试与联系部署者才是出路
+    reason = '看板拒绝了该操作，请重新发起；持续失败请联系部署者';
   } else {
-    reason = '看板服务暂时无响应，请稍后重试；持续失败请联系部署者';
+    // 连接类失败：CLI 无重连机制，看板正常但仍失败时重启本程序才能恢复连接
+    reason = '看板服务暂时无响应，请稍后重试；若看板服务正常但仍失败，请重启本程序恢复连接；持续失败请联系部署者';
   }
   return `调用失败：${label}（${reason}）`;
 }

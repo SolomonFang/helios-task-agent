@@ -27,6 +27,22 @@ function print(data) {
   process.stdout.write(JSON.stringify(data === undefined ? null : data, null, 2) + '\n');
 }
 
+// undici fetch failures throw TypeError("fetch failed") with the real reason on
+// err.cause (ECONNREFUSED / ENOTFOUND / timeout); multi-address failures nest an
+// AggregateError of sub-errors. Unwrap so stderr stays diagnosable.
+function netErrorText(err) {
+  const cause = err && err.cause;
+  const parts = [err && err.message];
+  if (cause) {
+    parts.push(cause.code, cause.message);
+    if (Array.isArray(cause.errors)) {
+      for (const sub of cause.errors) parts.push(sub && sub.code, sub && sub.message);
+    }
+  }
+  const detail = [...new Set(parts.filter(Boolean).map(String))].join(' ');
+  return `error: ${detail || 'network request failed'} (target: ${BASE_URL})`;
+}
+
 async function api(method, path, body, opts = {}) {
   const url = `${BASE_URL}/api${path}`;
   let res;
@@ -37,8 +53,9 @@ async function api(method, path, body, opts = {}) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (err) {
-    if (opts.soft) throw new ApiError(err.message);
-    fail(err.message);
+    const msg = netErrorText(err);
+    if (opts.soft) throw new ApiError(msg);
+    fail(msg);
   }
   const text = await res.text();
   let json;
@@ -304,7 +321,7 @@ async function cmdHealth() {
   try {
     res = await fetch(`${BASE_URL}/api/health`);
   } catch (err) {
-    fail(err.message);
+    fail(netErrorText(err));
   }
   const text = await res.text();
   let json;

@@ -1,6 +1,6 @@
 import type { ToolHandler } from '../../types';
 import { wrapUntrusted } from '../guard';
-import { collectWorkSummary, type WorkSummaryScope } from '../../kanban/summary';
+import { collectWorkSummary, type WorkSummaryData, type WorkSummaryScope } from '../../kanban/summary';
 import { summarizeForChat, writeSummaryReports } from '../../report/report';
 import { errMessage } from '../../infra/err';
 
@@ -10,11 +10,13 @@ export function makeWorkSummaryHandler({
   kanbanProjectId,
   kanbanIteration,
   reportLinkBaseUrl,
+  channel,
 }: {
   kanbanUrl: string;
   kanbanProjectId?: string;
   kanbanIteration?: string;
   reportLinkBaseUrl?: string;
+  channel?: 'cli' | 'bot';
 }): ToolHandler {
   return async (raw) => {
     const iteration =
@@ -25,23 +27,30 @@ export function makeWorkSummaryHandler({
     else scope = iteration ? 'iteration' : 'today';
     if (scope === 'iteration' && !iteration) scope = 'today';
     const format = raw.format === 'html' || raw.format === 'md' ? raw.format : 'both';
+    let data: WorkSummaryData;
     try {
-      const data = await collectWorkSummary({
+      data = await collectWorkSummary({
         kanbanUrl,
         projectId: kanbanProjectId || undefined,
         iteration: iteration || undefined,
         scope,
       });
+    } catch (err) {
+      // 看板地址（本机 localhost，bot 用户打不开）与英文报错原文不落用户面；原文进 HTA_DEBUG 日志
+      if (process.env.HTA_DEBUG) console.error(`[work_summary] 报错原文：${errMessage(err)}`);
+      return '生成工作总结失败：看板服务暂时无响应，请稍后重试；持续失败请联系部署者检查看板服务。';
+    }
+    try {
       const paths = writeSummaryReports(data, { format });
       const empty = data.tasks.length
         ? ''
         : '该范围内没有匹配的任务，已生成空报告（各项为 0）。\n\n';
       // 报告内容源自看板数据（任务标题/摘要等），UNTRUSTED 包裹
-      return wrapUntrusted(empty + summarizeForChat(data, paths, { linkBaseUrl: reportLinkBaseUrl }));
+      return wrapUntrusted(empty + summarizeForChat(data, paths, { linkBaseUrl: reportLinkBaseUrl, channel }));
     } catch (err) {
-      // 看板地址（本机 localhost，bot 用户打不开）与英文报错原文不落用户面；原文进 HTA_DEBUG 日志
+      // 写盘失败（磁盘满/权限不足）重试必败，与看板采集失败分开定性，不把部署者引向看板服务
       if (process.env.HTA_DEBUG) console.error(`[work_summary] 报错原文：${errMessage(err)}`);
-      return '生成工作总结失败：看板服务暂时无响应，请稍后重试；持续失败请联系部署者检查看板服务。';
+      return '生成工作总结失败：报告文件写入失败，请联系部署者检查报告目录。';
     }
   };
 }

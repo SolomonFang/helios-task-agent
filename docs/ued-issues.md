@@ -528,3 +528,54 @@
 
 - 周报错过推送日不补推（T42）：若修复需引入「本周已推」落盘判重，与晨报「看板不可达当天静默」同属刻意不打扰的设计权衡，修复前维持现状。
 - 提醒/晨报按部署机器时区触发（T35 的根因）：产品级约定，本轮仅修文案标注，时区可配置化留待后续。
+
+## 第十一轮复查（2026-10-12，飞书交互深度优化/Windows 适配后全表面复审）
+
+> 背景：第十轮后经历 20 个提交（1.0.33→1.0.40）：Windows 适配、ocr 模型单独配置、来源查重、handler 重构与「飞书交互深度优化」（进度占位改交互卡片含 ⏹ 停止按钮、确认裁决同步换卡、AI 审查/诊断/重试「进行中」卡片、review-jobs 抽出、hk.mjs 零依赖备用通道）。本轮 12 路并行审查 = 增量 diff 专项（bd09811..HEAD，86 文件）+ 11 个用户可见表面，共修复 57 项。修复由两波 9 路并行完成；验证：typecheck 0 错误，单测 17 个套件全过（含新增用例），smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为审查时点快照。
+
+### P1 误导与高风险
+
+- [x] **V1 「点击即换进行中卡片」改造引入两类死胡同**（本轮最大增量的系统性问题）：
+  - 作业失败后重试指引指向已消失的按钮：点「AI 审查/AI 诊断/↻ 重试」后原卡片被同步换成静态「进行中」卡片（按钮消失），但失败文案仍写「重新点击卡片上的『AI 审查/AI 诊断/↻ 重试』」——必败指引（N6/F15 同型恶化）。修复：失败文案全部改指文本可达路径（「可回复『重新审查这个任务』/『为什么失败』/『重试这个任务』」，handler 已有确定性拦截分支），review-jobs 的 hasOwnWayOut 抑制词同步把「重试」移出（底层按钮指引不再算自带出路）；ai-review.ts/failure-diagnosis.ts 底层文案同款对齐（`src/bot/review-jobs.ts`、`src/bot/handler.ts`、`src/kanban/ai-review.ts`、`src/kanban/failure-diagnosis.ts`）。
+  - 「进行中」卡片在机器人重启后永久谎称「完成后推送结果」：作业状态全在内存，重启后静默消亡、用户无限干等。修复：进行中卡片注脚补「机器人重启会使本次作业中断且不通知，若长时间无结果请重新发起」（`src/bot/cards.ts`）。
+
+### P2 文案可理解性与死胡同
+
+- [x] **V2 结果卡绿头恒称「✅ 已完成」，正文可能是「已中止/已达上限/（无回复）」**（T31 在新卡片模式复发）：buildResultCard 绿头与 seeBelow 终态卡、progress-reporter 文本兜底统一改中性「处理结束」（`cards.ts`、`progress-reporter.ts`）。
+- [x] **V3 进度卡片等确认注脚未按确认实际形态分支**（T49 漏网新路径）：文本降级确认时注脚仍写「点上方确认卡片的按钮」且漏「免问」应答词；文本心跳等确认分支丢「/stop 可中断」。接线 `pendingForm()`（hasCard/batchKey）按形态出文案（`cards.ts`、`progress-reporter.ts`、`handler.ts`）。
+- [x] **V4 「否」被 bot 单字符护栏静默吞掉，CLI 端却有效**：护栏 `t.length <= 1` 误伤词表内合法中文单字，用户已作答却收到「请回复确认或取消」谎称提示。改只挡 ASCII 单字母（`confirm.ts`，新增单测）。
+- [x] **V5 看板不可达时去重拦截文案指向打不开的看板**：kanbanTaskExists 改三态（exists/missing/unknown），unknown 时拦截文案改「看板连接异常…已暂缓，请待看板恢复后重试」（`source-registry.ts`、`gated-write.ts`，新增单测）。
+- [x] **V6 LLM 失败兜底「可设 HTA_DEBUG=1 重新运行」对 bot 用户不可执行且 Windows 语法不成立**（T6 漏网共享兜底）：按 channel 分岔，CLI 侧 win32 给 `set`/`$env:` 写法（`commands.ts`）。
+- [x] **V7 CLI /status、/tools 用启动时快照，会话中看板掉线后仍谎称「正常」且重试必败**：新增调用时存活探测（ping 短超时），掉线显示「连接已断开，退出并重新运行本程序即可恢复」（`cli.ts`）。
+- [x] **V8 向导四连**：EOF 文案「已完成的步骤已保存/断点继续」对主流程失实（改中性「本次未保存的输入需重新填写」）；OCR 校验条件把「只隔离 key」首推用法排除（改 `effOcrUrl || effOcrToken`）；空输入误按回车中止整个向导（改原地重问 6 处）；llm-verify 把 404 误诊「不代表配置有误」（单列「找不到该路径，请检查 Base URL 是否完整（如是否漏了 /v1）」）（`config-wizard.ts`、`llm-verify.ts`）。
+- [x] **V9 诊断采集失败嵌套括号+404 重试必败+病句**：404 单独定性「该任务在看板上已不存在…请到看板确认任务状态」（去「重试」字样），其余分支逗号分句（`failure-diagnosis.ts`）。
+- [x] **V10 AI 审查「输出过大」指引不可执行**：看板无「缩小审查范围」入口，改「到看板打开改动详情人工查看；反复出现请联系部署者」（`ai-review.ts`）。
+- [x] **V11 端口文件诊断「重启本程序即可恢复」只在看板是本程序子进程时成立**：主指引改「请重启看板服务即可恢复；若看板是本程序自动拉起的，退出并重新运行本程序即可」（`mcp.ts`）。
+- [x] **V12 work_summary 两处 T11/T43 漏网**：写盘失败误诊「看板服务无响应」（拆两段 try）；bot 场景报告服务不可用时推宿主机绝对路径、format='md' 时尾注指向不存在的链接（channel 透传 summarizeForChat，bot 无链接省略路径行、尾注回落「完整清单可直接问我」）（`work-summary.ts`、`defs.ts`、`report.ts`）。
+- [x] **V13 SKILL.md digest 超 3500 上限静默截断**：「Out of scope」整节丢失且断面无标记（实测 3613 字符）。精简 SKILL.md 压回 3423；skills.ts 截断改按章节边界丢弃并追加省略标记，loadSkill 补契约警告（`SKILL.md`、`skills.ts`，新增单测）。
+- [x] **V14 hk.mjs 网络失败只报英文 `fetch failed`**：解包 err.cause（含 AggregateError）输出错误码+目标地址，与 net-error.ts 口径对齐（`hk.mjs`，新增单测）。
+- [x] **V15 prompt 教模型「展示错误」与英文禁用规则同屏打架**：改「先用中文转述错误原因再给排查建议；地址/部署类问题引导联系部署者」（`prompt.ts`）。
+- [x] **V16 Windows cmd `set HOST=0.0.0.0 && …` 尾随空格陷阱**（&& 前空格被吃进变量值，照抄必败）：改 `set "HOST=0.0.0.0"&& …` 引号包值（`SKILL.md`、`INSTALL.md`）。
+- [x] **V17 hk 缺目标分支报错出路错挂「创建任务时」**（start 对已有任务不可执行）：改中性「直接告诉我使用哪个分支（如 develop）」（`hk-cli.ts`）。
+- [x] **V18 lark 对象级免问回执对文档/日程操作谎称「发往同一接收人」**：改「对同一对象（接收人/文档/日程等）」（`guard.ts`）。
+- [x] **V19 skill-tools 报错暴露内部工具名**：「先用 skill_doc（空 name）列出」改自然语言（T34 同类）；interpreter 参数名指引收进 description（`skill-tools.ts`）。
+- [x] **V20 BOT_CLI_USAGE 的 --rebind/--reconfig 缺「先停止当前机器人进程」警告**（bin 主帮助与 README 都有，bot --help 恰是最常看到的）：补齐（`bot-main.ts`）。
+- [x] **V21 CHANGELOG 缺 [1.0.38]/[1.0.39]/[1.0.40] 三节（第五次复发）**：按 tag 时点收编——原 [Unreleased] 三条移入 [1.0.38] 并补审查/查重摘要；[1.0.39] 收编飞书交互卡片化改造；[1.0.40] 一句话构建修复（`CHANGELOG.md`）。
+- [x] **V22 README 进度反馈停留在纯文本占位时代**：进度卡片（步骤轨迹/心跳/等确认橙头）与「⏹ 停止」按钮零提及。两版 README 改写为如实描述现状，/stop 行补按钮等价入口（`README.md`、`README.en.md`）。
+
+### P3 细节打磨
+
+- [x] **V23** deliverFailed 注脚「请重试或稍后再问」两句同义改「请把刚才的问题再发一次」；重试进行中卡片补回「📋 查看任务」url（按钮 value 透传）；hta_stop 契约注释改如实；「任务进展会继续推送」三处补对冲句；「重试这个任务」匹配剥尾部标点；retryLaunching 窗口回执改「重试正在发起中，请稍候」（`cards.ts`、`progress-reporter.ts`、`review-jobs.ts`、`handler.ts`、`feishu.ts`）。
+- [x] **V24** CLI/infra：未知命令对 /stop 特判「CLI 中按 Ctrl+C 中断」；kanbanManualStartHint 命令与说明分行（整行复制不再污染）；更新失败补 EACCES 分诊；Spinner 非 TTY 打印首行与心跳（F49 意图落到非 TTY）；banner「/config 重新配置模型」补「/ 看板地址」；退出提示「（进程组）」注解前移；「Promise rejection」改「异步错误」（`cli.ts`、`deps.ts`、`update-check.ts`、`ui.ts`、`process-lifecycle.ts`）。
+- [x] **V25** 向导细节：OCR 模型提示嵌套括号解套；重试操作串句式统一「输入 k = 改 API Key」；白名单 `-` 在 allowClear=false 时忽略并提示（原会被当字面 open_id 存下、全员被拒）；feishu-verify 先判 res.ok（5xx 不再误诊「凭证无效」）；KANBAN_WATCH_INTERVAL_SEC clamp 告警；OCR 重试循环支持 `-` 清除；--rebind 跳过新手清单（`config/`）。
+- [x] **V26** 看板链路：kanban-ensure 的 HTA_DEBUG 提示按平台分档；workspace-ready 超时去「执行目录一直为空」实现视角括注（`kanban-ensure.ts`、`workspace-ready.ts`）。
+- [x] **V27** agent 核心：提醒解析报错「本地时间」统一「按部署机器时区」；提醒投递日志 open_id 脱敏（复用 confirm 掩码）；历史裁剪注记落盘保留（重启恢复后模型知道历史不完整）；创建上限文案补「/clear 会清空当前对话上下文」（`reminder.ts`、`session-store.ts`、`gated-write.ts`）。
+- [x] **V28** 工具层：defs.ts 描述黑话中文化（HTTP REST/MCP/HELIOS_KANBAN_*/attempt/URL 等模型必读文本）；MCP 动态工具前缀「[helios-kanban MCP]」改「[看板]」；skill_exec「每次需确认」改如实「首次执行需确认（可选同脚本免问）」；提醒确认摘要截断补省略号；shared.run 的 bash/python3 缺失指引 Windows 分档；formatMcpDetail 空标题省略、create_project 补名称行、invalid 误诊收窄、失败兜底补「重启本程序恢复连接」；hk 确认 detail 标注缩写形态（`tools/`）。
+- [x] **V29** 报告与晨报/周报：晨报「其它状态」统一「其他」；工作总结「查看 diff」统一「查看改动」；晨报/周报日志 owner open_id 脱敏+半角冒号全角化；报告服务 404 出路按报告类型分岔；ocr Summary 正则不命中不再原文上徽章；日报页「其它分组」同类清理（`report/`、`daily-brief.ts`、`weekly-brief.ts`）。
+- [x] **V30** prompt/技能文档：INSTALL.md 排障表症状列更新为 hk.mjs 实际输出；SKILL.md 类型展示改中英映射表（防「新功能 feat」混排）；回复模板半角 `|` 全角化；INSTALL 汇报模板「Kanban 地址」改「看板地址」（`prompt.ts`、`SKILL.md`、`INSTALL.md`）。
+- [x] **V31** 收尾：bot-main 认领成功/失败通知与日志的英文 owner 统一「部署者」；看板连接失败行补「，大部分功能可用」与 CLI banner 对齐；review-jobs 抑制词注释同步新口径（`bot-main.ts`、`review-jobs.ts`）。
+
+### 本轮暂不修（记录在案）
+
+- 「进行中」卡片重启后无主动终态通知：本轮已在注脚如实说明（V1），重启后对残留作业补中断通知需 watcher/启动链路跨层配合，留待后续。
+- 第十轮及以前「暂不修」清单（周报错过不补推、部署机器时区触发、CLI 免问词粒度、bot 场景 MD 报告在线化等）维持原结论。

@@ -10,6 +10,11 @@ import { auditLog } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 
+/** 确认摘要的内容预览：超长截断须补省略号，否则看起来像完整内容。 */
+function shortText(s: string): string {
+  return s.length > 50 ? `${s.slice(0, 50)}…` : s;
+}
+
 /**
  * reminder_* handler 组：自然语言定时提醒（到点经 runner 主动推送）。
  * 创建/取消是用户自有数据的写操作，与 memory_* 同口径一律过确认闸门（项目约定：所有写都过闸）；
@@ -39,7 +44,7 @@ export function makeReminderHandlers({
     }
     const timeText = formatLocal(triggerAt);
     // 创建提醒是写操作（写入持久化文件，到点会主动推送打扰用户）：与 memory_set 同口径过确认闸门
-    const summary = `创建提醒「${text.slice(0, 50)}」（${timeText}）`;
+    const summary = `创建提醒「${shortText(text)}」（${timeText}）`;
     const detail = summarizeBothEnds(`内容：${text}\n触发时间：${timeText}（按部署机器时区）`);
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: 'reminder:set', batchScope: 'kind' },
@@ -90,7 +95,7 @@ export function makeReminderHandlers({
     const target = reminders.find(uid, ref);
     if (!target) return `未找到待触发的提醒「${ref}」（可以先问「我有哪些提醒」查看序号）`;
     // 取消是删除性写操作：过确认闸门；免问按对象绑定（防借一次授权取消任意提醒）
-    const summary = `取消提醒「${target.text.slice(0, 50)}」（${formatLocal(target.triggerAt)}）`;
+    const summary = `取消提醒「${shortText(target.text)}」（${formatLocal(target.triggerAt)}）`;
     const detail = `内容：${target.text}\n触发时间：${formatLocal(target.triggerAt)}（按部署机器时区）`;
     const gate = await passGate(
       { kind: 'reminder', summary, detail, batchKey: `reminder:cancel:${target.id}`, batchScope: 'object', destructive: true },

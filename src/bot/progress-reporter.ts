@@ -24,8 +24,8 @@ export interface ProgressKitDeps {
   channel: ProgressChannel;
   /** 静默期心跳间隔（测试注入缩短；默认 PROGRESS_HEARTBEAT_MS 由 handler 传入）。 */
   heartbeatMs: number;
-  /** 写操作确认挂起判断（心跳文案分支：挂起期间实际在等用户裁决，「仍在处理」是谎称）。 */
-  hasPendingConfirm: (openId: string) => boolean;
+  /** 写操作确认挂起查询（心跳文案分支）：返回挂起确认的展示形态（confirm.pendingForm），无挂起返回 null；挂起期间实际在等用户裁决，「仍在处理」是谎称。 */
+  hasPendingConfirm: (openId: string) => { hasCard: boolean; batchKey: boolean } | null;
 }
 
 export interface ProgressKit {
@@ -177,23 +177,26 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     const timer = setInterval(() => {
       if (Date.now() - activity.lastEventAt < heartbeatMs) return;
       const track = cardTracks.get(progressId);
+      // 确认挂起期间实际在等用户裁决：换 waitingConfirm 橙头变体（蓝头「处理中」是谎称）；
+      // 指引按确认实际形态分支（文本降级不提按钮，支持免问补应答词），/stop 中断两条路径都保留
+      const confirmForm = hasPendingConfirm(openId);
       if (track) {
-        // 确认挂起期间实际在等用户裁决：换 waitingConfirm 橙头变体（蓝头「处理中」是谎称）
         enqueueCardUpdate(
           progressId,
           buildProgressCard({
             steps: track.steps,
             current: track.current,
             elapsedSec: Math.round((Date.now() - startedAt) / 1000),
-            waitingConfirm: hasPendingConfirm(openId),
+            waitingConfirm: confirmForm ?? undefined,
             stopToken: progressId,
           }),
         );
         return;
       }
-      // 确认挂起期间实际在等用户裁决，「仍在处理」是谎称
-      const text = hasPendingConfirm(openId)
-        ? '⏳ 等待你处理上方的写操作确认…'
+      const text = confirmForm
+        ? confirmForm.hasCard
+          ? `⏳ 等待你处理上方的写操作确认…（点卡片按钮或回复${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）`
+          : `⏳ 等待你回复写操作确认（${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）…`
         : `⏳ 仍在处理…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒；/stop 可中断）`;
       void channel.updateText(progressId, text).catch(() => {});
     }, heartbeatMs);
@@ -295,8 +298,9 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
         try {
           await channel.sendText(msg.sessionId, chunks[0]!);
           firstDelivered = true;
-          // 直发兜底成功：占位还停在「⏳ 处理中…」（心跳已清不再刷新），best-effort 收尾为终态
-          await channel.updateText(progressId, '✅ 已完成，结果见下方 ⬇️').catch(() => {});
+          // 直发兜底成功：占位还停在「⏳ 处理中…」（心跳已清不再刷新），best-effort 收尾为终态；
+          // 措辞中性（与 seeBelow 终态卡片同口径）：正文可能是「（无回复）」等非成功内容，不恒称「已完成」
+          await channel.updateText(progressId, '处理结束，结果见下方 ⬇️').catch(() => {});
         } catch (err2) {
           console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
         }
@@ -319,7 +323,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       }
       if (!firstDelivered) {
         // 首段彻底失败：占位消息还停在「处理中」，尽量更新为失败提示，别让用户干等
-        await channel.updateText(progressId, '⚠️ 回复投递失败，请重试或稍后再问。').catch(() => {});
+        await channel.updateText(progressId, '⚠️ 回复投递失败，请把刚才的问题再发一次。').catch(() => {});
       }
     } else {
       await channel.reply(msg, text);

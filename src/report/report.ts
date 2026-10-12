@@ -123,7 +123,7 @@ export function renderMarkdown(data: WorkSummaryData): string {
         lines.push(`- 变更文件：${files}${extra > 0 ? ` 等 +${extra} 个` : ''}`);
       }
       const diffUrl = safeHttpUrl(t.diffUrl);
-      if (diffUrl) lines.push(`- [查看 diff](<${diffUrl}>)`);
+      if (diffUrl) lines.push(`- [查看改动](<${diffUrl}>)`);
       lines.push('');
     }
   }
@@ -165,7 +165,7 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   }
   const diffUrl = safeHttpUrl(t.diffUrl);
   if (diffUrl) {
-    parts.push(`<a class="diff-link" href="${escapeHtml(diffUrl)}" target="_blank" rel="noopener">查看 diff →</a>`);
+    parts.push(`<a class="diff-link" href="${escapeHtml(diffUrl)}" target="_blank" rel="noopener">查看改动 →</a>`);
   }
   parts.push('</div>');
   return parts.join('\n');
@@ -336,7 +336,7 @@ export function writeSummaryReports(
 export function summarizeForChat(
   data: WorkSummaryData,
   paths: SummaryReportPaths,
-  opts: { linkBaseUrl?: string } = {},
+  opts: { linkBaseUrl?: string; channel?: 'cli' | 'bot' } = {},
 ): string {
   const { totals } = data;
   const lines: string[] = [`📊 工作总结报告已生成（${data.sinceLabel}）`];
@@ -351,12 +351,13 @@ export function summarizeForChat(
           ? '（链接仅本机可达，手机/局域网打不开；报告保留 30 天，机器人重启后链接失效）'
           : '（链接仅本机所在网络可达；报告保留 30 天，机器人重启后链接失效）',
       );
-    } else {
+    } else if (opts.channel !== 'bot') {
       lines.push(`- HTML：${paths.htmlPath}`);
     }
+    // bot 场景报告服务不可用时无链接可给：本机路径对飞书用户是死链且泄露部署机目录，省略只给文本摘要
   }
   // bot 场景用户够不到部署机文件系统，md 本机路径不推给飞书用户；CLI 场景保留
-  if (paths.mdPath && !opts.linkBaseUrl) lines.push(`- Markdown：${paths.mdPath}`);
+  if (paths.mdPath && !opts.linkBaseUrl && opts.channel !== 'bot') lines.push(`- Markdown：${paths.mdPath}`);
   const sampleNote = sampleStatsNote(data);
   lines.push(
     '',
@@ -367,9 +368,16 @@ export function summarizeForChat(
   for (const t of data.tasks.slice(0, 5)) {
     lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '（无标题）'}`);
   }
-  // bot 场景用户够不到部署机文件系统，指向报告链接；CLI 场景指向本机报告文件
+  // 指引与上方实际给出的入口一致：有链接说链接，有文件说文件（bot 拿不到部署机文件），
+  // bot 报告服务不可用或未生成 html（format=md）时没有可指的入口，只报数量
   if (data.tasks.length > 5) {
-    lines.push(`· … 其余 ${data.tasks.length - 5} 条${opts.linkBaseUrl ? '见上方报告链接' : '见报告文件'}`);
+    const guide =
+      paths.htmlPath && opts.linkBaseUrl
+        ? '见上方报告链接'
+        : opts.channel !== 'bot' && (paths.htmlPath || paths.mdPath)
+          ? '见报告文件'
+          : '完整清单可直接问我';
+    lines.push(`· … 其余 ${data.tasks.length - 5} 条，${guide}`);
   }
   const note = truncationNote(data);
   if (note) lines.push(`（${note}）`);

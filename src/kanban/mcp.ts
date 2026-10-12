@@ -250,7 +250,7 @@ export function diagnoseMcpFailure(stderrTail: string): string | null {
   if (/vibe-kanban\.port|Reading port from/i.test(stderrTail) && /No such file|not found|error/i.test(stderrTail)) {
     return (
       '看板连接失败：看板运行时间过久，其端口记录文件可能已被系统清理。' +
-      '退出并重新运行本程序即可恢复（会同时重启看板）。' +
+      '请重启看板服务即可恢复；若看板是本程序自动拉起的，退出并重新运行本程序即可。' +
       `当前${MCP_FALLBACK_TEXT}。`
     );
   }

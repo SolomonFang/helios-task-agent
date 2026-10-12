@@ -34,6 +34,7 @@ import { ensureKanbanRunning } from '../src/kanban/kanban-ensure';
 import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
+import { readRuntimeFlags } from '../src/config/runtime-flags';
 import { friendlyNetError } from '../src/config/net-error';
 import { killProcessTree, processTreeAlive } from '../src/infra/proc';
 import type { AgentConfig } from '../src/types';
@@ -535,13 +536,14 @@ async function run(): Promise<void> {
 
   // ================= 盲区 4：config-wizard 非交互部分 + 链路 =================
 
-  check('resolveAllowedOpenIds：回车保留现状 / 新列表覆盖 / 换绑场景 "-" 清除', (() => {
+  check('resolveAllowedOpenIds：回车保留现状 / 新列表覆盖 / 换绑场景 "-" 清除 / 非换绑场景 "-" 忽略', (() => {
     const existing = ['ou_1', 'ou_2'];
     return (
       resolveAllowedOpenIds('', existing, false) === existing && // 回车：原数组原样保留
       resolveAllowedOpenIds('  ', existing, false).length === 0 && // 纯空白：视为输入了新列表（split 后滤空）
       resolveAllowedOpenIds('ou_3, ou_4', existing, false).join(',') === 'ou_3,ou_4' &&
-      resolveAllowedOpenIds('-', existing, false).join(',') === '-' && // 非换绑场景 "-" 只是普通输入
+      resolveAllowedOpenIds('-', existing, false) === existing && // 非换绑场景 "-" 忽略，不误当字面 open_id（否则全员被拒）
+      resolveAllowedOpenIds('ou_3, -', existing, false).join(',') === 'ou_3' && // 混排时仅滤掉 "-"
       resolveAllowedOpenIds('-', existing, true).length === 0 // 换绑场景 "-" 清除白名单
     );
   })());
@@ -681,6 +683,8 @@ async function run(): Promise<void> {
     const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
     try {
       process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      // 隔离本机真实用户配置（~/.helios-task-agent/.env 已懒加载进进程）：OCR_LLM_* 以本用例为准
+      for (const k of ['OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL']) delete process.env[k];
       const answers = [
         String(PRESETS.length), // 自定义（OpenAI 兼容接口）
         `${base}/v1`, // Base URL（loopback 免明文确认）
@@ -751,6 +755,8 @@ async function run(): Promise<void> {
     const prompts: string[] = [];
     try {
       process.env.HELIOS_TASK_AGENT_ENV = envPath;
+      // 隔离本机真实用户配置（~/.helios-task-agent/.env 已懒加载进进程）：OCR_LLM_* 一律以 presetEnv 为准
+      for (const k of ['OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL']) delete process.env[k];
       for (const [k, v] of Object.entries(presetEnv)) process.env[k] = v;
       const queue = [String(PRESETS.length), `${base}/v1`, 'sk-wiz', 'wiz-model', '', '', '', '', ...answers];
       const ask = async (p: string): Promise<string | null> => {
@@ -780,7 +786,7 @@ async function run(): Promise<void> {
     assert.equal(parsed.OCR_LLM_MODEL, undefined, '未配模型不应写入模型覆盖项');
     assert.equal(parsed.OCR_LLM_URL, undefined, '未配模型不应写入 URL 覆盖项');
     const modelPrompt = prompts.find((p) => p.includes('AI 审查模型'));
-    assert.ok(modelPrompt?.includes('与上方一致（wiz-model）'), `模型问题应带上上方模型名，实际：${modelPrompt}`);
+    assert.ok(modelPrompt?.includes('与上方一致，即 wiz-model'), `模型问题应带上上方模型名（单层括号），实际：${modelPrompt}`);
     assert.ok(!prompts.some((p) => p.includes('AI 审查 Base URL')), '未配模型且无 URL 残留时不应追问 Base URL');
     const tokenPrompt = prompts.find((p) => p.includes('AI 审查专用 API Key'));
     assert.ok(tokenPrompt?.includes('；输入可见）'), `key 问题应为单括号排版，实际：${tokenPrompt}`);
@@ -822,12 +828,44 @@ async function run(): Promise<void> {
     assert.equal(saved.parsed.OCR_LLM_TOKEN, 'sk-bad', '显式 s 应原样保存');
   });
 
+  await checkAsync('config-wizard：只隔离专用 key（不配模型）同样触发联网预检——抄错 key 不静默通过', async () => {
+    // 预检走 /models 不依赖模型名：模型回车复用 + sk-bad 专用 key → 401 → k 改 key → 重试通过
+    const byAuth = (auth: string) => (auth === 'Bearer sk-bad' ? 401 : 200);
+    const retried = await runWizardScenario(['', 'sk-bad', 'k', 'sk-good'], {}, '', byAuth);
+    assert.equal(retried.leftover.length, 0, `剩余：${retried.leftover.join('|')}`);
+    assert.equal(retried.parsed.OCR_LLM_TOKEN, 'sk-good', '改 key 重试后应落盘新 key');
+    assert.equal(retried.parsed.OCR_LLM_MODEL, undefined, '未配模型不应写入模型覆盖项');
+  });
+
+  await checkAsync('config-wizard：OCR 预检重试循环内 Base URL 支持输入 - 清除覆盖项', async () => {
+    // URL 覆盖项指向不可达地址 → 预检失败 → b 改 Base URL → 输入 - 清除 → 回退主模型配置重试通过
+    const cleared = await runWizardScenario(['ocr-model', 'http://127.0.0.1:1/v1', '', 'b', '-']);
+    assert.equal(cleared.leftover.length, 0, `剩余：${cleared.leftover.join('|')}`);
+    assert.equal(cleared.parsed.OCR_LLM_URL, undefined, '输入 - 应清除 URL 覆盖项');
+    assert.equal(cleared.parsed.OCR_LLM_MODEL, 'ocr-model');
+    const bPrompt = cleared.prompts.find((p) => p.includes('清除覆盖项'));
+    assert.ok(bPrompt, `重试循环的 Base URL 问题应给出清除入口，实际：${cleared.prompts.join('|')}`);
+  });
+
+  check('runtime-flags：KANBAN_WATCH_INTERVAL_SEC 低于下限 15 告警并抬升，正常值不告警', (() => {
+    const warns: string[] = [];
+    const low = readRuntimeFlags({ KANBAN_WATCH_INTERVAL_SEC: '5' }, (m) => warns.push(m));
+    const warnsOk: string[] = [];
+    const normal = readRuntimeFlags({ KANBAN_WATCH_INTERVAL_SEC: '30' }, (m) => warnsOk.push(m));
+    return (
+      low.kanbanWatchIntervalSec === 15 &&
+      warns.some((m) => m.includes('低于下限')) &&
+      normal.kanbanWatchIntervalSec === 30 &&
+      warnsOk.length === 0
+    );
+  })());
+
   await checkAsync('config-wizard：已配置时首步可跳过模型配置（回车默认 = 跳过），保留现有模型且不再联网校验', async () => {
     // 跳过后不应触发任何联网校验（旧 Base URL 指向不可达地址，一旦校验必然失败并多消费回答）
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-skip-'));
     const envPath = path.join(tmp, '.env');
     fs.writeFileSync(envPath, 'LLM_BASE_URL=http://127.0.0.1:1/v1\nLLM_API_KEY=sk-old\nLLM_MODEL=old-model\n');
-    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
+    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
     const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
     const prompts: string[] = [];
     try {
@@ -836,6 +874,8 @@ async function run(): Promise<void> {
       process.env.LLM_BASE_URL = 'http://127.0.0.1:1/v1';
       process.env.LLM_API_KEY = 'sk-old';
       process.env.LLM_MODEL = 'old-model';
+      // 同理隔离真实用户配置里的 OCR_LLM_*（其残留会改变 AI 审查段的提问与预检路径）
+      for (const k of ['OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL']) delete process.env[k];
       const answers = [
         '', // 配置模型：已配置过，默认 0 = 跳过
         '', // 看板地址：保留当前
@@ -858,7 +898,7 @@ async function run(): Promise<void> {
       assert.ok(prompts[0]?.includes('默认 0 = 跳过'), `已配置时首问应提供跳过默认项，实际：${prompts[0]}`);
       assert.ok(prompts[1]?.includes('看板地址'), `跳过后应直接进入看板地址步骤，实际：${prompts[1]}`);
       const ocrPrompt = prompts.find((p) => p.includes('AI 审查模型'));
-      assert.ok(ocrPrompt?.includes('与上方一致（old-model）'), `AI 审查模型问题应回显保留的模型名，实际：${ocrPrompt}`);
+      assert.ok(ocrPrompt?.includes('与上方一致，即 old-model'), `AI 审查模型问题应回显保留的模型名，实际：${ocrPrompt}`);
     } finally {
       for (const [k, v] of saved) {
         if (v === undefined) delete process.env[k];
@@ -872,13 +912,14 @@ async function run(): Promise<void> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-cov-wiz-skip0-'));
     const envPath = path.join(tmp, '.env');
     fs.writeFileSync(envPath, 'LLM_BASE_URL=http://127.0.0.1:1/v1\nLLM_API_KEY=sk-old\nLLM_MODEL=old-model\n');
-    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
+    const KEYS = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL', 'HELIOS_TASK_AGENT_ENV'];
     const saved = new Map(KEYS.map((k) => [k, process.env[k]] as const));
     try {
       process.env.HELIOS_TASK_AGENT_ENV = envPath;
       process.env.LLM_BASE_URL = 'http://127.0.0.1:1/v1';
       process.env.LLM_API_KEY = 'sk-old';
       process.env.LLM_MODEL = 'old-model';
+      for (const k of ['OCR_LLM_URL', 'OCR_LLM_TOKEN', 'OCR_LLM_MODEL']) delete process.env[k];
       const answers = ['0', '', '', '', '', '', ''];
       const ask = async (): Promise<string | null> => answers.shift() ?? null;
       await ensureConfig(ask, { force: true });
@@ -914,6 +955,7 @@ async function run(): Promise<void> {
       const noModels = await verifyLlmConfig(`${base}/v1`, 'sk-x');
       assert.equal(noModels.ok, false);
       assert.equal(noModels.uncertain, true); // 端点不实现 /models：不确定，不误拦
+      assert.ok(noModels.message.includes('/v1'), `404 应单列提示检查 Base URL 路径，实际：${noModels.message}`);
       // 连接失败（端口无人监听）：返回失败结果而非抛异常
       const down = await verifyLlmConfig('http://127.0.0.1:1/v1', 'sk-x', 2000);
       assert.equal(down.ok, false);
@@ -943,19 +985,33 @@ async function run(): Promise<void> {
     assert.equal(friendlyNetError(new Error('something odd')), null);
   });
 
-  await checkAsync('feishu-verify：无效凭证 / 未启用机器人 / 网络异常均返回失败而非抛异常', async () => {
+  await checkAsync('feishu-verify：无效凭证 / 未启用机器人 / 服务 5xx / 网络异常均返回失败而非抛异常', async () => {
     const origFetch = globalThis.fetch;
     try {
       // 换 token 即失败：code != 0
       globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
         json: async () => ({ code: 10003, msg: 'app_id invalid' }),
       })) as unknown as typeof fetch;
       const bad = await verifyFeishuApp('bad-id', 'bad-secret');
       assert.equal(bad.ok, false);
       assert.ok(bad.message.includes('无效'), `实际：${bad.message}`);
+      // 飞书侧 5xx（即使带 JSON body）不误诊为「凭证无效」
+      globalThis.fetch = (async () => ({
+        ok: false,
+        status: 502,
+        json: async () => ({ code: 10003, msg: 'app_id invalid' }),
+      })) as unknown as typeof fetch;
+      const srvDown = await verifyFeishuApp('id', 'secret');
+      assert.equal(srvDown.ok, false);
+      assert.ok(srvDown.message.includes('飞书服务异常'), `实际：${srvDown.message}`);
+      assert.ok(!srvDown.message.includes('无效'), `5xx 不应落入凭证无效误诊，实际：${srvDown.message}`);
       // token 成功但机器人能力未启用
       let call = 0;
       globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
         json: async () =>
           ++call === 1
             ? { code: 0, tenant_access_token: 't-token' }
@@ -1293,7 +1349,11 @@ async function run(): Promise<void> {
       process.env.PATH = `${binDir}${path.delimiter}${prevPath ?? ''}`;
       await assert.rejects(
         () => ensureKanbanRunning('http://127.0.0.1:1', { autoStart: true, waitMs: 15000 }),
-        /启动后退出/,
+        (err: unknown) => {
+          const m = err instanceof Error ? err.message : String(err);
+          // POSIX 下保留前缀写法；win32 分支（set/$env: 写法）由源码 platform 分档覆盖，本用例仅 POSIX 运行
+          return m.includes('启动后退出') && m.includes('可设 HTA_DEBUG=1 重新运行查看详细报错');
+        },
       );
       const gpid = Number(fs.readFileSync(gpidFile, 'utf8').trim());
       // 孙进程应已被失败分支的 stopKanbanChild 按组杀掉；信号到回收有短暂窗口，轮询确认

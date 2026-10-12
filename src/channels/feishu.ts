@@ -38,7 +38,7 @@ export interface FeishuCardAction {
       hta_diagnose?: string;
       /** 「按诊断结论重试」按钮：失败任务 id（诊断结论由 bot 侧按 taskId 查）。 */
       hta_retry?: string;
-      /** 进度卡片「⏹ 停止」按钮：中断当前轮次（值恒为 '1'，字段存在即语义）。 */
+      /** 进度卡片「⏹ 停止」按钮：值为占位消息 id（轮次令牌），回调据此校验按钮属于当前轮次；空串是令牌注入帧失败的形态，走专门的「暂不可用」分支。 */
       hta_stop?: string;
       attempt?: string;
       title?: string;

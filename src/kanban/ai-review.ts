@@ -309,7 +309,9 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
     const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
     if (full) console.error(`[ai-review] 代码审查工具完整输出：\n${full}`);
     if (e.bufferExceeded) {
-      throw new Error('AI 审查输出过大已终止（可能变更范围过大），请到看板缩小审查范围后重试。');
+      // 看板 Web 没有「缩小审查范围」入口：出路改人工查看改动详情；不带「重试」字样，
+      // 让 handler 统一追加可执行的文本重试指引
+      throw new Error('AI 审查输出过大已终止（可能变更范围过大），请到看板打开该任务的改动详情人工查看；若反复出现，请联系部署者查看日志定位。');
     }
     if (opts.signal?.aborted) {
       throw new Error('已中断');
@@ -318,7 +320,7 @@ export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
       // 重试指引由 handler 统一追加，这里不再自带，避免两句重复
       throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
     }
-    throw new Error('代码审查工具执行失败，请重新点击卡片上的「AI 审查」重试；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。');
+    throw new Error('代码审查工具执行失败，可回复「重新审查这个任务」重新发起审查；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。');
   }
   const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
   return text || '（代码审查工具未产生输出：可能没有可审查的变更）';

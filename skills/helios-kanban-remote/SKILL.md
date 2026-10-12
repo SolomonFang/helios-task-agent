@@ -33,7 +33,7 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
    ```
    Windows（env 前缀语法在 cmd/PowerShell 不可用，按 shell 二选一）：
    ```cmd
-   set HOST=0.0.0.0 && set PORT=7964 && npx -y helios-kanban@latest
+   set "HOST=0.0.0.0"&& set "PORT=7964"&& npx -y helios-kanban@latest
    ```
    ```powershell
    $env:HOST="0.0.0.0"; $env:PORT=7964; npx -y helios-kanban@latest
@@ -50,7 +50,7 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 
 | User intent | Action |
 |-------------|--------|
-| "有哪些项目" | `hk projects`（看 `description` + `repos` 选项目） |
+| "有哪些项目" | `hk projects`（看 description/repos 选项目） |
 | "创建项目" | `hk projects create "名称" --repo-path /server/abs/path` |
 | "默认 agent / 仓库" | `hk info`；`hk repos` |
 | "看看进行中的" | `hk tasks list --status inprogress` |
@@ -63,7 +63,6 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "有哪些分支" | `hk branches <repo_id> [--query develop]` |
 | "多仓启动" | `hk start <task_id> --repo <id1> --repo <id2>:develop` |
 | "有哪些 tag" | `hk tags` |
-| "基于 develop 启动" | `hk start <task_id> --branch develop` |
 | "新建并启动" | `hk create-and-start "标题"` |
 | "再跟它说一句…" | `hk follow-up <task_id> <prompt>`（运行中自动排队） |
 | "跑得怎么样了" | `hk status <task_id>` |
@@ -73,7 +72,7 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "删除任务" | 确认后 → `hk tasks delete <task_id>` |
 | "标记完成" | `hk tasks update <task_id> --status done` |
 
-Cache `project_id` / `repo_id` in the conversation. Prefer env defaults so commands stay short.
+Cache `project_id` / `repo_id` in the conversation. Prefer env defaults.
 
 ## Complete lifecycle
 
@@ -125,7 +124,7 @@ Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs 
 **迭代**：{迭代，无则 —}
 **优先级**：{紧急/高/中/低}
 **类型**：{新功能/修复/文档/样式/重构/性能优化/测试/杂务}
-**状态**：{中文状态} | 运行状态：{运行中/未运行}{，执行失败}
+**状态**：{中文状态}；运行状态：{运行中/未运行}{，执行失败}
 **分支**：{分支名}
 **执行器**：{用户指定的名字，如 Claude}
 **链接**：{url}
@@ -162,7 +161,7 @@ Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs 
 
 ## Task priorities
 
-给用户展示时用中文优先级；英文键仅用于 `--priority` 参数（省略默认 `medium`）。卡片带颜色徽标（红/橙/蓝/灰）：
+给用户展示时用中文优先级；英文键仅用于 `--priority` 参数（省略默认 `medium`）：
 
 | 英文键（`--priority` 参数） | 中文优先级 |
 |---|---|
@@ -173,11 +172,22 @@ Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs 
 
 ## Task types
 
-`feat` | `fix` | `docs` | `style` | `refactor` | `perf` | `test` | `chore` — 省略默认 `feat`。类型会作为合并（squash）提交信息前缀，如 `fix: 修复登录 500 (helios-kanban a1b2c3d4)`。`tasks create` / `tasks update` / `create-and-start` 用 `--type` 指定；MCP 工具 `create_task` / `update_task` / `create_task_and_start` 对应参数为 `task_type`。
+省略默认 `feat`。类型会作为合并（squash）提交信息前缀，如 `fix: 修复登录 500 (…)`。`tasks create` / `tasks update` / `create-and-start` 用 `--type` 指定；MCP 工具 `create_task` / `update_task` / `create_task_and_start` 对应参数为 `task_type`。
 
-给用户展示时用中文类型（新功能 feat/修复 fix/文档 docs/样式 style/重构 refactor/性能优化 perf/测试 test/杂务 chore），与优先级/状态同口径；英文键仅用于参数与合并提交前缀。
+给用户展示时只用中文类型；英文键仅用于 `--type` 参数与合并提交前缀：
 
-**必须根据任务内容推断类型，不要等用户点名**：修缺陷/报错/崩溃 → `fix`，新功能/需求 → `feat`，文档 → `docs`，重构 → `refactor`，性能优化 → `perf`，补测试 → `test`，构建/依赖/杂务 → `chore`。例如「修复登录 500」即使用户没说类型也必须传 `--type fix`；只有内容性质不明时才省略（落到默认 `feat`）。
+| 英文键（`--type` 参数） | 中文类型 |
+|---|---|
+| `feat` | 新功能 |
+| `fix` | 修复 |
+| `docs` | 文档 |
+| `style` | 样式 |
+| `refactor` | 重构 |
+| `perf` | 性能优化 |
+| `test` | 测试 |
+| `chore` | 杂务 |
+
+**必须根据任务内容推断类型，不要等用户点名**：修复缺陷/报错/崩溃 → `fix`，新功能/需求 → `feat`，其余按上表类推。例如「修复登录 500」即使用户没说类型也必须传 `--type fix`；只有内容性质不明时才省略（落到默认 `feat`）。
 
 ## Safety rules
 
@@ -187,9 +197,9 @@ Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs 
 4. If `hk health` fails, stop and report connectivity.
 5. Multi-repo: repeat `--repo` (`ID` or `ID:branch`).
 6. 合并/推送/变基等操作：引导用户用电脑浏览器打开看板网页版操作。
-7. `@tagname` in `--desc` / follow-up expands via `hk tags` / `/api/tags`.
+7. `@tagname` in `--desc` / follow-up expands via `hk tags`.
 
-## Out of scope（引导用户用看板网页版操作）
+## Out of scope（网页版操作）
 
 - 创建 / 合并合并请求（PR）、推送、变基（rebase）、冲突解决
 - 完整改动对比查看 / 在编辑器中打开

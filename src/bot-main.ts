@@ -73,8 +73,8 @@ const BOT_CLI_USAGE = `用法：helios-task-agent bot [选项]
       helios-task-agent-bot [选项]（独立入口，等同上一行）
 
 选项
-  --rebind      换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置）
-  --reconfig    重跑模型/看板配置向导（飞书凭证保留）
+  --rebind      换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置；先停止当前机器人进程）
+  --reconfig    重跑模型/看板配置向导（飞书凭证保留；先停止当前机器人进程）
   --version     打印版本号
   --help        显示本帮助`;
 
@@ -283,8 +283,8 @@ async function main(): Promise<void> {
   } else {
     console.log(
       c.warn(
-        '⚠️ 安全警告：未设置 FEISHU_ALLOWED_OPEN_IDS，首个私聊本机器人的用户将自动成为唯一 owner 并写入白名单' +
-          `（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定 owner，请先在 ${userEnvPath()} 中配置该白名单。`,
+        '⚠️ 安全警告：未设置 FEISHU_ALLOWED_OPEN_IDS，首个私聊本机器人的用户将自动成为唯一部署者并写入白名单' +
+          `（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定部署者，请先在 ${userEnvPath()} 中配置该白名单。`,
       ),
     );
   }
@@ -332,7 +332,7 @@ async function main(): Promise<void> {
   } else {
     // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
     if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
-    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}          \n`));
+    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用          \n`));
     if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
   }
 
@@ -423,14 +423,14 @@ async function main(): Promise<void> {
   channel.onOwnerClaim = (openId) => {
     try {
       writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
-      console.log(c.ok(`首个私聊用户已成为 owner 并写入白名单：${openId}`));
+      console.log(c.ok(`首个私聊用户已成为部署者并写入白名单：${openId}`));
     } catch (err) {
       const message = errMessage(err);
-      console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）: ${message}`);
+      console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）：${message}`);
       void channel
         .notifyOpenId(
           openId,
-          `⚠️ owner 绑定失败：白名单写入 .env 未成功，本次绑定未持久化，你暂时无法使用本机器人。` +
+          `⚠️ 部署者绑定失败：白名单写入 .env 未成功，本次绑定未持久化，你暂时无法使用本机器人。` +
             `请检查 ${userEnvPath()} 及所在目录的写权限，修复后重启机器人再私聊。`,
         )
         .catch(() => {});

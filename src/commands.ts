@@ -238,13 +238,17 @@ export function llmFailureParts(
       ? `你的上一条消息未处理：「${quoted}」，${retryHint}。`
       : `上一条内容「${quoted}」未被处理，${retryHint}；也可用 /config 检查模型配置。`;
   if (friendly) return { head: `请求失败：${message}`, friendly, tail };
-  // 未命中已知模式：原始 message 截断收 HTA_DEBUG 日志，用户面只给中性与通用出路
+  // 未命中已知模式：原始 message 截断收 HTA_DEBUG 日志，用户面只给中性与通用出路。
+  // bot 用户无法设环境变量/重跑进程，指向部署者；CLI 保留 HTA_DEBUG 提示，
+  // win32 上 `HTA_DEBUG=1 命令` 前缀语法不可用，按 cmd / PowerShell 给等价写法（同 deps.ts 平台分档）。
   if (process.env.HTA_DEBUG) {
     console.error(`[llm] 请求失败原文：${message.slice(0, 200)}${message.length > 200 ? '…' : ''}`);
   }
-  return {
-    head: '请求失败。请稍后重试；仍失败请检查模型配置与网络（原始报错可设 HTA_DEBUG=1 重新运行查看）。',
-    friendly: null,
-    tail,
-  };
+  const head =
+    channel === 'bot'
+      ? '请求失败。请稍后重试；持续失败请联系部署者检查模型配置与网络。'
+      : process.platform === 'win32'
+        ? '请求失败。请稍后重试；仍失败请检查模型配置与网络（原始报错可在 cmd 执行 set HTA_DEBUG=1 && helios-task-agent、PowerShell 执行 $env:HTA_DEBUG=1; helios-task-agent 重新运行查看）。'
+        : '请求失败。请稍后重试；仍失败请检查模型配置与网络（原始报错可设 HTA_DEBUG=1 重新运行查看）。';
+  return { head, friendly: null, tail };
 }

@@ -69,8 +69,8 @@ export type TryStartResult<T extends string> = { status: 'accepted' } | { status
 export interface ReviewJobs {
   /** 「AI 审查」按钮：同步受理判定（去重/并发上限）；accepted 时异步执行 open-code-review 并把结果推回飞书。 */
   tryStartAiReview: (openId: string, attemptId: string, title: string) => TryStartResult<'running' | 'over-limit'>;
-  /** 「AI 诊断」按钮：同步受理判定；accepted 时异步采集失败信息 → LLM 中文诊断 → 推结果卡片（带「↻ 重试」按钮）。 */
-  tryStartDiagnosis: (openId: string, taskId: string, attemptId: string, title: string) => TryStartResult<'running' | 'diagnosed' | 'over-limit'>;
+  /** 「AI 诊断」按钮：同步受理判定；accepted 时异步采集失败信息 → LLM 中文诊断 → 推结果卡片（带「↻ 重试」按钮）。url 为看板任务链接，随诊断结论留存（重试按钮与「进行中」卡片的「查看任务」入口）。 */
+  tryStartDiagnosis: (openId: string, taskId: string, attemptId: string, title: string, url?: string) => TryStartResult<'running' | 'diagnosed' | 'over-limit'>;
   /** 「↻ 按诊断结论重试」按钮与文本「重试这个任务」：同步受理判定；accepted 时异步以诊断结论作 follow-up 重启任务。 */
   tryStartRetry: (openId: string, taskId: string, title: string) => TryStartResult<'launching' | 'launched' | 'no-diagnosis'>;
   /** 文本「重试这个任务」确定性分支定位用：该用户最近一次诊断完成的任务（无记录为 undefined）。 */
@@ -92,8 +92,8 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
   const diagnosisRunning = new Map<string, { openId: string; ctl: AbortController }>();
   /** 已完成诊断的 (task, attempt) 键：同一 attempt 只诊断一次（进程内语义，与 AI 审查去重一致）。 */
   const diagnosedKeys = new Set<string>();
-  /** 每个任务最近一次诊断结论（「↻ 重试」按钮的 follow-up 材料；键为 taskId）。 */
-  const diagnosisResults = new Map<string, { attemptId?: string; text: string; cardMessageId?: string }>();
+  /** 每个任务最近一次诊断结论（「↻ 重试」按钮的 follow-up 材料；键为 taskId）；url 随结论留存（重试链路的「查看任务」入口）。 */
+  const diagnosisResults = new Map<string, { attemptId?: string; text: string; cardMessageId?: string; url?: string }>();
   /** 已发起过重试的 (task, attempt) 键：重试发起后按钮置终态，重复点击不再发起。 */
   const retryLaunched = new Set<string>();
   /** 发起中的重试（taskId 粒度，首个 await 前落键）：attemptId 补拉窗口内的连点穿透防护（retryLaunched 的键那时还算不出来）。 */
@@ -180,10 +180,12 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       if (ctl.signal.aborted) {
         await safeNotify(channel, openId, `⏹ AI 审查已中断：《${title}》`);
       } else {
-        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/人工审查）时不重复追加重试后缀
+        // 失败原因截断防超长推送；底层文案自带真实出路（重新发起/人工审查）时不重复追加后缀。
+        // 注意「重试」不算自带出路：底层文案里的重试指引若指向卡片按钮，按钮已随
+        // 「进行中」卡片换掉，是必败指引——必须补上文本回复类出路，不能让它成为唯一出路
         const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重试', '重新发起', '人工审查'].some((w) => message.includes(w));
-        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击卡片上的「AI 审查」重试。';
+        const hasOwnWayOut = ['重新发起', '人工审查'].some((w) => message.includes(w));
+        const retryHint = hasOwnWayOut ? '' : '\n可回复「重新审查这个任务」再试一次。';
         await safeNotify(channel, openId, `⚠️ AI 审查失败：《${title}》\n${message}${retryHint}`);
       }
     } finally {
@@ -223,6 +225,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     title: string,
     dedupeKey: string,
     ctl: AbortController,
+    url?: string,
   ): Promise<void> => {
     try {
       await channel.notifyOpenId(
@@ -248,8 +251,9 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
         diagnosedKeys.add(`${taskId}:${realAttemptId}`);
         diagnosedKeys.add(dedupeKey);
       }
-      const result: { attemptId?: string; text: string; cardMessageId?: string } = { text };
+      const result: { attemptId?: string; text: string; cardMessageId?: string; url?: string } = { text };
       if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
+      if (url) result.url = url;
       if (diagnosisResults.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosisResults.clear();
       diagnosisResults.set(taskId, result);
       // 「重试这个任务」文本分支按用户定位最近一次诊断的任务（卡片按钮自带 taskId，不走这里）
@@ -257,7 +261,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       lastDiagnosisByUser.set(openId, { taskId, title });
       // 结果推送与诊断执行分开兜底：推送失败降级为文本（含重试指引），不谎报「诊断失败」
       try {
-        const messageId = await channel.notifyCardOpenId(openId, buildDiagnosisCard(title, text, taskId));
+        const messageId = await channel.notifyCardOpenId(openId, buildDiagnosisCard(title, text, taskId, url ? { url } : undefined));
         if (messageId) result.cardMessageId = messageId;
       } catch (deliverErr) {
         console.error(`[diagnosis] 诊断卡片推送失败，降级文本推送: ${errMessage(deliverErr)}`);
@@ -286,10 +290,11 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       if (ctl.signal.aborted) {
         await safeNotify(channel, openId, `⏹ AI 诊断已中断：《${title}》`);
       } else {
-        // 失败原因截断防超长推送；底层文案自带出路（重试/重新发起/配置不完整联系部署者）时不重复追加重试后缀
+        // 失败原因截断防超长推送；底层文案自带真实出路（看板重新发起/配置不完整联系部署者）时不重复追加后缀。
+        // 「重试」不算自带出路（同审查链路）：底层「重新点击卡片按钮」指引的按钮已随「进行中」卡片消失
         const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重试', '重新发起', '配置不完整'].some((w) => message.includes(w));
-        const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击失败卡片上的「AI 诊断」重试。';
+        const hasOwnWayOut = ['重新发起', '配置不完整'].some((w) => message.includes(w));
+        const retryHint = hasOwnWayOut ? '' : '\n可回复「为什么失败」重新诊断。';
         await safeNotify(channel, openId, `⚠️ AI 诊断失败：《${title}》\n${message}${retryHint}`);
       }
     } finally {
@@ -303,6 +308,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     taskId: string,
     attemptId: string,
     title: string,
+    url?: string,
   ): TryStartResult<'running' | 'diagnosed' | 'over-limit'> => {
     title = title.trim() || '未命名任务';
     const dedupeKey = `${taskId}:${attemptId || 'latest'}`;
@@ -329,7 +335,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     }
     const ctl = new AbortController();
     diagnosisRunning.set(taskId, { openId, ctl });
-    void runDiagnosisJob(openId, taskId, attemptId, title, dedupeKey, ctl);
+    void runDiagnosisJob(openId, taskId, attemptId, title, dedupeKey, ctl, url);
     return { status: 'accepted' };
   };
 
@@ -338,7 +344,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     openId: string,
     taskId: string,
     title: string,
-    result: { attemptId?: string; text: string; cardMessageId?: string },
+    result: { attemptId?: string; text: string; cardMessageId?: string; url?: string },
   ): Promise<void> => {
     try {
       // 诊断时没采到 attempt（attempts 端点异常）这里补拉一次；仍没有则无法定位会话
@@ -352,7 +358,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
           await safeNotify(
             channel,
             openId,
-            `⚠️ 重试未发起：《${title}》查询执行记录失败（看板暂时不可用），请稍后重新点击「↻ 按诊断结论重试」。`,
+            `⚠️ 重试未发起：《${title}》查询执行记录失败（看板暂时不可用），请稍后回复「重试这个任务」重新发起。`,
           );
           return;
         }
@@ -397,12 +403,13 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       await safeNotify(
         channel,
         openId,
-        `↻ 已按诊断结论发起重试：《${title}》\n已把以下跟进指令发给任务执行方，任务进展会继续推送：\n${followUpExcerpt}`,
+        `↻ 已按诊断结论发起重试：《${title}》\n已把以下跟进指令发给任务执行方，任务进展会继续推送（如长时间无进展，请到看板查看或手动重新发起）：\n${followUpExcerpt}`,
       );
     } catch (err) {
+      // 「重试」不算自带出路（同审查/诊断链路）：卡片按钮已随「进行中」卡片消失，出路必须是文本可达的
       const message = errMessage(err).slice(0, 200);
-      const hasOwnWayOut = ['重试', '重新发起', '手动', '已被看板清理'].some((w) => message.includes(w));
-      const retryHint = hasOwnWayOut ? '' : '\n可稍后重新点击诊断卡片上的「↻ 按诊断结论重试」。';
+      const hasOwnWayOut = ['重新发起', '手动', '已被看板清理'].some((w) => message.includes(w));
+      const retryHint = hasOwnWayOut ? '' : '\n可回复「重试这个任务」重新发起重试。';
       await safeNotify(channel, openId, `⚠️ 重试发起失败：《${title}》\n${message}${retryHint}`);
     } finally {
       retryLaunching.delete(taskId);
@@ -422,15 +429,17 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       void safeNotify(
         channel,
         openId,
-        `⚠️ 找不到《${title}》的诊断结论（机器人可能已重启）。请重新点击失败卡片上的「AI 诊断」后再重试。`,
+        `⚠️ 找不到《${title}》的诊断结论（机器人可能已重启）。请回复「为什么失败」重新诊断后再重试。`,
       );
-      return { status: 'no-diagnosis', toast: '找不到诊断结论，请重新点「AI 诊断」' };
+      return { status: 'no-diagnosis', toast: '找不到诊断结论，请回复「为什么失败」重新诊断' };
     }
     const launchedToast = '重试已发起过，请稍候';
     const launchedNotify = `↻ 《${title}》的重试已发起过，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。`;
     if (retryLaunching.has(taskId)) {
-      void safeNotify(channel, openId, launchedNotify);
-      return { status: 'launching', toast: launchedToast };
+      // 「发起中」窗口（attemptId 补拉/follow-up 在途）：如实说正在发起——
+      // 谎称「已发起过」会与随后的「重试未发起」失败通知同屏矛盾
+      void safeNotify(channel, openId, `↻ 《${title}》的重试正在发起中，请稍候…`);
+      return { status: 'launching', toast: '重试正在发起中，请稍候' };
     }
     // 诊断已采到真实 attempt 时「已发起过」可同步判定；attemptId 未知的由异步段复核兜底
     if (result.attemptId && retryLaunched.has(`${taskId}:${result.attemptId}`)) {

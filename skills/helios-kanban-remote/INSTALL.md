@@ -157,7 +157,7 @@ HOST=0.0.0.0 PORT=7964 npx -y helios-kanban@latest
 Windows（env 前缀语法不可用，按 shell 二选一）：
 
 ```cmd
-set HOST=0.0.0.0 && set PORT=7964 && npx -y helios-kanban@latest
+set "HOST=0.0.0.0"&& set "PORT=7964"&& npx -y helios-kanban@latest
 ```
 
 ```powershell
@@ -189,7 +189,7 @@ If failed → check URL, kanban process, network (Tailscale). Do not claim insta
 - **来源**：npm 包 `helios-task-agent` 内置副本
 - **安装路径**：`{SKILL_DIR}`
 - **CLI**：`{SKILL_DIR}/scripts/hk.mjs`
-- **Kanban 地址**：`{HELIOS_KANBAN_URL}`
+- **看板地址**：`{HELIOS_KANBAN_URL}`
 - **连通性**：正常
 
 你现在可以对我说：
@@ -244,7 +244,8 @@ Also remove any `HELIOS_KANBAN_*` exports previously appended to the shell profi
 | Symptom | Action |
 |---------|--------|
 | npm 包内找不到 skill | 确认 `npm i -g helios-task-agent` 成功；或改用 Step 2 Option B |
-| `health` connection refused | Kanban not running or wrong `HELIOS_KANBAN_URL` |
+| `health` 报 `error: fetch failed ECONNREFUSED …` | 看板未运行或 `HELIOS_KANBAN_URL` 填错（按输出里的 target 地址核对） |
+| `health` 报 `error: fetch failed ENOTFOUND …` | 域名/主机名解析失败，核对 `HELIOS_KANBAN_URL` 与网络（Tailscale） |
 | API 403 | Set `VK_ALLOWED_ORIGINS` on kanban server (reverse proxy) |
 | Skill not loading | Confirm `$SKILL_DIR/SKILL.md` exists; restart agent session |
 
