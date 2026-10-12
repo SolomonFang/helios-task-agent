@@ -3070,7 +3070,8 @@ async function run(): Promise<void> {
   // ---------- ensureKanbanRunning：onSpawn 拉起即回调 + detached 进程组超时清理 ----------
   await checkAsync('ensureKanbanRunning：onSpawn 回调拿到 child，超时后进程组被清理', async () => {
     // 假 npx = 常驻脚本：忽略 -y 等参数直接 sleep，health 永不通，走超时路径。
-    // （不能用系统二进制符号链接：GNU yes/sleep 会把 spawn 的 -y 当非法选项直接退出，Linux CI 上假 npx 秒退）
+    // （不能用系统二进制符号链接：GNU yes/sleep 会把 spawn 的 -y 当非法选项直接退出，Linux CI 上假 npx 秒退；
+    //   win32 用 ping 而非 timeout：timeout.exe 在 stdin 被重定向时立即报错退出，假 npx 会秒退走错分支）
     const probe = http.createServer();
     await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
     const port = (probe.address() as AddressInfo).port;
@@ -3078,7 +3079,7 @@ async function run(): Promise<void> {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-'));
     writeFakeCli(bin, 'npx', {
       sh: 'exec /bin/sleep 60\n',
-      cmd: 'timeout /t 60 /nobreak >nul\r\n',
+      cmd: 'ping -n 60 127.0.0.1 >nul\r\n',
     });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
@@ -3158,37 +3159,29 @@ async function run(): Promise<void> {
 
   // ---------- deps：lark-cli 三态探测（临时 PATH 注入假二进制，不依赖本机真实环境） ----------
   await checkAsync('deps：checkLarkCliStatus 三态 / probeLarkCliAuth 保守判失败', async () => {
-    // 假命令用系统二进制的符号链接：true = 退出 0 无输出（模拟「已安装但 auth status
-    // 输出异常」），false = 命令失败；「已授权」用 shebang 直指 node 的脚本输出 JSON
-    // （探测走 minimalChildEnv，NODE_OPTIONS --require 注入已不可达，故改用脚本形态）。
+    // 假命令经 writeFakeCli 双形态落地（POSIX sh / win32 .cmd；符号链接 /usr/bin/true 在
+    // win32 上是断链，起不了进程）：exit 0 无输出 = 「已安装但 auth status 输出异常」，
+    // exit 1 = 命令失败；「已授权」输出 identities.available=true 的 JSON（忽略传入参数）。
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-deps-'));
     const prevPath = process.env.PATH;
-    const link = (name: string, target: string) => {
-      const p = path.join(bin, name);
-      if (fs.existsSync(p)) fs.rmSync(p);
-      fs.symlinkSync(target, p);
-    };
+    const AUTH_OK_JSON = '{"identities":{"user":{"available":true}}}';
     try {
       // 空 PATH：全部 missing
       process.env.PATH = bin;
       assert.equal(checkLarkCli(), false);
       assert.equal(checkLarkCliStatus(), 'missing');
       // 已安装但 auth status 输出为空 → 保守判未授权（不误报可用）
-      link('lark-cli', '/usr/bin/true');
+      writeFakeCli(bin, 'lark-cli', { sh: 'exit 0\n', cmd: 'exit /b 0\r\n' });
       assert.equal(checkLarkCli(), true);
       assert.equal(checkLarkCliStatus(), 'unauthorized');
       // auth status 命令失败 → 同样保守判未授权
-      link('lark-cli', '/usr/bin/false');
+      writeFakeCli(bin, 'lark-cli', { sh: 'exit 1\n', cmd: 'exit /b 1\r\n' });
       assert.equal(probeLarkCliAuth(), 'unauthorized');
       // 已授权：auth status 输出 identities.available=true 的 JSON
-      // （shebang 直指 node 绝对路径，不依赖 PATH 查找解释器；忽略传入参数）
-      const fakeCli = path.join(bin, 'lark-cli');
-      if (fs.existsSync(fakeCli)) fs.rmSync(fakeCli);
-      fs.writeFileSync(
-        fakeCli,
-        `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({identities:{user:{available:true}}})+"\\n");\n`,
-        { mode: 0o755 },
-      );
+      writeFakeCli(bin, 'lark-cli', {
+        sh: `printf '%s\\n' '${AUTH_OK_JSON}'\n`,
+        cmd: `echo ${AUTH_OK_JSON}\r\n`,
+      });
       assert.equal(checkLarkCliStatus(), 'ok');
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
