@@ -366,12 +366,17 @@ async function main(): Promise<void> {
     });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
+    // 成功路径 ensureKanbanRunning 不会回收子进程：win32 上 cmd 执行期间 .cmd 文件被占用，
+    // 直接 rmSync 会 EPERM/EBUSY，先在 finally 里按树停掉再删（taskkill 需先还原 PATH）
+    let spawned: import('child_process').ChildProcess | null = null;
     try {
       const ret = await ensureKanbanRunning(`http://127.0.0.1:${port}`, { waitMs: 15000 });
+      spawned = ret.child;
       assert.equal(ret.started, true);
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
+      if (spawned) await stopKanbanChild(spawned);
       fs.rmSync(bin, { recursive: true, force: true });
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
