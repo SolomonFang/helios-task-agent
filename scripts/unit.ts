@@ -3101,7 +3101,8 @@ async function run(): Promise<void> {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-'));
     writeFakeCli(bin, 'npx', {
       sh: 'exec /bin/sleep 60\n',
-      cmd: 'ping -n 60 127.0.0.1 >nul\r\n',
+      // win32 用绝对路径的 ping：PATH 已被替换为 bin，裸 `ping` 会 not found 导致假 npx 秒退走错分支
+      cmd: '%SystemRoot%\\System32\\ping.exe -n 60 127.0.0.1 >nul\r\n',
     });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;

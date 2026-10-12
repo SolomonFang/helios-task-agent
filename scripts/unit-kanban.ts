@@ -359,10 +359,10 @@ async function main(): Promise<void> {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-fakenpx-exit-'));
     // sleep 用绝对路径：子进程经 minimalChildEnv 只继承 PATH=bin，裸 `sleep` 会 not found
     // 导致壳瞬间退出（Linux 回收更快，首轮轮询即误判「进程已退出」，macOS 靠时序侥幸通过）；
-    // win32 用 ping 近似 0.5s 等待（cmd 无 sleep）
+    // win32 用 ping 近似 0.5s 等待（cmd 无 sleep）；ping 同样需绝对路径（PATH 只有 bin）
     writeFakeCli(bin, 'npx', {
       sh: '/bin/sleep 0.5\nexit 0\n',
-      cmd: 'ping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n',
+      cmd: '%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n',
     });
     const prevPath = process.env.PATH;
     process.env.PATH = bin;
