@@ -485,12 +485,12 @@ async function main(): Promise<void> {
       assert.equal(checkLarkCli(), true, 'probeSync 应探测到假 lark-cli');
       let leaked = fs.readFileSync(dump, 'utf8');
       assert.ok(!leaked.includes('HTA_UNIT_SECRET'), `probeSync 子进程不应看到敏感变量，实际 env：${leaked}`);
-      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+      assert.ok(leaked.toLowerCase().includes(`path=${bin.toLowerCase()}`), 'PATH 属放行清单，应保留（win32 环境块键惯例为 Path，大小写不敏感比对）');
       fs.rmSync(dump, { force: true });
       assert.equal(await checkLarkCliAsync(), true, 'probeAsync 应探测到假 lark-cli');
       leaked = fs.readFileSync(dump, 'utf8');
       assert.ok(!leaked.includes('HTA_UNIT_SECRET'), `probeAsync 子进程不应看到敏感变量，实际 env：${leaked}`);
-      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+      assert.ok(leaked.toLowerCase().includes(`path=${bin.toLowerCase()}`), 'PATH 属放行清单，应保留（win32 环境块键惯例为 Path，大小写不敏感比对）');
     } finally {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
@@ -506,7 +506,7 @@ async function main(): Promise<void> {
       assert.equal(cmd.via, 'path', 'PATH 上有假 ocr，应命中 path 形态');
       const leaked = fs.readFileSync(dump, 'utf8');
       assert.ok(!leaked.includes('LLM_API_KEY'), `探测子进程不应看到 LLM_API_KEY，实际 env：${leaked}`);
-      assert.ok(leaked.includes(`PATH=${bin}`), 'PATH 属放行清单，应保留');
+      assert.ok(leaked.toLowerCase().includes(`path=${bin.toLowerCase()}`), 'PATH 属放行清单，应保留（win32 环境块键惯例为 Path，大小写不敏感比对）');
     } finally {
       fs.rmSync(bin, { recursive: true, force: true });
     }
