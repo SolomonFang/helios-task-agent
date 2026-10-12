@@ -3745,7 +3745,7 @@ async function run(): Promise<void> {
       assert.throws(() => uninstallSkill('src-skill'), /未找到技能/);
       assert.throws(() => uninstallSkill('helios-kanban-remote'), /随产品自带的技能，不能卸载/);
 
-      // ~/ 前缀展开（POSIX 下 os.homedir() 读 $HOME）
+      // ~/ 前缀展开（installSkill 优先读 $HOME，win32 下 os.homedir() 不读环境变量）
       const fakeHome = path.join(tmp, 'fake-home');
       fs.mkdirSync(path.join(fakeHome, 'tilde-skill'), { recursive: true });
       fs.writeFileSync(

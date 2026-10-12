@@ -1059,27 +1059,30 @@ async function run(): Promise<void> {
     }
   };
 
-  await checkAsync('cli 启动窗口：看板探测在途时收到 SIGTERM，优雅退出（退出码 0）', async () => {
-    const kanban = await startHangingKanban();
-    try {
-      const { code, out } = await signalDuringKanbanBoot('SIGTERM', kanban.url, kanban.healthSeen);
-      // 修复前无 SIGTERM handler：进程被信号默认终止，exit code 为 null
-      assert.equal(code, 0, `SIGTERM 路径退出码应为 0，实际 ${code}；输出：${out()}`);
-    } finally {
-      await stopServer(kanban.server);
-    }
-  });
+  // win32 无 POSIX 信号语义：child.kill 的 SIGTERM/SIGINT 被强转无条件终止，优雅退出路径走不到，整组跳过
+  if (process.platform !== 'win32') {
+    await checkAsync('cli 启动窗口：看板探测在途时收到 SIGTERM，优雅退出（退出码 0）', async () => {
+      const kanban = await startHangingKanban();
+      try {
+        const { code, out } = await signalDuringKanbanBoot('SIGTERM', kanban.url, kanban.healthSeen);
+        // 修复前无 SIGTERM handler：进程被信号默认终止，exit code 为 null
+        assert.equal(code, 0, `SIGTERM 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+      } finally {
+        await stopServer(kanban.server);
+      }
+    });
 
-  await checkAsync('cli 启动窗口：看板探测在途时按 Ctrl+C 直接退出（不再吞信号继续启动）', async () => {
-    const kanban = await startHangingKanban();
-    try {
-      const { code, out } = await signalDuringKanbanBoot('SIGINT', kanban.url, kanban.healthSeen);
-      assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
-      assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
-    } finally {
-      await stopServer(kanban.server);
-    }
-  });
+    await checkAsync('cli 启动窗口：看板探测在途时按 Ctrl+C 直接退出（不再吞信号继续启动）', async () => {
+      const kanban = await startHangingKanban();
+      try {
+        const { code, out } = await signalDuringKanbanBoot('SIGINT', kanban.url, kanban.healthSeen);
+        assert.ok(out().includes('再见'), `应走优雅退出路径，输出：${out()}`);
+        assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+      } finally {
+        await stopServer(kanban.server);
+      }
+    });
+  }
 
   // ================= 盲区 6：config 安全过滤与 dotenv 解析对齐 =================
 

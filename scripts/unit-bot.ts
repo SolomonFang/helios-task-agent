@@ -336,18 +336,21 @@ async function main(): Promise<void> {
       }
     });
 
-    await checkAsync('退出码：bot 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
-      const { child, tmp, out } = spawnAgent('bot-main.ts', kanban.url, feishuEnv);
-      try {
-        await waitOutput(out, '正在连接看板'); // 连接在途（慢命令）时发信号
-        child.kill('SIGINT');
-        const code = await waitExit(child);
-        assert.ok(out().includes('正在退出'), `应走优雅退出路径，输出：${out()}`);
-        assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
-      } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
-      }
-    });
+    // win32 无 POSIX 信号语义：child.kill('SIGINT') 被强转无条件终止，优雅退出路径走不到，跳过该用例
+    if (process.platform !== 'win32') {
+      await checkAsync('退出码：bot 在 MCP 连接窗口内收到 SIGINT 正常退出且退出码为 0', async () => {
+        const { child, tmp, out } = spawnAgent('bot-main.ts', kanban.url, feishuEnv);
+        try {
+          await waitOutput(out, '正在连接看板'); // 连接在途（慢命令）时发信号
+          child.kill('SIGINT');
+          const code = await waitExit(child);
+          assert.ok(out().includes('正在退出'), `应走优雅退出路径，输出：${out()}`);
+          assert.equal(code, 0, `SIGINT 路径退出码应为 0，实际 ${code}；输出：${out()}`);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      });
+    }
 
     await checkAsync('退出码：cli uncaughtException 优雅退出且退出码为 1', async () => {
       const { child, tmp, out } = spawnAgent('cli.ts', kanban.url, { HTA_TEST_CRASH: '1' });
