@@ -110,6 +110,9 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   const home = userEnvPath();
   const project = projectEnvPath();
   const cwd = path.join(process.cwd(), '.env');
+  // shell 已存在键快照（任何 .env 加载前取样）：cwd .env 不得覆盖 shell 环境变量，
+  // 与 dotenv 默认语义对齐（dotenv.config 不覆盖 process.env 已存在的键）
+  const shellKeys = new Set(Object.keys(process.env));
 
   if (fs.existsSync(project)) {
     dotenv.config({ path: project });
@@ -121,6 +124,7 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
   const forcedEnvSnapshot = process.env.HELIOS_TASK_AGENT_ENV;
   if (fs.existsSync(cwd) && path.resolve(cwd) !== path.resolve(project)) {
     // 不用 dotenv.config(override)：先解析再过滤高危键（大小写不敏感，见 isCwdRestrictedKey），其余键仍覆盖项目 .env。
+    // shell 已存在的键跳过（与 dotenv 不覆盖 shell 的语义对齐）；项目 .env 写入的键不在快照内，仍被覆盖。
     const parsed = dotenv.parse(fs.readFileSync(cwd));
     const dropped: string[] = [];
     for (const [k, v] of Object.entries(parsed)) {
@@ -128,6 +132,7 @@ export function loadEnvFiles(): { primaryWritePath: string; loaded: string[] } {
         dropped.push(k);
         continue;
       }
+      if (shellKeys.has(k)) continue;
       process.env[k] = v;
     }
     if (dropped.length) {
@@ -313,7 +318,13 @@ function serializeEnvValue(v: string): string {
   return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
 }
 
-function applyProcessEnv(map: Record<string, string>): void {
+/**
+ * 把合并后的 env map 应用到 process.env：空串值删键；removedKeys 是本轮从文件中
+ * 删除的键（已不在 map 里，遍历时碰不到），必须同步 delete——否则向导用 `-` 清除
+ * 可选字段后，process.env 旧值残留，currentConfig() 进程内继续返回已清除的值。
+ */
+function applyProcessEnv(map: Record<string, string>, removedKeys: readonly string[] = []): void {
+  for (const k of removedKeys) delete process.env[k];
   for (const [k, v] of Object.entries(map)) {
     if (v === '') delete process.env[k];
     else process.env[k] = v;
@@ -326,9 +337,12 @@ export function writeEnvFile(
   filePath = resolveEnvWritePath(),
 ): string {
   const map = parseEnvFile(filePath);
+  const removedKeys: string[] = [];
   for (const [k, v] of Object.entries(updates)) {
-    if (v === undefined || v === '') delete map[k];
-    else map[k] = v;
+    if (v === undefined || v === '') {
+      delete map[k];
+      removedKeys.push(k);
+    } else map[k] = v;
   }
   const preferredOrder = [
     'LLM_BASE_URL',
@@ -354,7 +368,7 @@ export function writeEnvFile(
   // 避免写盘中途被杀导致 .env 截断、凭证丢失；rename 后目标一定是新建的
   // 0600 文件（内部含 chmod），所在目录确保 0700。
   writeFileAtomicPrivateSync(filePath, body);
-  applyProcessEnv(map);
+  applyProcessEnv(map, removedKeys);
   return filePath;
 }
 

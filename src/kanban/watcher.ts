@@ -11,7 +11,8 @@ import {
   type KanbanTaskRow,
   type KanbanProjectRow,
 } from './http';
-import { statusLabel } from './summary';
+import { statusLabel } from './status';
+import { pickAttemptSummaryText } from './parse';
 import { isLoopbackUrl } from '../infra/url-utils';
 import { StaleNudgeTracker } from './stale-nudge';
 
@@ -142,10 +143,8 @@ export class KanbanWatcher {
   /** stop() 后置位：在途 tick 的推送循环逐条检查，已停即跳过剩余推送（避免打到已关闭的 channel）。 */
   private stopped = false;
   private state: WatchState | null;
-  /** 最近一次落盘快照的序列化结果（tasks/approvals）：tick 里比较与写盘复用它，不再每轮重复 stringify。 */
-  private lastSnapshotJson: { tasks: string; approvals: string } | null;
-  /** 最近一次落盘的 pending 序列化结果：与 tasks/approvals 同口径，pending 非空但内容不变的空转 tick 不重复写。 */
-  private lastPendingJson: string | null;
+  /** 最近一次成功落盘的全量序列化结果：tick 里与本轮序列化比较，内容不变的空转 tick 不重复写盘。 */
+  private lastPersistedJson: string | null;
   /** 项目 id → 项目名（每轮 collect 刷新；stale 事件展示用，不进快照）。 */
   private projectNames = new Map<string, string>();
   /** 停滞提醒状态跟踪器（staleNudge 开启时构造；决策与落盘见 stale-nudge.ts）。 */
@@ -154,8 +153,7 @@ export class KanbanWatcher {
   constructor(opts: KanbanWatcherOptions) {
     this.opts = opts;
     this.state = this.load();
-    this.lastSnapshotJson = this.state ? KanbanWatcher.serializeSnapshot(this.state) : null;
-    this.lastPendingJson = this.state?.pending ? JSON.stringify(this.state.pending, null, 2) : null;
+    this.lastPersistedJson = this.state ? KanbanWatcher.serializeState(this.state) : null;
     if (opts.staleNudge) {
       this.staleTracker = new StaleNudgeTracker({
         statePath: opts.staleNudge.statePath,
@@ -223,25 +221,16 @@ export class KanbanWatcher {
     }
   }
 
-  /** 快照序列化（tasks/approvals 各一份，与 state 文件内的缩进口径一致）：每 tick 只算一次，比较与写盘复用。 */
-  private static serializeSnapshot(state: WatchState): { tasks: string; approvals: string } {
-    return { tasks: JSON.stringify(state.tasks, null, 2), approvals: JSON.stringify(state.approvals, null, 2) };
+  /** state 全量序列化（落盘格式：2 格缩进 + 末尾换行）：每 tick 只算一次，变更比较与写盘复用同一份输出。 */
+  private static serializeState(state: WatchState): string {
+    return `${JSON.stringify(state, null, 2)}\n`;
   }
 
-  /** 落盘 state：由调用方已算好的快照序列化结果拼装（pending 增量序列化），不再整树重复 stringify。 */
-  private persist(snapshotJson: { tasks: string; approvals: string }): void {
+  /** 落盘 state：全量 stringify（WatchState 新增字段不会被手工拼装静默丢弃），成功后更新变更比较基线。 */
+  private persist(json: string): void {
     try {
-      // 与 JSON.stringify(state, null, 2) 等价的拼装：嵌套部分每行补两格缩进
-      const indent = (json: string) => json.replace(/\n/g, '\n  ');
-      const pending = this.state?.pending;
-      const pendingJson = pending ? JSON.stringify(pending, null, 2) : null;
-      const pendingPart = pendingJson ? `,\n  "pending": ${indent(pendingJson)}` : '';
-      writeFileAtomicPrivateSync(
-        this.opts.statePath,
-        `{\n  "tasks": ${indent(snapshotJson.tasks)},\n  "approvals": ${indent(snapshotJson.approvals)}${pendingPart}\n}\n`,
-      );
-      this.lastSnapshotJson = snapshotJson;
-      this.lastPendingJson = pendingJson;
+      writeFileAtomicPrivateSync(this.opts.statePath, json);
+      this.lastPersistedJson = json;
     } catch (err) {
       // best-effort：落盘失败不阻断主流程（重启后由旧快照 diff 兜底重推），HTA_DEBUG 下留信号
       if (process.env.HTA_DEBUG) console.error(`[watcher] state 落盘失败：${errMessage(err)}`);
@@ -259,8 +248,6 @@ export class KanbanWatcher {
         // 否则恢复后 diff 会把全部 pending 审批当成「新的待审批」再推一遍
         if (approvalsUnknown) current.approvals = prev.approvals;
       }
-      // 快照序列化每 tick 只算这一次：下方基线落盘、persistIfChanged 的比较与写盘都复用它
-      const snapshotJson = KanbanWatcher.serializeSnapshot(current);
       if (!prev) {
         // 首轮 approvals 拉取失败（未知）时不落基线：[] 落盘后，下一轮端点恢复会把
         // 全部既有待审批 diff 成「新的待审批」推一遍，违背「首轮不刷通知」契约——
@@ -270,17 +257,19 @@ export class KanbanWatcher {
           return;
         }
         this.state = current;
-        this.persist(snapshotJson);
+        this.persist(KanbanWatcher.serializeState(current));
         this.opts.log?.(`基线已建立（${Object.keys(current.tasks).length} 个任务）`);
         return;
       }
       const events = await this.diffEvents(current, prev);
       events.push(...this.staleEvents(current));
-      const { pending, pendingTouched, failed } = await this.deliverPending(events, prev.pending);
+      const { pending, failed } = await this.deliverPending(events, prev.pending);
       const next: WatchState = { ...current };
       if (Object.keys(pending).length) next.pending = pending;
       this.state = next;
-      this.persistIfChanged(prev, pendingTouched, snapshotJson);
+      // 与上次成功落盘的内容比较：快照或待重投队列任一变化才写盘，内容不变的空转 tick 不重复写
+      const nextJson = KanbanWatcher.serializeState(next);
+      if (nextJson !== this.lastPersistedJson) this.persist(nextJson);
       if (failed) {
         this.opts.log?.(`${failed} 个 (事件, owner) 组合推送失败，已记入待重投队列，下轮仅重试未送达组合`);
       }
@@ -431,11 +420,11 @@ export class KanbanWatcher {
     return events;
   }
 
-  /** 合并本轮事件入重投队列，按 (事件, owner) 粒度投递未送达组合；返回仍需重投的队列、本轮是否碰过队列及失败计数。 */
+  /** 合并本轮事件入重投队列，按 (事件, owner) 粒度投递未送达组合；返回仍需重投的队列与本轮失败计数。 */
   private async deliverPending(
     events: Array<{ id: string; event: WatchEvent }>,
     prevPending: WatchState['pending'],
-  ): Promise<{ pending: Record<string, PendingWatchEvent>; pendingTouched: boolean; failed: number }> {
+  ): Promise<{ pending: Record<string, PendingWatchEvent>; failed: number }> {
     // 事件粒度送达追踪：快照每轮都推进，未送达的 (事件, owner) 组合记入 pending 并随
     // state 文件持久化，下轮只重投未送达组合——一个 owner 长期不可达不再连累其他 owner
     // 被整批重推刷屏。进程重启后 pending 从 state 文件恢复继续重投；若写盘失败，盘上
@@ -466,7 +455,7 @@ export class KanbanWatcher {
       if (Object.keys(pending).length) {
         this.opts.log?.(`暂无认领 owner，${Object.keys(pending).length} 条事件保留待重投队列，下轮再投递`);
       }
-      return { pending, pendingTouched: Object.keys(pending).length > 0, failed: 0 };
+      return { pending, failed: 0 };
     }
     let failed = 0;
     let stoppedMidDeliver = false;
@@ -500,26 +489,8 @@ export class KanbanWatcher {
     }
     return {
       pending: pendingOut,
-      pendingTouched: Object.keys(pending).length > 0,
       failed,
     };
-  }
-
-  /** 仅在快照有变化或待重投队列内容有变化（含刚清零需落盘出队的）时写盘，无变化的空转 tick 不重复写 state 文件。 */
-  private persistIfChanged(
-    prev: WatchState,
-    pendingTouched: boolean,
-    snapshotJson: { tasks: string; approvals: string },
-  ): void {
-    const last = this.lastSnapshotJson;
-    const snapshotChanged =
-      !last || snapshotJson.tasks !== last.tasks || snapshotJson.approvals !== last.approvals;
-    // pending 与 tasks/approvals 同口径按内容比较：owner 持续不可达时队列长期非空，
-    // 但内容一字节没变的空转 tick 不得全量重写 state 文件
-    const pending = this.state?.pending;
-    const pendingJson = pending ? JSON.stringify(pending, null, 2) : null;
-    const queueActive = pendingTouched || Boolean(prev.pending && Object.keys(prev.pending).length);
-    if (snapshotChanged || (queueActive && pendingJson !== this.lastPendingJson)) this.persist(snapshotJson);
   }
 
   /** 拉取一轮快照；approvals 端点失败时 approvalsUnknown=true（调用方沿用旧快照，见 tick）。 */
@@ -584,16 +555,11 @@ export class KanbanWatcher {
     return { state: { tasks, approvals }, approvalsUnknown };
   }
 
-  /** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
+  /** 宽松提取任务详情里的可读摘要（字段链收口在 ./parse；本层按通知场景截断到 200 字符）。 */
   private static pickDetail(detail: unknown): string {
-    if (!detail || typeof detail !== 'object') return '';
-    const o = detail as Record<string, unknown>;
-    const summary = o.last_attempt_summary ?? o.summary ?? o.result ?? o.last_attempt_output;
-    if (typeof summary === 'string' && summary.trim()) {
-      const t = summary.trim();
-      return `${t.slice(0, 200)}${t.length > 200 ? '…' : ''}`;
-    }
-    return '';
+    const t = pickAttemptSummaryText(detail);
+    if (!t) return '';
+    return `${t.slice(0, 200)}${t.length > 200 ? '…' : ''}`;
   }
 
   private async fetchProjectIds(): Promise<string[]> {

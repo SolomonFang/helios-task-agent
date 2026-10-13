@@ -3,11 +3,9 @@ import type { MemoryStore } from '../memory';
 import type { OpenAiTool, ToolHandlers } from '../../types';
 import type { ConfirmFn } from '../guard';
 import { SourceRegistry } from '../source-registry';
-import { LOCAL_TOOL_SPECS, MEMORY_TOOLS, REMINDER_TOOLS, type LocalToolDeps } from './defs';
+import { LOCAL_TOOL_SPECS, MEMORY_TOOL_SPECS, REMINDER_TOOL_SPECS, type LocalToolDeps } from './defs';
 import { makeGatedWriter, type CreateCounter } from './gated-write';
 import { makeKanbanMcpHandler } from './kanban-mcp';
-import { makeMemoryHandlers } from './memory-tools';
-import { makeReminderHandlers } from './reminder-tools';
 import type { ReminderStore } from '../reminder';
 
 export { summarizeBothEnds } from './shared';
@@ -118,7 +116,8 @@ export function buildTools({
     }
   }
 
-  // 本地工具：单源注册表驱动（def/summary/handler 同条登记于 defs.ts），不存在「有 def 无 handler」的漏注册态
+  // 本地工具：单源注册表驱动（def/summary/handler 同条登记于 defs.ts）；memory_*/reminder_* 的
+  // makeHandler 在对应 store 缺省时返回 null——def 与 handler 同源，不存在「有 def 无 handler」的漏注册态
   const localDeps: LocalToolDeps = {
     uid,
     confirm,
@@ -130,25 +129,16 @@ export function buildTools({
     runGatedWrite,
     reportLinkBaseUrl,
     channel,
+    memory,
+    reminders,
+    onMemoryChange,
   };
-  for (const spec of LOCAL_TOOL_SPECS) {
-    handlers.set(spec.tool.function.name, spec.makeHandler(localDeps));
+  // 顺序沿用旧版拼装序（MCP → memory_* → reminder_* → 其余本地工具），避免工具列表无谓漂移
+  const allSpecs = [...MEMORY_TOOL_SPECS, ...REMINDER_TOOL_SPECS, ...LOCAL_TOOL_SPECS];
+  for (const spec of allSpecs) {
+    const handler = spec.makeHandler(localDeps);
+    if (handler) handlers.set(spec.tool.function.name, handler);
   }
-
-  if (memory) {
-    for (const [name, handler] of makeMemoryHandlers({ uid, memory, confirm, auditHome, onMemoryChange })) {
-      handlers.set(name, handler);
-    }
-    openAiTools.push(...MEMORY_TOOLS);
-  }
-
-  if (reminders) {
-    for (const [name, handler] of makeReminderHandlers({ uid, reminders, confirm, auditHome })) {
-      handlers.set(name, handler);
-    }
-    openAiTools.push(...REMINDER_TOOLS);
-  }
-
-  openAiTools.push(...LOCAL_TOOL_SPECS.map((s) => s.tool));
+  openAiTools.push(...allSpecs.filter((s) => handlers.has(s.tool.function.name)).map((s) => s.tool));
   return { openAiTools, handlers };
 }

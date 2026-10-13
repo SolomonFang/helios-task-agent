@@ -275,6 +275,7 @@ export function selectList({
 
     const cleanup = () => {
       stdin.removeListener('keypress', onKeypress);
+      stdin.removeListener('end', onEnd);
       if (stdin.isTTY && Boolean(stdin.isRaw) !== wasRaw) stdin.setRawMode(wasRaw);
       stdin.pause();
     };
@@ -284,6 +285,14 @@ export function selectList({
       settled = true;
       cleanup();
       fn(value);
+    };
+
+    // stdin EOF（如输入流被管道关闭）：不悬挂 promise，与 Esc/Ctrl+C 同口径按取消处理
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('已取消'));
     };
 
     const onKeypress = (str: string | undefined, key: readline.Key | undefined) => {
@@ -313,6 +322,7 @@ export function selectList({
     if (stdin.isTTY && !wasRaw) stdin.setRawMode(true);
     stdin.resume();
     stdin.on('keypress', onKeypress);
+    stdin.on('end', onEnd);
   });
 }
 
@@ -330,8 +340,18 @@ export function readSecret(promptText: string): Promise<string> {
 
     const cleanup = () => {
       stdin.removeListener('keypress', onKeypress);
+      stdin.removeListener('end', onEnd);
       if (stdin.isTTY && Boolean(stdin.isRaw) !== wasRaw) stdin.setRawMode(wasRaw);
       stdin.pause();
+    };
+
+    // stdin EOF（如输入流被管道关闭）：不悬挂 promise，与 Esc/Ctrl+C 同口径按取消处理
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      process.stdout.write('\n');
+      cleanup();
+      reject(new Error('已取消'));
     };
 
     const onKeypress = (str: string | undefined, key: readline.Key | undefined) => {
@@ -367,5 +387,6 @@ export function readSecret(promptText: string): Promise<string> {
     if (stdin.isTTY && !wasRaw) stdin.setRawMode(true);
     stdin.resume();
     stdin.on('keypress', onKeypress);
+    stdin.on('end', onEnd);
   });
 }

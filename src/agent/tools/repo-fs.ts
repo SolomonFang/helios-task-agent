@@ -13,10 +13,11 @@ export function makeRepoFsHandler({
   kanbanUrl: string;
   auditHome?: string;
 }): ToolHandler {
-  return async (raw) => {
+  return async (raw, ctx) => {
     const action = typeof raw.action === 'string' ? raw.action : '';
     const relPath = typeof raw.path === 'string' ? raw.path : '.';
     // 仓库代码属外部内容（可能含注释型注入）：UNTRUSTED 包裹
+    // ctx.signal 贯穿到看板接口 fetch 与 grep 扫描循环：/stop 与轮次超时能中断在途操作
     const { out, denied } = await runRepoFs(kanbanUrl, {
       action,
       root: typeof raw.root === 'string' ? raw.root : undefined,
@@ -24,6 +25,7 @@ export function makeRepoFsHandler({
       path: typeof raw.path === 'string' ? raw.path : undefined,
       pattern: typeof raw.pattern === 'string' ? raw.pattern : undefined,
       glob: typeof raw.glob === 'string' ? raw.glob : undefined,
+      signal: ctx?.signal,
     });
     // 读审计：仓库代码外发 LLM 留痕；只记 action/目标路径，不记读回内容。
     // 被敏感文件 denylist / 仓库白名单拒绝的尝试最值得记（探测行为的信号），记 decision: 'denied'。

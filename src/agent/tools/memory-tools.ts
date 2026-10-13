@@ -6,21 +6,20 @@ import { auditLog } from '../../infra/audit';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 
-/** memory_* handler 组：写/删/备注回注系统提示词（持久化注入通道），一律过确认闸门。 */
-export function makeMemoryHandlers({
-  uid,
-  memory,
-  confirm,
-  auditHome,
-  onMemoryChange,
-}: {
+/**
+ * memory_* handler 组（defs.ts 的 MEMORY_TOOL_SPECS 单源注册，每个工具一个工厂）：
+ * 写/删/备注回注系统提示词（持久化注入通道），一律过确认闸门。
+ */
+export interface MemoryToolDeps {
   uid: string;
   memory: MemoryStore;
   confirm?: ConfirmFn;
   auditHome?: string;
   onMemoryChange?: () => void;
-}): Array<[string, ToolHandler]> {
-  const memorySet: ToolHandler = async (raw, ctx) => {
+}
+
+export function makeMemorySetHandler({ uid, memory, confirm, auditHome, onMemoryChange }: MemoryToolDeps): ToolHandler {
+  return async (raw, ctx) => {
     const key = typeof raw.key === 'string' ? raw.key : '';
     if (!key.trim()) return '参数错误：key 不能为空';
     // 与空 key 同口径：缺失/非字符串/空 value 直接报参数错误，不静默写空串
@@ -54,8 +53,10 @@ export function makeMemoryHandlers({
       return `保存记忆失败：${errMessage(err)}`;
     }
   };
+}
 
-  const memoryGet: ToolHandler = async (raw) => {
+export function makeMemoryGetHandler({ uid, memory }: MemoryToolDeps): ToolHandler {
+  return async (raw) => {
     const key = typeof raw.key === 'string' ? raw.key.trim() : '';
     if (key) {
       const value = memory.getFact(uid, key);
@@ -67,8 +68,10 @@ export function makeMemoryHandlers({
     // updatedAt 是 UTC ISO 串，模型会原样转告且无决策价值：不放进返回（避免误导用户）
     return JSON.stringify({ facts: user.facts, notes: user.notes });
   };
+}
 
-  const memoryDelete: ToolHandler = async (raw, ctx) => {
+export function makeMemoryDeleteHandler({ uid, memory, confirm, auditHome, onMemoryChange }: MemoryToolDeps): ToolHandler {
+  return async (raw, ctx) => {
     const key = typeof raw.key === 'string' ? raw.key.trim() : '';
     if (!key) return '参数错误：key 不能为空';
     // 删除同样可被注入利用（先删合法来源再写伪造值），与写入一样过确认闸门；
@@ -95,8 +98,10 @@ export function makeMemoryHandlers({
       return `删除记忆失败：${errMessage(err)}`;
     }
   };
+}
 
-  const memoryNote: ToolHandler = async (raw, ctx) => {
+export function makeMemoryNoteHandler({ uid, memory, confirm, auditHome, onMemoryChange }: MemoryToolDeps): ToolHandler {
+  return async (raw, ctx) => {
     const text = typeof raw.text === 'string' ? raw.text : '';
     // 备注同样回注系统提示词，与 memory_set 同级风险，过确认闸门；summary 不含备注原文
     // （同 memory_set 口径：summary 原样进 audit.log），完整内容在卡片 detail 展示；
@@ -123,11 +128,4 @@ export function makeMemoryHandlers({
       return `追加备注失败：${errMessage(err)}`;
     }
   };
-
-  return [
-    ['memory_set', memorySet],
-    ['memory_get', memoryGet],
-    ['memory_delete', memoryDelete],
-    ['memory_note', memoryNote],
-  ];
 }

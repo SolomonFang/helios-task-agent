@@ -8,8 +8,7 @@ import { probeLarkCliAuthAsync, LARK_CLI_AUTH_HINT } from './infra/deps';
 import { fetchKanbanHealth } from './kanban/http';
 import { localToolSummary } from './agent/tools';
 import { installSkill, loadSkillDigests, uninstallSkill } from './agent/skills';
-import { friendlyLlmError } from './config/llm-error';
-import { CONTEXT_OVERFLOW_RE } from './agent/llm';
+import { friendlyLlmError, CONTEXT_OVERFLOW_RE, RATE_LIMIT_RE } from './config/llm-error';
 import { errMessage } from './infra/err';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -93,7 +92,7 @@ export async function buildStatusLines(
 export function buildToolsLines(
   opts: {
     mcpOk: boolean;
-    mcpTools: Tool[];
+    mcpTools: readonly Tool[];
     /** 本地侧是否启用持久化记忆：memory_* 工具仅在实际注册时列出，否则展示的是不存在的工具。 */
     memoryEnabled: boolean;
     /** 本地侧是否启用定时提醒：reminder_* 工具仅在实际注册时列出（两形态会话恒注册，调用方传 true）。 */
@@ -224,11 +223,9 @@ export function confirmRevokedText(n: number, noneText: string): string {
 
 /**
  * 上下文超限与限流/额度类错误：改模型配置解决不了这两类（friendly 已给出 /clear、稍后重试/查额度
- * 等正确出路），CLI 尾注再附「/config 检查模型配置」是错误出路。词表须与 config/llm-error.ts 的
- * 类别判定保持一致（超限正则单源复用 CONTEXT_OVERFLOW_RE；限流词表那边未导出，此处对齐维护）。
+ * 等正确出路），CLI 尾注再附「/config 检查模型配置」是错误出路。词表与 config/llm-error.ts 的
+ * 类别判定同一来源（超限复用 CONTEXT_OVERFLOW_RE，限流复用 RATE_LIMIT_RE）。
  */
-const RATE_LIMIT_RE = /\b429\b|rate limit|too many requests|quota|insufficient|余额|额度/i;
-
 function llmFailureConfigWontHelp(message: string): boolean {
   return CONTEXT_OVERFLOW_RE.test(message) || RATE_LIMIT_RE.test(message);
 }

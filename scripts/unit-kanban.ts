@@ -14,7 +14,7 @@ import { ensureKanbanRunning, stopKanbanChild } from '../src/kanban/kanban-ensur
 import {
   classifyWorkspaceSetup,
   fetchWorkspaceSnapshot,
-  fillHkStartBranches,
+  fillHkStartBranchesOrThrow,
   waitForWorkspaceReady,
   type RepoStartInput,
 } from '../src/kanban/workspace-ready';
@@ -112,25 +112,23 @@ async function main(): Promise<void> {
     console.log('SKIP  stopKanbanChild 进程组用例 ×2  — POSIX 专属（win32 无进程组）');
   }
 
-  // ---------- fillHkStartBranches：argv 形态 ----------
-  await checkAsync('fillHkStartBranches argv：--repo 无 :branch 时回填默认分支', async () => {
+  // ---------- fillHkStartBranchesOrThrow：argv 形态 ----------
+  await checkAsync('fillHkStartBranchesOrThrow argv：--repo 无 :branch 时回填默认分支', async () => {
     const mock = await mockKanban({ r1: 'hly-dev' });
     try {
       const argv = ['start', '--repo', 'r1'];
-      const err = await fillHkStartBranches(argv, mock.baseUrl);
-      assert.equal(err, null);
+      await fillHkStartBranchesOrThrow(argv, mock.baseUrl);
       assert.deepEqual(argv, ['start', '--repo', 'r1:hly-dev']);
     } finally {
       await mock.close();
     }
   });
 
-  await checkAsync('fillHkStartBranches argv：--repo 已带 :branch 时原样保留且不回填', async () => {
+  await checkAsync('fillHkStartBranchesOrThrow argv：--repo 已带 :branch 时原样保留且不回填', async () => {
     const mock = await mockKanban({ r1: 'hly-dev' });
     try {
       const argv = ['start', '--repo', 'r1:dev'];
-      const err = await fillHkStartBranches(argv, mock.baseUrl);
-      assert.equal(err, null);
+      await fillHkStartBranchesOrThrow(argv, mock.baseUrl);
       assert.deepEqual(argv, ['start', '--repo', 'r1:dev']);
       assert.equal(mock.requests(), 0); // 没有待补全项，不应请求看板
     } finally {
@@ -138,51 +136,55 @@ async function main(): Promise<void> {
     }
   });
 
-  await checkAsync('fillHkStartBranches argv：混合形态只补未带 :branch 的 --repo', async () => {
+  await checkAsync('fillHkStartBranchesOrThrow argv：混合形态只补未带 :branch 的 --repo', async () => {
     const mock = await mockKanban({ r2: 'hly-dev' });
     try {
       const argv = ['start', '--repo', 'r1:dev', '--repo', 'r2'];
-      const err = await fillHkStartBranches(argv, mock.baseUrl);
-      assert.equal(err, null);
+      await fillHkStartBranchesOrThrow(argv, mock.baseUrl);
       assert.deepEqual(argv, ['start', '--repo', 'r1:dev', '--repo', 'r2:hly-dev']);
     } finally {
       await mock.close();
     }
   });
 
-  await checkAsync('fillHkStartBranches argv：仓库无默认分支时返回 unresolved 错误', async () => {
+  await checkAsync('fillHkStartBranchesOrThrow argv：仓库无默认分支时抛 unresolved 错误', async () => {
     const mock = await mockKanban({}); // r1 未配置 default_target_branch
     try {
       const argv = ['start', '--repo', 'r1'];
-      const err = await fillHkStartBranches(argv, mock.baseUrl);
-      assert.ok(err && err.includes('无法启动工作区') && err.includes('r1'), `实际：${err}`);
+      await assert.rejects(
+        () => fillHkStartBranchesOrThrow(argv, mock.baseUrl),
+        (err: unknown) => {
+          const msg = String((err as Error).message);
+          return msg.includes('无法启动工作区') && msg.includes('r1');
+        },
+      );
       assert.deepEqual(argv, ['start', '--repo', 'r1']); // 出错不改写 argv
     } finally {
       await mock.close();
     }
   });
 
-  await checkAsync('fillHkStartBranches argv：无任何 --repo 时按 noRepoError 报错 / 未传则放行', async () => {
+  await checkAsync('fillHkStartBranchesOrThrow argv：无任何 --repo 时按 noRepoError 抛错 / 未传则放行', async () => {
     const mock = await mockKanban({});
     try {
       const noRepoError = '无法启动 workspace：未指定 --branch / --repo ID:branch';
-      const err = await fillHkStartBranches(['start'], mock.baseUrl, { noRepoError });
-      assert.equal(err, noRepoError);
-      const ok = await fillHkStartBranches(['start', '--branch', 'dev'], mock.baseUrl);
-      assert.equal(ok, null);
+      await assert.rejects(
+        () => fillHkStartBranchesOrThrow(['start'], mock.baseUrl, { noRepoError }),
+        (err: unknown) => (err as Error).message === noRepoError,
+      );
+      await fillHkStartBranchesOrThrow(['start', '--branch', 'dev'], mock.baseUrl);
       assert.equal(mock.requests(), 0);
     } finally {
       await mock.close();
     }
   });
 
-  // ---------- fillHkStartBranches：repos 形态（MCP start_workspace_session） ----------
-  await checkAsync('fillHkStartBranches repos：缺 base_branch 的回填，显式传入的保留', async () => {
+  // ---------- fillHkStartBranchesOrThrow：repos 形态（MCP start_workspace_session） ----------
+  await checkAsync('fillHkStartBranchesOrThrow repos：缺 base_branch 的回填，显式传入的保留', async () => {
     const mock = await mockKanban({ r1: 'hly-dev' });
     try {
       const repos: RepoStartInput[] = [{ repo_id: 'r1' }, { repo_id: 'r2', base_branch: 'feat' }];
-      const err = await fillHkStartBranches(repos, mock.baseUrl);
-      assert.equal(err, null);
+      await fillHkStartBranchesOrThrow(repos, mock.baseUrl);
       assert.deepEqual(repos, [
         { repo_id: 'r1', base_branch: 'hly-dev' },
         { repo_id: 'r2', base_branch: 'feat' },
@@ -192,12 +194,14 @@ async function main(): Promise<void> {
     }
   });
 
-  await checkAsync('fillHkStartBranches repos：无默认分支可回填时报错且不写回', async () => {
+  await checkAsync('fillHkStartBranchesOrThrow repos：无默认分支可回填时抛错且不写回', async () => {
     const mock = await mockKanban({});
     try {
       const repos: RepoStartInput[] = [{ repo_id: 'r9' }];
-      const err = await fillHkStartBranches(repos, mock.baseUrl);
-      assert.ok(err && err.includes('r9'), `实际：${err}`);
+      await assert.rejects(
+        () => fillHkStartBranchesOrThrow(repos, mock.baseUrl),
+        (err: unknown) => String((err as Error).message).includes('r9'),
+      );
       assert.deepEqual(repos, [{ repo_id: 'r9' }]);
     } finally {
       await mock.close();

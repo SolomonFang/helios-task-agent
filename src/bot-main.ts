@@ -32,7 +32,7 @@ import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from '.
 import { batchAckText, batchScopeWord, wrapUntrusted, type ConfirmKind } from './agent/guard';
 import { checkForUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
 import { createGracefulExit, handleWizardCancel, installCrashGuards, maybePromptUpdate } from './infra/process-lifecycle';
-import { connectMcp } from './kanban/mcp';
+import { connectMcp, type KanbanMcp } from './kanban/mcp';
 import { TRY_EXAMPLES } from './commands';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { McpSupervisor } from './bot/supervisor';
@@ -41,9 +41,11 @@ import { DailyBrief } from './bot/daily-brief';
 import { WeeklyBrief } from './bot/weekly-brief';
 import { runtimeFlags } from './config/runtime-flags';
 import { ReminderRunner, ReminderStore } from './agent/reminder';
-import { createBotHandlers, createRoundNoticeTracker, type ConfirmCardBridge } from './bot/handler';
+import { createBotHandlers, createRoundNoticeTracker, type ConfirmCardBridge, type RoundNoticeTracker } from './bot/handler';
+import { safeNotify } from './bot/notify';
 import { errMessage } from './infra/err';
-import type { AskFn, ChooseFn } from './types';
+import type { AgentConfig, AskFn, ChooseFn } from './types';
+import type { RuntimeFlags } from './config/runtime-flags';
 import type { ChildProcess } from 'child_process';
 import { c } from './infra/ui';
 
@@ -161,6 +163,414 @@ function createAsk(): { ask: AskFn; askSecret?: AskFn; choose: ChooseFn; close: 
   };
 }
 
+/** 启动推进过程中逐段登记的资源：shutdown 只清理已登记的部分（清理顺序固定在 shutdown 内）。 */
+interface BotCleanup {
+  channel: FeishuChannel | null;
+  mcp: { close(): Promise<void> } | null;
+  watcher: KanbanWatcher | null;
+  kanbanChild: ChildProcess | null;
+  supervisor: McpSupervisor | null;
+  wsAlerter: WsAlerter | null;
+  reportServer: ReportServer | null;
+  dailyBrief: DailyBrief | null;
+  weeklyBrief: WeeklyBrief | null;
+  reminderRunner: ReminderRunner | null;
+  historyStore: SessionHistoryStore | null;
+}
+
+interface ConfirmAssembly {
+  /** 轮次内插消息追踪：确认卡片/回执插在「处理中」占位之后时标记，最终回复改发新消息保持时间线顺序。 */
+  roundNotices: RoundNoticeTracker;
+  /** 确认卡片合并桥（单卡片生命周期）：空实现下确认一律走独立卡片/文本路径，由 createBotHandlers 填充真实实现。 */
+  confirmCardBridge: ConfirmCardBridge;
+  /** 每用户最近一次写操作确认请求的 kind（bot 批准回执按 kind 细化免问措辞；confirm.ts 未暴露该状态，随发送记录）。 */
+  lastWriteKind: Map<string, ConfirmKind>;
+  confirmations: ConfirmationManager;
+}
+
+/**
+ * 写操作确认装配：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）；
+ * 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）。
+ * 确认卡片合并桥（单卡片生命周期）：当前轮次有存活进度卡时，确认卡片原地更新进度卡，
+ * 不再另发消息；实现由 createBotHandlers 填充（confirmations 先于 handlers 构建，这里先给空实现，
+ * 空实现下 activeCardId 恒 undefined → 确认一律走独立卡片/文本路径，与旧行为一致）。
+ */
+function assembleConfirmations(channel: FeishuChannel): ConfirmAssembly {
+  const roundNotices = createRoundNoticeTracker();
+  const confirmCardBridge: ConfirmCardBridge = {
+    activeCardId: () => undefined,
+    hold: () => {},
+    release: () => {},
+    paint: () => Promise.resolve(),
+  };
+  /** 确认已合并进进度卡的消息 id 集合（onSettled 分支与 handler 同步换卡判定用；settle 后删除）。 */
+  const mergedConfirms = new Set<string>();
+  const lastWriteKind = new Map<string, ConfirmKind>();
+  const confirmations = new ConfirmationManager(
+    async (openId, chatId, req, id, timeoutMs) => {
+      // Map 无清理会无界增长：超上限整体清空（代价只是免问回执措辞回退为泛化文案）
+      if (lastWriteKind.size >= 1000) lastWriteKind.clear();
+      lastWriteKind.set(openId, req.kind);
+      // 单卡片生命周期：有存活进度卡时确认卡片原地画上去（带停止按钮令牌），并占用该卡
+      //（hold 期间进度刷新暂停，确认按钮不被覆盖）；合并成功不 mark roundNotices——
+      // 轮次没有插入独立消息，最终回复继续原地更新同一张卡
+      const progressCardId = confirmCardBridge.activeCardId(openId);
+      if (progressCardId) {
+        confirmCardBridge.hold(progressCardId);
+        try {
+          await confirmCardBridge.paint(progressCardId, buildConfirmCard(req, id, timeoutMs, { stopToken: progressCardId }));
+          mergedConfirms.add(progressCardId);
+          return progressCardId;
+        } catch (err) {
+          // 合并绘制失败：解除占用并落入既有「独立卡片 → 文本」降级链
+          confirmCardBridge.release(progressCardId);
+          console.error(`[confirm] 进度卡合并确认失败，降级独立卡片: ${errMessage(err)}`);
+        }
+      }
+      roundNotices.mark(openId);
+      const sendText = () => {
+        // 免问提示与卡片口径一致：粒度词与后果说明复用 guard 的统一文案；
+        // 后果的「免问」改述为「不再逐次询问」，避免同句「免问」堆砌
+        const batchHint = req.batchKey
+          ? `；回复「${batchScopeWord(req.batchScope)}免问」则${batchAckText(req.batchScope, req.kind).replace('免问', '不再逐次询问')}`
+          : '';
+        // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
+        const detailBlock = req.detail
+          .split('\n')
+          .map((l) => `  ${l}`)
+          .join('\n');
+        return channel.notifyOpenId(
+          openId,
+          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}；回复「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
+        );
+      };
+      if (chatId) {
+        const r = await sendCardWithTextFallback({
+          sendCard: () => channel.sendCard(chatId, buildConfirmCard(req, id, timeoutMs)),
+          sendText,
+          cardFailLog: (m) => console.error(`[confirm] 卡片发送失败，降级文本: ${m}`),
+        });
+        // 文本降级也失败：抛给管理器按拒绝收尾并走 onSendFailed 通知
+        if (r.error) throw r.error;
+        return r.card;
+      }
+      await sendText();
+      return undefined;
+    },
+    {
+      timeoutMs: 120000,
+      onTimeout: (openId, req) => {
+        roundNotices.mark(openId);
+        void safeNotify(channel, openId, `确认超时，已自动拒绝：${req.summary}。如仍需执行，直接再跟我说一声即可。`);
+      },
+      onSuperseded: (openId, req) => {
+        roundNotices.mark(openId);
+        void safeNotify(channel, openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}。新操作的确认会稍后出现在卡片上，请留意处理。`);
+      },
+      onSettled: (_openId, req, settle, cardMessageId) => {
+        if (!cardMessageId) return;
+        if (mergedConfirms.delete(cardMessageId)) {
+          // 合并单卡片场景：确认卡片就是进度占位卡片，终态处理经 paint 入有序链（与后续结果卡保序）
+          confirmCardBridge.release(cardMessageId);
+          // 批准路径：同步回调已把卡片换回「执行中」进度卡，轮次会继续刷进度/结果卡，不再画静态终态
+          if (settle === 'once' || settle === 'batch') return;
+          // 拒绝/超时/作废：轮次 reply 可能滞后，先把卡片收为终态（结果卡随后保序覆盖）
+          confirmCardBridge.paint(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
+            console.error(`[confirm] 卡片终态更新失败: ${errMessage(err)}`);
+          });
+          return;
+        }
+        void channel.updateCard(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
+          const message = errMessage(err);
+          console.error(`[confirm] 卡片终态更新失败: ${message}`);
+        });
+      },
+      // 卡片与文本降级都发送失败：管理器已按拒绝收尾，这里走最后可达路径告知用户，
+      // 避免"操作默默没执行"（仍失败只能落日志，等待方已拿到明确拒绝、不会干等）
+      onSendFailed: (openId, req, error) => {
+        roundNotices.mark(openId);
+        // 原始错误（可能是 axios 英文原文）只进日志，不落用户面
+        console.error(`[confirm] 确认发送最终失败(${openId.slice(0, 4)}…): ${error}`);
+        void safeNotify(
+          channel,
+          openId,
+          `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n请稍后重试；若反复出现，请检查部署机器的网络。`,
+        );
+      },
+    },
+  );
+  return { roundNotices, confirmCardBridge, lastWriteKind, confirmations };
+}
+
+/**
+ * owner 认领钩子：白名单为空时首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）。
+ * 写盘失败返回 false：channel 撤销内存放行（fail-closed），避免重启后任何人可再 claim。
+ */
+function attachOwnerClaimHandler(channel: FeishuChannel): void {
+  channel.onOwnerClaim = (openId) => {
+    try {
+      writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
+      console.log(c.ok(`首个私聊用户已成为部署者并写入白名单：${openId}`));
+    } catch (err) {
+      const message = errMessage(err);
+      console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）：${message}`);
+      void safeNotify(
+        channel,
+        openId,
+        `⚠️ 部署者绑定失败：白名单写入 .env 未成功，本次绑定未持久化，你暂时无法使用本机器人。` +
+          `请检查 ${userEnvPath()} 及所在目录的写权限，修复后重启机器人再私聊。`,
+      );
+      return false;
+    }
+    void safeNotify(
+      channel,
+      openId,
+      '👋 你已成为本机器人实例的部署者（已写入白名单），其他私聊用户将被拒绝。发送 /help 查看我能做什么。',
+    );
+    return true;
+  };
+}
+
+/** 全体 owner 推送（watcher 告警等共用）：逐个投递，失败记日志不抛出。 */
+function createNotifyOwners(channel: FeishuChannel): (text: string) => void {
+  return (text) => {
+    for (const oid of channel.allowedOpenIds()) {
+      void safeNotify(channel, oid, text);
+    }
+  };
+}
+
+/**
+ * 报告静态服务装配：AI 审查（reviews/）与工作总结（reports/）两类报告都推 HTTP 链接，
+ * 避免长文本截断与本机路径在手机飞书打不开的问题；启动失败回退文本推送（不阻断启动）。
+ */
+async function startReportServerSafe(kanbanUrl: string, cleanup: BotCleanup): Promise<ReportServer | null> {
+  try {
+    const reportServer = await startReportServer([reviewsDir(), reportsDir()], kanbanUrl);
+    cleanup.reportServer = reportServer;
+    console.log(c.gray(`报告服务：${reportServer.baseUrl}`));
+    return reportServer;
+  } catch (err) {
+    // 原始错误可能是英文 SDK 原文，只进调试输出（与 MCP 连接失败同一口径）；用户面只给中文结论
+    if (process.env.HTA_DEBUG) console.error(`[report] 报告服务启动失败原文: ${errMessage(err)}`);
+    console.warn(c.warn('报告服务启动失败，报告将回退为文本推送'));
+    return null;
+  }
+}
+
+/**
+ * 看板 MCP 连接装配：实例一创建即登记 cleanup（45s 连接窗口内收到退出信号时 shutdown 能拿到
+ * mcp 做 close，其 in-flight stdio 子进程由 closePending 兜底关闭）；连接等待期每 ~10 秒
+ * 覆写当前行补进度（bot 无 spinner，否则最长 45s 无反馈像卡死）。失败降级 hk_cli，不阻断启动。
+ */
+async function connectKanbanMcp(agentCfg: AgentConfig, cleanup: BotCleanup): Promise<{ mcp: KanbanMcp; mcpOk: boolean }> {
+  const bootLabel = '正在连接看板…';
+  process.stdout.write(c.gray(bootLabel));
+  const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg, {
+    onCreate: (instance) => {
+      cleanup.mcp = instance;
+    },
+    onLog: (msg) => process.stdout.write(c.gray(`\r${msg}`)),
+  });
+  if (mcpOk) {
+    process.stdout.write(c.ok(`\r看板已连接（${mcp.tools.length} 个工具）          \n`));
+  } else {
+    // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
+    if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
+    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用          \n`));
+    if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
+  }
+  return { mcp, mcpOk };
+}
+
+/**
+ * MCP 健康监督装配：60s 探测；连续失败才降级 hk_cli，自动重连（退避至 ~5 分钟），恢复后切回。
+ * 有用户轮次进行中时不重连（reconnect 的 close 会杀 in-flight 工具调用），竞态防护见 supervisor。
+ * kanbanHealth：mcp.ping 只证明 stdio 活着，看板假死时探活会误判健康——每 5 分钟
+ * （失败后逐 tick）补一次真实看板健康调用，连续失败走同一 onLost 降级/告警通道。
+ */
+function assembleSupervisor(opts: {
+  mcp: KanbanMcp;
+  mcpOk: boolean;
+  cfg: AgentConfig;
+  router: SessionRouter;
+  notifyOwners: (text: string) => void;
+  cleanup: BotCleanup;
+}): McpSupervisor {
+  const supervisor = new McpSupervisor({
+    mcp: opts.mcp,
+    initiallyAlive: opts.mcpOk,
+    kanbanHealth: async () => {
+      if (!(await fetchHealth(opts.cfg.kanbanUrl))) throw new Error('看板健康检查未通过');
+    },
+    onLost: () => {
+      opts.router.setMcpOk(false);
+      console.log(c.warn(`看板连接已中断，${MCP_FALLBACK_TEXT}，将自动重连…`));
+      opts.notifyOwners(`⚠️ 看板连接已中断：${MCP_FALLBACK_TEXT}，恢复后自动切回。`);
+    },
+    onRecovered: () => {
+      opts.router.setMcpOk(true);
+      console.log(c.ok('看板连接已恢复'));
+      opts.notifyOwners('✅ 看板连接已恢复');
+    },
+  });
+  supervisor.start();
+  opts.cleanup.supervisor = supervisor;
+  return supervisor;
+}
+
+/**
+ * 看板状态主动推送装配：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）。
+ * 停滞任务提醒依赖看板推送（watcher）驱动：watch 整体关闭时静默失效会误导部署者，须告警。
+ */
+function assembleWatcher(opts: {
+  flags: RuntimeFlags;
+  cfg: AgentConfig;
+  channel: FeishuChannel;
+  router: SessionRouter;
+  cleanup: BotCleanup;
+}): void {
+  const { flags, cfg, channel, router, cleanup } = opts;
+  if (!flags.kanbanWatch) {
+    if (flags.staleNudgeHours) {
+      console.warn(c.warn('停滞任务提醒依赖看板推送，已随 KANBAN_WATCH=0 一并关闭'));
+    }
+    return;
+  }
+  const intervalSec = flags.kanbanWatchIntervalSec;
+  const staleNudgeHours = flags.staleNudgeHours;
+  const staleThresholdMs = (staleNudgeHours ?? 0) * 60 * 60 * 1000;
+  // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
+  // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
+  const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
+    const r = await sendCardWithTextFallback({
+      sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event)),
+      sendText: () => channel.notifyOpenId(oid, event.text),
+      cardFailLog: (m) => console.error(`[watch] 卡片推送失败(${oid.slice(0, 4)}…): ${m}，降级纯文本`),
+      textFailLog: (m) => console.error(`[watch] 推送失败(${oid.slice(0, 4)}…): ${m}`),
+    });
+    // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
+    // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
+    //   注入发生在轮边界，不会打断进行中的 tool 配对）
+    try {
+      router
+        .getOrCreate(oid)
+        .injectSystemNote(
+          `[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`,
+          `watch:${eventId}`,
+        );
+    } catch {
+      /* ignore */
+    }
+    // 发送失败抛出：watcher 把该 (事件, owner) 记入待重投，下轮仅重投未送达的 owner
+    if (r.error) throw r.error;
+  };
+  const watcher = new KanbanWatcher({
+    kanbanUrl: cfg.kanbanUrl,
+    projectId: cfg.kanbanProjectId || undefined,
+    intervalMs: intervalSec * 1000,
+    statePath: path.join(defaultDataHome(), 'watch-state.json'),
+    owners: () => channel.allowedOpenIds(),
+    notifyOwner: notifyWatchOwner,
+    // owners/notifyOwner 均已提供 → 启用 (事件, owner) 粒度送达追踪；
+    // notify 仅作缺任一时的旧整批回退路径
+    notify: async (event, eventId) => {
+      let firstErr: unknown = null;
+      for (const oid of channel.allowedOpenIds()) {
+        try {
+          await notifyWatchOwner(event, oid, eventId);
+        } catch (err) {
+          firstErr = err;
+        }
+      }
+      if (firstErr) throw firstErr;
+    },
+    log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
+    ...(staleNudgeHours
+      ? {
+          staleNudge: {
+            thresholdMs: staleThresholdMs,
+            statePath: path.join(defaultDataHome(), 'stale-nudge-state.json'),
+          },
+        }
+      : {}),
+  });
+  cleanup.watcher = watcher;
+  watcher.start();
+  console.log(c.gray(`看板状态推送已开启（每 ${intervalSec} 秒轮询）`));
+  if (staleNudgeHours) {
+    // 时长口径与 watcher 停滞提醒文案一致（向下取整，不足 1 小时按分钟描述，不说「0.5 小时」）
+    const duration =
+      staleThresholdMs >= 3600000
+        ? `${Math.floor(staleThresholdMs / 3600000)} 小时`
+        : `${Math.max(1, Math.floor(staleThresholdMs / 60000))} 分钟`;
+    console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${duration} 无更新时提醒）`));
+  }
+}
+
+/** 定时晨报/周报装配：HTA_DAILY_BRIEF=HH:MM / HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭。 */
+function assembleBriefs(opts: { flags: RuntimeFlags; cfg: AgentConfig; channel: FeishuChannel; cleanup: BotCleanup }): void {
+  const { flags, cfg, channel, cleanup } = opts;
+  const dailyBriefTime = flags.dailyBriefTime;
+  if (dailyBriefTime) {
+    const brief = new DailyBrief({
+      time: dailyBriefTime,
+      statePath: path.join(defaultDataHome(), 'daily-brief-state.json'),
+      kanbanUrl: cfg.kanbanUrl,
+      projectId: cfg.kanbanProjectId || undefined,
+      iteration: cfg.kanbanIteration || undefined,
+      owners: () => channel.allowedOpenIds(),
+      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
+      log: (msg) => console.log(c.gray(`[daily-brief] ${msg}`)),
+    });
+    cleanup.dailyBrief = brief;
+    brief.start();
+    const hh = String(dailyBriefTime.hour).padStart(2, '0');
+    const mm = String(dailyBriefTime.minute).padStart(2, '0');
+    console.log(c.gray(`定时晨报已开启（每天 ${hh}:${mm} 推送）`));
+  }
+
+  // HTA_WEEKLY_BRIEF_DAY=1-7 指定周几推送（默认 5 周五）
+  const weeklyBriefTime = flags.weeklyBriefTime;
+  const weeklyBriefDay = flags.weeklyBriefDay;
+  if (weeklyBriefTime) {
+    const brief = new WeeklyBrief({
+      time: weeklyBriefTime,
+      day: weeklyBriefDay,
+      statePath: path.join(defaultDataHome(), 'weekly-brief-state.json'),
+      kanbanUrl: cfg.kanbanUrl,
+      projectId: cfg.kanbanProjectId || undefined,
+      iteration: cfg.kanbanIteration || undefined,
+      owners: () => channel.allowedOpenIds(),
+      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
+      log: (msg) => console.log(c.gray(`[weekly-brief] ${msg}`)),
+    });
+    cleanup.weeklyBrief = brief;
+    brief.start();
+    const hh = String(weeklyBriefTime.hour).padStart(2, '0');
+    const mm = String(weeklyBriefTime.minute).padStart(2, '0');
+    const weekdayName = '周' + '一二三四五六日'[weeklyBriefDay - 1]!;
+    console.log(c.gray(`定时周报已开启（每${weekdayName} ${hh}:${mm} 推送）`));
+  }
+}
+
+/**
+ * 定时提醒投递装配：tick 检查到期提醒，通过飞书私聊推送给设定人；已触发/已投递状态落盘，
+ * 重启后到点未投的立即补投、已投的不重复；投递失败按 1→2→4…分钟指数退避（封顶 30 分钟）。
+ */
+function assembleReminders(opts: { reminders: ReminderStore; channel: FeishuChannel; cleanup: BotCleanup }): void {
+  const reminderRunner = new ReminderRunner({
+    store: opts.reminders,
+    deliver: (openId, text) => opts.channel.notifyOpenId(openId, text),
+    // 跨形态不串桶：'local' 是 CLI 形态的提醒，由 CLI 自己投递，bot 不投递也不标记
+    deliverable: (uid) => uid !== 'local',
+    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
+  });
+  opts.cleanup.reminderRunner = reminderRunner;
+  reminderRunner.start();
+  console.log(c.gray('定时提醒投递已开启'));
+}
+
 async function main(): Promise<void> {
   // helios-task-agent bot --rebind / --reconfig / --help / --version：见 parseBotArgs 注释
   // 尽早解析：--help / --version / 未知参数在打印启动横幅前就退出
@@ -177,19 +587,7 @@ async function main(): Promise<void> {
   // 信号处理尽早注册：向导/更新检查/看板拉起（最长 90s）/MCP 连接期间收到 SIGTERM
   // 走默认终止会让自动拉起的看板子进程成孤儿；这里保证已建立的资源都被清理。
   // 资源随着启动推进逐个登记进 cleanup，shutdown 只清理已登记的部分。
-  const cleanup: {
-    channel: FeishuChannel | null;
-    mcp: { close(): Promise<void> } | null;
-    watcher: KanbanWatcher | null;
-    kanbanChild: ChildProcess | null;
-    supervisor: McpSupervisor | null;
-    wsAlerter: WsAlerter | null;
-    reportServer: ReportServer | null;
-    dailyBrief: DailyBrief | null;
-    weeklyBrief: WeeklyBrief | null;
-    reminderRunner: ReminderRunner | null;
-    historyStore: SessionHistoryStore | null;
-  } = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null };
+  const cleanup: BotCleanup = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null };
   /**
    * 优雅退出（实现见 infra/process-lifecycle.ts）：exitCode 由触发路径决定——正常信号
    * （SIGINT/SIGTERM）传 0；uncaughtException 传 1（崩溃以 0 退出会被进程管理器当成干净停止）。
@@ -309,185 +707,19 @@ async function main(): Promise<void> {
   });
   cleanup.kanbanChild = ensured.child;
 
-  // 报告静态服务：AI 审查（reviews/）与工作总结（reports/）两类报告都推 HTTP 链接，
-  // 避免长文本截断与本机路径在手机飞书打不开的问题
-  let reportServer: ReportServer | null = null;
-  try {
-    reportServer = await startReportServer([reviewsDir(), reportsDir()], agentCfg.kanbanUrl);
-    cleanup.reportServer = reportServer;
-    console.log(c.gray(`报告服务：${reportServer.baseUrl}`));
-  } catch (err) {
-    // 原始错误可能是英文 SDK 原文，只进调试输出（与 MCP 连接失败同一口径）；用户面只给中文结论
-    if (process.env.HTA_DEBUG) console.error(`[report] 报告服务启动失败原文: ${errMessage(err)}`);
-    console.warn(c.warn('报告服务启动失败，报告将回退为文本推送'));
-  }
-
-  const bootLabel = '正在连接看板…';
-  process.stdout.write(c.gray(bootLabel));
-  const { mcp, ok: mcpOk, error: mcpError, hint: mcpHint } = await connectMcp(agentCfg, {
-    // 实例一创建即登记：45s 连接窗口内收到退出信号时，shutdown 能拿到 mcp 做 close
-    //（其 in-flight stdio 子进程由 closePending 兜底关闭），不等 connect resolve
-    onCreate: (instance) => {
-      cleanup.mcp = instance;
-    },
-    // 连接等待期每 ~10 秒覆写当前行补进度（bot 无 spinner，否则最长 45s 无反馈像卡死）
-    onLog: (msg) => process.stdout.write(c.gray(`\r${msg}`)),
-  });
-  if (mcpOk) {
-    process.stdout.write(c.ok(`\r看板已连接（${mcp.tools.length} 个工具）          \n`));
-  } else {
-    // 原始错误是英文 SDK 原文，只进调试输出；用户面给中文结论 + 已知模式排查提示
-    if (process.env.HTA_DEBUG && mcpError) console.error(`[mcp] 连接失败原文: ${mcpError}`);
-    process.stdout.write(c.warn(`\r看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用          \n`));
-    if (mcpHint) process.stdout.write(c.warn(`${mcpHint}\n`));
-  }
+  // 报告静态服务 + 看板 MCP 连接（各自带降级，不阻断启动）
+  const reportServer = await startReportServerSafe(agentCfg.kanbanUrl, cleanup);
+  const { mcp, mcpOk } = await connectKanbanMcp(agentCfg, cleanup);
 
   const memory = new MemoryStore();
   const channel = new FeishuChannel(feishuCfg);
   cleanup.channel = channel;
 
-  // 写操作确认：发确认卡片（按钮回调），失败降级为文本确认；超时自动拒绝（破坏性操作更长）；
-  // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
-  // roundNotices：确认卡片/回执插在「处理中」占位之后时标记，最终回复改发新消息保持时间线顺序
-  const roundNotices = createRoundNoticeTracker();
-  // 确认卡片合并桥（单卡片生命周期）：当前轮次有存活进度卡时，确认卡片原地更新进度卡，
-  // 不再另发消息；实现由 createBotHandlers 填充（confirmations 先于 handlers 构建，这里先给空实现，
-  // 空实现下 activeCardId 恒 undefined → 确认一律走独立卡片/文本路径，与旧行为一致）。
-  const confirmCardBridge: ConfirmCardBridge = {
-    activeCardId: () => undefined,
-    hold: () => {},
-    release: () => {},
-    paint: () => Promise.resolve(),
-  };
-  /** 确认已合并进进度卡的消息 id 集合（onSettled 分支与 handler 同步换卡判定用；settle 后删除）。 */
-  const mergedConfirms = new Set<string>();
-  /** 每用户最近一次写操作确认请求的 kind（bot 批准回执按 kind 细化免问措辞；confirm.ts 未暴露该状态，这里随发送记录）。 */
-  const lastWriteKind = new Map<string, ConfirmKind>();
-  const confirmations = new ConfirmationManager(
-    async (openId, chatId, req, id, timeoutMs) => {
-      // Map 无清理会无界增长：超上限整体清空（代价只是免问回执措辞回退为泛化文案）
-      if (lastWriteKind.size >= 1000) lastWriteKind.clear();
-      lastWriteKind.set(openId, req.kind);
-      // 单卡片生命周期：有存活进度卡时确认卡片原地画上去（带停止按钮令牌），并占用该卡
-      //（hold 期间进度刷新暂停，确认按钮不被覆盖）；合并成功不 mark roundNotices——
-      // 轮次没有插入独立消息，最终回复继续原地更新同一张卡
-      const progressCardId = confirmCardBridge.activeCardId(openId);
-      if (progressCardId) {
-        confirmCardBridge.hold(progressCardId);
-        try {
-          await confirmCardBridge.paint(progressCardId, buildConfirmCard(req, id, timeoutMs, { stopToken: progressCardId }));
-          mergedConfirms.add(progressCardId);
-          return progressCardId;
-        } catch (err) {
-          // 合并绘制失败：解除占用并落入既有「独立卡片 → 文本」降级链
-          confirmCardBridge.release(progressCardId);
-          console.error(`[confirm] 进度卡合并确认失败，降级独立卡片: ${errMessage(err)}`);
-        }
-      }
-      roundNotices.mark(openId);
-      const sendText = () => {
-        // 免问提示与卡片口径一致：粒度词与后果说明复用 guard 的统一文案；
-        // 后果的「免问」改述为「不再逐次询问」，避免同句「免问」堆砌
-        const batchHint = req.batchKey
-          ? `；回复「${batchScopeWord(req.batchScope)}免问」则${batchAckText(req.batchScope, req.kind).replace('免问', '不再逐次询问')}`
-          : '';
-        // detail 缩进成块，避免长命令与正文混排（对齐卡片的代码块视觉）
-        const detailBlock = req.detail
-          .split('\n')
-          .map((l) => `  ${l}`)
-          .join('\n');
-        return channel.notifyOpenId(
-          openId,
-          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}；回复「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
-        );
-      };
-      if (chatId) {
-        const r = await sendCardWithTextFallback({
-          sendCard: () => channel.sendCard(chatId, buildConfirmCard(req, id, timeoutMs)),
-          sendText,
-          cardFailLog: (m) => console.error(`[confirm] 卡片发送失败，降级文本: ${m}`),
-        });
-        // 文本降级也失败：抛给管理器按拒绝收尾并走 onSendFailed 通知
-        if (r.error) throw r.error;
-        return r.card;
-      }
-      await sendText();
-      return undefined;
-    },
-    {
-      timeoutMs: 120000,
-      onTimeout: (openId, req) => {
-        roundNotices.mark(openId);
-        void channel
-          .notifyOpenId(openId, `确认超时，已自动拒绝：${req.summary}。如仍需执行，直接再跟我说一声即可。`)
-          .catch(() => {});
-      },
-      onSuperseded: (openId, req) => {
-        roundNotices.mark(openId);
-        void channel
-          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}。新操作的确认会稍后出现在卡片上，请留意处理。`)
-          .catch(() => {});
-      },
-      onSettled: (_openId, req, settle, cardMessageId) => {
-        if (!cardMessageId) return;
-        if (mergedConfirms.delete(cardMessageId)) {
-          // 合并单卡片场景：确认卡片就是进度占位卡片，终态处理经 paint 入有序链（与后续结果卡保序）
-          confirmCardBridge.release(cardMessageId);
-          // 批准路径：同步回调已把卡片换回「执行中」进度卡，轮次会继续刷进度/结果卡，不再画静态终态
-          if (settle === 'once' || settle === 'batch') return;
-          // 拒绝/超时/作废：轮次 reply 可能滞后，先把卡片收为终态（结果卡随后保序覆盖）
-          confirmCardBridge.paint(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
-            console.error(`[confirm] 卡片终态更新失败: ${errMessage(err)}`);
-          });
-          return;
-        }
-        void channel.updateCard(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
-          const message = errMessage(err);
-          console.error(`[confirm] 卡片终态更新失败: ${message}`);
-        });
-      },
-      // 卡片与文本降级都发送失败：管理器已按拒绝收尾，这里走最后可达路径告知用户，
-      // 避免"操作默默没执行"（仍失败只能落日志，等待方已拿到明确拒绝、不会干等）
-      onSendFailed: (openId, req, error) => {
-        roundNotices.mark(openId);
-        // 原始错误（可能是 axios 英文原文）只进日志，不落用户面
-        console.error(`[confirm] 确认发送最终失败(${openId.slice(0, 4)}…): ${error}`);
-        void channel
-          .notifyOpenId(openId, `⚠️ 写操作确认发送失败，本次操作未执行：${req.summary}\n请稍后重试；若反复出现，请检查部署机器的网络。`)
-          .catch((err) => {
-            const message = errMessage(err);
-            console.error(`[confirm] 发送失败通知也未送达(${openId.slice(0, 4)}…): ${message}`);
-          });
-      },
-    },
-  );
+  // 写操作确认装配（卡片确认 + 文本降级 + 超时拒绝 + 终态更新）
+  const { roundNotices, confirmCardBridge, lastWriteKind, confirmations } = assembleConfirmations(channel);
 
-  // 白名单为空时：首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）。
-  // 写盘失败返回 false：channel 撤销内存放行（fail-closed），避免重启后任何人可再 claim。
-  channel.onOwnerClaim = (openId) => {
-    try {
-      writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
-      console.log(c.ok(`首个私聊用户已成为部署者并写入白名单：${openId}`));
-    } catch (err) {
-      const message = errMessage(err);
-      console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）：${message}`);
-      void channel
-        .notifyOpenId(
-          openId,
-          `⚠️ 部署者绑定失败：白名单写入 .env 未成功，本次绑定未持久化，你暂时无法使用本机器人。` +
-            `请检查 ${userEnvPath()} 及所在目录的写权限，修复后重启机器人再私聊。`,
-        )
-        .catch(() => {});
-      return false;
-    }
-    void channel
-      .notifyOpenId(
-        openId,
-        '👋 你已成为本机器人实例的部署者（已写入白名单），其他私聊用户将被拒绝。发送 /help 查看我能做什么。',
-      )
-      .catch(() => {});
-    return true;
-  };
+  // 白名单为空时的 owner 认领钩子（fail-closed）
+  attachOwnerClaimHandler(channel);
 
   // 注意：router 始终持有 mcp 对象（即使启动时降级），supervisor 重连后可热切换回来
   const reminders = new ReminderStore();
@@ -502,35 +734,10 @@ async function main(): Promise<void> {
     reminders,
   });
 
-  const notifyOwners = (text: string): void => {
-    for (const oid of channel.allowedOpenIds()) {
-      void channel.notifyOpenId(oid, text).catch(() => {});
-    }
-  };
+  const notifyOwners = createNotifyOwners(channel);
 
-  // MCP 健康监督：60s 探测；连续失败才降级 hk_cli，自动重连（退避至 ~5 分钟），恢复后切回。
-  // 有用户轮次进行中时不重连（reconnect 的 close 会杀 in-flight 工具调用），竞态防护见 supervisor。
-  // kanbanHealth：mcp.ping 只证明 stdio 活着，看板假死时探活会误判健康——每 5 分钟
-  //（失败后逐 tick）补一次真实看板健康调用，连续失败走同一 onLost 降级/告警通道。
-  const supervisor = new McpSupervisor({
-    mcp,
-    initiallyAlive: mcpOk,
-    kanbanHealth: async () => {
-      if (!(await fetchHealth(agentCfg.kanbanUrl))) throw new Error('看板健康检查未通过');
-    },
-    onLost: () => {
-      router.setMcpOk(false);
-      console.log(c.warn(`看板连接已中断，${MCP_FALLBACK_TEXT}，将自动重连…`));
-      notifyOwners(`⚠️ 看板连接已中断：${MCP_FALLBACK_TEXT}，恢复后自动切回。`);
-    },
-    onRecovered: () => {
-      router.setMcpOk(true);
-      console.log(c.ok('看板连接已恢复'));
-      notifyOwners('✅ 看板连接已恢复');
-    },
-  });
-  supervisor.start();
-  cleanup.supervisor = supervisor;
+  // MCP 健康监督（降级/重连/恢复告警）
+  const supervisor = assembleSupervisor({ mcp, mcpOk, cfg: agentCfg, router, notifyOwners, cleanup });
 
   const handlers = createBotHandlers({
     channel,
@@ -582,138 +789,14 @@ async function main(): Promise<void> {
   // 运行期开关统一解析（非法值告警集中在 config/runtime-flags.ts）
   const flags = runtimeFlags((m) => console.warn(c.warn(m)));
 
-  // 看板状态主动推送：任务完成/失败、待审批 → 飞书通知（同时注入会话上下文，可直接追问）
-  if (flags.kanbanWatch) {
-    const intervalSec = flags.kanbanWatchIntervalSec;
-    const staleNudgeHours = flags.staleNudgeHours;
-    const staleThresholdMs = (staleNudgeHours ?? 0) * 60 * 60 * 1000;
-    // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
-    // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
-    const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
-      const r = await sendCardWithTextFallback({
-        sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event)),
-        sendText: () => channel.notifyOpenId(oid, event.text),
-        cardFailLog: (m) => console.error(`[watch] 卡片推送失败(${oid.slice(0, 4)}…): ${m}，降级纯文本`),
-        textFailLog: (m) => console.error(`[watch] 推送失败(${oid.slice(0, 4)}…): ${m}`),
-      });
-      // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
-      // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
-      //   注入发生在轮边界，不会打断进行中的 tool 配对）
-      try {
-        router
-          .getOrCreate(oid)
-          .injectSystemNote(
-            `[看板事件通知 ${new Date().toLocaleString('zh-CN')}]\n${wrapUntrusted(event.text)}`,
-            `watch:${eventId}`,
-          );
-      } catch {
-        /* ignore */
-      }
-      // 发送失败抛出：watcher 把该 (事件, owner) 记入待重投，下轮仅重投未送达的 owner
-      if (r.error) throw r.error;
-    };
-    const watcher = new KanbanWatcher({
-      kanbanUrl: agentCfg.kanbanUrl,
-      projectId: agentCfg.kanbanProjectId || undefined,
-      intervalMs: intervalSec * 1000,
-      statePath: path.join(defaultDataHome(), 'watch-state.json'),
-      owners: () => channel.allowedOpenIds(),
-      notifyOwner: notifyWatchOwner,
-      // owners/notifyOwner 均已提供 → 启用 (事件, owner) 粒度送达追踪；
-      // notify 仅作缺任一时的旧整批回退路径
-      notify: async (event, eventId) => {
-        let firstErr: unknown = null;
-        for (const oid of channel.allowedOpenIds()) {
-          try {
-            await notifyWatchOwner(event, oid, eventId);
-          } catch (err) {
-            firstErr = err;
-          }
-        }
-        if (firstErr) throw firstErr;
-      },
-      log: (msg) => console.log(c.gray(`[watch] ${msg}`)),
-      ...(staleNudgeHours
-        ? {
-            staleNudge: {
-              thresholdMs: staleThresholdMs,
-              statePath: path.join(defaultDataHome(), 'stale-nudge-state.json'),
-            },
-          }
-        : {}),
-    });
-    cleanup.watcher = watcher;
-    watcher.start();
-    console.log(c.gray(`看板状态推送已开启（每 ${intervalSec} 秒轮询）`));
-    if (staleNudgeHours) {
-      // 时长口径与 watcher 停滞提醒文案一致（向下取整，不足 1 小时按分钟描述，不说「0.5 小时」）
-      const duration =
-        staleThresholdMs >= 3600000
-          ? `${Math.floor(staleThresholdMs / 3600000)} 小时`
-          : `${Math.max(1, Math.floor(staleThresholdMs / 60000))} 分钟`;
-      console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${duration} 无更新时提醒）`));
-    }
-  } else if (flags.staleNudgeHours) {
-    // 停滞任务提醒依赖看板推送（watcher）驱动：watch 整体关闭时静默失效会误导部署者
-    console.warn(c.warn('停滞任务提醒依赖看板推送，已随 KANBAN_WATCH=0 一并关闭'));
-  }
+  // 看板状态主动推送（任务完成/失败、待审批 → 飞书通知）+ 停滞任务提醒
+  assembleWatcher({ flags, cfg: agentCfg, channel, router, cleanup });
 
-  // 定时晨报：HTA_DAILY_BRIEF=HH:MM（本地时间）开启，默认关闭
-  const dailyBriefTime = flags.dailyBriefTime;
-  if (dailyBriefTime) {
-    const brief = new DailyBrief({
-      time: dailyBriefTime,
-      statePath: path.join(defaultDataHome(), 'daily-brief-state.json'),
-      kanbanUrl: agentCfg.kanbanUrl,
-      projectId: agentCfg.kanbanProjectId || undefined,
-      iteration: agentCfg.kanbanIteration || undefined,
-      owners: () => channel.allowedOpenIds(),
-      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
-      log: (msg) => console.log(c.gray(`[daily-brief] ${msg}`)),
-    });
-    cleanup.dailyBrief = brief;
-    brief.start();
-    const hh = String(dailyBriefTime.hour).padStart(2, '0');
-    const mm = String(dailyBriefTime.minute).padStart(2, '0');
-    console.log(c.gray(`定时晨报已开启（每天 ${hh}:${mm} 推送）`));
-  }
+  // 定时晨报 / 定时周报（默认关闭）
+  assembleBriefs({ flags, cfg: agentCfg, channel, cleanup });
 
-  // 定时周报：HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭。
-  // HTA_WEEKLY_BRIEF_DAY=1-7 指定周几推送（默认 5 周五）
-  const weeklyBriefTime = flags.weeklyBriefTime;
-  const weeklyBriefDay = flags.weeklyBriefDay;
-  if (weeklyBriefTime) {
-    const brief = new WeeklyBrief({
-      time: weeklyBriefTime,
-      day: weeklyBriefDay,
-      statePath: path.join(defaultDataHome(), 'weekly-brief-state.json'),
-      kanbanUrl: agentCfg.kanbanUrl,
-      projectId: agentCfg.kanbanProjectId || undefined,
-      iteration: agentCfg.kanbanIteration || undefined,
-      owners: () => channel.allowedOpenIds(),
-      notifyOwner: (oid, text) => channel.notifyOpenId(oid, text),
-      log: (msg) => console.log(c.gray(`[weekly-brief] ${msg}`)),
-    });
-    cleanup.weeklyBrief = brief;
-    brief.start();
-    const hh = String(weeklyBriefTime.hour).padStart(2, '0');
-    const mm = String(weeklyBriefTime.minute).padStart(2, '0');
-    const weekdayName = '周' + '一二三四五六日'[weeklyBriefDay - 1]!;
-    console.log(c.gray(`定时周报已开启（每${weekdayName} ${hh}:${mm} 推送）`));
-  }
-
-  // 定时提醒投递：tick 检查到期提醒，通过飞书私聊推送给设定人；已触发/已投递状态落盘，
-  // 重启后到点未投的立即补投、已投的不重复；投递失败按 1→2→4…分钟指数退避（封顶 30 分钟）
-  const reminderRunner = new ReminderRunner({
-    store: reminders,
-    deliver: (openId, text) => channel.notifyOpenId(openId, text),
-    // 跨形态不串桶：'local' 是 CLI 形态的提醒，由 CLI 自己投递，bot 不投递也不标记
-    deliverable: (uid) => uid !== 'local',
-    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
-  });
-  cleanup.reminderRunner = reminderRunner;
-  reminderRunner.start();
-  console.log(c.gray('定时提醒投递已开启'));
+  // 定时提醒投递
+  assembleReminders({ reminders, channel, cleanup });
 
   console.log(c.gray('Ctrl+C 退出'));
 }
@@ -721,8 +804,11 @@ async function main(): Promise<void> {
 export { main };
 
 if (require.main === module) {
-  main().catch((err) => {
+  main().catch((err: unknown) => {
     console.error(err);
-    process.exit(1);
+    // bootstrap 的 FatalStartupError 携带 exitCode（见 bootstrap.ts ensureKanbanOrExit）：按携带码退出；
+    // 未知错误保持既有收尾（打印 + 退出码 1）
+    const exitCode = (err as { exitCode?: unknown } | null)?.exitCode;
+    process.exit(typeof exitCode === 'number' ? exitCode : 1);
   });
 }

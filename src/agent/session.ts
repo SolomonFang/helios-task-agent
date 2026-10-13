@@ -64,6 +64,8 @@ export class AgentSession {
   private messages: ChatMessage[];
   /** 后台事件缓存（injectSystemNote）：下一个轮边界注入，避免打断 tool_calls 配对。 */
   private pendingNotes: Array<{ text: string; key?: string }> = [];
+  /** 用户消息轮次的会话内串行队列：并发调用入队串行执行，不竞争共享的 messages 数组。 */
+  private turnQueue: Promise<void> = Promise.resolve();
 
   constructor(cfg: AgentConfig, mcp: KanbanMcp | null, mcpOk: boolean, opts: AgentSessionOptions = {}) {
     this.cfg = cfg;
@@ -250,6 +252,24 @@ export class AgentSession {
    * 写入会话历史的仍是 text 本体（调用方传文本占位，如「[图片] 配文」）。
    */
   async handleUserMessage(
+    text: string,
+    onProgress?: (info: ProgressInfo) => void,
+    signal?: AbortSignal,
+    image?: InlineImage,
+  ): Promise<string> {
+    // per-session promise 链：并发消息按到达顺序入队串行执行，共享的 messages 数组
+    // 同一时刻只允许一个轮次在写（不再依赖调用方外部的串行契约）
+    const turn = this.turnQueue.then(() => this.runUserTurn(text, onProgress, signal, image));
+    // 队列本体吞掉上轮失败（失败已通过 turn 抛回调用方），不阻塞后续排队消息
+    this.turnQueue = turn.then(
+      () => undefined,
+      () => undefined,
+    );
+    return turn;
+  }
+
+  /** 单个用户消息轮次的执行体（仅经 handleUserMessage 的串行队列调用）。 */
+  private async runUserTurn(
     text: string,
     onProgress?: (info: ProgressInfo) => void,
     signal?: AbortSignal,

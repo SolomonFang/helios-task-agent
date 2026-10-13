@@ -62,18 +62,19 @@ export function formatMissingBaseBranchError(
 }
 
 /**
- * hk start 分支补全：缺分支的仓库回填看板配置的 default_target_branch，回填不了返回错误消息
- * （否则 hk / MCP 会静默回退 main，仓库没有 main 时 workspace 创建失败且 UI 一直 loading）。
- * 两种载体共用同一套回填语义：
+ * hk start 分支补全（抛 Error 版，本层失败约定）：缺分支的仓库回填看板配置的
+ * default_target_branch，回填不了抛 Error（否则 hk / MCP 会静默回退 main，仓库没有
+ * main 时 workspace 创建失败且 UI 一直 loading）。
+ * 两种载体共用同一套回填语义（均为原地改写，调用方复用传入对象继续后续流程）：
  * - argv（string[]，hk_cli start）：扫描 `--repo <id>`，无 :branch 的原地改写为 `<id>:<branch>`；
  * - repos（RepoStartInput[]，MCP start_workspace_session）：缺 base_branch 的原地回填。
- * 没有任何待补全项时返回 noRepoError（未传则视为无需补全，返回 null）。
+ * 没有任何待补全项时：传了 noRepoError 则抛该错误，未传视为无需补全直接返回。
  */
-export async function fillHkStartBranches(
+export async function fillHkStartBranchesOrThrow(
   target: string[] | RepoStartInput[],
   kanbanUrl: string,
   { signal, noRepoError }: { signal?: AbortSignal; noRepoError?: string } = {},
-): Promise<string | null> {
+): Promise<void> {
   const isArgv = target.length === 0 || typeof target[0] === 'string';
   let repos: RepoStartInput[];
   let repoArgs: number[] = [];
@@ -87,10 +88,13 @@ export async function fillHkStartBranches(
     // 数据可能直接来自 MCP 入参：逐元素运行时校验，坏输入直接报错而不是静默错位回填
     const rows = target as unknown[];
     const bad = rows.findIndex((r) => !isRepoStartInput(r));
-    if (bad >= 0) return `无法启动工作区：第 ${bad + 1} 个仓库参数格式不正确（需要提供仓库 ID）`;
+    if (bad >= 0) throw new Error(`无法启动工作区：第 ${bad + 1} 个仓库参数格式不正确（需要提供仓库 ID）`);
     repos = rows as RepoStartInput[];
   }
-  if (!repos.length) return noRepoError ?? null;
+  if (!repos.length) {
+    if (noRepoError) throw new Error(noRepoError);
+    return;
+  }
   const defaults = await fetchRepoDefaultBranches(
     kanbanUrl,
     repos.map((r) => r.repo_id),
@@ -100,7 +104,7 @@ export async function fillHkStartBranches(
   // 报错前再按 unresolved 拉一次仓库名（仅错误路径的额外请求），让用户面能显示「名字（ID：…）」
   if (unresolved.length) {
     const names = await fetchRepoNames(kanbanUrl, unresolved, signal);
-    return formatMissingBaseBranchError(unresolved, names);
+    throw new Error(formatMissingBaseBranchError(unresolved, names));
   }
   if (isArgv) {
     const argv = target as string[];
@@ -109,7 +113,6 @@ export async function fillHkStartBranches(
     const out = target as unknown[];
     for (let i = 0; i < out.length; i++) out[i] = filled[i]!;
   }
-  return null;
 }
 
 /** Prefer workspace_id field when present (start returns both task_id and workspace_id). */

@@ -54,6 +54,7 @@ export function execFileCompat(
 
   const cleanup = () => {
     if (timer) clearTimeout(timer);
+    if (escalateTimer) clearTimeout(escalateTimer);
     options.signal?.removeEventListener('abort', onAbort);
   };
   const done = (error: ExecFileCompatError | null) => {
@@ -81,11 +82,18 @@ export function execFileCompat(
     return undefined as unknown as ChildProcess;
   }
 
+  // 超时升级：killSignal（默认 SIGTERM）发出后给 2s 优雅退出窗口，仍未退出补 SIGKILL——
+  // 否则无视 SIGTERM 的子进程（如卡在不可中断 IO）会让 execFileCompat 永不回调
+  let escalateTimer: ReturnType<typeof setTimeout> | null = null;
   const timer =
     options.timeout && options.timeout > 0
       ? setTimeout(() => {
           timedOut = true;
           child.kill(killSignal);
+          escalateTimer = setTimeout(() => {
+            child.kill('SIGKILL');
+          }, 2000);
+          escalateTimer.unref?.();
         }, options.timeout)
       : null;
 

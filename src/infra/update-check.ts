@@ -122,7 +122,25 @@ async function npmRegistry(): Promise<string> {
   return cachedRegistry;
 }
 
+/**
+ * 代理环境一次性提示（限制说明）：Node 全局 fetch（undici）默认不走 HTTP(S)_PROXY
+ * ——走代理需显式配置 ProxyAgent/dispatcher，本项目不加新依赖故不支持；代理环境下
+ * 更新检查可能失败（按设计静默跳过）。而 proc-env.ts 会把代理透传给 npm 子进程，
+ * 即「更新检查不经代理、真正执行 npm i -g 更新可走代理」，两者策略不同属已知限制。
+ */
+let proxyNoticeShown = false;
+function maybeProxyNotice(): void {
+  if (proxyNoticeShown) return;
+  if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.https_proxy) {
+    proxyNoticeShown = true;
+    console.warn(
+      `[update-check] 检测到代理环境变量（HTTP(S)_PROXY）：内置更新检查不经代理直连 registry，可能失败并静默跳过；可手动执行 npm outdated -g ${PKG_NAME} 检查更新。`,
+    );
+  }
+}
+
 async function fetchDistTags(): Promise<DistTags> {
+  maybeProxyNotice();
   const registry = await npmRegistry();
   const res = await fetch(`${registry}/${PKG_NAME}`, {
     headers: { accept: 'application/json' },

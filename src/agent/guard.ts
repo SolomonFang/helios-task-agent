@@ -102,14 +102,24 @@ export interface BatchConfirmFn extends ConfirmFn {
 /**
  * Remember 'batch' approvals per batchKey for the rest of the session（内存态，
  * 进程退出即失效）。所有写操作都带 batchKey；key 粒度（工具名/命令路径 + 对象 id）
- * 由 tools.ts 的 batchKeyFor* 决定。
+ * 由各工具 handler 生成（kanban-mcp.ts batchKeyForMcp、hk-cli.ts batchKeyForHk、
+ * lark-cli.ts / memory-tools.ts / reminder-tools.ts 内联构造）。
  */
+/** 「同类免问」授权条数上限：常驻会话只增不减会无界累积，超限按 FIFO 淘汰最旧授权（Set 迭代序即插入序）。 */
+const MAX_BATCH_APPROVALS = 200;
+
 export function withBatchApproval(confirm: ConfirmFn): BatchConfirmFn {
   const approved = new Set<string>();
   const fn = (async (req, signal) => {
     if (req.batchKey && approved.has(req.batchKey)) return 'batch';
     const verdict = await confirm(req, signal);
-    if (verdict === 'batch' && req.batchKey) approved.add(req.batchKey);
+    if (verdict === 'batch' && req.batchKey) {
+      approved.add(req.batchKey);
+      if (approved.size > MAX_BATCH_APPROVALS) {
+        const oldest = approved.values().next().value;
+        if (oldest !== undefined) approved.delete(oldest);
+      }
+    }
     return verdict;
   }) as BatchConfirmFn;
   fn.revokeBatchApprovals = () => {
@@ -228,7 +238,7 @@ function larkVerbs(args: string[]): string[] {
 
 /**
  * lark-cli `<command> [subcommand] [method]`:
- * - 含本地落盘 flag（--output / -o / --output-dir，含 --output=路径 等号形态）→ write
+ * - 含本地落盘 flag（--output / -o / --output-dir，含 --output=路径 / -o=路径 等号形态）→ write
  * - help/version/schema/doctor → read
  * - `api GET /open-apis/…` → read；非 GET 或路径形态不符（完整 URL / 相对路径前缀不符）→ write
  * - any write verb in command tokens → write
@@ -239,11 +249,16 @@ export function classifyLark(args: string[]): 'read' | 'write' {
   if (!args.length) return 'read';
   // 本地落盘 flag 一律判写：--output/-o/--output-dir 会把输出写入任意本地路径——即使命令
   // 本体是读动词（api GET .../download、+fetch、+version-get），也可借此覆盖 ~/.zshrc 等
-  // 任意文件，必须过确认闸门（-o 只认独立 argv 元素，避免误伤 --option 之类长 flag）
+  // 任意文件，必须过确认闸门（-o 只认独立 argv 元素或 -o=路径 等号形态，避免误伤 --option 之类长 flag）
   if (
     args.some(
       (a) =>
-        a === '-o' || a === '--output' || a === '--output-dir' || a.startsWith('--output=') || a.startsWith('--output-dir='),
+        a === '-o' ||
+        a.startsWith('-o=') ||
+        a === '--output' ||
+        a === '--output-dir' ||
+        a.startsWith('--output=') ||
+        a.startsWith('--output-dir='),
     )
   ) {
     return 'write';
@@ -335,7 +350,7 @@ export function classifyMcp(toolName: string): 'read' | 'write' {
   return 'write'; // unknown → safe default
 }
 
-// --- 破坏性 / 高影响操作判定（唯一来源，tools.ts 引用） ---
+// --- 破坏性 / 高影响操作判定（唯一来源，kanban-mcp.ts / hk-cli.ts 引用） ---
 
 /** 破坏性 / 高影响操作：确认超时放宽（词表覆盖 MCP 写动词中的高危子集）。 */
 const DESTRUCTIVE_RE = /delete|cancel|stop|deny|approve|start|archive|merge|push|execute/i;

@@ -7,9 +7,9 @@ import path from 'path';
 import { defaultDataHome } from '../infra/paths';
 import { isLoopbackUrl } from '../infra/url-utils';
 import { escapeHtml, renderReportPage } from './report-page';
-import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
-import { newReportToken } from './report-server';
-import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
+import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-cards';
+import { writeFilePrivate, ensurePrivateDirSync } from '../infra/private-file';
+import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { TASK_STATUS_KEYS, isKnownStatus, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
 
@@ -62,11 +62,6 @@ function diffStatsLine(t: WorkSummaryTask): string {
   if (t.additions !== undefined) parts.push(`+${t.additions} 行`);
   if (t.deletions !== undefined) parts.push(`-${t.deletions} 行`);
   return parts.join('，');
-}
-
-/** 数据层 generatedAt 保持 ISO（文件名反解依赖它）；仅渲染层转本地可读时间。 */
-function formatGeneratedAt(iso: string): string {
-  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
 }
 
 /** MD 侧最小转义：换行会破坏行结构（行首 # 会被当成标题），压成空格并转义行首 #。 */
@@ -133,10 +128,6 @@ export function renderMarkdown(data: WorkSummaryData): string {
   return lines.join('\n');
 }
 
-function htmlStatCard(num: string, label: string, cls = ''): string {
-  return `<div class="stat${cls ? ` ${cls}` : ''}"><div class="stat-num">${num}</div><div class="stat-label">${label}</div></div>`;
-}
-
 function htmlTaskCard(t: WorkSummaryTask): string {
   const meta = statusMeta(t.status);
   const parts: string[] = ['<div class="card">'];
@@ -171,80 +162,22 @@ function htmlTaskCard(t: WorkSummaryTask): string {
   return parts.join('\n');
 }
 
-/** work-summary 页面专属区块样式（公共基底与页框见 report-page.ts）。 */
+/** work-summary 页面差异样式（与复盘/日报雷同的公共区块见 report-cards.ts 的 REPORT_CARDS_CSS）。 */
 const SUMMARY_PAGE_CSS = `
-  body { background: #f3f4f8; line-height: 1.6; }
-  .page { max-width: 880px; }
   .hero {
     background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-    padding: 36px 40px;
   }
-  .hero h1 { font-size: 28px; }
-  .hero .subtitle { font-size: 17px; }
-  .hero .gen { margin-top: 10px; }
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 12px;
-    margin: 20px 0 8px;
-  }
-  .stat {
-    background: #fff;
-    border-radius: 12px;
-    padding: 16px;
-    text-align: center;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
-  .stat-num { font-size: 24px; font-weight: 700; }
-  .stat-label { font-size: 12px; color: #6b7280; margin-top: 2px; }
-  .stat.add .stat-num { color: #16a34a; }
-  .stat.del .stat-num { color: #dc2626; }
-  .group { margin-top: 28px; }
-  .group h2 { font-size: 18px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-  .count {
-    font-size: 12px;
-    font-weight: 600;
-    background: #e5e7eb;
-    color: #4b5563;
-    border-radius: 999px;
-    padding: 1px 9px;
-  }
-  .card {
-    background: #fff;
-    border-radius: 12px;
-    padding: 18px 20px;
-    margin-bottom: 12px;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
-  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-  .card-head h3 { font-size: 16px; flex: 1; }
   .badge { flex-shrink: 0; }
   .badge.done { background: #dcfce7; color: #15803d; }
   .badge.inreview { background: #fef3c7; color: #b45309; }
   .badge.inprogress { background: #dbeafe; color: #1d4ed8; }
   .badge.todo { background: #e5e7eb; color: #4b5563; }
   .badge.cancelled { background: #fee2e2; color: #b91c1c; }
-  .meta-line { font-size: 12px; color: #9ca3af; margin-top: 2px; }
-  .summary { font-size: 14px; color: #4b5563; margin-top: 8px; white-space: normal; }
-  .changes { font-size: 13px; margin-top: 8px; color: #6b7280; }
   .plus { color: #16a34a; font-weight: 600; }
   .minus { color: #dc2626; font-weight: 600; }
   .chips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
   .chips code { font-size: 12px; border-radius: 6px; padding: 2px 8px; }
-  .diff-link {
-    display: inline-block;
-    margin-top: 12px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #6366f1;
-    text-decoration: none;
-    border: 1px solid #c7d2fe;
-    border-radius: 8px;
-    padding: 4px 14px;
-    transition: background 0.15s;
-  }
-  .diff-link:hover { background: #eef2ff; }
-  .empty { text-align: center; color: #9ca3af; margin-top: 40px; }
+  .diff-link { transition: background 0.15s; }
   .trunc-note { text-align: center; font-size: 13px; color: #6b7280; margin-top: 20px; }
 `;
 
@@ -265,7 +198,7 @@ export function renderHtml(data: WorkSummaryData): string {
   const sampleNote = sampleStatsNote(data);
   return renderReportPage({
     title: `工作总结 · ${escapeHtml(data.sinceLabel)}`,
-    css: SUMMARY_PAGE_CSS,
+    css: REPORT_CARDS_CSS + SUMMARY_PAGE_CSS,
     body: `  <header class="hero">
     <h1>工作总结</h1>
     <p class="subtitle">${escapeHtml(data.sinceLabel)}</p>
@@ -300,10 +233,11 @@ export function reportsDir(): string {
   return path.join(defaultDataHome(), 'reports');
 }
 
-export function writeSummaryReports(
+/** 写工作总结报告（HTML/MD，0600 私有写盘；异步版不在 bot 事件循环上阻塞写盘）。 */
+export async function writeSummaryReports(
   data: WorkSummaryData,
   opts: WriteSummaryReportsOptions = {},
-): SummaryReportPaths {
+): Promise<SummaryReportPaths> {
   const format = opts.format ?? 'both';
   const dir = opts.dir ?? reportsDir();
   ensurePrivateDirSync(dir);
@@ -323,11 +257,11 @@ export function writeSummaryReports(
   if (format === 'both' || format === 'html') {
     // HTML 走 report-server HTTP 访问：文件名带随机 token 作为访问凭证（含任务 diff 数据，0600 写入）
     out.htmlPath = `${base}.${newReportToken()}.html`;
-    writeFilePrivateSync(out.htmlPath, renderHtml(data));
+    await writeFilePrivate(out.htmlPath, renderHtml(data));
   }
   if (format === 'both' || format === 'md') {
     out.mdPath = `${base}.md`;
-    writeFilePrivateSync(out.mdPath, renderMarkdown(data));
+    await writeFilePrivate(out.mdPath, renderMarkdown(data));
   }
   return out;
 }

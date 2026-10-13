@@ -476,7 +476,7 @@ async function run(): Promise<void> {
       });
       try {
         const daily = await collectDailyData({ kanbanUrl: kanban.url, date: todayStr, iteration: '260717' });
-        const dailyPath = writeDailyReport(daily);
+        const dailyPath = await writeDailyReport(daily);
         assert.ok(
           /daily-report-\d{4}-\d{2}-\d{2}\.[0-9a-f]{32}\.html$/.test(dailyPath),
           `日报文件名应带 128-bit token：${dailyPath}`,
@@ -493,7 +493,7 @@ async function run(): Promise<void> {
         const { collectWorkSummary } = await import('../src/kanban/summary');
         const wsData = await collectWorkSummary({ kanbanUrl: kanban.url, scope: 'iteration', iteration: '260717' });
         const model = buildRetroModel(wsData);
-        const retroPath = writeRetroReport(model);
+        const retroPath = await writeRetroReport(model);
         assert.ok(
           /iteration-retro-.+\.[0-9a-f]{32}\.html$/.test(retroPath),
           `复盘文件名应带 128-bit token：${retroPath}`,

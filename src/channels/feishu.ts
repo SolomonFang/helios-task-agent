@@ -95,6 +95,39 @@ export class FeishuApiError extends Error {
 const BOT_OPENID_RETRY_MS = 10 * 60 * 1000;
 
 /**
+ * 本 client 专用的 httpInstance：逐方法委托 SDK 的 defaultHttpInstance（其 UA 注入与
+ * 响应解包拦截器随委托一并生效），仅在调用方未显式指定 timeout 时注入默认超时。
+ * 不改 defaultHttpInstance.defaults：那是进程级共享单例，改它会波及进程内一切 Lark client
+ * （SDK 内部 WS 握手等调用显式自带 timeout，委托时原样透传、不被覆盖）。
+ * 导出供单测断言「per-client 超时已注入、全局 defaults 未被污染」。
+ */
+export function createFeishuHttpInstance(timeoutMs: number): Lark.HttpInstance {
+  const base = Lark.defaultHttpInstance;
+  const withTimeout = <D>(opts?: Lark.HttpRequestOptions<D>): Lark.HttpRequestOptions<D> => {
+    const o = opts ?? {};
+    return o.timeout === undefined ? { ...o, timeout: timeoutMs } : o;
+  };
+  // SDK 的 HttpRequestOptions 与 axios config 结构兼容（$return_headers 由 SDK 拦截器读取）；
+  // 返回类型以 SDK 的 HttpInstance 口径为准（defaultHttpInstance 的响应解包拦截器会把返回值压成 resp.data）
+  const instance = {
+    request: (opts: Lark.HttpRequestOptions<unknown>) => base.request(withTimeout(opts)),
+    get: (url: string, opts?: Lark.HttpRequestOptions<unknown>) => base.get(url, withTimeout(opts)),
+    delete: (url: string, opts?: Lark.HttpRequestOptions<unknown>) => base.delete(url, withTimeout(opts)),
+    head: (url: string, opts?: Lark.HttpRequestOptions<unknown>) => base.head(url, withTimeout(opts)),
+    options: (url: string, opts?: Lark.HttpRequestOptions<unknown>) => base.options(url, withTimeout(opts)),
+    post: (url: string, data?: unknown, opts?: Lark.HttpRequestOptions<unknown>) => base.post(url, data, withTimeout(opts)),
+    put: (url: string, data?: unknown, opts?: Lark.HttpRequestOptions<unknown>) => base.put(url, data, withTimeout(opts)),
+    patch: (url: string, data?: unknown, opts?: Lark.HttpRequestOptions<unknown>) => base.patch(url, data, withTimeout(opts)),
+  };
+  return instance as unknown as Lark.HttpInstance;
+}
+
+/** open_id 日志脱敏（与 notify.ts 的通知失败日志同口径：只留头部摘要）。 */
+function maskOpenId(openId: string): string {
+  return `${openId.slice(0, 4)}…`;
+}
+
+/**
  * Owner-claim access control: with an empty allowlist, the FIRST user to DM
  * the bot becomes the owner (persisted to .env by the caller); everyone else
  * is denied. With a configured allowlist, only listed users pass.
@@ -405,14 +438,14 @@ export class FeishuChannel implements AgentChannel {
     this.wsFirstConnectTimeoutMs = opts?.wsFirstConnectTimeoutMs ?? FEISHU_WS_FIRST_CONNECT_TIMEOUT_MS;
     this.access = createAccessChecker(cfg.allowedOpenIds);
     // SDK 内部 axios 默认 timeout=0（永不超时）：一个挂死的 TCP 连接会让 reply/updateText
-    // 永久 pending，卡死用户队列与 watcher 推送。defaultHttpInstance 是 SDK 导出的共享实例
-    // （带响应解包拦截器，自建实例需复制拦截器否则 res.code 解析会坏），配默认超时即可；
-    // 超时抛 AxiosError（timeout of …ms exceeded），由上层既有错误处理消化。
-    Lark.defaultHttpInstance.defaults.timeout = FEISHU_HTTP_TIMEOUT_MS;
+    // 永久 pending，卡死用户队列与 watcher 推送。用 per-client httpInstance（委托 defaultHttpInstance
+    // 并注入默认超时，见 createFeishuHttpInstance）覆盖全部 REST 调用（含 SDK 内部取 token），
+    // 不改全局共享单例；超时抛 AxiosError（timeout of …ms exceeded），由上层既有错误处理消化。
     this.client = new Lark.Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret,
       appType: Lark.AppType.SelfBuild,
+      httpInstance: createFeishuHttpInstance(FEISHU_HTTP_TIMEOUT_MS),
     });
   }
 
@@ -488,13 +521,13 @@ export class FeishuChannel implements AgentChannel {
             persistClaim: (id) => (this.onOwnerClaim ? this.onOwnerClaim(id) : true),
             onClaimError: (msg) => console.error(`[feishu] owner claim hook error: ${msg}`),
           });
-          if (gate.claimed) console.log(`[feishu] owner claimed by ${openId}`);
+          if (gate.claimed) console.log(`[feishu] owner claimed by ${maskOpenId(openId)}`);
           if (gate.claimRevoked) {
-            console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${openId}`);
+            console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${maskOpenId(openId)}`);
             return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
           }
           if (gate.decision === 'deny') {
-            console.warn(`[feishu] ignore open_id not in allowlist: ${openId}`);
+            console.warn(`[feishu] ignore open_id not in allowlist: ${maskOpenId(openId)}`);
             if (!this.deniedNotified.has(openId)) {
               // Set 无清理会无界增长：超上限整体清空（代价只是老用户再收一次提醒）
               if (this.deniedNotified.size >= 1000) this.deniedNotified.clear();
@@ -540,7 +573,7 @@ export class FeishuChannel implements AgentChannel {
           try {
             // 与消息同一套白名单：卡片可能被转发，任何人都能点按钮
             if (!isCardActionAllowed(data, this.access.list())) {
-              console.warn(`[feishu] ignore card action from open_id not in allowlist: ${data.operator?.open_id || '(unknown)'}`);
+              console.warn(`[feishu] ignore card action from open_id not in allowlist: ${data.operator?.open_id ? maskOpenId(data.operator.open_id) : '(unknown)'}`);
               return;
             }
             this.lastEventAtMs = Date.now();
@@ -870,7 +903,7 @@ export class FeishuChannel implements AgentChannel {
       const senderOpenId = data.sender?.sender_id?.open_id || '';
       const allowed = this.access.list();
       if (senderOpenId && allowed.length > 0 && !allowed.includes(senderOpenId)) {
-        console.warn(`[feishu] 群 @ 回执跳过：发送者不在白名单: ${senderOpenId}`);
+        console.warn(`[feishu] 群 @ 回执跳过：发送者不在白名单: ${maskOpenId(senderOpenId)}`);
         return;
       }
       const now = Date.now();

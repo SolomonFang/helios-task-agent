@@ -36,6 +36,24 @@ const DIAGNOSIS_MAX_CONCURRENT = 2;
 /** 进程级诊断状态表上限：只增不减会无界累积，超上限整体清空（代价只是同键可再诊断/重试一次）。 */
 const DIAGNOSIS_STATE_MAX_ENTRIES = 1000;
 
+/** 有界 Set 写入：超上限整体清空后再写（代价只是老条目重新判定一次），防无界增长。 */
+function boundedSetAdd<T>(set: Set<T>, value: T, max: number): void {
+  if (set.size >= max) set.clear();
+  set.add(value);
+}
+
+/** 有界 Map 写入：口径同 boundedSetAdd。 */
+function boundedMapSet<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
+  if (map.size >= max) map.clear();
+  map.set(key, value);
+}
+
+/**
+ * 显式 opt-in 环境变量：未配置独立 OCR key 时，置 1 才允许把机器人主 LLM key 派生给
+ * 第三方 ocr 审查子进程（secure-by-default，见 runAiReviewJob 的派生门）。
+ */
+export const OCR_ALLOW_DERIVED_LLM_KEY_ENV = 'HELIOS_OCR_ALLOW_DERIVED_LLM_KEY';
+
 /** 双向截断：超长文本保留头尾、中间省略（重试回执展示将发送的 follow-up 全文摘要用）。 */
 function excerptMiddle(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -219,15 +237,37 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
   /** AI 审查的异步段（执行/投递/注入会话）；受理判定与去重落键在 tryStartAiReview 同步完成。 */
   const runAiReviewJob = async (openId: string, attemptId: string, title: string, ctl: AbortController): Promise<void> => {
     try {
-      // 开始反馈已由卡片回调的 toast + 「进行中」卡片承担，这里不再重复发文本通知（三重同义刷屏）；
-      // 仅首次触发且会派生主 key 时补发安全提示（每进程一次；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
+      // 开始反馈已由卡片回调的 toast + 「进行中」卡片承担，这里不再重复发文本通知（三重同义刷屏）。
+      // 主 LLM key 派生门（secure-by-default）：未配置独立 OCR key 时，默认不把机器人主 LLM
+      // 配置派生给第三方 ocr 子进程——跳过派生（ocr 缺少模型配置会自行失败），并输出清晰警告
+      // 告知开启方式；显式 opt-in（HELIOS_OCR_ALLOW_DERIVED_LLM_KEY=1）保留旧的派生行为，
+      // 该路径仍每进程一次补发安全提示。
+      const willDerive = ocrWillDeriveBotLlm();
+      const deriveAllowed = !willDerive || process.env[OCR_ALLOW_DERIVED_LLM_KEY_ENV] === '1';
       let llmNotice = '';
-      if (!aiReviewLlmNoticed && ocrWillDeriveBotLlm()) {
+      if (willDerive && !deriveAllowed) {
+        console.warn(
+          `[review] 未配置独立 OCR key，已跳过主 LLM key 派生（本次审查可能因审查工具缺少模型配置而失败）。` +
+            `开启方式（二选一）：为审查工具配置专用 key（OCR_LLM_URL/OCR_LLM_TOKEN，详见 README）；` +
+            `或显式设置 ${OCR_ALLOW_DERIVED_LLM_KEY_ENV}=1 允许派生机器人主 LLM 配置。`,
+        );
+        if (!aiReviewLlmNoticed) {
+          aiReviewLlmNoticed = true;
+          llmNotice =
+            '\n⚠️ 安全提示：AI 审查由第三方工具执行，未配置独立 key 时默认不会把机器人主模型 key 交给它，本次审查可能因此失败。' +
+            `如需使用，请联系部署者为审查工具配置专用 key（OCR_LLM_URL / OCR_LLM_TOKEN），或显式设置 ${OCR_ALLOW_DERIVED_LLM_KEY_ENV}=1 允许派生。`;
+        }
+      } else if (!aiReviewLlmNoticed && willDerive) {
         aiReviewLlmNoticed = true;
         llmNotice =
           '\n⚠️ 安全提示：AI 审查由第三方工具执行，会使用你的模型 API key。' +
           '如需隔离，可以为它单独配置一个专用 key（在配置文件中设置 OCR_LLM_TOKEN，详见 README）。';
       }
+      // 派生被拒时清空 llm 配置：buildOcrEnv 的派生条件（baseUrl/apiKey/model 齐全）不成立，
+      // ocr 子进程拿不到机器人主 key；显式 OCR_* 环境变量 / OCR 配置文件不受影响
+      const jobLlm = deriveAllowed
+        ? { baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.llmModel }
+        : { baseUrl: '', apiKey: '', model: '' };
       if (llmNotice) {
         await channel.notifyOpenId(
           openId,
@@ -242,7 +282,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
           kanbanUrl: cfg.kanbanUrl,
           attemptId,
           title,
-          llm: { baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.llmModel },
+          llm: jobLlm,
           signal: ctl.signal,
         }),
         new Promise<never>((_, reject) => {
@@ -254,7 +294,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       try {
         if (reportServer) {
           // 完整结果写入 HTML 报告，飞书推卡片（按钮直达静态报告页，进程存活期间有效）
-          const name = writeReviewReport({
+          const name = await writeReviewReport({
             title,
             attemptId,
             generatedAt: new Date().toLocaleString('zh-CN'),
@@ -332,8 +372,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     aiReviewRunning.set(attemptId, { openId, ctl });
     trackJob({ kind: 'review', openId, key: attemptId, title, startedAt: new Date().toISOString() });
     // 受理成功即记录：文本「重新审查这个任务」确定性分支据此复用本次审查重新发起
-    if (lastReviewByUser.size >= DIAGNOSIS_STATE_MAX_ENTRIES) lastReviewByUser.clear();
-    lastReviewByUser.set(openId, { attemptId, title });
+    boundedMapSet(lastReviewByUser, openId, { attemptId, title }, DIAGNOSIS_STATE_MAX_ENTRIES);
     void runAiReviewJob(openId, attemptId, title, ctl);
     return { status: 'accepted' };
   };
@@ -365,18 +404,16 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       // 只落 task:<real> 会漏掉它——同卡片再点（attempt 仍为空）会绕过 task:<real> 重跑完整诊断
       const realAttemptId = diagnosedAttemptId || attemptId;
       if (realAttemptId) {
-        if (diagnosedKeys.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosedKeys.clear();
-        diagnosedKeys.add(`${taskId}:${realAttemptId}`);
+        // 两个键一起落（清空判定只在首键做一次：清空后第二键必然装得下）
+        boundedSetAdd(diagnosedKeys, `${taskId}:${realAttemptId}`, DIAGNOSIS_STATE_MAX_ENTRIES);
         diagnosedKeys.add(dedupeKey);
       }
       const result: { attemptId?: string; text: string; cardMessageId?: string; url?: string } = { text };
       if (diagnosedAttemptId) result.attemptId = diagnosedAttemptId;
       if (url) result.url = url;
-      if (diagnosisResults.size >= DIAGNOSIS_STATE_MAX_ENTRIES) diagnosisResults.clear();
-      diagnosisResults.set(taskId, result);
+      boundedMapSet(diagnosisResults, taskId, result, DIAGNOSIS_STATE_MAX_ENTRIES);
       // 「重试这个任务」文本分支按用户定位最近一次诊断的任务（卡片按钮自带 taskId，不走这里）
-      if (lastDiagnosisByUser.size >= DIAGNOSIS_STATE_MAX_ENTRIES) lastDiagnosisByUser.clear();
-      lastDiagnosisByUser.set(openId, { taskId, title });
+      boundedMapSet(lastDiagnosisByUser, openId, { taskId, title }, DIAGNOSIS_STATE_MAX_ENTRIES);
       // 结果推送与诊断执行分开兜底：推送失败降级为文本（含重试指引），不谎报「诊断失败」
       try {
         const messageId = await channel.notifyCardOpenId(openId, buildDiagnosisCard(title, text, taskId, url ? { url } : undefined));
@@ -501,9 +538,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
         );
         return;
       }
-      if (retryLaunched.size >= DIAGNOSIS_STATE_MAX_ENTRIES) retryLaunched.clear();
-      retryLaunched.add(retryKey);
-      // 点「重试」时用户看不到将发送的 follow-up 全文（诊断结论直发执行方）：
+      boundedSetAdd(retryLaunched, retryKey, DIAGNOSIS_STATE_MAX_ENTRIES);      // 点「重试」时用户看不到将发送的 follow-up 全文（诊断结论直发执行方）：
       // 回执与终态卡片附双向截断摘要，发出去什么用户看得见
       const followUp = buildRetryPrompt(title, result.text);
       const followUpExcerpt = excerptMiddle(followUp, 400);

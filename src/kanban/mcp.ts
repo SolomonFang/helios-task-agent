@@ -21,7 +21,14 @@ export class KanbanMcp {
    * close() 置位后，connect 完成时立即自我关闭。
    */
   private closePending = false;
-  tools: Tool[] = [];
+  /** 在途 connect 的占位 Promise：并发调用复用同一次连接，否则会拉起两个 stdio 子进程且前者泄漏。 */
+  private connecting: Promise<Tool[]> | null = null;
+  private _tools: Tool[] = [];
+
+  /** 已连接 MCP 的工具清单（只读暴露；仅 connect 内部可赋值，外部不得改写）。 */
+  get tools(): readonly Tool[] {
+    return this._tools;
+  }
 
   constructor({ command, args }: { command: string; args: string[] }) {
     this.command = command;
@@ -29,6 +36,18 @@ export class KanbanMcp {
   }
 
   async connect({ timeoutMs = 30000 }: { timeoutMs?: number } = {}): Promise<Tool[]> {
+    // 重入护栏：连接在途时并发调用共享同一 Promise（含失败结果）， settle 后复位允许重试
+    if (this.connecting) return this.connecting;
+    const p = this.doConnect(timeoutMs);
+    this.connecting = p;
+    try {
+      return await p;
+    } finally {
+      this.connecting = null;
+    }
+  }
+
+  private async doConnect(timeoutMs: number): Promise<Tool[]> {
     this.closePending = false;
     this.stderrTail = '';
     const transport = new StdioClientTransport({
@@ -62,7 +81,7 @@ export class KanbanMcp {
       await client.connect(transport);
       this.transportPid = transport.pid;
       const { tools } = await client.listTools();
-      this.tools = tools || [];
+      this._tools = tools || [];
       this.client = client;
       if (this.closePending) {
         // connect 在途期间收到 close()（如 supervisor.stop 竞速超时后进程退出）：
@@ -70,7 +89,7 @@ export class KanbanMcp {
         this.closePending = false;
         await this.close();
       }
-      return this.tools;
+      return this._tools;
     } catch (err) {
       // 快速失败路径（connect 在超时前 reject）：超时定时器尚未触发，transport 未关闭，
       // 不主动关会泄漏 stdio 子进程（超时已触发过的重复 close 无害）。

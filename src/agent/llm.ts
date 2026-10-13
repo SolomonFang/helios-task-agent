@@ -2,6 +2,8 @@ import OpenAI from 'openai';
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { UNTRUSTED_OPEN, wrapUntrusted } from './guard';
 import { errMessage } from '../infra/err';
+// 上下文超限特征正则单源在 config/llm-error.ts（消除 config→agent 反向依赖）
+import { CONTEXT_OVERFLOW_RE } from '../config/llm-error';
 import type {
   ChatMessage,
   InlineImage,
@@ -117,10 +119,6 @@ export function trimHistory(
   return messages;
 }
 
-/** 模型返回的上下文超限错误特征（用于自动恢复重试）。 */
-export const CONTEXT_OVERFLOW_RE =
-  /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|reduce the length|exceed.{0,20}token|token.{0,10}exceed/i;
-
 /**
  * 发送前把非首位的 system 消息（flushPendingNotes 注入的后台事件通知）降级为 user 角色。
  * 部分 OpenAI 兼容网关对非首位/多条 system 消息直接 400；降级后语义为「外部事件通知，
@@ -220,12 +218,21 @@ export async function runAgentTurn({
     else signal.addEventListener('abort', forwardAbort, { once: true });
   }
   const turnSignal = watchdog.signal;
+  // onProgress 是调用方注入的回调：其抛错不得冒泡为轮次失败（否则用户消息会被上层误弹出历史）
+  const reportProgress = (info: ProgressInfo) => {
+    if (!onProgress) return;
+    try {
+      onProgress(info);
+    } catch (err) {
+      console.error(`[llm] onProgress 回调抛错（已忽略，不影响本轮）: ${errMessage(err)}`);
+    }
+  };
   const timeoutText = `（本轮处理已超过 ${Math.max(1, Math.round(wallClockMs / 60000))} 分钟时间上限，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
   try {
     for (let round = 0; ; round++) {
       if (signal?.aborted) return '⏹ 已中断（未完成的操作未执行，可继续对话）。';
       if (timedOut) return timeoutText;
-      if (onProgress) onProgress({ type: round === 0 ? 'think' : 'continue' });
+      reportProgress({ type: round === 0 ? 'think' : 'continue' });
       const createReq = () => {
         const payload = downgradeSystemNotes(messages);
         // 图片只进当次首个请求：会话历史存的是文本占位（[图片] …），这里仅在请求载荷副本上
@@ -283,7 +290,7 @@ export async function runAgentTurn({
         if (!recovered) throw err;
         // 自愈丢轮同样要告知模型历史不完整（与 trimHistory 同一注记机制）
         insertTruncationNote(messages);
-        if (onProgress) onProgress({ type: 'continue' });
+        reportProgress({ type: 'continue' });
       }
       if (!resp) throw new Error('模型请求失败');
       const msg = resp.choices[0]?.message;
@@ -325,7 +332,7 @@ export async function runAgentTurn({
         const name = call.function.name;
         const handler = handlers.get(name);
         let result: string | undefined;
-        if (onProgress) onProgress({ type: 'tool', name });
+        reportProgress({ type: 'tool', name });
         if (!handler) {
           // 内部工具名不落用户面（黑话），只提示改用已有工具
           result = '错误：没有这个工具，请改用已有工具重试';

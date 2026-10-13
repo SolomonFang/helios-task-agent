@@ -15,6 +15,7 @@ import {
   type KanbanProjectRow,
   type SummaryTaskRow,
 } from './http';
+import { pickAttemptSummaryText, buildStatsLookup, type DiffStats } from './parse';
 import { TASK_STATUS_KEYS } from './status';
 
 export type WorkSummaryScope = 'iteration' | 'today' | 'all';
@@ -54,9 +55,6 @@ export interface WorkSummaryTotals {
   deletions: number;
 }
 
-// statusLabel 已收口到 ./status（状态键与中文 label 的唯一来源）；re-export 兼容既有调用方
-export { statusLabel, isKnownStatus } from './status';
-
 export interface WorkSummaryData {
   scope: WorkSummaryScope;
   iteration?: string;
@@ -84,13 +82,6 @@ interface ProjectRef {
   name: string;
 }
 
-interface DiffStats {
-  filesChanged?: number;
-  additions?: number;
-  deletions?: number;
-  changedFiles?: string[];
-}
-
 /** 单报告最多展开的任务数（按更新时间倒序取最近）。 */
 const MAX_TASKS = 50;
 /** 任务详情并发上限。 */
@@ -105,67 +96,11 @@ function compareUpdatedAtDesc(a: string, b: string): number {
   return tb - ta;
 }
 
-/** 宽松提取任务详情里的可读摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
+/** 宽松提取任务详情里的可读摘要（字段链收口在 ./parse；本层按报告场景截断到 500 字符）。 */
 function pickAttemptSummary(detail: unknown): string | undefined {
-  if (!detail || typeof detail !== 'object') return undefined;
-  const o = detail as Record<string, unknown>;
-  const summary = o.last_attempt_summary ?? o.summary ?? o.result ?? o.last_attempt_output;
-  if (typeof summary === 'string' && summary.trim()) {
-    const t = summary.trim();
-    return t.length > 500 ? `${t.slice(0, 500)}…` : t;
-  }
-  return undefined;
-}
-
-function toNumber(v: unknown): number | undefined {
-  const n = typeof v === 'string' ? Number(v) : v;
-  return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
-}
-
-/** 从单条 workspace summary 记录里宽松提取 diff 统计。 */
-function pickDiffStats(row: Record<string, unknown>): DiffStats {
-  const out: DiffStats = {};
-  const rawFiles = row.changed_files ?? row.files ?? row.file_list;
-  if (Array.isArray(rawFiles)) {
-    const names = rawFiles
-      .map((f) => {
-        if (typeof f === 'string') return f;
-        if (f && typeof f === 'object') {
-          const o = f as Record<string, unknown>;
-          return String(o.path ?? o.file ?? o.name ?? o.filename ?? '');
-        }
-        return '';
-      })
-      .filter(Boolean);
-    if (names.length) out.changedFiles = names;
-  }
-  const filesChanged = toNumber(
-    row.files_changed ?? row.file_count ?? row.filesChanged ?? row.changed_files_count,
-  );
-  if (filesChanged !== undefined) out.filesChanged = filesChanged;
-  else if (out.changedFiles) out.filesChanged = out.changedFiles.length;
-  const additions = toNumber(row.additions ?? row.added_lines ?? row.lines_added);
-  if (additions !== undefined) out.additions = additions;
-  const deletions = toNumber(row.deletions ?? row.deleted_lines ?? row.lines_removed);
-  if (deletions !== undefined) out.deletions = deletions;
-  return out;
-}
-
-/** POST /task-attempts/summary 返回结构不稳定：数组或按 id 键控的对象都兼容，产出 id → stats。 */
-function buildStatsLookup(raw: unknown): Map<string, DiffStats> {
-  const map = new Map<string, DiffStats>();
-  const walk = (key: string | undefined, val: unknown) => {
-    if (!val || typeof val !== 'object' || Array.isArray(val)) return;
-    const row = val as Record<string, unknown>;
-    const id = String(row.workspace_id ?? row.id ?? row.attempt_id ?? row.task_attempt_id ?? key ?? '');
-    if (id) map.set(id, pickDiffStats(row));
-  };
-  if (Array.isArray(raw)) {
-    for (const v of raw) walk(undefined, v);
-  } else if (raw && typeof raw === 'object') {
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) walk(k, v);
-  }
-  return map;
+  const t = pickAttemptSummaryText(detail);
+  if (!t) return undefined;
+  return t.length > 500 ? `${t.slice(0, 500)}…` : t;
 }
 
 async function resolveProjects(kanbanUrl: string, projectId?: string): Promise<ProjectRef[]> {

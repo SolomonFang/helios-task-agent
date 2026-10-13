@@ -9,7 +9,7 @@ import { SessionHistoryStore } from './agent/session-store';
 import { connectMcp } from './kanban/mcp';
 import type { KanbanMcp } from './kanban/mcp';
 import { checkLarkCliStatus, MCP_FALLBACK_TEXT } from './infra/deps';
-import { ensureKanbanOrExit, migrateAndValidateSkills, warnStartupDeps } from './bootstrap';
+import { ensureKanbanOrExit, FatalStartupError, migrateAndValidateSkills, warnStartupDeps, type KanbanEnsureResult } from './bootstrap';
 import { wizardAskSecret, wizardChoose } from './config/wizard-io';
 import { checkForUpdate, readPkgVersion, updateCheckDisabled } from './infra/update-check';
 import { createGracefulExit, handleWizardCancel, installCrashGuards, maybePromptUpdate } from './infra/process-lifecycle';
@@ -339,19 +339,27 @@ export async function main(): Promise<void> {
   installCrashGuards(cleanup);
 
   const bootKanban = new Spinner('检查 helios-kanban…').start();
-  const ensured = await ensureKanbanOrExit({
-    kanbanUrl: cfg.kanbanUrl,
-    onLog: (msg) => bootKanban.setText(msg),
-    // 就绪等待期间（最长 90s）收到退出信号时，cleanup 需要拿到 child 才能处置
-    onSpawn: (child) => {
-      kanbanChild = child;
-    },
-    onFail: () => {
-      bootKanban.stop();
-      rl.close();
-    },
-    failLabel: '看板不可用',
-  });
+  let ensured: KanbanEnsureResult;
+  try {
+    ensured = await ensureKanbanOrExit({
+      kanbanUrl: cfg.kanbanUrl,
+      onLog: (msg) => bootKanban.setText(msg),
+      // 就绪等待期间（最长 90s）收到退出信号时，cleanup 需要拿到 child 才能处置
+      onSpawn: (child) => {
+        kanbanChild = child;
+      },
+      onFail: () => {
+        bootKanban.stop();
+        rl.close();
+      },
+      failLabel: '看板不可用',
+    });
+  } catch (err) {
+    // 启动失败（FatalStartupError）：错误与手动指引已在 ensureKanbanOrExit 内打印，
+    // 这里按 exitCode 走 cleanup 统一收尾（保持原退出码语义，不再绕过清理）
+    if (err instanceof FatalStartupError) await cleanup(err.exitCode);
+    throw err;
+  }
   kanbanChild = ensured.child;
   bootKanban.stop();
   if (ensured.started) console.log(c.ok('已自动启动 helios-kanban'));
@@ -458,147 +466,173 @@ export async function main(): Promise<void> {
     }
   }
 
+  /**
+   * 斜杠命令表（命令名 → handler）：handler 闭包引用 cfg 等可变绑定，/config 改配置后自然读到新值。
+   * /quit 与 /exit 同效，共用同一 handler；分发见 dispatchCommand。
+   */
+  const commandHandlers: Record<string, (line: string, fullCmd: string) => void | Promise<void>> = {
+    '/exit': async () => {
+      console.log(c.gray('再见 👋'));
+      await cleanup();
+    },
+    '/help': () => console.log(HELP),
+    '/clear': () => {
+      // clearHistory 会一并撤销免问授权：先取计数，按新语义告知（取在 clear 后恒为 0，提示成死文案）
+      const revoked = session.activeBatchApprovals();
+      session.clearHistory();
+      console.log(c.gray(clearedText(revoked)));
+    },
+    '/confirm': (_line, fullCmd) => {
+      // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）。
+      // 未匹配的子命令（如 /confirm off）按状态查询处理，与 bot 端行为对齐
+      if (fullCmd === '/confirm revoke' || fullCmd === '/confirm on') {
+        const n = session.revokeBatchApprovals();
+        console.log(n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, confirmStateText(0, ''))));
+      } else {
+        const active = session.activeBatchApprovals();
+        console.log(
+          active
+            ? c.warn(confirmStateText(active, '输入 /confirm revoke 恢复逐次确认'))
+            : c.gray(confirmStateText(0, '')),
+        );
+      }
+    },
+    '/memory': () => {
+      // CLI 端记忆归属恒为 local：仅在非 local（未来多用户）时展示 user= 后缀，避免无信息量的内部细节
+      const userSuffix = session.memoryUserId === 'local' ? '' : c.gray(`  user=${session.memoryUserId}`);
+      for (const l of buildMemoryLines(session, c.strong('你的记忆') + userSuffix)) {
+        console.log(l);
+      }
+      console.log('');
+    },
+    '/tools': async () => {
+      const mcpAlive = await probeMcpAlive();
+      for (const l of buildToolsLines(
+        {
+          mcpOk: mcpAlive,
+          mcpTools: mcp.tools,
+          // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册；reminder_* 同理恒注册
+          memoryEnabled: true,
+          reminderEnabled: true,
+          kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
+          downNote: mcpOk
+            ? c.warn('看板连接已断开，看板工具暂不可用；退出并重新运行本程序即可恢复（/exit 退出）。')
+            : c.warn(`看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`),
+          localHeader: c.strong('本地工具：'),
+          bullet: '  ',
+        },
+        c,
+      )) {
+        console.log(l);
+      }
+    },
+    '/skills': (line) => {
+      // 子命令参数（install 路径等）区分大小写，用原始 line 而非小写化后的 cmd
+      for (const l of handleSkillsCommand(
+        line,
+        {
+          header: c.strong('已安装技能：'),
+          bullet: '  ',
+          footer: c.gray('对话中可直接问「你有什么技能」；细节会在对话中按需自动加载。'),
+        },
+        c,
+      )) {
+        console.log(l);
+      }
+    },
+    '/status': async () => {
+      const mcpAlive = await probeMcpAlive();
+      const lines = await buildStatusLines(
+        {
+          model: cfg.llmModel,
+          kanbanUrl: cfg.kanbanUrl,
+          mcpOk: mcpAlive,
+          mcpToolCount: mcp.tools.length,
+          mcpDownNote: mcpOk
+            ? '连接已断开，退出并重新运行本程序即可恢复（/exit 退出）'
+            : '连接失败，已切换为备用通道',
+          larkOk: larkStatus !== 'missing',
+          // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启；
+          // MCP 从未连上时不存在「旧连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
+          extra:
+            cfg.kanbanUrl !== mcpBoundKanbanUrl
+              ? [
+                  c.warn(
+                    mcpOk
+                      ? `注意：看板连接仍指向旧地址 ${mcpBoundKanbanUrl}，看板工具操作的是旧看板；/exit 重启后才会连接新地址。`
+                      : '注意：看板主连接未建立，备用通道已指向新地址。',
+                  ),
+                ]
+              : undefined,
+        },
+        c,
+      );
+      console.log(c.strong('状态'));
+      for (const l of lines) console.log('  ' + l);
+      console.log('');
+    },
+    '/config': async () => {
+      try {
+        const prevKanbanUrl = cfg.kanbanUrl;
+        const prevModel = cfg.llmModel;
+        cfg = await ensureConfig(ask, { force: true, choose, askSecret });
+        session.applyConfig(cfg);
+        console.log(
+          cfg.llmModel !== prevModel
+            ? c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel)
+            : c.ok(`配置已更新（模型仍为 ${cfg.llmModel}）`),
+        );
+        if (cfg.kanbanUrl !== prevKanbanUrl) {
+          // MCP 从未连上时不存在「仍指向旧看板的连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
+          console.log(
+            c.warn(
+              mcpOk
+                ? `看板地址已改为 ${cfg.kanbanUrl}，但当前连接仍指向启动时的旧看板，看板工具操作的仍是旧看板；` +
+                  '备用通道已指向新地址。建议 /exit 后重启以连接新地址。'
+                : `看板地址已改为 ${cfg.kanbanUrl}；看板主连接未建立，备用通道已指向新地址。`,
+            ),
+          );
+        }
+      } catch (err) {
+        // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，不打成红色「配置失败」
+        if (!handleWizardCancel(err)) console.error(c.err(`配置失败：${errMessage(err)}`));
+      }
+    },
+    '/stop': () => {
+      // bot 帮助教用户 /stop；同一用户到 CLI 输入 /stop 时给出本端等价操作，不报「未知命令」
+      console.log(c.gray('CLI 中按 Ctrl+C 中断当前任务（/exit 退出）。'));
+    },
+  };
+  commandHandlers['/quit'] = commandHandlers['/exit']!;
+
+  /**
+   * 表驱动斜杠命令分发：按首词判定命令（与 bot 的 parseCommand 一致）：/status foo 不再整行被当成
+   * 未知命令；带子命令的 /confirm 仍按整行词表匹配（fullCmd）。未命中按未知命令提示。
+   */
+  const dispatchCommand = async (line: string): Promise<void> => {
+    const cmd = line.toLowerCase().split(/\s+/)[0]!;
+    const handler = commandHandlers[cmd];
+    if (!handler) {
+      console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));
+      return;
+    }
+    await handler(line, line.toLowerCase());
+  };
+
   for (;;) {
     atMainPrompt = true;
     const input = await ask(c.info('› '));
     atMainPrompt = false;
-    if (input === null) await cleanup();
-    const line = input!.trim();
+    if (input === null) {
+      await cleanup();
+      // cleanup 内部 process.exit 不返回；幂等重入路径会正常返回，显式 return 消除对「cleanup 必退出」的隐式依赖
+      return;
+    }
+    const line = input.trim();
     if (!line) continue;
 
     if (line.startsWith('/')) {
-      // 按首词判定命令（与 bot 的 parseCommand 一致）：/status foo 不再整行被当成未知命令；
-      // 带子命令的 /confirm 仍按整行词表匹配（fullCmd）
-      const cmd = line.toLowerCase().split(/\s+/)[0]!;
-      const fullCmd = line.toLowerCase();
-      if (cmd === '/exit' || cmd === '/quit') {
-        console.log(c.gray('再见 👋'));
-        await cleanup();
-      } else if (cmd === '/help') {
-        console.log(HELP);
-      } else if (cmd === '/clear') {
-        // clearHistory 会一并撤销免问授权：先取计数，按新语义告知（取在 clear 后恒为 0，提示成死文案）
-        const revoked = session.activeBatchApprovals();
-        session.clearHistory();
-        console.log(c.gray(clearedText(revoked)));
-      } else if (cmd === '/confirm') {
-        // /confirm on 是历史别名；语义化的写法是 /confirm revoke（撤销免问、恢复逐次确认）。
-        // 未匹配的子命令（如 /confirm off）按状态查询处理，与 bot 端行为对齐
-        if (fullCmd === '/confirm revoke' || fullCmd === '/confirm on') {
-          const n = session.revokeBatchApprovals();
-          console.log(
-            n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, confirmStateText(0, ''))),
-          );
-        } else {
-          const active = session.activeBatchApprovals();
-          console.log(
-            active
-              ? c.warn(confirmStateText(active, '输入 /confirm revoke 恢复逐次确认'))
-              : c.gray(confirmStateText(0, '')),
-          );
-        }
-      } else if (cmd === '/memory') {
-        // CLI 端记忆归属恒为 local：仅在非 local（未来多用户）时展示 user= 后缀，避免无信息量的内部细节
-        const userSuffix = session.memoryUserId === 'local' ? '' : c.gray(`  user=${session.memoryUserId}`);
-        for (const l of buildMemoryLines(session, c.strong('你的记忆') + userSuffix)) {
-          console.log(l);
-        }
-        console.log('');
-      } else if (cmd === '/tools') {
-        const mcpAlive = await probeMcpAlive();
-        for (const l of buildToolsLines(
-          {
-            mcpOk: mcpAlive,
-            mcpTools: mcp.tools,
-            // CLI 会话恒挂 MemoryStore（session.ts 构造默认），memory_* 工具始终注册；reminder_* 同理恒注册
-            memoryEnabled: true,
-            reminderEnabled: true,
-            kanbanHeader: c.strong(`看板工具（${mcp.tools.length} 个）`),
-            downNote: mcpOk
-              ? c.warn('看板连接已断开，看板工具暂不可用；退出并重新运行本程序即可恢复（/exit 退出）。')
-              : c.warn(`看板连接失败，${MCP_FALLBACK_TEXT}，大部分功能可用，如遇操作失败请稍后再试。`),
-            localHeader: c.strong('本地工具：'),
-            bullet: '  ',
-          },
-          c,
-        )) {
-          console.log(l);
-        }
-      } else if (cmd === '/skills') {
-        // 子命令参数（install 路径等）区分大小写，用原始 line 而非小写化后的 cmd
-        for (const l of handleSkillsCommand(
-          line,
-          {
-            header: c.strong('已安装技能：'),
-            bullet: '  ',
-            footer: c.gray('对话中可直接问「你有什么技能」；细节会在对话中按需自动加载。'),
-          },
-          c,
-        )) {
-          console.log(l);
-        }
-      } else if (cmd === '/status') {
-        const mcpAlive = await probeMcpAlive();
-        const lines = await buildStatusLines(
-          {
-            model: cfg.llmModel,
-            kanbanUrl: cfg.kanbanUrl,
-            mcpOk: mcpAlive,
-            mcpToolCount: mcp.tools.length,
-            mcpDownNote: mcpOk
-              ? '连接已断开，退出并重新运行本程序即可恢复（/exit 退出）'
-              : '连接失败，已切换为备用通道',
-            larkOk: larkStatus !== 'missing',
-            // /config 改过看板地址后一次性警告易被淹没，/status 里持续提示直到重启；
-            // MCP 从未连上时不存在「旧连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
-            extra:
-              cfg.kanbanUrl !== mcpBoundKanbanUrl
-                ? [
-                    c.warn(
-                      mcpOk
-                        ? `注意：看板连接仍指向旧地址 ${mcpBoundKanbanUrl}，看板工具操作的是旧看板；/exit 重启后才会连接新地址。`
-                        : '注意：看板主连接未建立，备用通道已指向新地址。',
-                    ),
-                  ]
-                : undefined,
-          },
-          c,
-        );
-        console.log(c.strong('状态'));
-        for (const l of lines) console.log('  ' + l);
-        console.log('');
-      } else if (cmd === '/config') {
-        try {
-          const prevKanbanUrl = cfg.kanbanUrl;
-          const prevModel = cfg.llmModel;
-          cfg = await ensureConfig(ask, { force: true, choose, askSecret });
-          session.applyConfig(cfg);
-          console.log(
-            cfg.llmModel !== prevModel
-              ? c.ok('配置已更新，模型切换为 ') + c.strong(cfg.llmModel)
-              : c.ok(`配置已更新（模型仍为 ${cfg.llmModel}）`),
-          );
-          if (cfg.kanbanUrl !== prevKanbanUrl) {
-            // MCP 从未连上时不存在「仍指向旧看板的连接」，工具实际走已指向新地址的备用通道，按 mcpOk 条件化
-            console.log(
-              c.warn(
-                mcpOk
-                  ? `看板地址已改为 ${cfg.kanbanUrl}，但当前连接仍指向启动时的旧看板，看板工具操作的仍是旧看板；` +
-                    '备用通道已指向新地址。建议 /exit 后重启以连接新地址。'
-                  : `看板地址已改为 ${cfg.kanbanUrl}；看板主连接未建立，备用通道已指向新地址。`,
-              ),
-            );
-          }
-        } catch (err) {
-          // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，不打成红色「配置失败」
-          if (!handleWizardCancel(err)) console.error(c.err(`配置失败：${errMessage(err)}`));
-        }
-      } else if (cmd === '/stop') {
-        // bot 帮助教用户 /stop；同一用户到 CLI 输入 /stop 时给出本端等价操作，不报「未知命令」
-        console.log(c.gray('CLI 中按 Ctrl+C 中断当前任务（/exit 退出）。'));
-      } else {
-        console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));
-      }
+      await dispatchCommand(line);
       continue;
     }
 

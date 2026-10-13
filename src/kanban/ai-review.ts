@@ -130,13 +130,24 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
     const p = (r.path || '').trim();
     if (p) candidates.push(p);
   }
-  for (const dir of candidates) {
-    if (fs.existsSync(dir) && (await isGitRepo(dir))) {
-      const fromRef = repos.map((r) => (r.target_branch || '').trim()).find(Boolean) || undefined;
-      const toRef = (attempt.branch || '').trim() || undefined;
-      const taskId = typeof attempt.task_id === 'string' ? attempt.task_id.trim() || undefined : undefined;
-      return { repoDir: dir, fromRef, toRef, taskId };
-    }
+  // 候选目录并行探测（bot 事件循环路径：逐个串行 await isGitRepo 会叠加阻塞）；
+  // 命中后仍按候选顺序取首个，优先级语义不变。目录存在性用异步 access，不用同步 existsSync
+  const hits = await Promise.all(
+    candidates.map(async (dir) => {
+      try {
+        await fs.promises.access(dir);
+      } catch {
+        return null;
+      }
+      return (await isGitRepo(dir)) ? dir : null;
+    }),
+  );
+  const repoDir = hits.find((d): d is string => Boolean(d));
+  if (repoDir) {
+    const fromRef = repos.map((r) => (r.target_branch || '').trim()).find(Boolean) || undefined;
+    const toRef = (attempt.branch || '').trim() || undefined;
+    const taskId = typeof attempt.task_id === 'string' ? attempt.task_id.trim() || undefined : undefined;
+    return { repoDir, fromRef, toRef, taskId };
   }
   // 宿主机绝对路径清单只进日志（对用户无意义且泄露本机目录结构）；用户面只留中文结论与可执行指引
   if (candidates.length) {

@@ -1,6 +1,8 @@
-import OpenAI from 'openai';
 import { apiGet, apiPost, combinedSignal, pickLatestAttempt, KanbanHttpError } from './http';
+import { friendlyNetError } from '../config/net-error';
 import { errMessage } from '../infra/err';
+import { createKanbanLlmClient } from './llm-client';
+import { buildStatsLookup, pickAttemptSummaryText } from './parse';
 import type { OcrLlmConfig } from './ai-review';
 
 /**
@@ -68,43 +70,23 @@ export interface FailureContext {
   diffStats?: { filesChanged?: number; additions?: number; deletions?: number };
 }
 
-function toNumber(v: unknown): number | undefined {
-  const n = typeof v === 'string' ? Number(v) : v;
-  return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
-}
-
-/** 宽松提取任务详情里的描述与失败摘要（看板版本间字段可能不同，取不到就静默兜底）。 */
+/** 宽松提取任务详情里的描述与失败摘要（字段链收口在 ./parse，取不到就静默兜底）。 */
 function pickTaskFields(detail: unknown): { description: string; attemptSummary: string } {
   if (!detail || typeof detail !== 'object') return { description: '', attemptSummary: '' };
   const o = detail as Record<string, unknown>;
   const description = typeof o.description === 'string' ? o.description.trim() : '';
-  const summary = o.last_attempt_summary ?? o.summary ?? o.result ?? o.last_attempt_output;
-  return { description, attemptSummary: typeof summary === 'string' ? summary.trim() : '' };
+  return { description, attemptSummary: pickAttemptSummaryText(detail) };
 }
 
-/** 从 /task-attempts/summary 返回里宽松提取单个 attempt 的 diff 统计（形状不稳定：数组或按 id 键控）。 */
+/** 从 /task-attempts/summary 返回里取单个 attempt 的 diff 统计（形状不稳定，经 ./parse 的 buildStatsLookup 单源解析）。 */
 function pickDiffStatsFor(raw: unknown, attemptId: string): FailureContext['diffStats'] {
-  const rows: Array<Record<string, unknown>> = [];
-  if (Array.isArray(raw)) {
-    for (const v of raw) if (v && typeof v === 'object' && !Array.isArray(v)) rows.push(v as Record<string, unknown>);
-  } else if (raw && typeof raw === 'object') {
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (v && typeof v === 'object' && !Array.isArray(v)) rows.push({ ...v, __key: k } as Record<string, unknown>);
-    }
-  }
-  const row = rows.find((r) => {
-    const id = String(r.workspace_id ?? r.id ?? r.attempt_id ?? r.task_attempt_id ?? r.__key ?? '');
-    return id === attemptId;
-  });
-  if (!row) return undefined;
-  const stats: NonNullable<FailureContext['diffStats']> = {};
-  const filesChanged = toNumber(row.files_changed ?? row.file_count ?? row.filesChanged ?? row.changed_files_count);
-  if (filesChanged !== undefined) stats.filesChanged = filesChanged;
-  const additions = toNumber(row.additions ?? row.added_lines ?? row.lines_added);
-  if (additions !== undefined) stats.additions = additions;
-  const deletions = toNumber(row.deletions ?? row.deleted_lines ?? row.lines_removed);
-  if (deletions !== undefined) stats.deletions = deletions;
-  return Object.keys(stats).length ? stats : undefined;
+  const stats = buildStatsLookup(raw).get(attemptId);
+  if (!stats) return undefined;
+  const out: NonNullable<FailureContext['diffStats']> = {};
+  if (stats.filesChanged !== undefined) out.filesChanged = stats.filesChanged;
+  if (stats.additions !== undefined) out.additions = stats.additions;
+  if (stats.deletions !== undefined) out.deletions = stats.deletions;
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** 采集失败上下文：任务详情 + 最新 attempt + diff 统计；后两者失败不阻断（有多少用多少）。 */
@@ -184,21 +166,14 @@ const SYSTEM_PROMPT =
   '你是资深研发工程师，擅长诊断自动化编码任务的失败原因。全程使用简体中文回答，结论务实、可直接执行，不要使用内部术语黑话。';
 
 /**
- * 采集失败的错误中文化（网络映射与 net-error 同族；kanban 层无反向依赖 config 的先例，这里内联最小集）：
- * 看板不可达/超时给中文定性，英文原文（fetch failed / The operation timed out…）由调用方收 HTA_DEBUG。
+ * 采集失败的错误中文化：网络错误映射收口到 config/net-error 的 friendlyNetError
+ * （含 AggregateError cause.errors 解包，两处不再各自维护）；英文原文
+ * （fetch failed / The operation timed out…）由调用方收 HTA_DEBUG。
  */
 function collectFailureMessage(err: unknown): string {
   if (err instanceof KanbanHttpError) return '看板接口暂时异常';
-  const cause = (err as { cause?: { code?: unknown; message?: unknown } } | null)?.cause;
-  const s = [errMessage(err), cause?.code, cause?.message]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-  if (/timed?\s*out|etimedout|aborted/.test(s)) return '连接看板超时';
-  if (s.includes('econnrefused')) return '看板不可达（连接被拒）';
-  if (s.includes('enotfound') || s.includes('eai_again')) return '看板地址解析失败';
-  if (s.includes('fetch failed')) return '看板不可达（网络请求失败）';
-  return '看板响应异常';
+  // friendlyNetError 未命中映射时返回通用定性「网络请求失败」（永不返回 null）
+  return friendlyNetError(err);
 }
 
 /** 执行失败诊断：采集上下文 → 单次 LLM 调用；失败抛出中文错误（原文只进日志/HTA_DEBUG）。 */
@@ -230,7 +205,7 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
       if (!l.baseUrl || !l.apiKey || !l.model) {
         throw new Error('模型配置不完整，请联系部署者检查模型配置。');
       }
-      const client = new OpenAI({ baseURL: l.baseUrl, apiKey: l.apiKey, timeout: timeoutMs, maxRetries: 2 });
+      const client = createKanbanLlmClient({ baseUrl: l.baseUrl, apiKey: l.apiKey, timeoutMs, maxRetries: 2 });
       const resp = await client.chat.completions.create(
         {
           model: l.model,

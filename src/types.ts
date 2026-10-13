@@ -90,6 +90,8 @@ export interface MemoryFile {
  * 接口形状（sessionId / open_id 风格 senderId）按飞书 IM 设计；CLI 终端不走此接口。
  * 注意：这层抽象目前只覆盖飞书单实现，bot handler（src/bot/handler.ts）直接依赖
  * 飞书具体类型（FeishuChannel / FeishuInboundMessage），并未面向本接口编程。
+ * TODO：单实现的死抽象——若长期没有第二个通道实现，可删除本接口让 FeishuChannel 独立
+ * （同步收敛 index.ts 导出，属 breaking change）；若新增通道，则先让 handler 面向本接口编程。
  */
 export interface AgentChannel {
   readonly name: string;

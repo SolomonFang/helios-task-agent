@@ -25,6 +25,20 @@ export function appendFilePrivateSync(filePath: string, content: string): void {
 }
 
 /**
+ * writeFilePrivateSync 的异步版：同一 0600 语义（mode 只对新建生效，已存在文件再 chmod
+ * 收紧一次），供 bot 事件循环内的报告写盘使用——HTML 可达数百 KB，同步写盘会阻塞
+ * 事件循环（卡住其他用户的消息处理与 watcher 轮询）。
+ */
+export async function writeFilePrivate(filePath: string, content: string): Promise<void> {
+  await fs.promises.writeFile(filePath, content, { encoding: 'utf8', mode: 0o600 });
+  try {
+    await fs.promises.chmod(filePath, 0o600);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
  * 私有数据目录创建：统一 0700（~/.helios-task-agent/ 下有 memory.json、audit.log、
  * .env 等个人数据），本机其他用户不得列举。mkdir 的 mode 只对新建生效，
  * 对已存在目录（历史遗留按 umask 0755 创建的）再 chmod 收紧一次。
@@ -39,6 +53,29 @@ export function ensurePrivateDirSync(dir: string): void {
 }
 
 /**
+ * 清理目标文件的崩溃残留 tmp（<file>.<pid>.tmp）：上次写盘中途被杀会留下孤儿 tmp，
+ * 写入路径上顺带清掉（跳过本进程自己的 tmp）。best-effort，失败忽略。
+ */
+function cleanupStaleTmpSync(filePath: string): void {
+  try {
+    const dir = path.dirname(filePath);
+    const prefix = `${path.basename(filePath)}.`;
+    const ownTmp = `${prefix}${process.pid}.tmp`;
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(prefix) && name.endsWith('.tmp') && name !== ownTmp) {
+        try {
+          fs.unlinkSync(path.join(dir, name));
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
  * 原子写私有文件：ensurePrivateDirSync(所在目录 0700) → 同目录 tmp 文件（0600）→ rename 就位。
  * 避免写盘中途被杀导致目标截断（.env 凭证 / memory.json / watch-state.json 等丢失）；
  * rename 后目标一定是新建的 0600 文件（writeFilePrivateSync 内含 chmod）。
@@ -46,6 +83,7 @@ export function ensurePrivateDirSync(dir: string): void {
  */
 export function writeFileAtomicPrivateSync(filePath: string, content: string): void {
   ensurePrivateDirSync(path.dirname(filePath));
+  cleanupStaleTmpSync(filePath);
   const tmp = `${filePath}.${process.pid}.tmp`;
   writeFilePrivateSync(tmp, content);
   fs.renameSync(tmp, filePath);

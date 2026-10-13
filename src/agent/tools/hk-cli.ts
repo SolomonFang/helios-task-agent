@@ -5,9 +5,10 @@ import {
   applyRepoBaseBranches,
   fetchRepoDefaultBranches,
   fetchRepoNames,
-  fillHkStartBranches,
+  fillHkStartBranchesOrThrow,
   formatMissingBaseBranchError,
 } from '../../kanban/workspace-ready';
+import { errMessage } from '../../infra/err';
 import { extractUuid, resolveHkScript, run, summarizeBothEnds } from './shared';
 import type { GatedWrite } from './gated-write';
 
@@ -146,7 +147,7 @@ export function makeHkCliHandler({
                 const defaults = await fetchRepoDefaultBranches(kanbanUrl, [repoId], ctx?.signal);
                 const { unresolved } = applyRepoBaseBranches([{ repo_id: repoId }], defaults);
                 if (unresolved.length) {
-                  // 报错前先拉仓库名（同 fillHkStartBranches 的错误路径），不落裸 UUID 列表
+                  // 报错前先拉仓库名（同 fillHkStartBranchesOrThrow 的错误路径），不落裸 UUID 列表
                   const names = await fetchRepoNames(kanbanUrl, unresolved, ctx?.signal);
                   return formatMissingBaseBranchError(unresolved, names);
                 }
@@ -154,16 +155,26 @@ export function makeHkCliHandler({
                 if (branch) argv.push('--branch', branch);
               } else {
                 // 显式 --repo id（无 :branch）也要先解析默认分支再补全，否则 hk 静默回退 main
-                return await fillHkStartBranches(argv, kanbanUrl, {
-                  signal: ctx?.signal,
-                  noRepoError:
-                    '无法启动工作区：本次未指定目标分支，且未配置默认仓库。\n' +
-                    '直接告诉我使用哪个分支（如 develop），或联系部署者配置默认仓库。',
-                });
+                try {
+                  await fillHkStartBranchesOrThrow(argv, kanbanUrl, {
+                    signal: ctx?.signal,
+                    noRepoError:
+                      '无法启动工作区：本次未指定目标分支，且未配置默认仓库。\n' +
+                      '直接告诉我使用哪个分支（如 develop），或联系部署者配置默认仓库。',
+                  });
+                  return null;
+                } catch (err) {
+                  return errMessage(err);
+                }
               }
             } else if (!argv.includes('--branch')) {
               // 混合形态：部分 --repo 已带 :branch，其余未带的也要补默认分支，不能静默回退 main
-              return await fillHkStartBranches(argv, kanbanUrl, { signal: ctx?.signal });
+              try {
+                await fillHkStartBranchesOrThrow(argv, kanbanUrl, { signal: ctx?.signal });
+                return null;
+              } catch (err) {
+                return errMessage(err);
+              }
             }
             return null;
           }

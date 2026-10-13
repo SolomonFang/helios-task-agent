@@ -11,7 +11,7 @@ import { Readable } from 'stream';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseBotArgs } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
-import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS } from '../src/channels/feishu';
+import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS, createFeishuHttpInstance } from '../src/channels/feishu';
 import { buildAiReviewCard } from '../src/bot/cards';
 import { check, checkAsync, finish } from './testkit';
 
@@ -187,11 +187,36 @@ async function main(): Promise<void> {
     assert.equal(ch.connectionState(), null);
   });
 
-  // ---------- 飞书 REST 超时：构造 channel 即给 SDK 共享 axios 实例配默认超时 ----------
-  check('FeishuChannel：REST 调用有超时兜底（SDK axios 默认 timeout=0 会永久 pending）', (() => {
+  // ---------- 飞书 REST 超时：per-client httpInstance 注入默认超时，不污染全局共享 axios 实例 ----------
+  await checkAsync('FeishuChannel：REST 调用有超时兜底（SDK axios 默认 timeout=0 会永久 pending）', async () => {
+    // 构造 channel 不得改进程级共享的 defaultHttpInstance.defaults（改它会波及一切 Lark client）
     new FeishuChannel({ appId: 'cli_x', appSecret: 's', allowedOpenIds: [] });
-    return Lark.defaultHttpInstance.defaults.timeout === FEISHU_HTTP_TIMEOUT_MS && FEISHU_HTTP_TIMEOUT_MS > 0;
-  })());
+    assert.notEqual(
+      Lark.defaultHttpInstance.defaults.timeout,
+      FEISHU_HTTP_TIMEOUT_MS,
+      '全局 defaultHttpInstance.defaults.timeout 不应被污染',
+    );
+    // per-client 实例：未显式指定 timeout 时注入默认超时；显式 timeout 原样透传、不被覆盖
+    const inst = createFeishuHttpInstance(FEISHU_HTTP_TIMEOUT_MS);
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    const orig = Lark.defaultHttpInstance.get;
+    (Lark.defaultHttpInstance as { get: unknown }).get = (_url: string, opts?: Record<string, unknown>) => {
+      seen.push(opts);
+      return Promise.resolve({} as never);
+    };
+    try {
+      await inst.get('https://example.invalid/a'); // 无 opts → 注入默认
+      await inst.get('https://example.invalid/b', { timeout: 1234 }); // 显式 timeout → 不覆盖
+      await inst.get('https://example.invalid/c', { headers: {} }); // 仅其他 opts → 注入默认
+    } finally {
+      (Lark.defaultHttpInstance as { get: unknown }).get = orig;
+    }
+    assert.equal(seen.length, 3);
+    assert.equal(seen[0]?.timeout, FEISHU_HTTP_TIMEOUT_MS);
+    assert.equal(seen[1]?.timeout, 1234);
+    assert.equal(seen[2]?.timeout, FEISHU_HTTP_TIMEOUT_MS);
+    assert.ok(FEISHU_HTTP_TIMEOUT_MS > 0);
+  });
 
   // ---------- downloadImage：流读取有整体超时（axios timeout 只覆盖到响应头） ----------
   // client 是私有字段：与既有 fake 注入同一手法，一次性收窄后替换 messageResource.get

@@ -3,12 +3,17 @@
  * KANBAN_WATCH / KANBAN_WATCH_INTERVAL_SEC / HTA_STALE_NUDGE_HOURS /
  * HTA_DAILY_BRIEF / HTA_WEEKLY_BRIEF / HTA_WEEKLY_BRIEF_DAY。
  * 非法值的告警集中在 readRuntimeFlags（warn 回调注入，调用方决定着色/前缀）；
- * 具体解析规则仍由各自模块的 parse 函数承担（单一事实源），这里只做编排与告警收口。
+ * 具体解析规则由 ./flags-parsers 承担（config 层单一事实源），这里只做编排与告警收口。
  */
 
-import { parseStaleNudgeHours } from '../kanban/stale-nudge';
-import { parseDailyBriefTime, type DailyBriefTime } from '../bot/daily-brief';
-import { parseWeeklyBriefDay, parseWeeklyBriefTime, type WeeklyBriefTime } from '../bot/weekly-brief';
+import {
+  parseDailyBriefTime,
+  parseStaleNudgeHours,
+  parseWeeklyBriefDay,
+  parseWeeklyBriefTime,
+  type DailyBriefTime,
+  type WeeklyBriefTime,
+} from './flags-parsers';
 import { errMessage } from '../infra/err';
 
 export interface RuntimeFlags {

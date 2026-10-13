@@ -114,7 +114,8 @@ import {
 } from '../src/commands';
 import { renderReply, printBanner, Spinner } from '../src/infra/ui';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { statusLabel, type WorkSummaryData } from '../src/kanban/summary';
+import { statusLabel } from '../src/kanban/status';
+import type { WorkSummaryData } from '../src/kanban/summary';
 import type { ChatMessage, OpenAiClient } from '../src/types';
 import { check, checkAsync, finish, modeOk, writeFakeCli } from './testkit';
 
@@ -2178,7 +2179,7 @@ async function run(): Promise<void> {
   // ---------- AI 审查：报告静态服务 ----------
   await checkAsync('report-server：服务 reviews 目录 html / 拒绝路径穿越与非 html', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-report-'));
-    const name = writeReviewReport(
+    const name = await writeReviewReport(
       { title: '测试任务', attemptId: 'att-9', generatedAt: '2026/7/30 12:00:00', text: '## 结论\n- ok' },
       tmp,
     );
@@ -3786,7 +3787,7 @@ async function run(): Promise<void> {
         tasks: [],
         totals: { done: 1, inreview: 0, inprogress: 2, todo: 0, cancelled: 0, filesChanged: 3, additions: 10, deletions: 4 },
       } as unknown as WorkSummaryData;
-      const paths = writeSummaryReports(data, { dir: tmp });
+      const paths = await writeSummaryReports(data, { dir: tmp });
       assert.ok(paths.htmlPath && paths.mdPath);
       const htmlName = path.basename(paths.htmlPath!);
       // token 是访问凭证：必须符合服务端白名单正则，且md（本机路径用）不带

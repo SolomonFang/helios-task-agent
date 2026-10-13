@@ -1,10 +1,9 @@
 import type { ChildProcess } from 'child_process';
-import http from 'http';
-import https from 'https';
 import { URL } from 'url';
 import { kanbanPackageSpec, kanbanManualStartHint } from '../infra/deps';
 import { killProcessTree, processTreeAlive, spawnCompat } from '../infra/proc';
 import { minimalChildEnv } from '../infra/proc-env';
+import { probeKanbanHealth } from './http';
 
 export interface KanbanEnsureResult {
   /** True if we spawned a new process. */
@@ -18,63 +17,15 @@ function isLocalHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0';
 }
 
-/** 看板健康响应的字段级校验：必须是可以 JSON.parse 的看板 API 信封——
- * success===true 且带 error_data/message 字段组合（vibe-kanban ApiResponse 的固定形状）。
- * 仅匹配 "success":true 子串可被任何返回该字段的服务冒充（含把这几个字符写进 HTML 的页面）。 */
-function isKanbanHealthBody(body: string): boolean {
-  try {
-    const o: unknown = JSON.parse(body);
-    if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
-    const r = o as Record<string, unknown>;
-    return r.success === true && 'error_data' in r && 'message' in r;
-  } catch {
-    return false;
-  }
-}
-
-/** 导出以便单测直接验证健康判定（单测起本地 HTTP server 模拟各类占用者）。 */
+/**
+ * 看板健康判定（严格口径）：2xx 且响应体是看板 API 信封才算健康——
+ * 任意占用端口的 HTTP 服务（含对健康路径回 404/HTML 的）不得误判为「看板已在运行」。
+ * 实现与 http.ts 的宽松探测同一来源（probeKanbanHealth，strict 参数区分口径），
+ * 本函数只保留 boolean 语义供启动判定使用。
+ * 导出以便单测直接验证健康判定（单测起本地 HTTP server 模拟各类占用者）。
+ */
 export async function fetchHealth(baseUrl: string, timeoutMs = 3000): Promise<boolean> {
-  const root = baseUrl.replace(/\/$/, '');
-  const paths = ['/api/health', '/health'];
-  for (const p of paths) {
-    const ok = await new Promise<boolean>((resolve) => {
-      let settled = false;
-      const done = (v: boolean) => {
-        if (settled) return;
-        settled = true;
-        resolve(v);
-      };
-      try {
-        const u = new URL(root + p);
-        const lib = u.protocol === 'https:' ? https : http;
-        const req = lib.get(u, { timeout: timeoutMs }, (res) => {
-          // 仅 2xx 且响应体是看板 API 信封（success+error_data+message 字段组合）才算健康：
-          // 任意占用端口的 HTTP 服务（含对这些路径回 404/HTML 的）不得误判为「看板已在运行」
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-            res.resume();
-            done(false);
-            return;
-          }
-          let body = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk: string) => {
-            if (body.length < 8192) body += chunk;
-          });
-          res.on('end', () => done(isKanbanHealthBody(body)));
-          res.on('error', () => done(false));
-        });
-        req.on('error', () => done(false));
-        req.on('timeout', () => {
-          req.destroy();
-          done(false);
-        });
-      } catch {
-        done(false);
-      }
-    });
-    if (ok) return true;
-  }
-  return false;
+  return (await probeKanbanHealth(baseUrl, { strict: true, timeoutMs })) === 'ok';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -113,8 +64,10 @@ export async function ensureKanbanRunning(
   try {
     const u = new URL(url);
     hostname = u.hostname;
-    port = u.port || (u.protocol === 'https:' ? '443' : '80');
-    if (!u.port && (hostname === 'localhost' || hostname === '127.0.0.1')) port = '7964';
+    // 显式端口优先；本机地址（localhost/127.0.0.1）未带端口时回退看板默认端口 7964
+    // （localhost 的 80/443 上没有看板，按协议默认端口会让自动启动以错误端口拉起）；
+    // 远端地址未带端口才按协议默认 443/80
+    port = u.port || (hostname === 'localhost' || hostname === '127.0.0.1' ? '7964' : u.protocol === 'https:' ? '443' : '80');
   } catch {
     /* keep defaults */
   }

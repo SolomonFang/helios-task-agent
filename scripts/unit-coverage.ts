@@ -610,7 +610,7 @@ async function run(): Promise<void> {
     const existing = ['ou_1', 'ou_2'];
     return (
       resolveAllowedOpenIds('', existing, false) === existing && // 回车：原数组原样保留
-      resolveAllowedOpenIds('  ', existing, false).length === 0 && // 纯空白：视为输入了新列表（split 后滤空）
+      resolveAllowedOpenIds('  ', existing, false) === existing && // 纯空白：解析为空列表视同回车保留现状（误操作不清空白名单）
       resolveAllowedOpenIds('ou_3, ou_4', existing, false).join(',') === 'ou_3,ou_4' &&
       resolveAllowedOpenIds('-', existing, false) === existing && // 非换绑场景 "-" 忽略，不误当字面 open_id（否则全员被拒）
       resolveAllowedOpenIds('ou_3, -', existing, false).join(',') === 'ou_3' && // 混排时仅滤掉 "-"
@@ -1052,7 +1052,8 @@ async function run(): Promise<void> {
     });
     assert.equal(friendlyNetError(aggregate), '连接被拒（目标地址无服务在监听）');
     assert.equal(friendlyNetError(new TypeError('fetch failed')), '网络请求失败（请检查网络/代理）');
-    assert.equal(friendlyNetError(new Error('something odd')), null);
+    // 未命中映射返回通用定性（friendlyNetError 永不返回 null，跨层调用方按 string 消费）
+    assert.equal(friendlyNetError(new Error('something odd')), '网络请求失败');
   });
 
   await checkAsync('feishu-verify：无效凭证 / 未启用机器人 / 服务 5xx / 网络异常均返回失败而非抛异常', async () => {

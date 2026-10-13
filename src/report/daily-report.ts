@@ -6,10 +6,10 @@
 
 import path from 'path';
 import { isLoopbackUrl } from '../infra/url-utils';
-import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
+import { writeFilePrivate, ensurePrivateDirSync } from '../infra/private-file';
 import { escapeHtml, renderReportPage } from './report-page';
-import { newReportToken } from './report-server';
-import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
+import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-cards';
+import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
 import { isWithinDate, localDate, type DailyReportData, type WorkSummaryTask } from '../kanban/summary';
@@ -73,15 +73,6 @@ function taskDiffLine(t: WorkSummaryTask): string {
   return parts.join(' ');
 }
 
-/** 数据层 generatedAt 保持 ISO；仅渲染层转本地可读时间（与 report.ts 同口径）。 */
-function formatGeneratedAt(iso: string): string {
-  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
-}
-
-function htmlStatCard(num: string, label: string, cls = ''): string {
-  return `<div class="stat${cls ? ` ${cls}` : ''}"><div class="stat-num">${num}</div><div class="stat-label">${label}</div></div>`;
-}
-
 function htmlTaskItem(t: WorkSummaryTask, opts?: { showStatus?: boolean }): string {
   const parts: string[] = ['<div class="card">'];
   const status = isKnownStatus(t.status) ? statusLabel(t.status) : '其他';
@@ -105,73 +96,13 @@ function htmlTaskItem(t: WorkSummaryTask, opts?: { showStatus?: boolean }): stri
   return parts.join('\n');
 }
 
-/** 日报页面专属区块样式（公共基底与页框见 report-page.ts；风格贴近 work-summary 报告）。 */
+/** 日报页面差异样式（与 work-summary/复盘雷同的公共区块见 report-cards.ts 的 REPORT_CARDS_CSS）。 */
 const DAILY_PAGE_CSS = `
-  body { background: #f3f4f8; line-height: 1.6; }
-  .page { max-width: 880px; }
   .hero {
     background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
-    padding: 36px 40px;
   }
-  .hero h1 { font-size: 28px; }
-  .hero .subtitle { font-size: 17px; }
-  .hero .gen { margin-top: 10px; }
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 12px;
-    margin: 20px 0 8px;
-  }
-  .stat {
-    background: #fff;
-    border-radius: 12px;
-    padding: 16px;
-    text-align: center;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
-  .stat-num { font-size: 24px; font-weight: 700; }
-  .stat-label { font-size: 12px; color: #6b7280; margin-top: 2px; }
-  .stat.add .stat-num { color: #16a34a; }
-  .stat.del .stat-num { color: #dc2626; }
-  .group { margin-top: 28px; }
-  .group h2 { font-size: 18px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-  .count {
-    font-size: 12px;
-    font-weight: 600;
-    background: #e5e7eb;
-    color: #4b5563;
-    border-radius: 999px;
-    padding: 1px 9px;
-  }
-  .card {
-    background: #fff;
-    border-radius: 12px;
-    padding: 18px 20px;
-    margin-bottom: 12px;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
-  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-  .card-head h3 { font-size: 16px; flex: 1; }
   .badge { background: #e5e7eb; color: #4b5563; flex-shrink: 0; }
-  .meta-line { font-size: 12px; color: #9ca3af; margin-top: 2px; }
-  .summary { font-size: 14px; color: #4b5563; margin-top: 8px; white-space: normal; }
-  .changes { font-size: 13px; margin-top: 8px; color: #6b7280; }
-  .diff-link {
-    display: inline-block;
-    margin-top: 12px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #6366f1;
-    text-decoration: none;
-    border: 1px solid #c7d2fe;
-    border-radius: 8px;
-    padding: 4px 14px;
-  }
-  .diff-link:hover { background: #eef2ff; }
-  .empty { text-align: center; color: #9ca3af; margin-top: 40px; }
   .note { font-size: 13px; color: #6b7280; margin-top: 20px; }
-  .notes { margin-top: 32px; font-size: 12px; color: #9ca3af; border-top: 1px solid #e5e7eb; padding-top: 12px; }
-  .notes li { margin-left: 18px; }
 `;
 
 function htmlSection(title: string, tasks: WorkSummaryTask[], total: number, opts?: { showStatus?: boolean }): string {
@@ -206,7 +137,7 @@ export function renderDailyHtml(data: DailyReportData): string {
   ];
   return renderReportPage({
     title: `工作日报 · ${escapeHtml(data.date)}`,
-    css: DAILY_PAGE_CSS,
+    css: REPORT_CARDS_CSS + DAILY_PAGE_CSS,
     body: `  <header class="hero">
     <h1>工作日报</h1>
     <p class="subtitle">${escapeHtml(data.sinceLabel)}</p>
@@ -224,13 +155,13 @@ export function renderDailyHtml(data: DailyReportData): string {
   });
 }
 
-/** 写日报 HTML（reports/，文件名带 128-bit token 作为访问凭证，与 work-summary 同一托管与清理策略）。 */
-export function writeDailyReport(data: DailyReportData, opts: { dir?: string } = {}): string {
+/** 写日报 HTML（reports/，文件名带 128-bit token 作为访问凭证，与 work-summary 同一托管与清理策略；异步写盘不阻塞 bot 事件循环）。 */
+export async function writeDailyReport(data: DailyReportData, opts: { dir?: string } = {}): Promise<string> {
   const dir = opts.dir ?? reportsDir();
   ensurePrivateDirSync(dir);
   pruneOldReports(dir);
   const file = path.join(dir, `daily-report-${sanitizeName(data.date, 'report')}.${newReportToken()}.html`);
-  writeFilePrivateSync(file, renderDailyHtml(data));
+  await writeFilePrivate(file, renderDailyHtml(data));
   return file;
 }
 

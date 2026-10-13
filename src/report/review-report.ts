@@ -15,9 +15,8 @@ import path from 'path';
 import { defaultDataHome } from '../infra/paths';
 import { escapeHtml } from './report';
 import { renderReportPage } from './report-page';
-import { ensurePrivateDirSync, writeFilePrivateSync } from '../infra/private-file';
-import { newReportToken } from './report-server';
-import { pruneOldReports, sanitizeName } from './report-utils';
+import { ensurePrivateDirSync, writeFilePrivate } from '../infra/private-file';
+import { newReportToken, pruneOldReports, sanitizeName } from './report-utils';
 
 export interface ReviewReportData {
   /** 任务标题。 */
@@ -360,7 +359,7 @@ function zhElapsed(raw: string): string {
   return parts.join(' ');
 }
 
-/** [ocr] Summary 原文 → 统计 chips；解析不到时不落原文（多为英文整句），原文收日志。 */
+/** [ocr] Summary 原文 → 统计 chips；解析不到时不落原文（多为英文整句），原文收 HTA_DEBUG 日志。 */
 function summaryChips(summary: string | undefined): string {
   if (!summary) return '';
   const defs: Array<[RegExp, string, (v: string) => string]> = [
@@ -376,8 +375,10 @@ function summaryChips(summary: string | undefined): string {
     })
     .filter(Boolean);
   if (!chips.length) {
-    // 上游 Summary 格式变化导致正则全不命中：概览卡不渲染原文 chip，原文留日志供部署者排查
-    console.error(`[review-report] ocr Summary 统计解析失败，原文：${summary.slice(0, 200)}`);
+    // 上游 Summary 格式变化导致正则全不命中：概览卡不渲染原文 chip，原文收 HTA_DEBUG 日志供部署者排查
+    if (process.env.HTA_DEBUG) {
+      console.error(`[review-report] ocr Summary 统计解析失败，原文：${summary.slice(0, 200)}`);
+    }
     return '';
   }
   return chips.join('');
@@ -644,11 +645,11 @@ export function reviewsDir(): string {
   return path.join(defaultDataHome(), 'reviews');
 }
 
-/** 渲染并写入 HTML 报告（0600），返回文件名（不含目录）；文件名带随机 token 作为访问凭证。 */
-export function writeReviewReport(data: ReviewReportData, dir = reviewsDir()): string {
+/** 渲染并写入 HTML 报告（0600 异步写盘，不阻塞 bot 事件循环），返回文件名（不含目录）；文件名带随机 token 作为访问凭证。 */
+export async function writeReviewReport(data: ReviewReportData, dir = reviewsDir()): Promise<string> {
   ensurePrivateDirSync(dir);
   pruneOldReports(dir);
   const name = `review-${sanitizeName(data.title, 'review').slice(0, 40)}-${newReportToken()}-${sanitizeName(data.attemptId, 'review').slice(0, 24)}-${Date.now()}.html`;
-  writeFilePrivateSync(path.join(dir, name), renderReviewHtml(data));
+  await writeFilePrivate(path.join(dir, name), renderReviewHtml(data));
   return name;
 }

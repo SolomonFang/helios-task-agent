@@ -17,22 +17,20 @@ function shortText(s: string): string {
 }
 
 /**
- * reminder_* handler 组：自然语言定时提醒（到点经 runner 主动推送）。
+ * reminder_* handler 组（defs.ts 的 REMINDER_TOOL_SPECS 单源注册，每个工具一个工厂）：
+ * 自然语言定时提醒（到点经 runner 主动推送）。
  * 创建/取消是用户自有数据的写操作，与 memory_* 同口径一律过确认闸门（项目约定：所有写都过闸）；
  * 查询为只读，不过闸。
  */
-export function makeReminderHandlers({
-  uid,
-  reminders,
-  confirm,
-  auditHome,
-}: {
+export interface ReminderToolDeps {
   uid: string;
   reminders: ReminderStore;
   confirm?: ConfirmFn;
   auditHome?: string;
-}): Array<[string, ToolHandler]> {
-  const reminderSet: ToolHandler = async (raw, ctx) => {
+}
+
+export function makeReminderSetHandler({ uid, reminders, confirm, auditHome }: ReminderToolDeps): ToolHandler {
+  return async (raw, ctx) => {
     // 先按存储口径截断再构造 summary/detail 过闸：确认页展示的就是最终落盘内容（所见即所得）
     const text = truncateReminderText(typeof raw.text === 'string' ? raw.text : '');
     if (!text) return '参数错误：text 不能为空';
@@ -74,8 +72,10 @@ export function makeReminderHandlers({
       return `创建提醒失败：${errMessage(err)}`;
     }
   };
+}
 
-  const reminderList: ToolHandler = async () => {
+export function makeReminderListHandler({ uid, reminders }: ReminderToolDeps): ToolHandler {
+  return async () => {
     const pending = reminders.list(uid);
     if (!pending.length) return '当前没有待触发的提醒。';
     const nowMs = Date.now();
@@ -90,8 +90,10 @@ export function makeReminderHandlers({
       })),
     });
   };
+}
 
-  const reminderCancel: ToolHandler = async (raw, ctx) => {
+export function makeReminderCancelHandler({ uid, reminders, confirm, auditHome }: ReminderToolDeps): ToolHandler {
+  return async (raw, ctx) => {
     const ref = typeof raw.ref === 'string' ? raw.ref.trim() : typeof raw.ref === 'number' ? String(raw.ref) : '';
     if (!ref) return '参数错误：ref 不能为空（传提醒的序号或 id；序号可以先问「我有哪些提醒」查看）';
     const target = reminders.find(uid, ref);
@@ -119,10 +121,4 @@ export function makeReminderHandlers({
       return `取消提醒失败：${errMessage(err)}`;
     }
   };
-
-  return [
-    ['reminder_set', reminderSet],
-    ['reminder_list', reminderList],
-    ['reminder_cancel', reminderCancel],
-  ];
 }

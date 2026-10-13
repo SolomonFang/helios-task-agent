@@ -2,7 +2,7 @@ import type { KanbanMcp } from '../../kanban/mcp';
 import type { ToolHandler } from '../../types';
 import { classifyMcp, isDestructive, summarizeMcp, wrapUntrusted } from '../guard';
 import { extractSourceUrls } from '../source-registry';
-import { fillHkStartBranches, type RepoStartInput } from '../../kanban/workspace-ready';
+import { fillHkStartBranchesOrThrow, type RepoStartInput } from '../../kanban/workspace-ready';
 import { apiGet } from '../../kanban/http';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
@@ -160,8 +160,11 @@ async function prepareMcpStartArgs(
 ): Promise<string | null> {
   const repos = parseMcpStartRepos(args);
   if (!repos) return null;
-  const error = await fillHkStartBranches(repos, kanbanUrl, { signal });
-  if (error) return error;
+  try {
+    await fillHkStartBranchesOrThrow(repos, kanbanUrl, { signal });
+  } catch (err) {
+    return errMessage(err);
+  }
   args.repos = repos;
   return null;
 }

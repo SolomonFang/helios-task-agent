@@ -4,7 +4,8 @@
  *
  * 安全边界：仅服务指定目录内的 *.html；路径穿越一律 404；随机空闲端口；
  * 默认只绑回环（报告含代码 diff，绑 0.0.0.0 会暴露到局域网）；
- * 报告文件名带 128-bit 随机 token（foo.<token>.html）作为访问凭证：
+ * 报告文件名内嵌 128-bit 随机 token 作为访问凭证（work-summary/日报/复盘为
+ * `foo.<token>.html`，AI 审查为 `foo-<token>-….html`，见各写入方）：
  * 服务不做目录列举，文件名不完全匹配即 404，猜不到 token 就拉不到报告。
  */
 
@@ -12,12 +13,9 @@ import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import crypto from 'crypto';
 
-/** 报告访问 token：128-bit 随机 hex，由报告写入方拼进文件名（见 writeReviewReport / writeSummaryReports）。 */
-export function newReportToken(): string {
-  return crypto.randomBytes(16).toString('hex');
-}
+// token 生成已移到 report-utils.ts（与文件名清洗/清理策略同模块）；re-export 兼容既有调用方
+export { newReportToken } from './report-utils';
 
 export interface ReportServer {
   /** 报告基地址，如 http://localhost:51234（拼上 /文件名 即完整链接）。 */
@@ -142,7 +140,11 @@ export function startReportServer(dirs: string | string[], kanbanUrl: string): P
       const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
       resolve({
         baseUrl: `http://${urlHost}:${port}`,
-        close: () => server.close(),
+        // server.close() 只停止接收新连接，keep-alive 空闲连接会让退出悬挂：一并销毁（Node ≥ 18.2）
+        close: () => {
+          server.close();
+          server.closeAllConnections();
+        },
         server,
       });
     });

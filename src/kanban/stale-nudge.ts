@@ -1,5 +1,9 @@
 import fs from 'fs';
 import { writeFileAtomicPrivateSync } from '../infra/private-file';
+// env 解析（parseStaleNudgeHours）单源在 config/flags-parsers.ts（config 层 runtime-flags
+// 直接依赖），此处 re-export 保持既有导入路径不变
+import { parseStaleNudgeHours } from '../config/flags-parsers';
+export { parseStaleNudgeHours };
 
 /**
  * 停滞任务提醒（stale nudge）：HTA_STALE_NUDGE_HOURS=N（小时）开启，默认关闭。
@@ -10,17 +14,6 @@ import { writeFileAtomicPrivateSync } from '../infra/private-file';
  * 进程重启不重复轰炸。文案口径与数据一致：只说「超过 N 小时/分钟无更新」（时长向下取整，
  * 不足 1 小时按分钟描述），不断言任务「卡死」——执行中的 attempt 不一定推动 updated_at。
  */
-
-/** 解析 HTA_STALE_NUDGE_HOURS：未设置/空串返回 null（关闭）；非法值抛错（由调用方告警并关闭）。 */
-export function parseStaleNudgeHours(raw: string | undefined): number | null {
-  const v = (raw ?? '').trim();
-  if (!v) return null;
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) {
-    throw new Error(`HTA_STALE_NUDGE_HOURS 值非法：${JSON.stringify(raw)}（应为正数小时，如 8）`);
-  }
-  return n;
-}
 
 /** 默认再次提醒间隔：24 小时。 */
 export const STALE_REMIND_INTERVAL_MS = 24 * 60 * 60 * 1000;

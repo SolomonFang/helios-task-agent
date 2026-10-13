@@ -257,26 +257,27 @@ export class ReminderStore {
    * 重读合避免盲写全量覆盖丢掉另一进程的更新（与 memory.ts 的 journal 重放同思路，
    * 这里每次只改一条记录，重读+单点变更即可，无需 journal）。
    * 已知限制：无跨进程文件锁，两进程同一瞬间写仍可能互相覆盖（与 memory.ts 相同）。
-   * 返回 false 表示写盘失败：调用方必须显式报错，不得谎报成功。
+   * 返回 false 仅表示写盘 IO 失败：调用方必须显式报错，不得谎报成功。
+   * fn 与收尾清理抛出的编程错误直接向上抛——吞成 false 会掩盖 bug（误判为磁盘故障）。
    */
   private mutate(fn: (file: ReminderFile) => void): boolean {
-    try {
-      const file = this.load();
-      fn(file);
-      for (const uid of Object.keys(file.users)) {
-        const list = file.users[uid]!;
-        // 已终结记录限量保留（丢弃最旧）；全空的桶整个删掉，防文件无界增长
-        const done = list.filter((r) => r.status !== 'pending');
-        if (done.length > MAX_DONE_PER_USER) {
-          const drop = new Set(done.slice(0, done.length - MAX_DONE_PER_USER).map((r) => r.id));
-          file.users[uid] = list.filter((r) => !drop.has(r.id));
-        }
-        if (!file.users[uid]!.length) delete file.users[uid];
+    const file = this.load();
+    fn(file);
+    for (const uid of Object.keys(file.users)) {
+      const list = file.users[uid]!;
+      // 已终结记录限量保留（丢弃最旧）；全空的桶整个删掉，防文件无界增长
+      const done = list.filter((r) => r.status !== 'pending');
+      if (done.length > MAX_DONE_PER_USER) {
+        const drop = new Set(done.slice(0, done.length - MAX_DONE_PER_USER).map((r) => r.id));
+        file.users[uid] = list.filter((r) => !drop.has(r.id));
       }
+      if (!file.users[uid]!.length) delete file.users[uid];
+    }
+    try {
       writeFileAtomicPrivateSync(this.filePath, JSON.stringify(file, null, 2) + '\n');
       return true;
     } catch (err) {
-      // fn 内部编程错误与写盘失败都落在这里：返回 false 让调用方显式报错，但至少留痕，不得静默吞掉
+      // 仅写盘 IO 失败落这里：返回 false 让调用方显式报错，但至少留痕，不得静默吞掉
       console.error(`[reminder] 提醒存储写入失败: ${errMessage(err)}`);
       return false;
     }

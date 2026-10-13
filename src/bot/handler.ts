@@ -35,6 +35,7 @@ import type { McpSupervisor } from './supervisor';
 import type { ReportServer } from '../report/report-server';
 import { errMessage } from '../infra/err';
 import { safeNotify } from './notify';
+import { matchDeterministicPhrase, resolveInstantCommandKey, stripTailPunct } from './instant-commands';
 import { createReviewJobs, type ReviewJobs } from './review-jobs';
 import { createProgressKit } from './progress-reporter';
 import { buildJobProcessingCard, buildProgressTerminalCard, buildResolvedCard } from './cards';
@@ -68,11 +69,22 @@ export interface RoundNoticeTracker {
   reset(openId: string): void;
 }
 
-export function createRoundNoticeTracker(): RoundNoticeTracker {
-  const counts = new Map<string, number>();
+/**
+ * mark 带 TTL（默认 35 分钟，覆盖最长 30 分钟的轮次）：轮次异常退出时 reset 可能不执行，
+ * 残留计数随 TTL 过期，不会永久把后续轮次的回复降级为「另发新消息」。
+ */
+export function createRoundNoticeTracker(ttlMs = 35 * 60 * 1000): RoundNoticeTracker {
+  const counts = new Map<string, { n: number; at: number }>();
   return {
-    mark: (openId) => counts.set(openId, (counts.get(openId) ?? 0) + 1),
-    has: (openId) => (counts.get(openId) ?? 0) > 0,
+    mark: (openId) => {
+      const now = Date.now();
+      const prev = counts.get(openId);
+      counts.set(openId, { n: prev && now - prev.at <= ttlMs ? prev.n + 1 : 1, at: now });
+    },
+    has: (openId) => {
+      const e = counts.get(openId);
+      return !!e && e.n > 0 && Date.now() - e.at <= ttlMs;
+    },
     reset: (openId) => counts.delete(openId),
   };
 }
@@ -132,9 +144,6 @@ export function extractKanbanUrl(text: string, kanbanUrl: string): string | unde
   }
   return undefined;
 }
-
-/** 剥掉尾部标点与空白：用户随手敲成「重试这个任务。」「恢复确认！」不能静默降级为模型闲聊或查询分支。 */
-const stripTailPunct = (s: string): string => s.replace(/[\s。！？!?，,．.…~～]+$/u, '');
 
 export interface BotHandlerDeps {
   channel: FeishuChannel;
@@ -480,7 +489,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     text: string,
     cmd: string | null,
   ): Promise<boolean> => {
-    const key = cmd === '/confirm' || stripTailPunct(text) === '恢复确认' ? '/confirm' : cmd;
+    const key = resolveInstantCommandKey(cmd, text);
     const fn = key ? instantCommands[key] : undefined;
     if (!fn) return false;
     await fn(msg, text, cmd);
@@ -749,19 +758,25 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       // 即时回执：给用户消息加「敲键盘」表情，该条处理完成后移除；
       // 排在队列里时表情先行，用户立刻知道消息已被收到。
       const cleanupTyping = await trackTypingReaction(fmsg, openId);
-      taskDone = router.enqueue(
-        openId,
-        async () => {
-          try {
-            await runQueuedMessage(msg, text, cmd, openId, image);
-          } finally {
-            await cleanupTyping();
-          }
-        },
-        // 被 /stop 代际丢弃的消息不会执行上面的回调，其敲键盘表情由这个钩子即时清理
-        // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
-        () => void cleanupTyping(),
-      );
+      try {
+        taskDone = router.enqueue(
+          openId,
+          async () => {
+            try {
+              await runQueuedMessage(msg, text, cmd, openId, image);
+            } finally {
+              await cleanupTyping();
+            }
+          },
+          // 被 /stop 代际丢弃的消息不会执行上面的回调，其敲键盘表情由这个钩子即时清理
+          // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
+          () => void cleanupTyping(),
+        );
+      } catch (err) {
+        // enqueue 同步抛错：消息未入队，两个回调都不会执行，敲键盘表情须就地清理
+        await cleanupTyping();
+        throw err;
+      }
     });
     // 链上只挂 catch 占位节点：单步失败（回执发送抛错等）不折断后续消息的入队；
     // 节点 settle 后若仍是链尾则摘除，Map 不随消息数无界增长
@@ -875,9 +890,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 「重试这个任务」确定性分支：诊断去重回执/文本降级推送向用户承诺过这个短语，
     // 不能仅靠模型自觉（pendingNotes 上限/LRU 淘汰/历史裁剪后承诺会失效）——
     // 有诊断结论时直接复用按钮的重试逻辑，没有则如实告知。
-    // 匹配前剥掉尾部标点与空白：用户随手敲成「重试这个任务。」不能静默降级为模型闲聊
-    const retryPhrase = stripTailPunct(text);
-    if (retryPhrase === '重试这个任务') {
+    // 短语识别（含尾部标点剥除与「重新审查这个任务」）见 instant-commands.ts
+    const deterministicPhrase = matchDeterministicPhrase(text);
+    if (deterministicPhrase === 'retry') {
       const last = reviewJobs.lastDiagnosis(msg.senderId);
       if (last) {
         // 受理判定同步完成（去重/无结论会如实通知）；accepted 时立即给受理回执（作业异步，结果随后推送）
@@ -892,7 +907,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
     // 「重新审查这个任务」确定性分支：AI 审查失败文案承诺过这个短语（review-jobs/ai-review），
     // 按该用户最近一次审查记录复用受理判定重新发起；无记录时如实告知，不降级为模型闲聊
-    if (retryPhrase === '重新审查这个任务') {
+    if (deterministicPhrase === 'review') {
       const last = reviewJobs.lastReview(msg.senderId);
       if (last) {
         // 早退分支（进行中/已达上限）的详细指引由 tryStartAiReview 经 safeNotify 落消息

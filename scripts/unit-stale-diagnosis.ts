@@ -789,9 +789,12 @@ async function main(): Promise<void> {
         }),
       (err: unknown) => {
         const m = err instanceof Error ? err.message : String(err);
+        // 网络错误文案统一走 config/net-error 的 friendlyNetError 口径（「网络请求失败（请检查网络/代理）」），
+        // 英文原文（fetch failed）收 HTA_DEBUG，不落用户面；括号不嵌套（文案内已有一对括号）
         return (
           m.startsWith('无法获取该任务的失败信息') &&
-          m.includes('看板不可达') &&
+          m.includes('网络请求失败') &&
+          m.includes('请检查网络/代理') &&
           !m.includes('fetch failed') &&
           !/（[^（）]*（/.test(m)
         );

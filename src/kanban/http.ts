@@ -21,6 +21,17 @@ interface KanbanEnvelope {
   message?: string;
 }
 
+/**
+ * 信封 success:false（业务拒绝，确定性终态）：与网络抖动/5xx 不同，重试不会改变结果，
+ * apiGet 按 instanceof 分类豁免重试。message 保持用户面中文定性，不落服务端英文原文。
+ */
+export class KanbanRejectedError extends Error {
+  constructor() {
+    super('看板拒绝了请求，请稍后重试；持续失败请联系部署者。');
+    this.name = 'KanbanRejectedError';
+  }
+}
+
 function envelopeData(json: unknown): unknown {
   const env = json as KanbanEnvelope | null;
   if (env && typeof env === 'object' && 'success' in env) {
@@ -30,7 +41,7 @@ function envelopeData(json: unknown): unknown {
     if (env.message && process.env.HTA_DEBUG) {
       console.error(`[kanban] 接口返回 success:false，服务端原文：${env.message}`);
     }
-    throw new Error('看板拒绝了请求，请稍后重试；持续失败请联系部署者。');
+    throw new KanbanRejectedError();
   }
   // 无信封宽松回退：直接返回 data 字段或原始 JSON
   if (env && typeof env === 'object' && 'data' in env) return env.data;
@@ -86,12 +97,18 @@ function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
 }
 
-/** GET /api&lt;p&gt;，返回信封 data。瞬时失败间隔 500ms 轻量重试 1 次（GET 幂等）；中断与 HTTP 4xx 不重试；写操作不重试。 */
+/** GET /api&lt;p&gt;，返回信封 data。瞬时失败间隔 500ms 轻量重试 1 次（GET 幂等）；中断、HTTP 4xx 与业务拒绝（success:false，确定性终态）不重试；写操作不重试。 */
 export async function apiGet(kanbanUrl: string, p: string, opts: KanbanApiOptions = {}): Promise<unknown> {
   try {
     return await request(kanbanUrl, p, {}, opts);
   } catch (err) {
-    if (isAbortError(err) || (err instanceof KanbanHttpError && err.status >= 400 && err.status < 500)) throw err;
+    if (
+      isAbortError(err) ||
+      err instanceof KanbanRejectedError ||
+      (err instanceof KanbanHttpError && err.status >= 400 && err.status < 500)
+    ) {
+      throw err;
+    }
     await new Promise((r) => setTimeout(r, 500));
     return request(kanbanUrl, p, {}, opts);
   }
@@ -107,16 +124,60 @@ export function apiPost(kanbanUrl: string, p: string, body: unknown, opts: Kanba
   );
 }
 
-/** kanban 健康探测（/api/health，5s 超时）：'ok' / '响应异常（状态码 N）' / '不可达'。 */
-export async function fetchKanbanHealth(kanbanUrl: string): Promise<string> {
+/** 看板健康响应的字段级校验（strict 模式）：必须是可以 JSON.parse 的看板 API 信封——
+ * success===true 且带 error_data/message 字段组合（vibe-kanban ApiResponse 的固定形状）。
+ * 仅匹配 "success":true 子串可被任何返回该字段的服务冒充（含把这几个字符写进 HTML 的页面）。 */
+function isKanbanHealthBody(body: string): boolean {
   try {
-    const res = await fetch(`${kanbanUrl.replace(/\/+$/, '')}/api/health`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    return res.ok ? 'ok' : `响应异常（状态码 ${res.status}）`;
+    const o: unknown = JSON.parse(body);
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+    const r = o as Record<string, unknown>;
+    return r.success === true && 'error_data' in r && 'message' in r;
   } catch {
-    return '不可达';
+    return false;
   }
+}
+
+export interface KanbanHealthProbeOptions {
+  /**
+   * 严格模式：2xx 之外还要求响应体是看板 API 信封（防端口被其它 HTTP 服务冒充，
+   * ensure 自动启动判定用），并顺带探测 /health 兜底路径；宽松模式仅看 HTTP 状态。
+   */
+  strict?: boolean;
+  /** 默认 5000ms。 */
+  timeoutMs?: number;
+}
+
+/**
+ * kanban 健康探测单实现（kanban-ensure 的严格判定与 fetchKanbanHealth 的宽松判定共用）：
+ * 返回 'ok' / '响应异常（…）' / '不可达'；严格模式依次探测 /api/health、/health，任一通过即 ok。
+ */
+export async function probeKanbanHealth(kanbanUrl: string, opts: KanbanHealthProbeOptions = {}): Promise<string> {
+  const base = kanbanUrl.replace(/\/+$/, '');
+  const paths = opts.strict ? ['/api/health', '/health'] : ['/api/health'];
+  let failure = '不可达';
+  for (const p of paths) {
+    try {
+      const res = await fetch(`${base}${p}`, { signal: AbortSignal.timeout(opts.timeoutMs ?? 5000) });
+      if (!res.ok) {
+        failure = `响应异常（状态码 ${res.status}）`;
+        continue;
+      }
+      if (!opts.strict) return 'ok';
+      // 响应体截取上限 8KB（健康端点正常只有一行信封，防御异常大响应体）
+      const body = (await res.text()).slice(0, 8192);
+      if (isKanbanHealthBody(body)) return 'ok';
+      failure = '响应异常（响应体不是看板信封）';
+    } catch {
+      failure = '不可达';
+    }
+  }
+  return failure;
+}
+
+/** kanban 健康探测（/api/health，5s 超时，宽松判定）：'ok' / '响应异常（状态码 N）' / '不可达'。 */
+export function fetchKanbanHealth(kanbanUrl: string): Promise<string> {
+  return probeKanbanHealth(kanbanUrl);
 }
 
 /** 看板 Web 任务详情页地址。 */

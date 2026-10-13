@@ -30,7 +30,7 @@ import {
   type WatchEvent,
   type WatchEventKind,
 } from '../kanban/watcher';
-import { statusLabel } from '../kanban/summary';
+import { statusLabel } from '../kanban/status';
 import { DIAGNOSIS_CARD_MAX_CHARS } from '../kanban/failure-diagnosis';
 
 /** 全部卡片的共同 config：宽屏（fill）+ 禁止转发 + 共享卡片（见文件头注释）。 */

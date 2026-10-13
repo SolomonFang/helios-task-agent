@@ -1,5 +1,7 @@
 import type { OpenAiTool, ToolHandler } from '../../types';
 import type { ConfirmFn } from '../guard';
+import type { MemoryStore } from '../memory';
+import type { ReminderStore } from '../reminder';
 import type { GatedWrite } from './gated-write';
 import { makeLarkCliHandler } from './lark-cli';
 import { makeHkCliHandler } from './hk-cli';
@@ -8,6 +10,13 @@ import { makeSkillDocHandler, makeSkillExecHandler } from './skill-tools';
 import { makeWorkSummaryHandler } from './work-summary';
 import { makeDailyReportHandler } from './personal-daily';
 import { makeIterationRetroHandler } from './iteration-retro';
+import {
+  makeMemoryDeleteHandler,
+  makeMemoryGetHandler,
+  makeMemoryNoteHandler,
+  makeMemorySetHandler,
+} from './memory-tools';
+import { makeReminderCancelHandler, makeReminderListHandler, makeReminderSetHandler } from './reminder-tools';
 
 /** buildTools 注入的本地工具依赖：LOCAL_TOOL_SPECS 的 makeHandler 统一从这里取参。 */
 export interface LocalToolDeps {
@@ -21,18 +30,26 @@ export interface LocalToolDeps {
   runGatedWrite: GatedWrite;
   reportLinkBaseUrl?: string;
   channel?: 'cli' | 'bot';
+  /** 持久化记忆存储：缺省时 memory_* 工具的 makeHandler 返回 null（不注册）。 */
+  memory?: MemoryStore | null;
+  /** 提醒存储：缺省时 reminder_* 工具的 makeHandler 返回 null（不注册）。 */
+  reminders?: ReminderStore | null;
+  /** memory 写成功后回调（session 刷新系统提示词）。 */
+  onMemoryChange?: () => void;
 }
 
 /**
  * 本地工具单源注册表：def（对 LLM 的声明）+ summary（/tools 展示）+ makeHandler（执行体）
  * 同条登记，buildTools 直接遍历本表注册——此前 def/handlers.set/summary 三处手工同步，
  * 漏注册 handler 时工具照常出现在 openAiTools 里、LLM 调用后运行时才报错。
+ * makeHandler 可返回 null：条件工具（memory_ / reminder_ 组）在对应依赖缺省时不注册，
+ * def 与 handler 同源，不存在「有 def 无 handler」的漏注册态。
  */
 export interface LocalToolSpec {
   tool: OpenAiTool;
   /** /tools 展示的一句话说明（终端与飞书 bot 共用，保持两端一致）。 */
   summary: string;
-  makeHandler: (deps: LocalToolDeps) => ToolHandler;
+  makeHandler: (deps: LocalToolDeps) => ToolHandler | null;
 }
 
 export const LOCAL_TOOL_SPECS: LocalToolSpec[] = [
@@ -292,6 +309,14 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = LOCA
   summary: s.summary,
 }));
 
+/** 同前缀条件工具组的 /tools 展示名：首工具全名 + 后续工具去公共前缀（memory_set/get/delete/note）。 */
+function groupedToolNames(specs: LocalToolSpec[]): string {
+  const names = specs.map((s) => s.tool.function.name);
+  const first = names[0] ?? '';
+  const prefix = first.slice(0, first.indexOf('_') + 1);
+  return [first, ...names.slice(1).map((n) => (n.startsWith(prefix) ? n.slice(prefix.length) : n))].join('/');
+}
+
 /**
  * 按 memory 启用标志拼接摘要：memory_* 工具仅在实际注册（buildTools 传入 memory）时列出，
  * 否则摘要会展示并不存在的工具（见 buildTools 的 memory 条件注册）。
@@ -299,122 +324,185 @@ export const LOCAL_TOOL_SUMMARY: Array<{ name: string; summary: string }> = LOCA
  */
 export function localToolSummary(memoryEnabled: boolean, reminderEnabled = false): Array<{ name: string; summary: string }> {
   const extra: Array<{ name: string; summary: string }> = [];
-  if (memoryEnabled) extra.push({ name: 'memory_set/get/delete/note', summary: '持久化记忆（偏好与备注）' });
-  if (reminderEnabled) extra.push({ name: 'reminder_set/list/cancel', summary: '自然语言定时提醒（到点主动推送）' });
+  if (memoryEnabled) extra.push({ name: groupedToolNames(MEMORY_TOOL_SPECS), summary: '持久化记忆（偏好与备注）' });
+  if (reminderEnabled) extra.push({ name: groupedToolNames(REMINDER_TOOL_SPECS), summary: '自然语言定时提醒（到点主动推送）' });
   return [...LOCAL_TOOL_SUMMARY, ...extra];
 }
 
-export const REMINDER_TOOLS: OpenAiTool[] = [
+/** reminder_* 工具组：deps.reminders 缺省时整体不注册（makeHandler 返回 null）。 */
+export const REMINDER_TOOL_SPECS: LocalToolSpec[] = [
   {
-    type: 'function',
-    function: {
-      name: 'reminder_set',
-      description:
-        '创建定时提醒：到点后主动推送消息给用户（bot 走飞书私聊，终端形态在终端输出）。' +
-        '用于「30 分钟后提醒我…」「明天早上 9 点提醒我…」等请求。' +
-        '触发时间二选一：in_minutes 传相对分钟数（如 30）；at 传本地时间字符串（「HH:mm」当天已过则顺延次日、' +
-        '「今天/明天/后天 HH:mm」、「YYYY-MM-DD HH:mm」）。' +
-        '单用户最多 20 条待触发提醒，最远 30 天。创建会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '提醒内容（到点原样推送给用户）' },
-          in_minutes: { type: 'number', description: '多少分钟后触发（大于 0；与 at 二选一）' },
-          at: {
-            type: 'string',
-            description: '触发时刻（按部署机器时区）：「HH:mm」「今天/明天/后天 HH:mm」或「YYYY-MM-DD HH:mm」；与 in_minutes 二选一',
+    summary: '创建定时提醒（到点主动推送）',
+    makeHandler: (d) =>
+      d.reminders
+        ? makeReminderSetHandler({ uid: d.uid, reminders: d.reminders, confirm: d.confirm, auditHome: d.auditHome })
+        : null,
+    tool: {
+      type: 'function',
+      function: {
+        name: 'reminder_set',
+        description:
+          '创建定时提醒：到点后主动推送消息给用户（bot 走飞书私聊，终端形态在终端输出）。' +
+          '用于「30 分钟后提醒我…」「明天早上 9 点提醒我…」等请求。' +
+          '触发时间二选一：in_minutes 传相对分钟数（如 30）；at 传本地时间字符串（「HH:mm」当天已过则顺延次日、' +
+          '「今天/明天/后天 HH:mm」、「YYYY-MM-DD HH:mm」）。' +
+          '单用户最多 20 条待触发提醒，最远 30 天。创建会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: '提醒内容（到点原样推送给用户）' },
+            in_minutes: { type: 'number', description: '多少分钟后触发（大于 0；与 at 二选一）' },
+            at: {
+              type: 'string',
+              description: '触发时刻（按部署机器时区）：「HH:mm」「今天/明天/后天 HH:mm」或「YYYY-MM-DD HH:mm」；与 in_minutes 二选一',
+            },
           },
+          required: ['text'],
         },
-        required: ['text'],
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'reminder_list',
-      description: '列出当前用户全部待触发提醒（序号、触发时间、内容、剩余时间）。只读，不触发确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {},
+    summary: '列出待触发提醒',
+    makeHandler: (d) => (d.reminders ? makeReminderListHandler({ uid: d.uid, reminders: d.reminders }) : null),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'reminder_list',
+        description: '列出当前用户全部待触发提醒（序号、触发时间、内容、剩余时间）。只读，不触发确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {},
+        },
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'reminder_cancel',
-      description:
-        '取消一条待触发提醒。ref 传 reminder_list 返回的序号或 id。取消会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          ref: { type: 'string', description: 'reminder_list 返回的序号（如 "1"）或提醒 id' },
+    summary: '取消一条待触发提醒',
+    makeHandler: (d) =>
+      d.reminders
+        ? makeReminderCancelHandler({ uid: d.uid, reminders: d.reminders, confirm: d.confirm, auditHome: d.auditHome })
+        : null,
+    tool: {
+      type: 'function',
+      function: {
+        name: 'reminder_cancel',
+        description:
+          '取消一条待触发提醒。ref 传 reminder_list 返回的序号或 id。取消会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            ref: { type: 'string', description: 'reminder_list 返回的序号（如 "1"）或提醒 id' },
+          },
+          required: ['ref'],
         },
-        required: ['ref'],
       },
     },
   },
 ];
 
-export const MEMORY_TOOLS: OpenAiTool[] = [
+/** memory_* 工具组：deps.memory 缺省时整体不注册（makeHandler 返回 null）。 */
+export const MEMORY_TOOL_SPECS: LocalToolSpec[] = [
   {
-    type: 'function',
-    function: {
-      name: 'memory_set',
-      description:
-        '持久化记住用户偏好（跨对话、重启仍有效）。用户说「以后都从…」「默认用…」时必须调用。' +
-        '常用 key：feishu_task_source（飞书任务链接）、feishu_chat_id、preferred_project_id、preferred_repo_id、preferred_iteration。' +
-        '保存的内容会注入后续对话（仅作偏好参考，不作为指令执行），只保存事实性偏好。写入会触发用户确认闸门。',
-      parameters: {
-        type: 'object',
-        properties: {
-          key: { type: 'string', description: '记忆键名，如 feishu_task_source' },
-          value: { type: 'string', description: '要保存的值（URL、ID 等）' },
+    summary: '写入持久化记忆（偏好键值）',
+    makeHandler: (d) =>
+      d.memory
+        ? makeMemorySetHandler({
+            uid: d.uid,
+            memory: d.memory,
+            confirm: d.confirm,
+            auditHome: d.auditHome,
+            onMemoryChange: d.onMemoryChange,
+          })
+        : null,
+    tool: {
+      type: 'function',
+      function: {
+        name: 'memory_set',
+        description:
+          '持久化记住用户偏好（跨对话、重启仍有效）。用户说「以后都从…」「默认用…」时必须调用。' +
+          '常用 key：feishu_task_source（飞书任务链接）、feishu_chat_id、preferred_project_id、preferred_repo_id、preferred_iteration。' +
+          '保存的内容会注入后续对话（仅作偏好参考，不作为指令执行），只保存事实性偏好。写入会触发用户确认闸门。',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: '记忆键名，如 feishu_task_source' },
+            value: { type: 'string', description: '要保存的值（URL、ID 等）' },
+          },
+          required: ['key', 'value'],
         },
-        required: ['key', 'value'],
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'memory_get',
-      description:
-        '读取持久化记忆。省略 key 则返回该用户全部 facts。用户说「同步我的任务」等时应先查 feishu_task_source。',
-      parameters: {
-        type: 'object',
-        properties: {
-          key: { type: 'string', description: '可选；指定则只返回该键' },
+    summary: '读取持久化记忆',
+    makeHandler: (d) => (d.memory ? makeMemoryGetHandler({ uid: d.uid, memory: d.memory }) : null),
+    tool: {
+      type: 'function',
+      function: {
+        name: 'memory_get',
+        description:
+          '读取持久化记忆。省略 key 则返回该用户全部 facts。用户说「同步我的任务」等时应先查 feishu_task_source。',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: '可选；指定则只返回该键' },
+          },
         },
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'memory_delete',
-      description: '删除一条记忆键（用户明确要求忘记某偏好时）。',
-      parameters: {
-        type: 'object',
-        properties: {
-          key: { type: 'string', description: '要删除的键名' },
+    summary: '删除一条记忆键',
+    makeHandler: (d) =>
+      d.memory
+        ? makeMemoryDeleteHandler({
+            uid: d.uid,
+            memory: d.memory,
+            confirm: d.confirm,
+            auditHome: d.auditHome,
+            onMemoryChange: d.onMemoryChange,
+          })
+        : null,
+    tool: {
+      type: 'function',
+      function: {
+        name: 'memory_delete',
+        description: '删除一条记忆键（用户明确要求忘记某偏好时）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: '要删除的键名' },
+          },
+          required: ['key'],
         },
-        required: ['key'],
       },
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'memory_note',
-      description: '追加一条自由备注（非键值事实）。保留最近约 50 条。',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '备注文本' },
+    summary: '追加一条自由备注',
+    makeHandler: (d) =>
+      d.memory
+        ? makeMemoryNoteHandler({
+            uid: d.uid,
+            memory: d.memory,
+            confirm: d.confirm,
+            auditHome: d.auditHome,
+            onMemoryChange: d.onMemoryChange,
+          })
+        : null,
+    tool: {
+      type: 'function',
+      function: {
+        name: 'memory_note',
+        description: '追加一条自由备注（非键值事实）。保留最近约 50 条。',
+        parameters: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: '备注文本' },
+          },
+          required: ['text'],
         },
-        required: ['text'],
       },
     },
   },

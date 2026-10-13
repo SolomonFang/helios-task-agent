@@ -5,7 +5,21 @@
  * 进程，否则会和在跑的 bot 起第二个实例），也可改 .env 后重启——建议必须指向存在的操作。
  */
 import { userEnvPath } from './config';
-import { CONTEXT_OVERFLOW_RE } from '../agent/llm';
+
+/**
+ * 模型返回的上下文超限错误特征（单源）：agent/llm.ts 的自愈重试与本模块的友好提示
+ * 共用。正则本体原在 agent/llm.ts，下沉至此以消除 config→agent 的反向依赖
+ * （agent/commands 均从本模块 import）。
+ */
+export const CONTEXT_OVERFLOW_RE =
+  /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|reduce the length|exceed.{0,20}token|token.{0,10}exceed/i;
+
+/**
+ * 限流/额度类错误特征（单源）：commands.ts 的「改模型配置无用」判定与本模块的友好
+ * 提示共用（原在 commands.ts 手工对齐维护）。与上下文超限刻意保持区分：超限的正确
+ * 出路是 /clear 清历史，限流是稍后重试/查额度，混为一类会给出错误指引。
+ */
+export const RATE_LIMIT_RE = /\b429\b|rate limit|too many requests|quota|insufficient|余额|额度/i;
 
 export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } = {}): string | null {
   const s = raw.toLowerCase();
@@ -24,11 +38,11 @@ export function friendlyLlmError(raw: string, opts: { channel?: 'cli' | 'bot' } 
   if (/\b401\b|unauthorized|invalid[_ ]api[_ ]key|incorrect api key|authentication/.test(s)) {
     return `排查建议：API Key 无效或已过期。${keyHint}`;
   }
-  // 上下文超限特征与 agent/llm.ts 单源复用（CONTEXT_OVERFLOW_RE），自愈失败的用户也能拿到 /clear 指引
+  // 上下文超限特征单源见本模块 CONTEXT_OVERFLOW_RE，自愈失败的用户也能拿到 /clear 指引
   if (CONTEXT_OVERFLOW_RE.test(s)) {
     return '排查建议：对话上下文超出模型上限。/clear 清空历史后重试（或把任务拆小分步执行）。';
   }
-  if (/\b429\b|rate limit|too many requests|quota|insufficient|余额|额度/.test(s)) {
+  if (RATE_LIMIT_RE.test(s)) {
     return '排查建议：模型限流或额度不足。稍后重试，或检查账户额度/余额。';
   }
   if (/model[_ ].*not found|no such model|does not exist|invalid[_ ]model/.test(s)) {

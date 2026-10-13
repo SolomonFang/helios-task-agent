@@ -1,4 +1,5 @@
 import { c } from '../infra/ui';
+import { isLoopbackUrl } from '../infra/url-utils';
 import {
   PRESETS,
   currentConfig,
@@ -59,23 +60,28 @@ export function makeNeed(
   return { need, needSecret, secretSuffix };
 }
 
+/** 各阶段子向导共享的交互闭包类型。 */
+type WizardIo = ReturnType<typeof makeNeed>;
+
 /**
  * 飞书白名单合并决策（纯函数，向导交互外可测）：
  * 输入 `-`（仅换绑场景 allowClear）= 清除；输入新列表 = 覆盖；回车 = 保留现状。
+ * 解析为空列表（如只输入 `,`）视同回车保留现状——仅非空列表才替换，误操作不应
+ * 清空白名单导致全员放行。
  * 非换绑场景列表中的 `-` 忽略（误当字面 open_id 存下会全员被拒）。
  */
 export function resolveAllowedOpenIds(raw: string, existing: string[], allowClear: boolean): string[] {
   if (allowClear && raw === '-') return [];
   if (!raw) return existing;
   const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  if (!list.length) return list;
+  if (!list.length) return existing;
   // 非换绑场景不支持清除：`-` 忽略而非当字面 open_id 存下（否则会全员被拒）
   const filtered = allowClear ? list : list.filter((s) => s !== '-');
   return filtered.length ? filtered : existing;
 }
 
 /** 必填项：空输入原地重问（与非法数字、缺协议头同一口径），误按一次回车不中止整个向导。 */
-async function needRequired(io: ReturnType<typeof makeNeed>, promptText: string, secret = false): Promise<string> {
+async function needRequired(io: WizardIo, promptText: string, secret = false): Promise<string> {
   for (;;) {
     const v = secret ? await io.needSecret(promptText) : await io.need(promptText);
     if (v) return v;
@@ -83,139 +89,139 @@ async function needRequired(io: ReturnType<typeof makeNeed>, promptText: string,
   }
 }
 
-async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
-  const io = makeNeed(ask, askSecret);
-  const { need, needSecret, secretSuffix } = io;
-
-  /**
-   * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
-   * 给出醒目警告并要求显式确认；不确认则重新输入，直到拿到 https 或用户确认。
-   * opts.label：重输/警告文案的场景名（主模型 / AI 审查）；opts.allowEmpty：可选字段
-   * 在重输提示处回车 = 放弃设置本项（返回 ''），不算校验失败。
-   */
-  const ensureSecureBaseUrl = async (url: string, opts: { label?: string; allowEmpty?: boolean } = {}): Promise<string> => {
-    const label = opts.label ?? 'Base URL';
-    const reprompt = async (): Promise<string> => {
-      for (;;) {
-        const v = await need(`${label}（如 https://api.deepseek.com/v1${opts.allowEmpty ? '；回车 = 放弃设置本项' : ''}）: `);
-        if (v) return v;
-        if (opts.allowEmpty) return '';
-        console.log(c.err(`${label} 不能为空，请重新输入。`));
-      }
-    };
-    let u = url;
+/**
+ * Base URL 安全检查：http:// 明文端点会把 API Key 明文外发（本机 loopback 除外），
+ * 给出醒目警告并要求显式确认；不确认则重新输入，直到拿到 https 或用户确认。
+ * opts.label：重输/警告文案的场景名（主模型 / AI 审查）；opts.allowEmpty：可选字段
+ * 在重输提示处回车 = 放弃设置本项（返回 ''），不算校验失败。
+ */
+async function ensureSecureBaseUrl(io: WizardIo, url: string, opts: { label?: string; allowEmpty?: boolean } = {}): Promise<string> {
+  const { need } = io;
+  const label = opts.label ?? 'Base URL';
+  const reprompt = async (): Promise<string> => {
     for (;;) {
-      if (/^https:\/\//i.test(u)) return u;
-      // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
-      if (!/^http:\/\//i.test(u)) {
-        console.log(c.err('请输入以 https:// 开头的地址。http:// 明文端点会要求显式确认（本机地址除外），建议用 https://，如 https://api.deepseek.com/v1。'));
-        u = await reprompt();
-        if (!u) return '';
-        continue;
-      }
-      // loopback 放行：IPv6 本机地址在 URL 中带方括号（http://[::1]:8080），一并覆盖
-      if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(u)) return u;
-      console.log(
-        c.err(`⚠️ 警告：${label} 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
-      );
-      const ok = (await need('确认继续使用该明文端点？（输入 YES = 继续，回车 = 重新输入）: ')).toUpperCase();
-      if (ok === 'YES' || ok === 'Y') return u;
-      u = await reprompt();
-      if (!u) return '';
+      const v = await need(`${label}（如 https://api.deepseek.com/v1${opts.allowEmpty ? '；回车 = 放弃设置本项' : ''}）: `);
+      if (v) return v;
+      if (opts.allowEmpty) return '';
+      console.log(c.err(`${label} 不能为空，请重新输入。`));
     }
   };
+  let u = url;
+  for (;;) {
+    if (/^https:\/\//i.test(u)) return u;
+    // 无协议前缀（如漏写 https:// 的 api.deepseek.com/v1）：不是明文端点，直接要求重输
+    if (!/^http:\/\//i.test(u)) {
+      console.log(c.err('请输入以 https:// 开头的地址。http:// 明文端点会要求显式确认（本机地址除外），建议用 https://，如 https://api.deepseek.com/v1。'));
+      u = await reprompt();
+      if (!u) return '';
+      continue;
+    }
+    // loopback 放行（单源判定见 infra/url-utils.isLoopbackUrl：localhost / 127.* / ::1，
+    // IPv6 本机地址在 URL 中带方括号 http://[::1]:8080，URL 解析已归一化）
+    if (isLoopbackUrl(u)) return u;
+    console.log(
+      c.err(`⚠️ 警告：${label} 使用 http:// 明文传输（${u}），你的 API Key 会以明文发送到该端点，可能被中间人窃取。`),
+    );
+    const ok = (await need('确认继续使用该明文端点？（输入 YES = 继续，回车 = 重新输入）: ')).toUpperCase();
+    if (ok === 'YES' || ok === 'Y') return u;
+    u = await reprompt();
+    if (!u) return '';
+  }
+}
 
-  /**
-   * 已配置过的重配场景（/config、bot --reconfig）在预设列表末尾追加「跳过」项：
-   * 选中（或非 TTY 输入 0 / 直接回车）即保留现有模型配置，直接进看板默认值等后续步骤，
-   * 不再追问 API Key、也不重复联网校验。首次配置（isConfigured() 为假）无此项。
-   */
-  const old = currentConfig();
-  const skippable = isConfigured();
+/**
+ * 预设选择阶段。已配置过的重配场景（/config、bot --reconfig）在预设列表末尾追加「跳过」项：
+ * 选中（或非 TTY 输入 0 / 直接回车）即保留现有模型配置，直接进看板默认值等后续步骤，
+ * 不再追问 API Key、也不重复联网校验。首次配置（isConfigured() 为假）无此项。
+ * 返回预设下标；skippable 时返回 PRESETS.length 表示「跳过」。
+ */
+async function choosePreset(io: WizardIo, choose: ChooseFn | null | undefined, old: AgentConfig, skippable: boolean): Promise<number> {
+  const { need } = io;
   const SKIP_IDX = PRESETS.length;
-  let idx: number;
   if (choose && process.stdin.isTTY) {
-    idx = await choose(
+    return choose(
       skippable ? [...PRESETS, { name: `跳过，保留当前模型（${old.llmModel}）`, baseUrl: '', model: '' }] : PRESETS,
     );
-  } else {
-    // 与 wizardChoose 的 selectList 同一口径：重配时标题给出当前模型
-    console.log(c.strong(`\n配置模型（OpenAI 兼容协议${old.llmModel ? `，当前 ${old.llmModel}` : ''}）：\n`));
-    if (skippable) console.log(`  ${c.info('0)')} 跳过，保留当前模型（${old.llmModel}）`);
-    PRESETS.forEach((p, i) => {
-      console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
-    });
-    for (;;) {
-      const pick = await need(
-        skippable
-          ? `\n请输入 0 到 ${PRESETS.length} 的数字（默认 0 = 跳过）: `
-          : `\n请输入 1 到 ${PRESETS.length} 的数字（默认 1）: `,
-      );
-      if (!pick) {
-        idx = skippable ? SKIP_IDX : 0;
-        break;
-      }
-      const n = Number(pick);
-      if (Number.isInteger(n) && n >= (skippable ? 0 : 1) && n <= PRESETS.length) {
-        idx = n === 0 ? SKIP_IDX : n - 1;
-        break;
-      }
-      console.log(c.err(`无效输入，请输入 ${skippable ? 0 : 1} 到 ${PRESETS.length} 的数字`));
-    }
   }
-  const skipModel = skippable && idx === SKIP_IDX;
-
-  let baseUrl = old.llmBaseUrl;
-  let apiKey = old.llmApiKey;
-  let model = old.llmModel;
-  if (skipModel) {
-    console.log(c.gray(`跳过模型配置，保留当前模型 ${model}`));
-  } else {
-    const preset = PRESETS[idx]!;
-    console.log(c.gray(`已选择 ${preset.name}`));
-    if (preset.baseUrl) {
-      baseUrl = preset.baseUrl;
-    } else {
-      baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
-      baseUrl = await ensureSecureBaseUrl(baseUrl);
+  // 与 wizardChoose 的 selectList 同一口径：重配时标题给出当前模型
+  console.log(c.strong(`\n配置模型（OpenAI 兼容协议${old.llmModel ? `，当前 ${old.llmModel}` : ''}）：\n`));
+  if (skippable) console.log(`  ${c.info('0)')} 跳过，保留当前模型（${old.llmModel}）`);
+  PRESETS.forEach((p, i) => {
+    console.log(`  ${c.info(String(i + 1) + ')')} ${p.name}${p.baseUrl ? c.gray('  ' + p.baseUrl) : ''}`);
+  });
+  for (;;) {
+    const pick = await need(
+      skippable
+        ? `\n请输入 0 到 ${PRESETS.length} 的数字（默认 0 = 跳过）: `
+        : `\n请输入 1 到 ${PRESETS.length} 的数字（默认 1）: `,
+    );
+    if (!pick) return skippable ? SKIP_IDX : 0;
+    const n = Number(pick);
+    if (Number.isInteger(n) && n >= (skippable ? 0 : 1) && n <= PRESETS.length) {
+      return n === 0 ? SKIP_IDX : n - 1;
     }
-    const apiKeyInput = await needRequired(io, `API Key${secretSuffix}: `, true);
-    apiKey = apiKeyInput;
-    if (preset.model) {
-      model = (await need(`模型名（默认 ${preset.model}）: `)) || preset.model;
-    } else {
-      model = await needRequired(io, '模型名（必填，如 gpt-4o）: ');
-    }
-
-    // 联网预检模型配置：Key 无效在向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后可仍保存。
-    // 两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免相邻问题同为回车却含义相反。
-    for (;;) {
-      console.log(c.gray('正在联网校验模型配置…'));
-      const check = await verifyLlmConfig(baseUrl, apiKey);
-      if (check.ok) {
-        console.log(c.ok('模型配置校验通过'));
-        break;
-      }
-      if (check.uncertain) {
-        console.log(c.warn(`无法预检：${check.message}`));
-      } else {
-        console.log(c.err(`模型配置校验失败：${check.message}`));
-      }
-      const act = (await need('回车 = 直接重试；输入 k = 改 API Key、b = 改 Base URL、m = 改模型名、s = 仍然保存: ')).toLowerCase();
-      if (act === 's' || act === 'save' || act === '保存') break;
-      if (act === 'b' || act === 'base' || act === 'url') {
-        baseUrl = await needRequired(io, `Base URL（当前 ${baseUrl}）: `);
-        baseUrl = await ensureSecureBaseUrl(baseUrl);
-      } else if (act === 'm' || act === 'model') {
-        model = await needRequired(io, `模型名（当前 ${model}）: `);
-      } else if (act === 'k' || act === 'key') {
-        apiKey = await needRequired(io, `API Key${secretSuffix}: `, true);
-      }
-      // 其余输入（含回车）= 不修改，用当前配置直接重试
-    }
+    console.log(c.err(`无效输入，请输入 ${skippable ? 0 : 1} 到 ${PRESETS.length} 的数字`));
   }
+}
+
+/**
+ * 模型配置阶段：按预设收集 Base URL / API Key / 模型名，随后联网预检——Key 无效在
+ * 向导里暴露（可重输 API Key / Base URL / 模型名）；端点不支持预检/网络不通则提示后
+ * 可仍保存。两个失败分支的默认动作统一为「直接重试」，保存必须显式输入 s——避免
+ * 相邻问题同为回车却含义相反。
+ */
+async function collectModelConfig(io: WizardIo, idx: number): Promise<{ baseUrl: string; apiKey: string; model: string }> {
+  const { need, secretSuffix } = io;
+  const preset = PRESETS[idx]!;
+  console.log(c.gray(`已选择 ${preset.name}`));
+  let baseUrl = preset.baseUrl;
+  if (!baseUrl) {
+    baseUrl = await need('Base URL（如 https://api.deepseek.com/v1）: ');
+    baseUrl = await ensureSecureBaseUrl(io, baseUrl);
+  }
+  let apiKey = await needRequired(io, `API Key${secretSuffix}: `, true);
+  let model = preset.model
+    ? (await need(`模型名（默认 ${preset.model}）: `)) || preset.model
+    : await needRequired(io, '模型名（必填，如 gpt-4o）: ');
+
+  for (;;) {
+    console.log(c.gray('正在联网校验模型配置…'));
+    const check = await verifyLlmConfig(baseUrl, apiKey);
+    if (check.ok) {
+      console.log(c.ok('模型配置校验通过'));
+      break;
+    }
+    if (check.uncertain) {
+      console.log(c.warn(`无法预检：${check.message}`));
+    } else {
+      console.log(c.err(`模型配置校验失败：${check.message}`));
+    }
+    const act = (await need('回车 = 直接重试；输入 k = 改 API Key、b = 改 Base URL、m = 改模型名、s = 仍然保存: ')).toLowerCase();
+    if (act === 's' || act === 'save' || act === '保存') break;
+    if (act === 'b' || act === 'base' || act === 'url') {
+      baseUrl = await needRequired(io, `Base URL（当前 ${baseUrl}）: `);
+      baseUrl = await ensureSecureBaseUrl(io, baseUrl);
+    } else if (act === 'm' || act === 'model') {
+      model = await needRequired(io, `模型名（当前 ${model}）: `);
+    } else if (act === 'k' || act === 'key') {
+      apiKey = await needRequired(io, `API Key${secretSuffix}: `, true);
+    }
+    // 其余输入（含回车）= 不修改，用当前配置直接重试
+  }
+  return { baseUrl, apiKey, model };
+}
+
+/**
+ * 看板默认值阶段：看板地址必须是完整 URL（缺 http(s):// 协议头直接重问）；
+ * 可选字段口径与白名单一致：有当前值时回车 = 保留当前值，输入 - = 清除；
+ * 无当前值时回车 = 跳过。
+ */
+async function collectKanbanDefaults(
+  io: WizardIo,
+  old: AgentConfig,
+): Promise<Pick<AgentConfig, 'kanbanUrl' | 'kanbanProjectId' | 'kanbanRepoId' | 'kanbanIteration'>> {
+  const { need } = io;
   console.log(c.gray('以下为可选的看板默认值：项目/仓库 ID 可在看板 Web UI 的地址栏或详情页复制，不确定直接回车跳过。'));
-  // 看板地址必须是完整 URL：缺 http(s):// 协议头直接重问
   let kanbanUrl = '';
   for (;;) {
     const raw = await need(`看板地址（回车 = 保留当前 ${old.kanbanUrl}）: `);
@@ -229,7 +235,6 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     }
     console.log(c.err('看板地址需以 http:// 或 https:// 开头，请重新输入。'));
   }
-  // 可选字段口径与白名单一致：有当前值时回车 = 保留当前值，输入 - = 清除；无当前值时回车 = 跳过
   const kanbanProjectIdRaw = await need(
     `默认项目 ID（可选${old.kanbanProjectId ? `，回车 = 保留当前 ${old.kanbanProjectId}，输入 - 清除` : '，直接回车跳过'}）: `,
   );
@@ -242,23 +247,34 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     `默认迭代（可选，与看板 Web UI 的迭代名一致，如 260717${old.kanbanIteration ? `；回车 = 保留当前 ${old.kanbanIteration}，输入 - 清除` : '；直接回车跳过'}）: `,
   );
   const kanbanIteration = kanbanIterationRaw === '-' ? '' : kanbanIterationRaw || old.kanbanIteration;
+  return { kanbanUrl, kanbanProjectId, kanbanRepoId, kanbanIteration };
+}
 
-  /**
-   * AI 审查（open-code-review）/ 失败诊断的独立模型配置（OCR_LLM_*，逐项优先、
-   * 缺项回退上方机器人模型配置，语义见 ai-review.ts buildOcrEnv）。全部可回车跳过；
-   * 与看板可选字段同一口径：有当前值时回车 = 保留、输入 - = 清除。
-   * 专用 key 独立询问：「只隔离 key、不换模型」是安全提示（handler.ts 首次审查）首推的
-   * 用法，不能要求先配模型；Base URL 只在配了模型或已有 URL 覆盖项时追问（换 provider
-   * 才需要，已有残留 URL 覆盖项时也要给用户看到并清除的入口）。
-   */
+// OCR_LLM_URL 存的是完整 chat 端点（…/chat/completions）；展示与输入都用 base URL 形态
+// （与主模型的 Base URL 口径一致），写入时再补全后缀（与 buildOcrEnv 派生口径相同）。
+const toBaseUrl = (u: string) => u.replace(/\/+$/, '').replace(/\/(chat\/completions|messages)$/, '');
+const toOcrEndpoint = (u: string) =>
+  /\/(chat\/completions|messages)\/?$/.test(u) ? u : `${u.replace(/\/+$/, '')}/chat/completions`;
+
+/**
+ * OCR 配置阶段：AI 审查（open-code-review）/ 失败诊断的独立模型配置（OCR_LLM_*，逐项优先、
+ * 缺项回退上方机器人模型配置，语义见 ai-review.ts buildOcrEnv）。全部可回车跳过；
+ * 与看板可选字段同一口径：有当前值时回车 = 保留、输入 - = 清除。
+ * 专用 key 独立询问：「只隔离 key、不换模型」是安全提示（handler.ts 首次审查）首推的
+ * 用法，不能要求先配模型；Base URL 只在配了模型或已有 URL 覆盖项时追问（换 provider
+ * 才需要，已有残留 URL 覆盖项时也要给用户看到并清除的入口）。
+ * 返回写入用的覆盖项（ocr）与生效的模型名（ocrModel，供保存确认文案标注）。
+ */
+async function collectOcrOverrides(
+  io: WizardIo,
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+): Promise<{ ocr: OcrLlmOverrides; ocrModel: string }> {
+  const { need, needSecret, secretSuffix } = io;
   console.log(
     c.gray('AI 审查（open-code-review）与失败诊断默认复用上方模型配置；想单独用别的模型跑审查、或给它隔离一个专用 key 时再填，可直接回车跳过。'),
   );
-  // OCR_LLM_URL 存的是完整 chat 端点（…/chat/completions）；展示与输入都用 base URL 形态
-  // （与上方主模型的 Base URL 口径一致），写入时再补全后缀（与 buildOcrEnv 派生口径相同）。
-  const toBaseUrl = (u: string) => u.replace(/\/+$/, '').replace(/\/(chat\/completions|messages)$/, '');
-  const toOcrEndpoint = (u: string) =>
-    /\/(chat\/completions|messages)\/?$/.test(u) ? u : `${u.replace(/\/+$/, '')}/chat/completions`;
   const ocrNow = ocrLlmOverrides();
   const ocr: OcrLlmOverrides = {};
   const ocrModelRaw = await need(
@@ -273,7 +289,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     if (ocrUrlRaw) {
       if (ocrUrlRaw === '-') ocr.url = '';
       else {
-        const u = await ensureSecureBaseUrl(ocrUrlRaw, { label: 'AI 审查 Base URL', allowEmpty: true });
+        const u = await ensureSecureBaseUrl(io, ocrUrlRaw, { label: 'AI 审查 Base URL', allowEmpty: true });
         if (u) ocr.url = toOcrEndpoint(u);
       }
     }
@@ -311,7 +327,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
         const raw = await need(`AI 审查 Base URL（当前 ${effOcrUrl ? toBaseUrl(effOcrUrl) : baseUrl}，输入 - = 清除覆盖项）: `);
         if (raw === '-') ocr.url = '';
         else if (raw) {
-          const u = await ensureSecureBaseUrl(raw, { label: 'AI 审查 Base URL', allowEmpty: true });
+          const u = await ensureSecureBaseUrl(io, raw, { label: 'AI 审查 Base URL', allowEmpty: true });
           if (u) ocr.url = toOcrEndpoint(u);
         }
       } else if (act === 'm' || act === 'model') {
@@ -329,6 +345,28 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
       effOcrToken = ocr.token !== undefined ? ocr.token : ocrNow.token;
     }
   }
+  return { ocr, ocrModel };
+}
+
+/** 主配置向导编排：预设选择 → 模型配置与预检 → 看板默认值 → OCR 配置 → 落盘。 */
+async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn | null): Promise<AgentConfig> {
+  const io = makeNeed(ask, askSecret);
+  const old = currentConfig();
+  const skippable = isConfigured();
+  const idx = await choosePreset(io, choose, old, skippable);
+  const skipModel = skippable && idx === PRESETS.length;
+
+  let baseUrl = old.llmBaseUrl;
+  let apiKey = old.llmApiKey;
+  let model = old.llmModel;
+  if (skipModel) {
+    console.log(c.gray(`跳过模型配置，保留当前模型 ${model}`));
+  } else {
+    ({ baseUrl, apiKey, model } = await collectModelConfig(io, idx));
+  }
+
+  const { kanbanUrl, kanbanProjectId, kanbanRepoId, kanbanIteration } = await collectKanbanDefaults(io, old);
+  const { ocr, ocrModel } = await collectOcrOverrides(io, baseUrl, apiKey, model);
 
   const cfg: AgentConfig = {
     ...old,

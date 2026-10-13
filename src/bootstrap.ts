@@ -13,6 +13,8 @@ import {
   type LarkCliStatus,
 } from './infra/deps';
 import { ensureKanbanRunning, type KanbanEnsureResult } from './kanban/kanban-ensure';
+
+export type { KanbanEnsureResult };
 import { migratePackageSkills, userSkillsDir, validateSkills } from './agent/skills';
 import { c } from './infra/ui';
 import { errMessage } from './infra/err';
@@ -53,18 +55,32 @@ export function migrateAndValidateSkills(): void {
   for (const problem of validateSkills()) console.log(c.warn(problem));
 }
 
+/**
+ * 启动失败的兜底错误：库函数不直接 process.exit（绕过调用方 cleanup 且不可单测），
+ * 改抛本错误，由入口（cli / bot-main）catch 后按 exitCode 统一收尾退出。
+ */
+export class FatalStartupError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode: number,
+  ) {
+    super(message);
+    this.name = 'FatalStartupError';
+  }
+}
+
 export interface KanbanBootOptions {
   kanbanUrl: string;
   onLog: (msg: string) => void;
   /** 就绪等待期间（最长 90s）收到退出信号时，调用方需要拿到 child 才能清理（bot 的 cleanup 登记）。 */
   onSpawn?: (child: ChildProcess) => void;
-  /** 失败退出前的调用方收尾（如 cli 停 spinner / 关闭 readline），在错误打印之前调用。 */
+  /** 失败抛出前（FatalStartupError）的调用方收尾（如 cli 停 spinner / 关闭 readline），在错误打印之前调用。 */
   onFail?: () => void;
   /** 失败文案前缀（cli「看板不可用」/ bot「看板启动失败」）。 */
   failLabel: string;
 }
 
-/** 拉起/复用看板进程；失败时收尾、打印错误与手动启动指引后退出进程（不返回）。 */
+/** 拉起/复用看板进程；失败时调用方收尾（onFail）、打印错误与手动启动指引后抛 FatalStartupError。 */
 export async function ensureKanbanOrExit(opts: KanbanBootOptions): Promise<KanbanEnsureResult> {
   try {
     return await ensureKanbanRunning(opts.kanbanUrl, { onLog: opts.onLog, onSpawn: opts.onSpawn });
@@ -86,6 +102,6 @@ export async function ensureKanbanOrExit(opts: KanbanBootOptions): Promise<Kanba
         c.gray(kanbanManualStartHint({ port, autoStart: process.env.HELIOS_KANBAN_AUTO_START !== '0' })),
       );
     }
-    process.exit(1);
+    throw new FatalStartupError(`${opts.failLabel}：${message}`, 1);
   }
 }

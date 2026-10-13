@@ -6,10 +6,10 @@
 
 import path from 'path';
 import { isLoopbackUrl } from '../infra/url-utils';
-import { writeFilePrivateSync, ensurePrivateDirSync } from '../infra/private-file';
+import { writeFilePrivate, ensurePrivateDirSync } from '../infra/private-file';
 import { escapeHtml, renderReportPage } from './report-page';
-import { newReportToken } from './report-server';
-import { pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
+import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-cards';
+import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
 import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
@@ -163,42 +163,12 @@ export function buildRetroModel(data: WorkSummaryData, now = new Date()): RetroM
 // HTML 渲染与写盘
 // ---------------------------------------------------------------------------
 
-function formatGeneratedAt(iso: string): string {
-  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
-}
-
-function htmlStatCard(num: string, label: string, cls = ''): string {
-  return `<div class="stat${cls ? ` ${cls}` : ''}"><div class="stat-num">${num}</div><div class="stat-label">${label}</div></div>`;
-}
-
+/** 复盘页面差异样式（公共区块见 report-cards.ts 的 REPORT_CARDS_CSS，此处覆盖/补充）。 */
 const RETRO_PAGE_CSS = `
-  body { background: #f3f4f8; line-height: 1.6; }
-  .page { max-width: 880px; }
   .hero {
     background: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%);
-    padding: 36px 40px;
   }
-  .hero h1 { font-size: 28px; }
-  .hero .subtitle { font-size: 17px; }
-  .hero .gen { margin-top: 10px; }
   .section-title { font-size: 18px; margin: 28px 0 12px; }
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 12px;
-    margin: 20px 0 8px;
-  }
-  .stat {
-    background: #fff;
-    border-radius: 12px;
-    padding: 16px;
-    text-align: center;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
-  .stat-num { font-size: 24px; font-weight: 700; }
-  .stat-label { font-size: 12px; color: #6b7280; margin-top: 2px; }
-  .stat.add .stat-num { color: #16a34a; }
-  .stat.del .stat-num { color: #dc2626; }
   .stat.warn .stat-num { color: #b45309; }
   .dist {
     display: grid;
@@ -208,40 +178,11 @@ const RETRO_PAGE_CSS = `
   }
   .group { margin-top: 20px; }
   .group h3 { font-size: 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
-  .count {
-    font-size: 12px;
-    font-weight: 600;
-    background: #e5e7eb;
-    color: #4b5563;
-    border-radius: 999px;
-    padding: 1px 9px;
-  }
-  .card {
-    background: #fff;
-    border-radius: 12px;
-    padding: 14px 18px;
-    margin-bottom: 10px;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  }
+  .card { padding: 14px 18px; margin-bottom: 10px; }
   .card h4 { font-size: 15px; }
   .badge { background: #fee2e2; color: #b91c1c; flex-shrink: 0; }
-  .meta-line { font-size: 12px; color: #9ca3af; margin-top: 2px; }
-  .summary { font-size: 13px; color: #4b5563; margin-top: 6px; }
-  .diff-link {
-    display: inline-block;
-    margin-top: 8px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #6366f1;
-    text-decoration: none;
-    border: 1px solid #c7d2fe;
-    border-radius: 8px;
-    padding: 3px 12px;
-  }
-  .diff-link:hover { background: #eef2ff; }
-  .empty { text-align: center; color: #9ca3af; margin-top: 40px; }
-  .notes { margin-top: 32px; font-size: 12px; color: #9ca3af; border-top: 1px solid #e5e7eb; padding-top: 12px; }
-  .notes li { margin-left: 18px; }
+  .summary { font-size: 13px; margin-top: 6px; }
+  .diff-link { margin-top: 8px; padding: 3px 12px; }
 `;
 
 /** 每类失败最多展开的代表任务数（概览性质，全量见看板）。 */
@@ -288,7 +229,7 @@ export function renderRetroHtml(model: RetroModel): string {
   ];
   return renderReportPage({
     title: `迭代复盘 · ${escapeHtml(model.sinceLabel)}`,
-    css: RETRO_PAGE_CSS,
+    css: REPORT_CARDS_CSS + RETRO_PAGE_CSS,
     body: `  <header class="hero">
     <h1>迭代复盘</h1>
     <p class="subtitle">${escapeHtml(model.sinceLabel)}</p>
@@ -321,14 +262,14 @@ export function renderRetroHtml(model: RetroModel): string {
   });
 }
 
-/** 写复盘 HTML（reports/，文件名带 128-bit token 作为访问凭证，与 work-summary 同一托管与清理策略）。 */
-export function writeRetroReport(model: RetroModel, opts: { dir?: string } = {}): string {
+/** 写复盘 HTML（reports/，文件名带 128-bit token 作为访问凭证，与 work-summary 同一托管与清理策略；异步写盘不阻塞 bot 事件循环）。 */
+export async function writeRetroReport(model: RetroModel, opts: { dir?: string } = {}): Promise<string> {
   const dir = opts.dir ?? reportsDir();
   ensurePrivateDirSync(dir);
   pruneOldReports(dir);
   const stamp = model.sinceLabel.replace(/^迭代\s*/, '');
   const file = path.join(dir, `iteration-retro-${sanitizeName(stamp, 'report')}.${newReportToken()}.html`);
-  writeFilePrivateSync(file, renderRetroHtml(model));
+  await writeFilePrivate(file, renderRetroHtml(model));
   return file;
 }
 

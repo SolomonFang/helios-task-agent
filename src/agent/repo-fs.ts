@@ -74,13 +74,24 @@ function sensitiveFileDenied(fileAbs: string): string {
   return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会发送给 AI 模型；确有需要的请联系部署者查看。`;
 }
 
-export async function fetchRepoPath(  kanbanUrl: string,
+/** 中断返回文案与 tools/shared.ts run() 的 /stop 口径一致（行首命中 guard.ts 强失败判定，审计记 ok:false）。 */
+const ABORTED_TEXT = '⏹ 已中断（未完成的操作未执行，可继续对话）。';
+
+/** fetch 的超时与轮次中断（/stop、墙钟看门狗）合并：任一触发即掐断在途请求。 */
+function fetchSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(8000);
+  return signal ? AbortSignal.any([timeout, signal]) : timeout;
+}
+
+export async function fetchRepoPath(
+  kanbanUrl: string,
   repoId: string,
+  signal?: AbortSignal,
 ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
   const base = kanbanUrl.replace(/\/$/, '');
   const url = `${base}/api/repos/${encodeURIComponent(repoId)}`;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const res = await fetch(url, { signal: fetchSignal(signal) });
     const text = await res.text();
     let json: { success?: boolean; data?: { path?: string }; message?: string };
     try {
@@ -96,15 +107,17 @@ export async function fetchRepoPath(  kanbanUrl: string,
     }
     return { ok: true, path: repoPath };
   } catch (err) {
+    // 轮次中断（/stop、墙钟看门狗）掐断在途请求：按中断口径收尾，不误报看板不可达
+    if (signal?.aborted) return { ok: false, error: ABORTED_TEXT };
     logRepoFsError(`请求看板服务失败（${url}）`, err);
     return { ok: false, error: '无法连接看板服务，请确认看板正在运行后重试' };
   }
 }
 
 /** 看板已注册仓库的本机路径列表（root 白名单校验用）。 */
-async function fetchRegisteredRepoPaths(kanbanUrl: string): Promise<string[]> {
+async function fetchRegisteredRepoPaths(kanbanUrl: string, signal?: AbortSignal): Promise<string[]> {
   const base = kanbanUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/api/repos`, { signal: AbortSignal.timeout(8000) });
+  const res = await fetch(`${base}/api/repos`, { signal: fetchSignal(signal) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = (await res.json()) as { success?: boolean; data?: Array<{ path?: string }> };
   if (json?.success !== true || !Array.isArray(json.data)) return [];
@@ -136,11 +149,13 @@ export async function resolveRepoRoot(opts: {
   kanbanUrl: string;
   root?: string;
   repoId?: string;
+  /** 轮次中断信号（/stop、墙钟看门狗）：贯穿到看板接口 fetch，掐断在途请求。 */
+  signal?: AbortSignal;
 }): Promise<{ ok: true; root: string } | { ok: false; error: string; denied?: boolean }> {
   const explicitRoot = Boolean(opts.root?.trim());
   let root = opts.root?.trim() || '';
   if (!root && opts.repoId?.trim()) {
-    const fetched = await fetchRepoPath(opts.kanbanUrl, opts.repoId.trim());
+    const fetched = await fetchRepoPath(opts.kanbanUrl, opts.repoId.trim(), opts.signal);
     if (!fetched.ok) return fetched;
     root = fetched.path;
   }
@@ -156,8 +171,10 @@ export async function resolveRepoRoot(opts: {
   if (explicitRoot) {
     let repoPaths: string[];
     try {
-      repoPaths = await fetchRegisteredRepoPaths(opts.kanbanUrl);
+      repoPaths = await fetchRegisteredRepoPaths(opts.kanbanUrl, opts.signal);
     } catch (err) {
+      // 轮次中断掐断白名单校验请求：按中断口径收尾，不误报看板不可达
+      if (opts.signal?.aborted) return { ok: false, error: ABORTED_TEXT };
       logRepoFsError('校验仓库白名单失败', err);
       // 区分网络异常与 HTTP 异常，给用户不同的可执行出路；不再裸挂原始错误（如「: HTTP 500」）
       const httpStatus = /^HTTP (\d{3})\b/.exec(errMessage(err))?.[1];
@@ -228,7 +245,13 @@ function matchesGlob(fileName: string, relFile: string, globHint?: string): bool
   return fileName.includes(globHint) || relFile.includes(globHint);
 }
 
-export async function repoFsGrep(root: string, pattern: string, relPath = '.', globHint?: string): Promise<string> {
+export async function repoFsGrep(
+  root: string,
+  pattern: string,
+  relPath = '.',
+  globHint?: string,
+  signal?: AbortSignal,
+): Promise<string> {
   if (!pattern) return '参数错误：grep 需要 pattern';
   // pattern 来自模型生成：限制长度缓解 ReDoS，编译异常友好报错
   if (pattern.length > MAX_PATTERN_LEN) return `参数错误：搜索表达式过长（超过 ${MAX_PATTERN_LEN} 字符），请缩短后重试`;
@@ -262,6 +285,9 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   let scannedFiles = 0;
   let scannedBytes = 0;
   let scanTruncated = '';
+  // 轮次中断（/stop、墙钟看门狗）：大仓库长扫描中可即时退出（scanAborted 区别于扫描上限截断）
+  let scanAborted = false;
+  const aborted = () => signal?.aborted === true;
 
   const yieldIfNeeded = async () => {
     if (scannedFiles % GREP_YIELD_EVERY_FILES === 0) {
@@ -270,6 +296,10 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   };
 
   const scanFile = async (fileAbs: string) => {
+    if (aborted()) {
+      scanAborted = true;
+      return;
+    }
     if (hits.length >= MAX_GREP_HITS || scanTruncated) return;
     if (isSensitiveFile(fileAbs)) return; // 敏感文件不参与 grep（同 read 的 denylist）
     const rel = path.relative(root, fileAbs);
@@ -299,6 +329,10 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
   };
 
   const walk = async (dir: string): Promise<void> => {
+    if (aborted()) {
+      scanAborted = true;
+      return;
+    }
     if (hits.length >= MAX_GREP_HITS || scanTruncated) return;
     let entries: fs.Dirent[];
     try {
@@ -307,7 +341,7 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
       return;
     }
     for (const ent of entries) {
-      if (hits.length >= MAX_GREP_HITS || scanTruncated) break;
+      if (hits.length >= MAX_GREP_HITS || scanTruncated || scanAborted) break;
       if (ent.isDirectory()) {
         if (skipDir.has(ent.name) || ent.name.startsWith('.')) continue;
         await walk(path.join(dir, ent.name));
@@ -322,6 +356,8 @@ export async function repoFsGrep(root: string, pattern: string, relPath = '.', g
     await scanFile(resolved.abs);
   } else await walk(resolved.abs);
 
+  // 中断优先于结果输出：已扫到的部分命中不回放（与 run() 的 /stop 口径一致，避免半截结果误导）
+  if (scanAborted) return ABORTED_TEXT;
   const truncNote = scanTruncated ? `\n…（${scanTruncated}，已达扫描总量上限，结果可能不全）` : '';
   if (!hits.length) return truncateOutput(`仓库根目录：${root}\n搜索表达式：${pattern}\n（无命中）${truncNote}`);
   const more = hits.length >= MAX_GREP_HITS ? `\n…（已达 ${MAX_GREP_HITS} 条上限）` : '';
@@ -337,12 +373,17 @@ export async function runRepoFs(
     path?: string;
     pattern?: string;
     glob?: string;
+    /** 轮次中断信号（/stop、墙钟看门狗）：贯穿到看板接口 fetch 与 grep 扫描循环。 */
+    signal?: AbortSignal;
   },
 ): Promise<{ out: string; denied: boolean }> {
+  // 入口即查中断：不发起任何 fetch/扫描（llm.ts 工具调用前也有检查，此处兜底在途到达的中断）
+  if (args.signal?.aborted) return { out: ABORTED_TEXT, denied: false };
   const rootRes = await resolveRepoRoot({
     kanbanUrl,
     root: args.root,
     repoId: args.repo_id,
+    signal: args.signal,
   });
   // denied 走结构化字段返回（白名单拒绝由 resolveRepoRoot 标记，敏感文件直读在下方判定），
   // 调用方据此记审计，不再反向解析输出文案
@@ -359,7 +400,7 @@ export async function runRepoFs(
     case 'read':
       return { out: await repoFsRead(rootRes.root, rel === '.' ? '' : rel), denied };
     case 'grep':
-      return { out: await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob), denied };
+      return { out: await repoFsGrep(rootRes.root, args.pattern || '', rel, args.glob, args.signal), denied };
     default:
       return { out: '参数错误：操作类型仅支持：列表 / 读取 / 搜索', denied: false };
   }
