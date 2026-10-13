@@ -50,8 +50,8 @@ export interface FeishuCardAction {
 
 /**
  * 卡片回调的同步响应：SDK 的 WS 路径会把 handler 返回值打进响应帧（即时生效，不等异步 REST）。
- * toast 为点击即时提示；card（type:'raw'）原地替换被点击的卡片——legacy 卡片无原生 disabled
- * 按钮属性，「置灰」按项目约定整卡替换为终态/进行中静态卡片。
+ * toast 为点击即时提示；card（type:'raw'）原地替换被点击的卡片——2.0 按钮的 disabled 属性
+ * 仅新版客户端支持，「置灰」按项目约定整卡替换为终态/进行中静态卡片（全端一致）。
  */
 export interface CardActionResponse {
   toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };

@@ -504,8 +504,11 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         const noteOverride =
           answer === 'approved_batch' ? `已批准（${scopeWord}免问）· 回复「恢复确认」可撤销 · /stop 可中断` : undefined;
         const snapshot = progress.progressSnapshot(mergedPid, '✅ 已批准，正在执行写操作…', noteOverride);
-        if (snapshot) void deps.confirmCardBridge?.paint(mergedPid, snapshot).catch(() => {});
-        return true;
+        if (snapshot) {
+          void deps.confirmCardBridge?.paint(mergedPid, snapshot).catch(() => {});
+          return true;
+        }
+        // 快照不可得（轨迹已收尾的极端竞态）：落回文本回执，不让用户无反馈
       }
       if (answer === 'approved') {
         await channel.reply(msg, '✅ 已批准，正在执行…');

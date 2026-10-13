@@ -2119,6 +2119,39 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    // ---------- 合并单卡片：文本裁决（回复「确认」）原地换回执行中卡，不发文本回执（防时间线倒挂） ----------
+    await checkAsync('handler：合并确认的文本裁决原地换回执行中卡且不发文本回执', async () => {
+      const f = setup(llm.baseUrl, 'http://localhost:1', { mergedConfirm: true });
+      llm.mode = 'hang';
+      const pA = f.handlers.handle(mkMsg('u1', '来个长任务'));
+      await waitFor(() => f.channel.sentCards.length === 1, '进度卡片已发出');
+      const pid = f.channel.sentCards[0]!.id;
+      const verdict = f.confirmations.request('u1', { kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' });
+      await waitFor(
+        () => f.channel.updatedCards.some((u) => u.messageId === pid && cardText(u.card).includes('写操作确认')),
+        '确认卡已原地画出',
+      );
+      await waitFor(() => f.confirmations.pendingForm('u1').hasCard, '确认卡片 id 已回填');
+      const replyBase = f.channel.replies.length;
+      // 文本裁决：回复「免问」（batch 路径，注脚应带撤销提示）
+      await f.handlers.handle(mkMsg('u1', '免问'));
+      assert.equal(await verdict, 'batch');
+      assert.equal(f.channel.replies.length, replyBase, '合并场景文本裁决不发文本回执');
+      await waitFor(
+        () => f.channel.updatedCards.some((u) => u.messageId === pid && cardText(u.card).includes('✅ 已批准，正在执行写操作')),
+        '文本批准应原地换回执行中进度卡',
+      );
+      const executing = f.channel.updatedCards.at(-1)!.card;
+      assert.ok(cardText(executing).includes('恢复确认'), '免问批准后注脚应带撤销提示');
+      llm.mode = 'ok';
+      llm.release();
+      await pA;
+      const last = f.channel.updatedCards.at(-1)!;
+      assert.equal(last.messageId, pid, '结果卡应原地落在同一张进度卡');
+      assert.ok(cardText(last.card).includes('好的，已收到'), '结果卡应包含回复正文');
+      cleanup(f);
+    });
+
     // ---------- hta_review：同步返回进行中卡片（保留任务链接），审查作业仍触发；连点只 toast ----------
     await checkAsync('handler：hta_review 同步返回进行中卡片与 toast，审查作业仍被触发', async () => {
       let reviewCalls = 0;

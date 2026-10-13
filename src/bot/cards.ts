@@ -12,6 +12,7 @@
  * - 按钮不用 1.0 的 action 容器（2.0 已废弃），逐个平铺 body.elements；
  *   回传 behaviors:[{type:'callback',value}]，跳转 behaviors:[{type:'open_url',…}]；
  *   主次规范：单按钮 primary_filled + width fill，多按钮首个 primary_filled、其余 default
+ *   （例外：停止/取消类破坏性按钮用 default/danger，不做强焦点）
  * - 2.0 无 note 组件：注脚一律 markdown + text_size:'notation'
  * - config：width_mode:'fill' + enable_forward:false + update_multi:true（cardkit 要求共享卡片）——
  *   卡片内含本机链接与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发
@@ -83,7 +84,7 @@ function linkButton(text: string, url: string, type = 'primary_filled'): Record<
   };
 }
 
-/** lark_md/markdown 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
+/** markdown 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
 function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
 }
