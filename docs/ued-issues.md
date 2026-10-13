@@ -579,3 +579,50 @@
 
 - 「进行中」卡片重启后无主动终态通知：本轮已在注脚如实说明（V1），重启后对残留作业补中断通知需 watcher/启动链路跨层配合，留待后续。
 - 第十轮及以前「暂不修」清单（周报错过不补推、部署机器时区触发、CLI 免问词粒度、bot 场景 MD 报告在线化等）维持原结论。
+
+## 第十二轮复查（2026-10-13，飞书卡片 2.0 重理后全表面复审）
+
+> 背景：第十一轮后经历 1.0.41 发布与「重新理一下飞书卡片」改造（卡片 JSON 2.0 迁移、确认原地画在进度卡、⏹ 停止按钮、🔗 查看详情、流式步骤轨迹；15 文件 +1115/-307）。本轮 14 路并行审查 = 增量 diff 专项 + 13 个用户可见表面，共修复 44 项。修复由 9 路并行完成；验证：typecheck 0 错误，单测全套件通过（含新增用例），smoke 与 e2e（真实 helios-kanban MCP 全链路）通过。文中行号为审查时点快照。
+
+### P1 误导与高风险
+
+- [x] **Y1 「重新审查这个任务」是空头支票（三路审查独立证实）**：审查失败文案承诺「可回复『重新审查这个任务』」，但 handler 确定性拦截只有「重试这个任务」、prompt 无映射、模型无任何能重跑审查的工具（按钮已随「进行中」换卡消失）——用户照做只得模型即兴回复。handler 新增该短语确定性拦截（剥尾部标点），review-jobs 新增 `lastReviewByUser` 记录复用 `tryStartAiReview` 重新发起；无记录如实告知「没有找到可重新审查的任务」（`handler.ts`、`review-jobs.ts`）。顺带修复同族漏网：ai-review 定位失败指引指向已消失的「人工审查」按钮（改「查看任务」，hasOwnWayOut 抑制词同步）；报告 404 页「重新点击卡片上的『AI 审查』」必败指引改指该短语（`ai-review.ts`、`report-server.ts`）。
+
+### P2 文案可理解性与死胡同
+
+- [x] **Y2 免问批准撤销指引失去持久载体**：卡片化后按钮路径只剩 3 秒 toast，文本裁决路径的注脚又被下一次整卡重建覆盖——扩大授权后用户找不到任何「免问生效中、如何撤销」的痕迹。进度卡/结果卡注脚在免问生效期间持续携带「免问生效中 · 回复「恢复确认」可撤销」（track 记批次标记，重建带上）（`cards.ts`、`progress-reporter.ts`）。
+- [x] **Y3 「进行中」卡片注脚「请重新发起」无路径**：机器人重启作业消亡的场景（注脚自认）用户必踩。按 kind 补文本可达出路（review「重新审查这个任务」/diagnosis「为什么失败」）（`cards.ts`）。
+- [x] **Y4 确认卡「取消」与「⏹ 停止」并存无区分**：后果差别大（拒绝本次 vs 中断整个任务）却零说明。注脚补「『停止』会中断整个任务」（`cards.ts`）。
+- [x] **Y5 心跳「等待你处理上方的写操作确认」方位必错**：确认永远在占位下方发出。改「下方」（`progress-reporter.ts`、`cards.ts`）。
+- [x] **Y6 「恢复确认。」尾部标点静默失效**：同文件 retryPhrase 已剥标点（V23），三处 `=== '恢复确认'` 漏网，撤销意图被吞或发给模型闲聊。统一剥尾部标点（`handler.ts`）。
+- [x] **Y7 vision 关闭时 post 混合图文静默丢图**（T58 待遇倒挂）：完全读不了图的场景反而不告知。补「（当前配置无法读取图片，图中关键信息请打字补充）」（`handler.ts`）。
+- [x] **Y8 CLI 闸口超时后模型仍转告「用户拒绝了该写操作」（T14 CLI 漏网）**：confirmWrite 超时未 markTimedOut，passGate 落 denied 且审计记错终态。超时分支补标记，与 bot 同口径（`cli.ts`，新增单测）。
+- [x] **Y9 bot 端无 batchKey 时回复「同类免问」只收通用提示**（CLI 有明确说明，两端不一）：resolveFromText 新增 `batch_unsupported`，回复「该操作每次都需要确认，不支持免问」（`confirm.ts`、`handler.ts`）。
+- [x] **Y10 CLI 不识别「恢复确认」**（bot 有拦截，README 未限端，模型可能谎称已撤销）：CLI 主循环加确定性拦截，与 /confirm revoke 同路（`cli.ts`）。
+- [x] **Y11 LLM 失败尾注恒附「/config 检查模型配置」**：对超限/限流类是错误出路且与同屏 friendly 出路打架。按错误类别条件化（`commands.ts`）。
+- [x] **Y12 bot 首次向导飞书阶段 Esc 提示「配置未变更」与磁盘事实相反**（T24 孪生路径漏网）：模型阶段已落盘。按 alreadySaved 分支改「此前已保存的配置不受影响，重新运行可从剩余步骤继续」（`process-lifecycle.ts`、`bot-main.ts`）。
+- [x] **Y13 hk.mjs tasks list 默认静默截断 50 条无总数无标注**（F3/G24 同族，备用通道直达模型）：输出改信封 `{ total, showing, tasks }`，usage 补默认值（`hk.mjs`）。
+- [x] **Y14 缺默认分支报错出路错挂「创建任务时」（V17 漏网共享函数）**：已有任务 start 回不到创建时。改中性「直接告诉我使用哪个分支（如 develop）」（`workspace-ready.ts`）。
+- [x] **Y15 复盘页「本周完成」日期范围含未来日期（T40 姊妹页漏修）**：终点取 min(weekEnd, now)（`retro.ts`）。
+- [x] **Y16 晨报/周报空态「其他状态 N 个」截断样本与同行「已取消」全量口径混排**（N35 漏网）：改 `scopedTotal − 五状态之和` 全量口径（`daily-brief.ts`、`weekly-brief.ts`，新增单测）。
+- [x] **Y17 CHANGELOG 缺 [1.0.41] 节（第六次复发）**：按 tag 时点收编，并加注 1.0.39/1.0.40 未发布 npm（变更随 1.0.41 一并发布）。
+
+### P3 细节打磨
+
+- [x] **Y18 卡片**：onSuperseded「另发确认」失实改「出现在卡片上」；「[生成中…]」全角化；步骤轨迹窗口滑动破坏流式前缀扩展（滑动时回退整卡更新）；「⏹ 停止」统一 default 色（U2 口径）；CardKit 缺 message_id 双发占位卡改按失败走降级；看板链接按钮统一「📋 查看任务」；诊断终态卡补「查看任务」入口；「总用时约 N 秒」≥120 秒换算分秒（`cards.ts`、`progress-reporter.ts`、`bot-main.ts`）。
+- [x] **Y19 bot 链路**：AI 审查/诊断开始三重同义反馈收敛（文本通知仅首次安全提示发）；文本「重试这个任务」受理即时回执；审查入口空标题兜底「未命名任务」；报告服务告警去「本机路径推送」谎称且英文原文收 HTA_DEBUG；停滞日志小数小时按分钟；watch 日志 open_id 脱敏；长连接失败原文收 HTA_DEBUG；文本降级确认第三分句补「回复」；BOT_CLI_USAGE 补 -v/-h 别名（`handler.ts`、`review-jobs.ts`、`bot-main.ts`）。
+- [x] **Y20 CLI**：闸口重问改绝对超时（与 bot 口径一致）；/status 看板「不可达」补出路；闸口 summary/detail 剥离 ANSI（新建 `infra/ansi.ts`）（`cli.ts`、`commands.ts`）。
+- [x] **Y21 向导/入口**：可选字段重问补「回车 = 放弃设置本项」；白名单破折号病句；bin --help 去 `LLM_*` glob 黑话；deps Windows `set "PORT=…"&&` 引号包值（V16 漏网）；高危键列表 join('、')（`config-wizard.ts`、`bin/`、`deps.ts`、`config.ts`）。
+- [x] **Y22 工具层**：MCP 非创建类确认 detail 伪调用串改结构化中文；查重拦截裸 UUID 改「《标题》（ID：…）」；「4MB」中文化；repo-fs 的 repo_id 黑话与「本机直接打开」出路；skills「空 name 调用」黑话（`tools/`、`repo-fs.ts`、`skills.ts`）。
+- [x] **Y23 提醒**：「上午/早上 12 点」按 0 点处理（T36 漏网）；确认闸展示先截断（所见即所得）；写盘失败「重启后会丢失」失实改「未保存成功」；投递与列表补「按部署机器时区」标注（`reminder.ts`、`reminder-tools.ts`）。
+- [x] **Y24 prompt/技能**：链接展开失败话术补中文转述（与 V15 对齐）；类型推断补中文展示对称句；SKILL.md「合并合并请求」叠字；INSTALL.md profile 按 $SHELL 选择；hk health 判 HTTP 状态（`prompt.ts`、`SKILL.md`、`INSTALL.md`、`hk.mjs`）。
+- [x] **Y25 文档**：README 回调订阅「不配则功能不变」失实（停止/审查/诊断按钮依赖该订阅）两端改写；HTA_DEBUG 描述与实际 20 处控制面同步；.env.example 括注扩展（`README×2`、`.env.example`）。
+- [x] **Y26 其余**：诊断「失败信息失败」叠词；复盘页「本地时区」→「按部署机器时区」（`failure-diagnosis.ts`、`retro.ts`）。
+
+### 本轮暂不修（记录在案）
+
+- handler.ts 两处注释残留旧按钮名「🔗 查看详情」（非用户可见面，随下轮顺手清理）。
+- `ai-review.ts` 的 sanitizeCliOutput 与新 `infra/ansi.ts` 的 stripAnsi 正则重复（功能各自正确，收敛留待后续）。
+- `RATE_LIMIT_RE` 与 llm-error.ts 的 429 词表重复维护（已加同源注释，单源化需跨组改动）。
+- bot 首次向导飞书阶段取消的新分支无自动化覆盖（该路径本无 bot 侧用例编排）。
+- 第十一轮及以前「暂不修」清单维持原结论。

@@ -11,6 +11,7 @@ import { toolActionLabel } from '../commands';
 import type { InboundMessage, ProgressInfo } from '../types';
 import { errMessage } from '../infra/err';
 import {
+  BATCH_ACTIVE_NOTE,
   RESULT_CARD_MAX_BYTES,
   buildProgressCard,
   buildProgressTerminalCard,
@@ -58,7 +59,7 @@ export interface ProgressKit {
     activity: { lastEventAt: number },
     openId: string,
   ) => () => void;
-  /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。resultUrl 提供时结果卡片带「🔗 查看详情」跳转按钮。 */
+  /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。resultUrl 提供时结果卡片带「📋 查看任务」跳转按钮。 */
   deliverReply: (
     msg: InboundMessage,
     progressId: string | undefined,
@@ -80,7 +81,8 @@ export interface ProgressKit {
   releaseCard: (progressId: string) => void;
   /** 确认占用期间的卡片绘制（确认卡/确认终态卡）：不受 held 拦截，入有序链保序；reject = 绘制失败（调用方降级）。 */
   paintConfirm: (progressId: string, card: Record<string, unknown>) => Promise<void>;
-  /** 按轨迹当前步骤构建进度卡（确认批准后的同步换卡用）；轨迹不存在（文本占位等）返回 undefined。 */
+  /** 按轨迹当前步骤构建进度卡（确认批准后的同步换卡用）；轨迹不存在（文本占位等）返回 undefined。
+   *  noteOverride 传入时（文本裁决的免问批准路径）在轨迹上记录批次标记，后续重建与结果卡注脚持续携带撤销指引。 */
   progressSnapshot: (progressId: string, currentLabel?: string, noteOverride?: string) => Record<string, unknown> | undefined;
 }
 
@@ -119,6 +121,16 @@ interface CardTrack {
    * 下一次进度更新必须整卡刷新（恢复 streaming 配置与锚点），不能走 streamCardElement。
    */
   needFullRefresh?: boolean;
+  /**
+   * 免问批准生效标记（文本裁决的 batch 路径经 progressSnapshot 的 noteOverride 记入）：
+   * 批准时的 toast 只停留几秒，免问生效期间进度卡重建与结果卡注脚持续携带撤销指引（BATCH_ACTIVE_NOTE）。
+   */
+  batchActive?: boolean;
+  /**
+   * cardkit 模式最近一次流式推送的 hta_main 文本：步骤轨迹只展示最近几步，窗口滑动后
+   * 新文本不再是旧文本的前缀扩展（打字机流式不变量被破坏），此时回退整卡更新。
+   */
+  streamedMain?: string;
 }
 
 /**
@@ -148,22 +160,36 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
 
   /**
    * 进度步骤的流式文本更新（仅 cardkit 模式）：hta_main 元素全量文本，前缀扩展部分呈打字机动画；
-   * message 模式回退整卡更新。入有序链、fire-and-forget（held/settled 跳过）。
+   * message 模式回退整卡更新。步骤轨迹只展示最近几步，窗口滑动后新文本不再是旧文本的前缀扩展，
+   * 同样回退整卡更新（与 needFullRefresh 同路）。入有序链、fire-and-forget（held/settled 跳过）。
    */
   const enqueueStepsStream = (progressId: string): void => {
     const track = cardTracks.get(progressId);
     if (!track || track.settled || track.held) return;
-    if (track.transport === 'cardkit' && track.cardId && !track.needFullRefresh) {
+    const content = progressMainText({ steps: track.steps, current: track.current });
+    if (
+      track.transport === 'cardkit' &&
+      track.cardId &&
+      !track.needFullRefresh &&
+      (!track.streamedMain || content.startsWith(track.streamedMain))
+    ) {
       const cardId = track.cardId;
-      const content = progressMainText({ steps: track.steps, current: track.current });
+      track.streamedMain = content;
       track.chain = track.chain.then(() => channel.streamCardElement(cardId, 'hta_main', content, ++track.seq)).catch(() => {});
       return;
     }
-    // 确认/终态整卡覆盖后的首次进度更新：整卡刷新恢复流式配置与 hta_main 锚点
+    // 确认/终态整卡覆盖或步骤窗口滑动后的首次进度更新：整卡刷新恢复流式配置与 hta_main 锚点；
+    // 免问生效期间注脚持续携带撤销指引（批次标记见 track.batchActive）
     track.needFullRefresh = false;
+    track.streamedMain = content;
     enqueueCardUpdate(
       progressId,
-      buildProgressCard({ steps: track.steps, current: track.current, stopToken: progressId }),
+      buildProgressCard({
+        steps: track.steps,
+        current: track.current,
+        stopToken: progressId,
+        noteOverride: track.batchActive ? `${BATCH_ACTIVE_NOTE} · 回复 /stop 也可中断` : undefined,
+      }),
     );
   };
 
@@ -196,6 +222,8 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
   const progressSnapshot = (progressId: string, currentLabel?: string, noteOverride?: string): Record<string, unknown> | undefined => {
     const track = cardTracks.get(progressId);
     if (!track || track.settled) return undefined;
+    // noteOverride 的唯一来源是文本裁决的免问批准路径（handler）：记入轨迹，后续重建与结果卡持续携带撤销指引
+    if (noteOverride !== undefined) track.batchActive = true;
     return buildProgressCard({
       steps: track.steps,
       current: currentLabel ?? track.current,
@@ -245,23 +273,23 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     try {
       const entityId = await channel.createCardEntity(buildProgressCard({ steps: [] }));
       const messageId = await channel.sendCardEntity(msg.sessionId, entityId);
-      if (messageId) {
-        const track: CardTrack = {
-          steps: [],
-          startedAt: Date.now(),
-          chain: Promise.resolve(),
-          settled: false,
-          transport: 'cardkit',
-          cardId: entityId,
-          seq: 0,
-        };
-        cardTracks.set(messageId, track);
-        // 令牌注入失败则本轮停止按钮不可用（点击落入令牌不匹配分支，不会误伤），进度展示不受影响
-        track.chain = track.chain
-          .then(() => channel.updateCardEntity(entityId, buildProgressCard({ steps: [], stopToken: messageId }), ++track.seq))
-          .catch((err) => console.error(`[feishu] 占位卡片令牌注入失败（本轮停止按钮不可用）: ${errMessage(err)}`));
-        return messageId;
-      }
+      // 缺 message_id 按失败处理（走下方降级链）：静默落入普通卡片分支会再发一张占位，双发
+      if (!messageId) throw new Error('sendCardEntity 未返回 message_id');
+      const track: CardTrack = {
+        steps: [],
+        startedAt: Date.now(),
+        chain: Promise.resolve(),
+        settled: false,
+        transport: 'cardkit',
+        cardId: entityId,
+        seq: 0,
+      };
+      cardTracks.set(messageId, track);
+      // 令牌注入失败则本轮停止按钮不可用（点击落入令牌不匹配分支，不会误伤），进度展示不受影响
+      track.chain = track.chain
+        .then(() => channel.updateCardEntity(entityId, buildProgressCard({ steps: [], stopToken: messageId }), ++track.seq))
+        .catch((err) => console.error(`[feishu] 占位卡片令牌注入失败（本轮停止按钮不可用）: ${errMessage(err)}`));
+      return messageId;
     } catch (err) {
       console.error(`[feishu] CardKit 流式卡片创建失败，降级普通卡片: ${errMessage(err)}`);
     }
@@ -347,13 +375,15 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
             elapsedSec: Math.round((Date.now() - startedAt) / 1000),
             waitingConfirm: confirmForm ?? undefined,
             stopToken: progressId,
+            // 免问生效期间注脚持续携带撤销指引；确认挂起时等待指引优先（更紧急，挂起解除后批次注脚随之恢复）
+            noteOverride: track.batchActive && !confirmForm ? `${BATCH_ACTIVE_NOTE} · 回复 /stop 也可中断` : undefined,
           }),
         );
         return;
       }
       const text = confirmForm
         ? confirmForm.hasCard
-          ? `⏳ 等待你处理上方的写操作确认…（点卡片按钮或回复${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）`
+          ? `⏳ 等待你处理下方的写操作确认…（点卡片按钮或回复${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）`
           : `⏳ 等待你回复写操作确认（${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）…`
         : `⏳ 仍在处理…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒；/stop 可中断）`;
       void channel.updateText(progressId, text).catch(() => {});
@@ -410,7 +440,12 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       try {
         await paintTerminal(
           progressId,
-          buildResultCard(text, { elapsedSec: Math.round((Date.now() - track.startedAt) / 1000) }, { url: resultUrl }),
+          buildResultCard(
+            text,
+            { elapsedSec: Math.round((Date.now() - track.startedAt) / 1000) },
+            // 免问生效期间结果卡注脚同样携带撤销指引（批准 toast 只停留几秒，注脚是持久载体）
+            { url: resultUrl, extraNote: track.batchActive ? BATCH_ACTIVE_NOTE : undefined },
+          ),
         );
         return;
       } catch (err) {

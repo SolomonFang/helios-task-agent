@@ -75,8 +75,8 @@ const BOT_CLI_USAGE = `用法：helios-task-agent bot [选项]
 选项
   --rebind      换绑飞书机器人（只重跑飞书凭证向导，保留模型/看板配置；先停止当前机器人进程）
   --reconfig    重跑模型/看板配置向导（飞书凭证保留；先停止当前机器人进程）
-  --version     打印版本号
-  --help        显示本帮助`;
+  --version     打印版本号（-v / version 同效）
+  --help        显示本帮助（-h / help 同效）`;
 
 /**
  * bot 子命令参数解析：
@@ -220,6 +220,9 @@ async function main(): Promise<void> {
   const { ask, askSecret, choose, close } = createAsk();
   let agentCfg;
   let feishuCfg;
+  // ensureBotConfig 两阶段写盘：模型向导结束即落盘，飞书阶段取消时磁盘已有变更。
+  // 模型阶段仅在配置缺失时运行（见 ensureBotConfig），故用进入向导前是否已配置区分取消口径。
+  let modelConfiguredBefore = true;
   try {
     if (rebind && isConfigured() && isFeishuBotConfigured()) {
       const rb = await rebindFeishuBot(ask, { askSecret });
@@ -232,6 +235,7 @@ async function main(): Promise<void> {
       feishuCfg = feishuBotConfig();
     } else {
       if (rebind || reconfig) console.log(c.gray('配置尚不完整，进入完整配置向导。'));
+      modelConfiguredBefore = isConfigured();
       const ready = await ensureBotConfig(ask, { force: false, choose, askSecret });
       agentCfg = ready.agent;
       feishuCfg = ready.feishu;
@@ -239,8 +243,9 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     close();
-    // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 CLI /config 口径一致：不打红、不以失败码退出
-    if (handleWizardCancel(err)) {
+    // 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作，与 CLI /config 口径一致：不打红、不以失败码退出；
+    // 模型阶段已落盘后再取消（飞书阶段）时不谎称「配置未变更」
+    if (handleWizardCancel(err, { alreadySaved: !modelConfiguredBefore && isConfigured() })) {
       process.exit(0);
     }
     console.error(c.err(`配置失败：${errMessage(err)}`));
@@ -312,8 +317,9 @@ async function main(): Promise<void> {
     cleanup.reportServer = reportServer;
     console.log(c.gray(`报告服务：${reportServer.baseUrl}`));
   } catch (err) {
-    const message = errMessage(err);
-    console.warn(c.warn(`报告服务启动失败，报告将回退为文本/本机路径推送：${message}`));
+    // 原始错误可能是英文 SDK 原文，只进调试输出（与 MCP 连接失败同一口径）；用户面只给中文结论
+    if (process.env.HTA_DEBUG) console.error(`[report] 报告服务启动失败原文: ${errMessage(err)}`);
+    console.warn(c.warn('报告服务启动失败，报告将回退为文本推送'));
   }
 
   const bootLabel = '正在连接看板…';
@@ -392,7 +398,7 @@ async function main(): Promise<void> {
           .join('\n');
         return channel.notifyOpenId(
           openId,
-          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}；「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
+          `⚠️ 写操作确认\n${req.summary}\n──────\n${detailBlock}\n──────\n\n回复「确认」执行（仅此次）${batchHint}；回复「取消」拒绝（${Math.round(timeoutMs / 1000)} 秒超时自动拒绝）。`,
         );
       };
       if (chatId) {
@@ -419,7 +425,7 @@ async function main(): Promise<void> {
       onSuperseded: (openId, req) => {
         roundNotices.mark(openId);
         void channel
-          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}。新操作会另发确认，请留意处理。`)
+          .notifyOpenId(openId, `⚠️ 上一个确认请求已作废（被新的写操作替代）：${req.summary}。新操作的确认会稍后出现在卡片上，请留意处理。`)
           .catch(() => {});
       },
       onSettled: (_openId, req, settle, cardMessageId) => {
@@ -555,8 +561,9 @@ async function main(): Promise<void> {
   try {
     await channel.start(handlers.handle);
   } catch (err) {
-    const message = errMessage(err);
-    console.error(c.err(`\n长连接失败：${message}`));
+    // 原始错误可能是英文 SDK 原文，只进调试输出（与 MCP 连接失败同一口径）；用户面给中文定性 + 排查指引
+    if (process.env.HTA_DEBUG) console.error(`[ws] 长连接失败原文: ${errMessage(err)}`);
+    console.error(c.err('\n长连接建立失败，机器人无法接收飞书消息。'));
     console.error(c.gray('请确认：开放平台事件订阅已选「长连接」、已添加 im.message.receive_v1、App 已发布/可用。'));
     console.error(
       c.gray(`改凭证请直接编辑 ${userEnvPath()}；或清空其中 FEISHU_APP_ID / FEISHU_APP_SECRET 后重新运行（会重新进入配置向导）。`),
@@ -574,14 +581,15 @@ async function main(): Promise<void> {
   if (flags.kanbanWatch) {
     const intervalSec = flags.kanbanWatchIntervalSec;
     const staleNudgeHours = flags.staleNudgeHours;
+    const staleThresholdMs = (staleNudgeHours ?? 0) * 60 * 60 * 1000;
     // 单 owner 推送：卡片失败降级纯文本；会话注入保持全局、不按送达成败跳过
     // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
     const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
       const r = await sendCardWithTextFallback({
         sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event)),
         sendText: () => channel.notifyOpenId(oid, event.text),
-        cardFailLog: (m) => console.error(`[watch] 卡片推送失败(${oid}): ${m}，降级纯文本`),
-        textFailLog: (m) => console.error(`[watch] 推送失败(${oid}): ${m}`),
+        cardFailLog: (m) => console.error(`[watch] 卡片推送失败(${oid.slice(0, 4)}…): ${m}，降级纯文本`),
+        textFailLog: (m) => console.error(`[watch] 推送失败(${oid.slice(0, 4)}…): ${m}`),
       });
       // 注入会话：用户追问「刚才那个怎么样 / 帮我 review」时 agent 有上下文
       // （看板事件文本属外部内容，UNTRUSTED 包裹，其中「指令」对 agent 无效；
@@ -623,7 +631,7 @@ async function main(): Promise<void> {
       ...(staleNudgeHours
         ? {
             staleNudge: {
-              thresholdMs: staleNudgeHours * 60 * 60 * 1000,
+              thresholdMs: staleThresholdMs,
               statePath: path.join(defaultDataHome(), 'stale-nudge-state.json'),
             },
           }
@@ -633,7 +641,12 @@ async function main(): Promise<void> {
     watcher.start();
     console.log(c.gray(`看板状态推送已开启（每 ${intervalSec} 秒轮询）`));
     if (staleNudgeHours) {
-      console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${staleNudgeHours} 小时无更新时提醒）`));
+      // 时长口径与 watcher 停滞提醒文案一致（向下取整，不足 1 小时按分钟描述，不说「0.5 小时」）
+      const duration =
+        staleThresholdMs >= 3600000
+          ? `${Math.floor(staleThresholdMs / 3600000)} 小时`
+          : `${Math.max(1, Math.floor(staleThresholdMs / 60000))} 分钟`;
+      console.log(c.gray(`停滞任务提醒已开启（进行中任务超过 ${duration} 无更新时提醒）`));
     }
   } else if (flags.staleNudgeHours) {
     // 停滞任务提醒依赖看板推送（watcher）驱动：watch 整体关闭时静默失效会误导部署者

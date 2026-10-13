@@ -62,14 +62,14 @@ function noticePage(title: string, lines: string[]): string {
 /**
  * 404 统一中文说明（报告按 30 天清理，链接随机端口随进程重启失效），并给出找回报告的出路。
  * 本服务同时托管审查/日报/复盘/工作总结报告：通用出路是回飞书重新发指令；
- * 仅 AI 审查报告（review- 前缀文件名）还可重新点击卡片上的「AI 审查」生成。
+ * 仅 AI 审查报告（review- 前缀文件名）还可回复「重新审查这个任务」重新生成。
  */
 function notFoundHtml(name: string): string {
   const lines = [
     '报告保留 30 天，机器人重启后旧链接也会失效。',
     '请回到飞书重新发送指令，生成新报告。',
   ];
-  if (name.startsWith('review-')) lines.push('AI 审查报告也可以重新点击卡片上的「AI 审查」重新生成。');
+  if (name.startsWith('review-')) lines.push('AI 审查报告也可以回复「重新审查这个任务」重新生成。');
   return noticePage('报告不存在或已过期', lines);
 }
 

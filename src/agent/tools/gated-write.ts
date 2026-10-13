@@ -110,7 +110,7 @@ export function makeGatedWriter({
         const createdShort = new Date(hit.createdAt).toLocaleString('zh-CN', { hour12: false });
         return (
           `该来源已同步过，为避免重复建任务已拦截：\n- 来源：${url}\n` +
-          `- 已创建：${createdShort} → 看板任务 ${hit.taskId}《${hit.title}》\n` +
+          `- 已创建：${createdShort} → 看板任务《${hit.title}》（ID：${hit.taskId}）\n` +
           '如确需重建，请先在「看板」中删除原任务（或告知用户该任务已存在）；\n' +
           '如用户是想把最新内容合并进原任务，改用更新操作修改该任务，不要重复创建；\n' +
           '如同一来源需要拆到多个项目（如中控/APP/后端各一个任务），请在创建时显式指定不同的目标项目。'

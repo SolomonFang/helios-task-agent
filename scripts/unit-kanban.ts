@@ -460,7 +460,10 @@ async function main(): Promise<void> {
       assert.ok(err instanceof Error && err.message.includes('无法定位该任务的代码目录'), `实际：${err}`);
       // 候选目录清单只进日志不进用户消息（宿主机绝对路径不抛给终端用户）
       assert.ok(!err.message.includes(missing), '候选目录路径不应出现在用户面文案');
-      assert.ok(err.message.includes('人工审查'), '用户面应给出「人工审查」指引');
+      assert.ok(
+        err.message.includes('查看任务') && err.message.includes('人工查看'),
+        '用户面应给出看板人工查看指引',
+      );
     } finally {
       await mock.close();
     }

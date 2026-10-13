@@ -9,6 +9,7 @@ import { fetchKanbanHealth } from './kanban/http';
 import { localToolSummary } from './agent/tools';
 import { installSkill, loadSkillDigests, uninstallSkill } from './agent/skills';
 import { friendlyLlmError } from './config/llm-error';
+import { CONTEXT_OVERFLOW_RE } from './agent/llm';
 import { errMessage } from './infra/err';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -68,11 +69,15 @@ export async function buildStatusLines(
     : larkAuthed
       ? p.ok('正常')
       : p.warn(LARK_CLI_AUTH_HINT);
-  // http.ts 的健康探测返回「响应异常（状态码 N）」裸文本：命中时补一句可操作的复查出路
+  // http.ts 的健康探测返回「响应异常（状态码 N）」「不可达」裸文本：两个分支各补一句可操作的复查出路
   const healthText =
     health === 'ok'
       ? p.ok('正常')
-      : p.warn(/状态码 \d+/.test(health) ? `${health}，看板服务可能正在重启，稍后可 /status 复查` : health);
+      : p.warn(
+          /状态码 \d+/.test(health)
+            ? `${health}，看板服务可能正在重启，稍后可 /status 复查`
+            : `${health}，请确认看板服务已启动、地址正确，稍后可 /status 复查`,
+        );
   const lines = [
     `模型：${p.info(opts.model)}`,
     `看板：${healthText}（${opts.kanbanUrl}）`,
@@ -218,6 +223,17 @@ export function confirmRevokedText(n: number, noneText: string): string {
 }
 
 /**
+ * 上下文超限与限流/额度类错误：改模型配置解决不了这两类（friendly 已给出 /clear、稍后重试/查额度
+ * 等正确出路），CLI 尾注再附「/config 检查模型配置」是错误出路。词表须与 config/llm-error.ts 的
+ * 类别判定保持一致（超限正则单源复用 CONTEXT_OVERFLOW_RE；限流词表那边未导出，此处对齐维护）。
+ */
+const RATE_LIMIT_RE = /\b429\b|rate limit|too many requests|quota|insufficient|余额|额度/i;
+
+function llmFailureConfigWontHelp(message: string): boolean {
+  return CONTEXT_OVERFLOW_RE.test(message) || RATE_LIMIT_RE.test(message);
+}
+
+/**
  * LLM 请求失败的三段回复：错误头 / 友好提示（可空）/ 原消息截断复述（60 字符）。
  * 命中 friendlyLlmError 已知模式（401/429/上下文超限/网络等）时 head 保留原始 message 便于对照；
  * 未命中时英文原始 message 不直达用户面——head 只给中性「请求失败」与通用出路，
@@ -233,10 +249,13 @@ export function llmFailureParts(
 ): { head: string; friendly: string | null; tail: string } {
   const friendly = channel === 'bot' ? friendlyLlmError(message, { channel: 'bot' }) : friendlyLlmError(message);
   const quoted = `${input.slice(0, 60)}${input.length > 60 ? '…' : ''}`;
+  // CLI 尾注的 /config 出路对超限/限流类是误导（改配置解决不了），仅其余类别保留
   const tail =
     channel === 'bot'
       ? `你的上一条消息未处理：「${quoted}」，${retryHint}。`
-      : `上一条内容「${quoted}」未被处理，${retryHint}；也可用 /config 检查模型配置。`;
+      : friendly && llmFailureConfigWontHelp(message)
+        ? `上一条内容「${quoted}」未被处理，${retryHint}。`
+        : `上一条内容「${quoted}」未被处理，${retryHint}；也可用 /config 检查模型配置。`;
   if (friendly) return { head: `请求失败：${message}`, friendly, tail };
   // 未命中已知模式：原始 message 截断收 HTA_DEBUG 日志，用户面只给中性与通用出路。
   // bot 用户无法设环境变量/重跑进程，指向部署者；CLI 保留 HTA_DEBUG 提示，

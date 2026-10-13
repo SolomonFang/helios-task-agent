@@ -3,6 +3,8 @@
 // 2. handler hta_review 按钮全链路（分发 → tryStartAiReview 受理 → runAiReview，PATH 桩伪造 ocr）
 // 3. cli askWithAbort 三路竞态（正常回答 / Ctrl+C abort / 超时自动拒绝；createAskWithAbort 已抽出可测）
 //    + abort/超时收尾取消挂起 waiter（fake reader 注入 waiter 语义，验证中断后输入不被吞）
+//    + cli confirmWrite（createCliConfirm）：超时经 markTimedOut 归因 timeout、重问不重置绝对超时窗口、
+//      闸口打印剥离 ANSI 转义
 // 4. config-wizard 非交互部分（resolveAllowedOpenIds 白名单合并决策）+ writeEnvFile 往返 + llm-verify / feishu-verify 失败路径 + net-error 的 err.cause 解包映射
 // 5. cli 启动窗口信号处理（信号注册前移到 ensureKanbanOrExit 之前：探测在途时 SIGTERM/SIGINT 优雅退出）
 // 6. config 安全与解析对齐：cwd .env 高危键大小写不敏感过滤 + npm_config_ 前缀拒绝、
@@ -31,7 +33,9 @@ import { McpSupervisor } from '../src/bot/supervisor';
 import { PRESETS, currentConfig, ensureEnvLoaded, loadEnvFiles, ocrLlmOverrides, writeEnv, writeEnvFile } from '../src/config/config';
 import { ensureConfig, resolveAllowedOpenIds } from '../src/config/config-wizard';
 import { ensureKanbanRunning } from '../src/kanban/kanban-ensure';
-import { ASK_TIMEOUT, createAskWithAbort } from '../src/cli';
+import { ASK_TIMEOUT, createAskWithAbort, createCliConfirm } from '../src/cli';
+import { DENIED_MESSAGE, TIMEOUT_MESSAGE, passGate } from '../src/agent/guard';
+import { stripAnsi } from '../src/infra/ansi';
 import { verifyLlmConfig } from '../src/config/llm-verify';
 import { verifyFeishuApp } from '../src/config/feishu-verify';
 import { readRuntimeFlags } from '../src/config/runtime-flags';
@@ -389,10 +393,8 @@ async function run(): Promise<void> {
           });
 
         click();
-        await waitFor(
-          () => channel.notifies.filter((n) => n.text.includes('AI 审查已开始')).length === 1,
-          '审查开始通知',
-        );
+        // 开始文本通知仅在首次安全提示时发送（刷屏治理）：进行中判定改看 ocr 是否已被拉起
+        await waitFor(() => fs.existsSync(ocrLog), '审查开始（ocr 已拉起）');
         click(); // 审查进行中连点同一 attempt：应走去重提示，不重复执行
         await waitFor(
           () => channel.notifies.some((n) => n.text.includes('AI 审查正在进行中')),
@@ -424,7 +426,7 @@ async function run(): Promise<void> {
         // finally 清理去重集合：完成后可再次发起同一 attempt 的审查
         click();
         await waitFor(
-          () => channel.notifies.filter((n) => n.text.includes('AI 审查已开始')).length === 2,
+          () => fs.readFileSync(ocrLog, 'utf8').split('--repo').length - 1 === 2,
           '完成后可再次发起',
         );
         await waitFor(
@@ -533,6 +535,74 @@ async function run(): Promise<void> {
     reader.feed('n');
     assert.equal(await p2, 'n');
   });
+
+  // ---------- cli confirmWrite（createCliConfirm）：超时归因 / 绝对超时窗口 / ANSI 剥离 ----------
+  const noopSpinner = { start: () => {}, stop: () => {} };
+
+  await checkAsync('cliConfirm：超时自动拒绝经 markTimedOut 归因，passGate 给 TIMEOUT 文案而非「用户拒绝」', async () => {
+    const logs: string[] = [];
+    const confirm = createCliConfirm(async () => ASK_TIMEOUT, noopSpinner, (l) => logs.push(l));
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm);
+    assert.ok(
+      !res.allowed && res.reason === 'timeout' && res.message === TIMEOUT_MESSAGE,
+      `超时应归因 timeout，实际：${JSON.stringify(res)}`,
+    );
+    assert.ok(logs.some((l) => l.includes('超时未操作，已自动拒绝')), '超时应有自动拒绝提示');
+  });
+
+  await checkAsync('cliConfirm：用户取消仍归因 denied（不与 timeout 混淆）', async () => {
+    const confirm = createCliConfirm(async () => 'n', noopSpinner, () => {});
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm);
+    assert.ok(
+      !res.allowed && res.reason === 'denied' && res.message === DENIED_MESSAGE,
+      `取消应归因 denied，实际：${JSON.stringify(res)}`,
+    );
+  });
+
+  await checkAsync('cliConfirm：批准（仅此次）放行', async () => {
+    const confirm = createCliConfirm(async () => 'y', noopSpinner, () => {});
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm);
+    assert.ok(res.allowed, `y 应放行，实际：${JSON.stringify(res)}`);
+  });
+
+  await checkAsync('cliConfirm：重问不重置超时窗口，按首次发问传剩余时间；窗口耗尽按超时归因', async () => {
+    let now = 1_000_000;
+    const seenTimeouts: number[] = [];
+    const prompts: string[] = [];
+    const confirm = createCliConfirm(
+      async (prompt, timeoutMs) => {
+        prompts.push(prompt);
+        seenTimeouts.push(timeoutMs!);
+        now += 30_000; // 用户 30 秒后才给出无法识别的回答 → 重问
+        return '随便说说';
+      },
+      noopSpinner,
+      () => {},
+      () => now,
+    );
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm);
+    // 普通写 120s 窗口：重问依次剩 90/60/30s，耗尽后按超时收尾（绝不重置回 120s）
+    assert.deepEqual(seenTimeouts, [120000, 90000, 60000, 30000], `重问应传剩余时间，实际：${seenTimeouts}`);
+    assert.ok(prompts[0]!.includes('120 秒') && prompts[1]!.includes('90 秒'), '提示文案应展示剩余秒数');
+    assert.ok(!res.allowed && res.reason === 'timeout', `窗口耗尽应归因 timeout，实际：${JSON.stringify(res)}`);
+  });
+
+  await checkAsync('cliConfirm：summary/detail 打印前剥离 ANSI 转义（看板可控标题不污染终端）', async () => {
+    const logs: string[] = [];
+    const confirm = createCliConfirm(async () => 'n', noopSpinner, (l) => logs.push(l));
+    await confirm({ kind: 'kanban', summary: '创建看板任务「\x1b[1;31m标题\x1b[0m」', detail: 'args \x1b[2K\x07detail' });
+    const joined = logs.join('\n');
+    assert.ok(!joined.includes('\x1b') && !joined.includes('\x07'), `闸口打印不得含 ANSI/控制字符，实际：${JSON.stringify(joined)}`);
+    assert.ok(joined.includes('标题') && joined.includes('detail'), '剥离后正文内容应保留');
+  });
+
+  check('stripAnsi：CSI/字符集序列与 BEL 剥离，普通文本原样', (() => {
+    return (
+      stripAnsi('\x1b[1;31m红\x1b[0m字') === '红字' &&
+      stripAnsi('\x1b(B\x07响铃') === '响铃' &&
+      stripAnsi('普通文本（无转义）') === '普通文本（无转义）'
+    );
+  })());
 
   // ================= 盲区 4：config-wizard 非交互部分 + 链路 =================
 

@@ -166,6 +166,26 @@ async function main(): Promise<void> {
     assert.ok(buildWeeklyBriefText(all, at(18, 0)).includes('看板上还没有任务。'));
   });
 
+  await checkAsync('buildWeeklyBriefText：空态兜底「其他状态」用全量口径（scopedTotal − 五状态全量和）', () => {
+    // 范围内全部是未知状态任务且清单样本被截断：计数取截断前全量，不数样本
+    const data = fakeSummary([fakeTask({ id: 'x', title: '归档的活儿', status: 'archived' })]);
+    data.scopedTotal = 4;
+    const text = buildWeeklyBriefText(data, at(18, 0));
+    assert.ok(text.includes('其他状态 4 个'), `其他状态应为全量口径: ${text}`);
+    // 与「已取消」混排：两者同为全量口径，其他状态扣除五状态全量和
+    const mixed = fakeSummary([
+      fakeTask({ id: 'x', title: '归档的活儿', status: 'archived' }),
+      fakeTask({ id: 'y', title: '取消的活儿', status: 'cancelled' }),
+    ]);
+    mixed.scopedTotal = 6;
+    const mixedText = buildWeeklyBriefText(mixed, at(18, 0));
+    assert.ok(mixedText.includes('已取消 1 个'), mixedText);
+    assert.ok(mixedText.includes('其他状态 5 个'), `其他状态应扣除五状态全量和: ${mixedText}`);
+    // 旧采集缺 scopedTotal：回退样本计数（只少报不谎报）
+    const legacy = fakeSummary([fakeTask({ id: 'x', title: '归档的活儿', status: 'archived' })]);
+    assert.ok(buildWeeklyBriefText(legacy, at(18, 0)).includes('其他状态 1 个'));
+  });
+
   await checkAsync('buildWeeklyBriefText：失败为 0 时不挂括注；单组超 10 个任务截断并提示剩余数量', () => {
     const tasks = Array.from({ length: 13 }, (_, i) =>
       fakeTask({ id: `t${i}`, title: `任务${i}`, status: 'done', updatedAt: '2026-09-02T10:00:00' }),

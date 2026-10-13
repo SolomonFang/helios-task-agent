@@ -25,7 +25,7 @@ function printHelp() {
 
 配置：首次运行进入交互向导，写入用户目录下的 .helios-task-agent/.env
   （macOS/Linux 即 ~/.helios-task-agent/.env，Windows 为 %USERPROFILE%\.helios-task-agent\.env；
-  可用 HELIOS_TASK_AGENT_HOME 覆盖目录）。LLM_* 必填；FEISHU_* 仅 bot 需要。
+  可用 HELIOS_TASK_AGENT_HOME 覆盖目录）。模型配置（地址 / Key / 模型名）必填；飞书凭证仅 bot 需要。
 更新：启动时检查 npm 新版本并请示是否更新（HTA_UPDATE_CHECK=0 关闭）；
   手动更新：npm i -g helios-task-agent@latest
 文档：https://github.com/SolomonFang/helios-task-agent#readme

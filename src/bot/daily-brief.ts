@@ -97,7 +97,14 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
     if (!anySection) {
       const parts: string[] = [];
       if (data.totals.cancelled) parts.push(`已取消 ${data.totals.cancelled} 个`);
-      const unknown = data.tasks.filter((t) => !isKnownStatus(t.status)).length;
+      // 「其他状态」与同行「已取消」同为全量口径：截断前范围内总行数 − 五状态全量和；
+      // 旧采集缺 scopedTotal 时回退样本计数（只少报不谎报）
+      const knownTotal =
+        data.totals.done + data.totals.inreview + data.totals.inprogress + data.totals.todo + data.totals.cancelled;
+      const unknown =
+        data.scopedTotal !== undefined
+          ? Math.max(0, data.scopedTotal - knownTotal)
+          : data.tasks.filter((t) => !isKnownStatus(t.status)).length;
       if (unknown) parts.push(`其他状态 ${unknown} 个`);
       if (parts.length) lines.push('', parts.join(' · '));
     }

@@ -97,7 +97,7 @@ async function runWizard(ask: AskFn, choose?: ChooseFn | null, askSecret?: AskFn
     const label = opts.label ?? 'Base URL';
     const reprompt = async (): Promise<string> => {
       for (;;) {
-        const v = await need(`${label}（如 https://api.deepseek.com/v1）: `);
+        const v = await need(`${label}（如 https://api.deepseek.com/v1${opts.allowEmpty ? '；回车 = 放弃设置本项' : ''}）: `);
         if (v) return v;
         if (opts.allowEmpty) return '';
         console.log(c.err(`${label} 不能为空，请重新输入。`));
@@ -392,7 +392,7 @@ async function promptFeishuConfig(
   }
   const allowedPrompt = existing.allowedOpenIds.length
     ? `允许的 open_id（可选，逗号分隔，可在飞书开放平台 API 调试台查询；回车 = 保留当前 ${existing.allowedOpenIds.join('、')}${allowClear ? '；输入 - 清除' : ''}）: `
-    : `允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置——则第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id${allowClear ? '' : '；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突）'}）: `;
+    : `允许的 open_id（可选，逗号分隔，open_id 可在飞书开放平台 API 调试台查询；回车 = 暂不设置；不设置时，第一个私聊机器人的人自动成为唯一使用者。机器人可被他人搜到时，建议先填自己的 open_id${allowClear ? '' : '；也可先回车，认领后先停止当前机器人进程，再运行 helios-task-agent bot --rebind 回填（--rebind 会启动完整 bot 实例，与在跑实例冲突）'}）: `;
   const allowedRaw = await need(allowedPrompt);
   if (!allowClear && allowedRaw.split(',').some((s) => s.trim() === '-')) {
     console.log(c.warn('「-」是换绑（bot --rebind）场景清除白名单的写法，本次配置不支持清除，已忽略该输入项。'));

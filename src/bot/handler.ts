@@ -133,6 +133,9 @@ export function extractKanbanUrl(text: string, kanbanUrl: string): string | unde
   return undefined;
 }
 
+/** 剥掉尾部标点与空白：用户随手敲成「重试这个任务。」「恢复确认！」不能静默降级为模型闲聊或查询分支。 */
+const stripTailPunct = (s: string): string => s.replace(/[\s。！？!?，,．.…~～]+$/u, '');
+
 export interface BotHandlerDeps {
   channel: FeishuChannel;
   router: SessionRouter;
@@ -395,7 +398,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 用 cmd === '/confirm revoke' 判的话该分支永不可达，撤销会静默失效（安全语义 bug）。
     // 比较前折叠连续空白：多敲空格/Tab 落入查询分支会静默不撤销
     const lower = text.trim().toLowerCase().replace(/\s+/g, ' ');
-    if (text === '恢复确认' || lower === '/confirm revoke' || lower === '/confirm on') {
+    if (stripTailPunct(text) === '恢复确认' || lower === '/confirm revoke' || lower === '/confirm on') {
       const n = session.revokeBatchApprovals();
       await channel.reply(
         msg,
@@ -472,7 +475,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     text: string,
     cmd: string | null,
   ): Promise<boolean> => {
-    const key = cmd === '/confirm' || text === '恢复确认' ? '/confirm' : cmd;
+    const key = cmd === '/confirm' || stripTailPunct(text) === '恢复确认' ? '/confirm' : cmd;
     const fn = key ? instantCommands[key] : undefined;
     if (!fn) return false;
     await fn(msg, text, cmd);
@@ -521,6 +524,11 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (!mergedPid) await channel.reply(msg, '已取消，操作未执行。');
       return true;
     }
+    // 「同类免问」但本次确认不支持免问：如实告知，别让通用提示让用户误以为免问已生效
+    if (answer === 'batch_unsupported') {
+      await channel.reply(msg, '该操作每次都需要确认，不支持免问；请回复「确认」或「取消」。');
+      return true;
+    }
     // 确认词但无 pending（已超时/已处理）：即时提示，不要落入普通对话发给 LLM
     if (!confirmations.hasPending(msg.senderId) && isConfirmWord(text)) {
       await channel.reply(msg, '当前没有待确认的写操作（可能已超时自动拒绝、被取消或被新操作替代）。如仍需执行，请重新描述你的需求。');
@@ -533,7 +541,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (
         text.length <= 10 &&
         !text.startsWith('/') &&
-        text !== '恢复确认' &&
+        stripTailPunct(text) !== '恢复确认' &&
         !confirmShortReplyReminded.has(msg.senderId)
       ) {
         confirmShortReplyReminded.add(msg.senderId);
@@ -847,6 +855,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       }
       if (cfg.visionEnabled) {
         await channel.reply(msg, '（消息中的图片未读取，请单独发送图片）');
+      } else {
+        // vision 关闭的混合图文：文字部分照常处理，但图中信息读不到，须如实提示（否则静默丢图）
+        await channel.reply(msg, '（当前配置无法读取图片，图中关键信息请打字补充）');
       }
     }
 
@@ -860,15 +871,30 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     // 不能仅靠模型自觉（pendingNotes 上限/LRU 淘汰/历史裁剪后承诺会失效）——
     // 有诊断结论时直接复用按钮的重试逻辑，没有则如实告知。
     // 匹配前剥掉尾部标点与空白：用户随手敲成「重试这个任务。」不能静默降级为模型闲聊
-    const retryPhrase = text.replace(/[\s。！？!?，,．.…~～]+$/u, '');
+    const retryPhrase = stripTailPunct(text);
     if (retryPhrase === '重试这个任务') {
       const last = reviewJobs.lastDiagnosis(msg.senderId);
       if (last) {
-        // 受理判定同步完成（去重/无结论会如实通知），返回值此处无需使用
-        reviewJobs.tryStartRetry(msg.senderId, last.taskId, last.title);
+        // 受理判定同步完成（去重/无结论会如实通知）；accepted 时立即给受理回执（作业异步，结果随后推送）
+        const r = reviewJobs.tryStartRetry(msg.senderId, last.taskId, last.title);
+        if (r.status === 'accepted') await channel.reply(msg, '↻ 正在发起重试，请稍候…');
       } else {
         // 原失败卡片的「AI 诊断」按钮点击后已随「进行中」卡片消失，出路走文本回复
         await channel.reply(msg, '没有找到可重试的诊断结论（机器人可能已重启）。可回复「为什么失败」重新诊断后再重试。');
+      }
+      return;
+    }
+
+    // 「重新审查这个任务」确定性分支：AI 审查失败文案承诺过这个短语（review-jobs/ai-review），
+    // 按该用户最近一次审查记录复用受理判定重新发起；无记录时如实告知，不降级为模型闲聊
+    if (retryPhrase === '重新审查这个任务') {
+      const last = reviewJobs.lastReview(msg.senderId);
+      if (last) {
+        // 早退分支（进行中/已达上限）的详细指引由 tryStartAiReview 经 safeNotify 落消息
+        const r = reviewJobs.tryStartAiReview(msg.senderId, last.attemptId, last.title);
+        if (r.status === 'accepted') await channel.reply(msg, `🤖 正在重新发起 AI 审查：《${last.title}》，完成后推送结果。`);
+      } else {
+        await channel.reply(msg, '没有找到可重新审查的任务（机器人可能已重启）。');
       }
       return;
     }

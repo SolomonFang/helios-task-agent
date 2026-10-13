@@ -12,7 +12,7 @@
  * - 按钮不用 1.0 的 action 容器（2.0 已废弃），逐个平铺 body.elements；
  *   回传 behaviors:[{type:'callback',value}]，跳转 behaviors:[{type:'open_url',…}]；
  *   主次规范：单按钮 primary_filled + width fill，多按钮首个 primary_filled、其余 default
- *   （例外：停止/取消类破坏性按钮用 default/danger，不做强焦点）
+ *   （例外：停止/取消为非破坏动作，一律 default 不做强焦点——红色只留给破坏性操作本身的警示）
  * - 2.0 无 note 组件：注脚一律 markdown + text_size:'notation'
  * - config：width_mode:'fill' + enable_forward:false + update_multi:true（cardkit 要求共享卡片）——
  *   卡片内含本机链接与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发
@@ -44,7 +44,7 @@ function streamingCardConfig(): Record<string, unknown> {
     ...baseCardConfig(),
     streaming_mode: true,
     streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' },
-    summary: { content: '[生成中…]' },
+    summary: { content: '（生成中…）' },
   };
 }
 
@@ -135,6 +135,8 @@ export function buildConfirmCard(
   const replyHint = req.batchKey
     ? `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「${batchScopeWord(req.batchScope)}免问」/「取消」`
     : `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「取消」`;
+  // 「取消」只拒绝本次写操作，「停止」中断整个任务：两按钮并存时注脚点明区别
+  const stopHint = opts?.stopToken ? ' · 「停止」会中断整个任务' : '';
   return {
     schema: '2.0',
     config: baseCardConfig(),
@@ -150,7 +152,7 @@ export function buildConfirmCard(
         mdEl(`**${mdSafe(req.summary)}**`),
         mdEl(detailCodeBlock(req.detail)),
         ...buttons,
-        noteEl(replyHint),
+        noteEl(replyHint + stopHint),
       ],
     },
   };
@@ -212,6 +214,12 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
  */
 export const RESULT_CARD_MAX_BYTES = 28000;
 
+/**
+ * 免问生效期间进度卡/结果卡注脚持续携带的撤销指引：批准时的 toast 只停留几秒，
+ * 注脚是持久载体（progress-reporter 在 track 上记 batchActive，重建与结果卡都带上）。
+ */
+export const BATCH_ACTIVE_NOTE = '免问生效中 · 回复「恢复确认」可撤销';
+
 /** 进度卡片展示的最近步骤数上限：长任务的步骤轨迹不无限变长。 */
 const PROGRESS_CARD_MAX_STEPS = 5;
 
@@ -256,8 +264,9 @@ export function progressMainText(state: Pick<ProgressCardState, 'steps' | 'curre
  */
 function waitingConfirmNote(form: { hasCard: boolean; batchKey: boolean }): string {
   const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
+  // 确认消息/卡片发于占位之后，真实方位是「下方」（合并场景确认原地画在占位上时 held 抑制更新，看不到本注脚）
   const how = form.hasCard
-    ? `请先点上方确认卡片的按钮（或回复${answers}）`
+    ? `请先点下方确认卡片的按钮（或回复${answers}）`
     : `请回复${answers}（本次确认以文本方式发送，没有卡片按钮）`;
   return `${how} · 回复 /stop 也可中断`;
 }
@@ -282,17 +291,26 @@ export function buildProgressCard(state: ProgressCardState): Record<string, unkn
     config: streamingCardConfig(),
     header: {
       template: state.waitingConfirm ? 'orange' : 'blue',
-      title: { tag: 'plain_text', content: state.waitingConfirm ? '⏳ 等待你处理上方的写操作确认' : '⏳ 处理中' },
+      title: { tag: 'plain_text', content: state.waitingConfirm ? '⏳ 等待你处理下方的写操作确认' : '⏳ 处理中' },
     },
     body: {
       direction: 'vertical',
       elements: [
         mdEl(progressMainText(state), 'hta_main'),
-        { ...callbackButton('⏹ 停止', { hta_stop: state.stopToken ?? '' }, 'danger'), element_id: 'hta_stop' },
+        // 停止是非破坏动作（中断而非删除），与确认卡「✖️ 取消」同用 default，不用 danger 红
+        { ...callbackButton('⏹ 停止', { hta_stop: state.stopToken ?? '' }), element_id: 'hta_stop' },
         noteEl(note),
       ],
     },
   };
+}
+
+/** 总用时人性化：≥120 秒换算成「N 分 N 秒」（三位数秒没有直觉）。 */
+function elapsedText(sec: number): string {
+  if (sec < 120) return `${sec} 秒`;
+  const min = Math.floor(sec / 60);
+  const rest = sec % 60;
+  return rest ? `${min} 分 ${rest} 秒` : `${min} 分`;
 }
 
 /**
@@ -303,15 +321,17 @@ export function buildProgressCard(state: ProgressCardState): Record<string, unkn
 export function buildResultCard(
   reply: string,
   meta?: { elapsedSec?: number },
-  opts?: { url?: string },
+  opts?: { url?: string; extraNote?: string },
 ): Record<string, unknown> {
   const elements: Array<Record<string, unknown>> = [mdEl(diagnosisMdSafe(reply || '（无回复）'))];
   if (opts?.url) {
-    // 「查看详情」跳转按钮（单按钮：primary_filled + width fill，官方主次规范）
-    elements.push(linkButton('🔗 查看详情', opts.url));
+    // 「查看任务」跳转看板任务页（单按钮：primary_filled + width fill，官方主次规范；命名与进行中/看板事件卡同口径）
+    elements.push(linkButton('📋 查看任务', opts.url));
   }
   const notes: string[] = [];
-  if (meta?.elapsedSec !== undefined) notes.push(`总用时约 ${meta.elapsedSec} 秒`);
+  if (meta?.elapsedSec !== undefined) notes.push(`总用时约 ${elapsedText(meta.elapsedSec)}`);
+  // 需持续携带的注脚（免问生效撤销指引等，见 BATCH_ACTIVE_NOTE）
+  if (opts?.extraNote) notes.push(opts.extraNote);
   // 看板链接跑在本机：注明可达范围（与 buildJobProcessingCard/buildWatchEventCard 同口径）
   if (opts?.url) notes.push(linkReachNote(opts.url));
   if (notes.length) elements.push(noteEl(notes.join(' · ')));
@@ -356,14 +376,14 @@ export function buildJobProcessingCard(
   url?: string,
 ): Record<string, unknown> {
   const meta = {
-    review: { heading: '🤖 AI 审查进行中', note: '正在调用代码审查工具分析改动，完成后推送审查结果。' },
-    diagnosis: { heading: '🔍 AI 诊断进行中', note: '正在采集失败信息并调用模型分析，完成后推送诊断结果。' },
-    retry: { heading: '↻ 正在按诊断结论重试', note: '重试指令发送中，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。' },
+    review: { heading: '🤖 AI 审查进行中', note: '正在调用代码审查工具分析改动，完成后推送审查结果。', stuck: '若长时间无结果，可回复「重新审查这个任务」' },
+    diagnosis: { heading: '🔍 AI 诊断进行中', note: '正在采集失败信息并调用模型分析，完成后推送诊断结果。', stuck: '若长时间无结果，可回复「为什么失败」重新诊断' },
+    retry: { heading: '↻ 正在按诊断结论重试', note: '重试指令发送中，任务进展会继续推送。', stuck: '若长时间无进展，请到看板查看或手动重新发起' },
   }[kind];
   const elements: Array<Record<string, unknown>> = [
-    // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底，别让用户死等卡片；
+    // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底并给出文本可达的出路，别让用户死等卡片；
     // 作业是进程内状态，机器人重启后静默消亡，卡片不能永久谎称「进行中」
-    mdEl(`${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，若长时间无结果请重新发起。`),
+    mdEl(`${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，${meta.stuck}。`),
   ];
   if (url) {
     elements.push(linkButton('📋 查看任务', url));
@@ -431,9 +451,9 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       elements.push(textEl(content));
     }
     if (e.url) {
-      const btn = e.kind === 'review' ? '🔍 人工审查' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
+      // 跳转目标都是看板任务页：按钮命名统一「📋 查看任务」（同目标同文案）；
       // 主按钮（跳转）primary_filled，其余（回传按钮）default——官方主次规范
-      elements.push(linkButton(btn, e.url));
+      elements.push(linkButton('📋 查看任务', e.url));
       // AI 审查：回传按钮（card.action.trigger），bot 侧调 open-code-review 跑该 attempt 的 diff
       if (e.kind === 'review' && e.attemptId) {
         elements.push(
@@ -532,7 +552,7 @@ function diagnosisMdSafe(s: string): string {
  * settledAt 提供时为重试发起后的终态卡片（原地替换，按钮消失，参照确认卡片终态模式）；
  * followUpExcerpt 为已发送的 follow-up 指令摘要（双向截断，handler 侧生成）——
  * 重试指令直发执行方用户原本看不到，终态卡片留一份可见记录。
- * url 为看板任务链接（随诊断结果留存）：重试按钮带上它，点击后换成的「进行中」卡片据此保留「查看任务」入口。
+ * url 为看板任务链接（随诊断结果留存）：重试按钮带上它，点击后换成的「进行中」卡片与重试终态卡片据此保留「查看任务」入口。
  */
 export function buildDiagnosisCard(
   title: string,
@@ -555,9 +575,13 @@ export function buildDiagnosisCard(
       // 外部内容（LLM 诊断复述）用 plain_text，不经 markdown 渲染
       elements.push(textEl(`已发送的跟进指令：\n${opts.followUpExcerpt}`));
     }
-    elements.push(
-      noteEl(`已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。`),
-    );
+    // 终态补看板入口（与进行中卡片同口径）：注脚里的「看板」有真实可达路径
+    if (opts.url) {
+      elements.push(linkButton('📋 查看任务', opts.url));
+      elements.push(noteEl(linkReachNote(opts.url)));
+    }
+    const stuckTail = opts.url ? '如长时间无进展，点上方「查看任务」到看板跟进。' : '如长时间无进展，请到看板查看或手动重新发起。';
+    elements.push(noteEl(`已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送；${stuckTail}`));
   } else {
     elements.push(
       callbackButton(

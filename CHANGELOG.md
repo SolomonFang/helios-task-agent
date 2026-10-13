@@ -11,12 +11,28 @@
 - 飞书卡片全部迁移至卡片 JSON 2.0（`src/bot/cards.ts`）：按钮平铺 `body.elements`（`action` 容器已废弃），回传走 `behaviors:[{type:'callback',value}]`、跳转走 `open_url` 行为；注脚改用 `markdown` + `notation` 字号（2.0 无 note 组件）；结果卡片新增「🔗 查看详情」跳转按钮（回复内含看板同源链接时）；需飞书客户端 ≥ 7.20
 - 一轮对话由一张卡片承载全生命周期（loading → 写入确认 → 执行中 → 结果，全程原地更新，不再另发确认卡片与批准回执文本）：写操作确认原地画在进度占位卡上（确认期间进度刷新挂起、按钮不被覆盖，「⏹ 停止」保留），批准同步换回执行中进度卡（`src/bot-main.ts`、`src/bot/handler.ts`、`src/bot/progress-reporter.ts`、`src/agent/confirm.ts`）
 - 进度占位卡优先走 CardKit 卡片实体 + `streaming_mode` 流式更新（步骤轨迹打字机动画、会话列表预览「[生成中…]」，收尾自动关流）；未开通 `cardkit:card` 权限或建卡失败时自动降级为普通卡片整卡更新（功能不变、无动画）（`src/channels/feishu.ts`、`src/bot/progress-reporter.ts`）
+- 第十二轮 UED 审查修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md) 第十二轮）：全链路文案与文档口径如实化打磨（含 CHANGELOG 补收 [1.0.41] 节、README/.env.example 更正卡片按钮订阅依赖与 HTA_DEBUG 调试范围说明等）
+
+## [1.0.41] - 2026-10-12
+
+### Fixed
+
+- 第十一轮 UED 审查修复（明细见 [docs/ued-issues.md](https://github.com/SolomonFang/helios-task-agent/blob/main/docs/ued-issues.md) 第十一轮，共 57 项）：「进行中」卡片失败指引改指文本可达路径（不再指向已随换卡消失的按钮）、注脚如实说明机器人重启会中断作业；结果卡绿头恒称「✅ 已完成」改中性「处理结束」；bot 文本裁决的「否」单字应答不再被护栏误吞；看板不可达时去重拦截改「已暂缓，待看板恢复后重试」；配置向导 EOF 文案/空回车误中止/OCR 校验条件/404 误诊四连修复；CLI `/status`、`/tools` 改调用时实时探测看板存活（掉线不再谎称「正常」）；技能文档截断、hk.mjs 网络报错、Windows 命令陷阱、报告与晨报/周报口径等细节打磨
+- 修复 GitHub Actions 线上构建失败（单测断言修正），无行为变更
+
+### Changed
+
+- 飞书交互深度优化跟进：技能安装路径 `~/` 展开优先读 `$HOME` 环境变量（POSIX shell 语义；win32 下 `os.homedir()` 走用户目录 API，HOME 重定向场景会解析到真实用户目录），缺失时回退系统用户目录；package-lock 依赖锁定同步（`src/agent/skills.ts`）
 
 ## [1.0.40] - 2026-10-10
+
+> 注：1.0.40 未发布到 npm（npm 上 1.0.38 之后直接是 1.0.41），以下变更随 1.0.41 一并发布。
 
 修复构建异常（package-lock 依赖锁定同步），无行为变更。
 
 ## [1.0.39] - 2026-10-10
+
+> 注：1.0.39 未发布到 npm（npm 上 1.0.38 之后直接是 1.0.41），以下变更随 1.0.41 一并发布。
 
 ### Changed
 

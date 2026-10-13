@@ -384,9 +384,9 @@ export function readSkillDoc(name: string): string {
   }
   if (!SKILL_NAME_RE.test(trimmed)) return `参数错误：非法技能名「${trimmed}」`;
   const dir = resolveSkillDir(trimmed);
-  if (!dir) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
+  if (!dir) return `未找到技能「${trimmed}」：技能名不存在，可先列出已安装技能再重试。`;
   const loaded = loadSkill(dir, trimmed);
-  if (!loaded) return `未找到技能「${trimmed}」。先用空 name 调用列出已安装技能。`;
+  if (!loaded) return `未找到技能「${trimmed}」：技能名不存在，可先列出已安装技能再重试。`;
   try {
     const skillFile = path.join(dir, 'SKILL.md');
     // 符号链接可指向技能目录外的任意文件（含凭证），拒绝读取

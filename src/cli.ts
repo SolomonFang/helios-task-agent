@@ -26,10 +26,11 @@ import {
   TRY_EXAMPLES,
 } from './commands';
 import { CONFIRM_BATCH_RE, CONFIRM_NO_RE, CONFIRM_YES_RE } from './agent/confirm';
-import { batchAckText, batchScopeWord, kindLabel, type ConfirmFn } from './agent/guard';
+import { batchAckText, batchScopeWord, kindLabel, markTimedOut, type ConfirmFn, type ConfirmRequest } from './agent/guard';
 import type { AgentConfig, AskFn } from './types';
 import { errMessage } from './infra/err';
 import { processTreeAlive } from './infra/proc';
+import { stripAnsi } from './infra/ansi';
 
 type LineReader = (() => Promise<string | null>) & { drain: () => void; cancelPending: () => void };
 
@@ -131,6 +132,78 @@ export function createAskWithAbort(
       }
       void ask(promptText).then((v) => finish(v));
     });
+  };
+}
+
+/**
+ * CLI 写操作确认闸门（main 内 confirmWrite 的实现，抽出以便单测）：
+ * 闸门触发时暂停 spinner；默认拒绝；「免问」开同类免问；Ctrl+C 视为拒绝；
+ * 超时自动拒绝（与飞书 bot 同语义：普通写 120s、破坏性 300s）。
+ * 两个与 bot 对齐的口径：
+ * - 超时先 markTimedOut 再收尾 false：passGate 据此归因 timeout（TIMEOUT_MESSAGE），
+ *   模型不会把超时误转告成「用户拒绝了该写操作」；
+ * - 重问不重置超时窗口：按首次发问的绝对截止时间传剩余时间（bot 是绝对超时）。
+ * summary/detail 含看板可控内容（任务标题等），打印前剥离 ANSI 转义序列。
+ * print/now 可注入（默认 console.log / Date.now），供单测替代。
+ */
+export function createCliConfirm(
+  askWithAbort: (promptText: string, timeoutMs?: number) => Promise<string | null | typeof ASK_TIMEOUT>,
+  spinner: { start(text?: string): unknown; stop(): unknown },
+  print: (line: string) => void = (l) => console.log(l),
+  now: () => number = Date.now,
+): ConfirmFn {
+  return async (req: ConfirmRequest) => {
+    spinner.stop();
+    print('');
+    print(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}${req.destructive ? ' · 高危' : ''}）：${stripAnsi(req.summary)}`));
+    print(c.gray(stripAnsi(req.detail)));
+    const timeoutMs = req.destructive ? 300000 : 120000;
+    const options = req.batchKey
+      ? `y=仅此次 / 免问=${batchScopeWord(req.batchScope)}免问（本会话） / N=取消 / 回车=取消`
+      : 'y=仅此次 / N=取消 / 回车=取消';
+    const deadline = now() + timeoutMs;
+    const timeoutFinish = (): false => {
+      // 必须先于收尾 false 标记：passGate 在拿到拒绝后才查归因集合（同 bot confirm.ts 的顺序约束）
+      markTimedOut(req);
+      print(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。如仍需执行，再说一次即可。'));
+      return false;
+    };
+    for (;;) {
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) return timeoutFinish();
+      const ans = await askWithAbort(
+        c.warn(`允许执行？【${options}】（${Math.round(remainingMs / 1000)} 秒未操作自动拒绝） `),
+        remainingMs,
+      );
+      spinner.start('思考中…（Ctrl+C 中断）');
+      if (ans === ASK_TIMEOUT) return timeoutFinish();
+      const t = (ans || '').trim().toLowerCase();
+      // 无 batchKey 的操作不支持同类免问：提示后重新等待输入，而不是落到「已取消」（行为与意图相反）
+      if (!req.batchKey && CONFIRM_BATCH_RE.test(t)) {
+        // 重问期间先停 spinner：否则转圈每 80ms 清行，把这条提示与用户输入一起擦除（且「思考中」失实，实际在等用户）
+        spinner.stop();
+        print(c.warn('该操作不支持同类免问，请回复 y 确认或 N 取消。'));
+        continue;
+      }
+      const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
+      const once = !batch && CONFIRM_YES_RE.test(t);
+      if (batch) {
+        print(c.ok(`已批准；${batchAckText(req.batchScope, req.kind)}（/confirm revoke 撤销）。`));
+        return 'batch';
+      }
+      if (once) {
+        print(c.ok('已批准（仅此次），继续执行。'));
+        return 'once';
+      }
+      // 非空但未命中任何词表（「好的/ok/可以」等随口应答）不是取消意图：提示后重问；空回车与取消词才取消
+      if (t && !CONFIRM_NO_RE.test(t)) {
+        spinner.stop();
+        print(c.warn('无法识别的回答，请回复 y 确认或 N 取消。'));
+        continue;
+      }
+      print(c.gray('已取消，操作未执行。'));
+      return false;
+    }
   };
 }
 
@@ -314,55 +387,8 @@ export async function main(): Promise<void> {
   /** ask 的 abort/超时感知版：实现见模块级 createAskWithAbort（单测覆盖三路竞态 + 陈旧 waiter 取消）。 */
   const askWithAbort = createAskWithAbort(ask, () => currentCtl, nextLine.cancelPending);
 
-  // 写操作硬确认：闸门触发时暂停 spinner；默认拒绝；「免问」（或 batch/同类免问等词）开启同类免问；Ctrl+C 视为拒绝；
-  // 超时自动拒绝（与飞书 bot 同语义：普通写 120s、破坏性 300s）。
-  const confirmWrite: ConfirmFn = async (req) => {
-    spinner.stop();
-    console.log('');
-    console.log(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}${req.destructive ? ' · 高危' : ''}）：${req.summary}`));
-    console.log(c.gray(req.detail));
-    const timeoutMs = req.destructive ? 300000 : 120000;
-    const options = req.batchKey
-      ? `y=仅此次 / 免问=${batchScopeWord(req.batchScope)}免问（本会话） / N=取消 / 回车=取消`
-      : 'y=仅此次 / N=取消 / 回车=取消';
-    for (;;) {
-      const ans = await askWithAbort(
-        c.warn(`允许执行？【${options}】（${Math.round(timeoutMs / 1000)} 秒未操作自动拒绝） `),
-        timeoutMs,
-      );
-      spinner.start('思考中…（Ctrl+C 中断）');
-      if (ans === ASK_TIMEOUT) {
-        console.log(c.gray('⏰ 超时未操作，已自动拒绝，操作未执行。如仍需执行，再说一次即可。'));
-        return false;
-      }
-      const t = (ans || '').trim().toLowerCase();
-      // 无 batchKey 的操作不支持同类免问：提示后重新等待输入，而不是落到「已取消」（行为与意图相反）
-      if (!req.batchKey && CONFIRM_BATCH_RE.test(t)) {
-        // 重问期间先停 spinner：否则转圈每 80ms 清行，把这条提示与用户输入一起擦除（且「思考中」失实，实际在等用户）
-        spinner.stop();
-        console.log(c.warn('该操作不支持同类免问，请回复 y 确认或 N 取消。'));
-        continue;
-      }
-      const batch = Boolean(req.batchKey) && CONFIRM_BATCH_RE.test(t);
-      const once = !batch && CONFIRM_YES_RE.test(t);
-      if (batch) {
-        console.log(c.ok(`已批准；${batchAckText(req.batchScope, req.kind)}（/confirm revoke 撤销）。`));
-        return 'batch';
-      }
-      if (once) {
-        console.log(c.ok('已批准（仅此次），继续执行。'));
-        return 'once';
-      }
-      // 非空但未命中任何词表（「好的/ok/可以」等随口应答）不是取消意图：提示后重问；空回车与取消词才取消
-      if (t && !CONFIRM_NO_RE.test(t)) {
-        spinner.stop();
-        console.log(c.warn('无法识别的回答，请回复 y 确认或 N 取消。'));
-        continue;
-      }
-      console.log(c.gray('已取消，操作未执行。'));
-      return false;
-    }
-  };
+  // 写操作硬确认：实现见模块级 createCliConfirm（单测覆盖超时归因 / 绝对超时窗口 / ANSI 剥离）
+  const confirmWrite: ConfirmFn = createCliConfirm(askWithAbort, spinner);
 
   const reminders = new ReminderStore();
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, {
@@ -573,6 +599,13 @@ export async function main(): Promise<void> {
       } else {
         console.log(c.warn(`未知命令 ${cmd}，输入 /help 查看帮助。`));
       }
+      continue;
+    }
+
+    // 纯文本「恢复确认」确定性拦截（剥尾部标点；与 bot handler、/confirm revoke 同路同文案）
+    if (line.replace(/[。！？!?.．…]+$/u, '') === '恢复确认') {
+      const n = session.revokeBatchApprovals();
+      console.log(n ? c.ok(confirmRevokedText(n, '')) : c.gray(confirmRevokedText(0, confirmStateText(0, ''))));
       continue;
     }
 

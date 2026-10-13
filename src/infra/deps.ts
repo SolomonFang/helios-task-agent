@@ -136,7 +136,7 @@ export function kanbanManualStartHint(opts?: { port?: string | number; autoStart
     process.platform === 'win32'
       ? [
           '可手动执行（多数情况是首次下载慢，重新运行即可）。cmd：',
-          `set PORT=${port} && npx -y ${spec}`,
+          `set "PORT=${port}"&& npx -y ${spec}`,
           '或 PowerShell：',
           `$env:PORT=${port}; npx -y ${spec}`,
         ]

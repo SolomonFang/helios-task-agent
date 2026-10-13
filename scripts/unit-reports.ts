@@ -417,6 +417,8 @@ async function run(): Promise<void> {
     assert.equal(model.total, 5);
     assert.equal(model.completionRate, 2 / 5);
     assert.equal(model.doneThisWeek, 1, '恰周一 00:00 计入、上周日 23:59 不计入');
+    // 「本周完成」范围终点不越过生成当天（与周报同口径：周中生成不得展示未来日期）
+    assert.equal(model.weekRange, `${localDate(monday)} 至 ${localDate(retroNow)}`, `weekRange：${model.weekRange}`);
     assert.equal(model.doneTotal, 2);
     assert.equal(model.failedTotal, 2);
     assert.deepEqual(

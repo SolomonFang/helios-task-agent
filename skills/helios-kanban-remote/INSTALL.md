@@ -141,10 +141,14 @@ export HELIOS_KANBAN_URL="<user-provided-url>"
 Persist (skip if already in profile). **Ask the user first** before modifying their shell profile — if they decline, keep the vars session-only:
 
 ```bash
-PROFILE="$HOME/.zshrc"
-[ -f "$HOME/.bashrc" ] && PROFILE="$HOME/.bashrc"
+case "$(basename "${SHELL:-}")" in
+  zsh)  PROFILE="$HOME/.zshrc" ;;
+  bash) PROFILE="$HOME/.bashrc" ;;
+  *)    PROFILE="$HOME/.profile" ;;
+esac
 grep -q 'HELIOS_KANBAN_URL' "$PROFILE" 2>/dev/null || \
   echo "export HELIOS_KANBAN_URL=\"$HELIOS_KANBAN_URL\"" >> "$PROFILE"
+echo "已写入 $PROFILE；请确认该文件会被当前 shell 加载（否则把上面的 export 手动加到实际使用的配置文件）"
 ```
 
 Kanban server (separate host) must be running:
@@ -235,7 +239,7 @@ npm i -g helios-task-agent@latest   # 升级 npm 包后重跑 Step 2 Option A + 
 rm -rf "$SKILL_DIR"
 ```
 
-Also remove any `HELIOS_KANBAN_*` exports previously appended to the shell profile (`~/.zshrc` / `~/.bashrc`).
+Also remove any `HELIOS_KANBAN_*` exports previously appended to the shell profile (`~/.zshrc` / `~/.bashrc` / `~/.profile`).
 
 ---
 

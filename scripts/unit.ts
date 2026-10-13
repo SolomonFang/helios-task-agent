@@ -321,7 +321,7 @@ async function run(): Promise<void> {
   await checkAsync('确认管理器：无 batchKey 时「同类免问」不生效', async () => {
     const mgr = new ConfirmationManager(async () => undefined);
     const p = mgr.request('u1', { kind: 'lark', summary: 's', detail: 'd' });
-    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'ignored'); // 无 batchKey 的请求不支持免问
+    assert.equal(mgr.resolveFromText('u1', '同类免问'), 'batch_unsupported'); // 无 batchKey 的请求不支持免问（如实区分，bot 据此提示）
     assert.equal(mgr.resolveFromText('u1', '确认'), 'approved');
     assert.equal(await p, 'once');
   });
@@ -1898,8 +1898,8 @@ async function run(): Promise<void> {
     );
   })());
 
-  // ---------- 看板事件卡片：人工审查 + AI 审查按钮 ----------
-  check('待审阅卡片：有人工审查链接按钮，有 attemptId 时追加 AI 审查回传按钮', (() => {
+  // ---------- 看板事件卡片：查看任务 + AI 审查按钮 ----------
+  check('待审阅卡片：有「查看任务」链接按钮，有 attemptId 时追加 AI 审查回传按钮', (() => {
     type Btn = { text?: { content?: string }; url?: string; value?: { hta_review?: string; title?: string } };
     const actionsOf = (card: Record<string, unknown>): Btn[] => {
       // 2.0：按钮平铺 body.elements；url 在 open_url 行为、回传值在 callback 行为
@@ -1926,7 +1926,7 @@ async function run(): Promise<void> {
     return (
       withId.length === 2 &&
       withId[0]!.url === base.url &&
-      withId[0]!.text?.content === '🔍 人工审查' &&
+      withId[0]!.text?.content === '📋 查看任务' &&
       withId[1]!.value?.hta_review === 'att-1' &&
       withId[1]!.value?.title === '测试任务' &&
       withId[1]!.text?.content === '🤖 AI 审查' &&
@@ -2203,11 +2203,11 @@ async function run(): Promise<void> {
         const res = await fetch(`${server.baseUrl}${bad}`);
         assert.equal(res.status, 404, bad);
       }
-      // 404 页出路：通用指引回飞书重新发指令；仅 AI 审查报告（review- 前缀）追加卡片按钮入口
+      // 404 页出路：通用指引回飞书重新发指令；仅 AI 审查报告（review- 前缀）追加回复短语入口
       const nf = await (await fetch(`${server.baseUrl}/nope.html`)).text();
-      assert.ok(nf.includes('请回到飞书重新发送指令') && !nf.includes('重新点击'), nf);
+      assert.ok(nf.includes('请回到飞书重新发送指令') && !nf.includes('重新审查这个任务'), nf);
       const nfReview = await (await fetch(`${server.baseUrl}/review-nope.html`)).text();
-      assert.ok(nfReview.includes('重新点击卡片上的「AI 审查」'), nfReview);
+      assert.ok(nfReview.includes('回复「重新审查这个任务」重新生成'), nfReview);
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3307,6 +3307,8 @@ async function run(): Promise<void> {
       assert.ok(unauth.includes(`lark-cli：${LARK_CLI_AUTH_HINT}`));
       assert.ok(unauth.includes('看板连接：MCP 不可用')); // mcpOk=false 时原样展示通道文案
       assert.ok(unauth.includes('备用通道：可用')); // hk.mjs 零外部依赖，备用通道始终可用
+      // 看板不可达（127.0.0.1:1）：裸状态须补可操作的复查出路
+      assert.ok(unauth.includes('看板：不可达，请确认看板服务已启动、地址正确，稍后可 /status 复查'));
       const missing = (await buildStatusLines({ ...opts, larkOk: false }, plainPaint)).join('\n');
       assert.ok(missing.includes('lark-cli：未安装'));
       // 已授权：shebang 直指 node 的假 lark-cli 输出 available=true（探测走 minimalChildEnv，NODE_OPTIONS 注入不可达）
@@ -4107,6 +4109,22 @@ async function run(): Promise<void> {
     );
   })());
 
+  check('llmFailureParts：超限/限流类 CLI 尾注不附 /config（改配置解决不了），401/未知错误保留', (() => {
+    const overflow = llmFailureParts('maximum context length exceeded', '短消息', 'cli');
+    const rate = llmFailureParts('429 Too Many Requests', '短消息', 'cli');
+    const quota = llmFailureParts('insufficient quota', '短消息', 'cli');
+    const unknown = llmFailureParts('llm exploded: kaboom', '短消息', 'cli');
+    return (
+      overflow.friendly !== null &&
+      rate.friendly !== null &&
+      !overflow.tail.includes('/config') &&
+      !rate.tail.includes('/config') &&
+      !quota.tail.includes('/config') &&
+      overflow.tail.includes('可修改后重发') &&
+      unknown.tail.includes('/config') // 未命中 friendly 时保留通用出路
+    );
+  })());
+
   check('llmFailureParts：未命中已知模式时兜底按通道分岔（bot 指向部署者不提 HTA_DEBUG，CLI 保留 HTA_DEBUG 提示）', (() => {
     const cli = llmFailureParts('llm exploded: kaboom', '短消息', 'cli');
     const bot = llmFailureParts('llm exploded: kaboom', '短消息', 'bot');
@@ -4124,7 +4142,7 @@ async function run(): Promise<void> {
   check('kanbanManualStartHint：命令与说明分行，整行复制命令不混入括注', (() => {
     const spec = kanbanPackageSpec();
     const lines = kanbanManualStartHint({ port: 7964 }).split('\n');
-    const cmd = process.platform === 'win32' ? `set PORT=7964 && npx -y ${spec}` : `PORT=7964 npx -y ${spec}`;
+    const cmd = process.platform === 'win32' ? `set "PORT=7964"&& npx -y ${spec}` : `PORT=7964 npx -y ${spec}`;
     return (
       lines.includes(cmd) &&
       !cmd.includes('（') &&

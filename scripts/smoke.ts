@@ -277,7 +277,7 @@ async function main(): Promise<void> {
   );
   check('「确认执行」仍可批准', cm.resolveFromText('u1', '确认执行') === 'approved' && (await prC) === 'once');
 
-  // 「同类免问」仅对可批量操作生效；无 batchKey 时按非应答忽略；旧词「都允许」保持兼容
+  // 「同类免问」仅对可批量操作生效；无 batchKey 时如实区分 batch_unsupported（bot 据此提示不支持免问）；旧词「都允许」保持兼容
   const prBatch = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' });
   check(
     '文本「同类免问」= 批量免问',
@@ -289,7 +289,7 @@ async function main(): Promise<void> {
     cm.resolveFromText('u1', '都允许') === 'approved_batch' && (await prBatchCompat) === 'batch',
   );
   const prNoKey = cm.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
-  check('无 batchKey 时「同类免问」不生效', cm.resolveFromText('u1', '同类免问') === 'ignored');
+  check('无 batchKey 时「同类免问」不生效', cm.resolveFromText('u1', '同类免问') === 'batch_unsupported');
   cm.resolveFromText('u1', '取消');
   await prNoKey;
 

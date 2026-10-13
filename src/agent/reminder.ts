@@ -88,7 +88,8 @@ function parseAbsoluteAt(raw: string, now: Date): number {
   // 「今天/明天/后天/今晚/明晚 HH:mm」与裸「HH:mm」（全角冒号兼容；也接受「9 点」「9 点 5 分」「9 点半」口语形态；
   // 可带「早上/凌晨/上午/中午/下午/晚上」修饰，下午/晚上且小时 <12 自动 +12；带修饰时小时须 ≤12——
   // 「晚上 13 点」「上午 15 点」这类与 24 小时制混用的矛盾输入直接拒绝，让模型/用户重述；
-  // 边界：「中午 1-6 点」按 13-18 点、「凌晨 12 点」按当天 0 点、「晚上 12 点」按次日 0 点（口语指当天结束的半夜）处理）
+  // 边界：「中午 1-6 点」按 13-18 点、「凌晨/上午/早上 12 点」按 0 点（12 小时制 AM 12）、
+  // 「晚上 12 点」按次日 0 点（口语指当天结束的半夜）处理）
   const cn =
     /^(今天|明天|后天|今晚|明晚)?\s*(?:(早上|凌晨|上午|中午|下午|晚上)\s*)?(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|(半))?)$/u.exec(
       s,
@@ -110,6 +111,7 @@ function parseAbsoluteAt(raw: string, now: Date): number {
       hour = 0;
       extraDay = 1;
     } else if (modifier === '凌晨' && hour === 12) hour = 0;
+    else if ((modifier === '上午' || modifier === '早上') && hour === 12) hour = 0;
     else if (modifier === '中午' && hour >= 1 && hour <= 6) hour += 12;
     if (hour > 23 || minute > 59) throw new Error(`时间「${raw}」非法：小时须 0-23、分钟须 0-59`);
     const dayOffset = (cn[1] === '明天' || cn[1] === '明晚' ? 1 : cn[1] === '后天' ? 2 : 0) + extraDay;
@@ -210,8 +212,14 @@ export function buildReminderText(r: Reminder): string {
   return [
     '⏰ 提醒时间到',
     r.text,
-    `（设定于 ${formatLocal(r.createdAt)}，定于 ${formatLocal(r.triggerAt)} 触发）`,
+    `（设定于 ${formatLocal(r.createdAt)}，定于 ${formatLocal(r.triggerAt)} 触发，时间均按部署机器时区）`,
   ].join('\n');
+}
+
+/** 提醒正文长度统一截断（存储与确认展示同一口径：闸上所见即最终所存）。 */
+export function truncateReminderText(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > MAX_TEXT_LEN ? `${trimmed.slice(0, MAX_TEXT_LEN)}…（已截断）` : trimmed;
 }
 
 export class ReminderStore {
@@ -292,7 +300,7 @@ export class ReminderStore {
 
   /** 创建提醒：活跃上限校验 + 落盘；写盘失败抛错（不谎报「已设置」）。 */
   add(userId: string, text: string, triggerAt: number): Reminder {
-    const trimmed = text.trim();
+    const trimmed = truncateReminderText(text);
     if (!trimmed) throw new Error('提醒内容不能为空');
     const pending = this.list(userId);
     if (pending.length >= MAX_ACTIVE_PER_USER) {
@@ -300,7 +308,7 @@ export class ReminderStore {
     }
     const reminder: Reminder = {
       id: newId(),
-      text: trimmed.length > MAX_TEXT_LEN ? `${trimmed.slice(0, MAX_TEXT_LEN)}…（已截断）` : trimmed,
+      text: trimmed,
       triggerAt,
       createdAt: Date.now(),
       status: 'pending',
@@ -308,7 +316,7 @@ export class ReminderStore {
     const ok = this.mutate((file) => {
       (file.users[userId] || (file.users[userId] = [])).push(reminder);
     });
-    if (!ok) throw new Error('提醒保存失败，本次设置重启后会丢失，请再试一次');
+    if (!ok) throw new Error('提醒保存失败，本次设置未保存成功，请再试一次');
     return { ...reminder };
   }
 
@@ -323,7 +331,7 @@ export class ReminderStore {
         r.cancelledAt = Date.now();
       }
     });
-    if (!ok) throw new Error('提醒保存失败，本次取消重启后会丢失，请再试一次');
+    if (!ok) throw new Error('提醒保存失败，本次取消未保存成功，请再试一次');
     return target;
   }
 

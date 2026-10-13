@@ -279,6 +279,7 @@ Commands:
   repos [project_id]
   branches <repo_id> [--query TEXT]
   tasks list [project_id] [--status S] [--priority P] [--type T] [--iteration CODE] [--query TEXT] [--limit N]
+                               # --limit default 50; output is { total, showing, tasks }
   tasks get <task_id>
   tasks create [project_id] <title> [--desc TEXT] [--iteration CODE] [--priority P] [--type T]
   tasks update <task_id> [--title T] [--status S] [--desc T] [--iteration CODE] [--priority P] [--type T]
@@ -329,6 +330,12 @@ async function cmdHealth() {
     json = JSON.parse(text);
   } catch {
     fail('error: invalid JSON in /api/health response');
+  }
+  if (res.status >= 400) {
+    fail(`HTTP ${res.status}: ${extractMessage(json) || 'request failed'}`);
+  }
+  if (!json || json.success !== true) {
+    fail(`API error: ${extractMessage(json) || 'unknown error'}`);
   }
   print(json);
 }
@@ -505,7 +512,8 @@ async function cmdTasksList(args) {
     const re = new RegExp(query, 'i');
     rows = rows.filter((t) => re.test(`${t.title} ${jqAlt(t.description, '')}`));
   }
-  print(rows.slice(0, Number(limit)));
+  const showing = Math.min(rows.length, Number(limit));
+  print({ total: rows.length, showing, tasks: rows.slice(0, showing) });
 }
 
 async function cmdTasksGet(args) {

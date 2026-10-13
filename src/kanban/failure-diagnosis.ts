@@ -214,7 +214,7 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
       // 404 是确定性终态：出路不含「重试」，用「重新发起」命中 review-jobs 抑制词以免被追加必败的重试后缀
       throw new Error('该任务在看板上已不存在（可能已被清理），请到看板确认任务状态，必要时重新发起任务。');
     }
-    throw new Error(`获取该任务的失败信息失败：${collectFailureMessage(err)}，请稍后重试。`);
+    throw new Error(`无法获取该任务的失败信息：${collectFailureMessage(err)}，请稍后重试。`);
   }
   const title = ctx.title || opts.title || '';
   const prompt = buildDiagnosisPrompt(ctx, title);

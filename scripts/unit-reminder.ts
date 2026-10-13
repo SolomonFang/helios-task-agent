@@ -1,7 +1,7 @@
 /**
  * 定时提醒（src/agent/reminder.ts + tools/reminder-tools.ts）单测：
  * - 时间解析：相对分钟数 / HH:mm（已过顺延次日）/ 今天·明天·后天 / 口语「9 点·9 点半」/
- *   口语修饰符边界（「晚上 12 点」按次日 0 点、「凌晨 12 点」按 0 点、「中午 1 点」按 13 点）/
+ *   口语修饰符边界（「晚上 12 点」按次日 0 点、「凌晨/上午/早上 12 点」按 0 点、「中午 1 点」按 13 点）/
  *   YYYY-MM-DD HH:mm / 带时区标准串；非法输入、过去时间、超 30 天期限、双参数互斥一律拒绝
  * - 存储：按用户分桶隔离、活跃上限 20 条、内容截断、落盘重载、按序号/id 取消
  * - 到点判定边界：triggerAt == now 到期、未来不到期、已取消/已投递不再到期、退避窗口内不投递
@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     assert.equal(parseTriggerAt({ at: '明天 21 点 5 分' }, NOW), new Date(2026, 8, 5, 21, 5).getTime());
   });
 
-  await checkAsync('parseTriggerAt：口语修饰符边界——「晚上 12 点」按次日 0 点、「凌晨 12 点」按 0 点、「中午 1 点」按 13 点', () => {
+  await checkAsync('parseTriggerAt：口语修饰符边界——「晚上 12 点」按次日 0 点、「凌晨/上午/早上 12 点」按 0 点、「中午 1 点」按 13 点', () => {
     assert.equal(parseTriggerAt({ at: '今晚 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime()); // 当天结束的半夜
     assert.equal(parseTriggerAt({ at: '晚上 12:00' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
     assert.equal(parseTriggerAt({ at: '明晚 12 点' }, NOW), new Date(2026, 8, 6, 0, 0).getTime());
@@ -107,6 +107,8 @@ async function main(): Promise<void> {
     assert.equal(parseTriggerAt({ at: '中午 1 点' }, NOW), new Date(2026, 8, 4, 13, 0).getTime());
     assert.equal(parseTriggerAt({ at: '凌晨 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime()); // 当天 0 点已过，顺延次日
     assert.equal(parseTriggerAt({ at: '明天凌晨 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
+    assert.equal(parseTriggerAt({ at: '上午 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime()); // 12 小时制 AM 12 = 0 点，不静默当中午
+    assert.equal(parseTriggerAt({ at: '明天早上 12 点' }, NOW), new Date(2026, 8, 5, 0, 0).getTime());
   });
 
   await checkAsync('parseTriggerAt：时段修饰与 24 小时制混用（「晚上 13 点」「上午 15 点」）拒绝', () => {

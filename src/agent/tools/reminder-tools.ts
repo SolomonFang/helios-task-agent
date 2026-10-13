@@ -3,6 +3,7 @@ import {
   formatLocal,
   parseTriggerAt,
   remainingText,
+  truncateReminderText,
   type ReminderStore,
 } from '../reminder';
 import { passGate, type ConfirmFn } from '../guard';
@@ -32,7 +33,8 @@ export function makeReminderHandlers({
   auditHome?: string;
 }): Array<[string, ToolHandler]> {
   const reminderSet: ToolHandler = async (raw, ctx) => {
-    const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+    // 先按存储口径截断再构造 summary/detail 过闸：确认页展示的就是最终落盘内容（所见即所得）
+    const text = truncateReminderText(typeof raw.text === 'string' ? raw.text : '');
     if (!text) return '参数错误：text 不能为空';
     const at = typeof raw.at === 'string' ? raw.at : undefined;
     const inMinutes = typeof raw.in_minutes === 'number' ? raw.in_minutes : undefined;
@@ -83,7 +85,7 @@ export function makeReminderHandlers({
         序号: i + 1,
         id: r.id,
         text: r.text,
-        triggerAt: formatLocal(r.triggerAt),
+        triggerAt: `${formatLocal(r.triggerAt)}（按部署机器时区）`,
         remaining: remainingText(r.triggerAt, nowMs, r.failCount),
       })),
     });

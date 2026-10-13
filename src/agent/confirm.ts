@@ -16,8 +16,8 @@ import { errMessage } from '../infra/err';
  * 终态（按钮消失），避免"点了没反应"与过期卡片误点。
  */
 
-/** 'approved' = 仅此次；'approved_batch' = 同类免问；'denied'；'ignored' = 无 pending 或非应答。 */
-export type ConfirmAnswer = 'approved' | 'approved_batch' | 'denied' | 'ignored';
+/** 'approved' = 仅此次；'approved_batch' = 同类免问；'denied'；'batch_unsupported' = 该确认不支持免问；'ignored' = 无 pending 或非应答。 */
+export type ConfirmAnswer = 'approved' | 'approved_batch' | 'denied' | 'batch_unsupported' | 'ignored';
 
 /**
  * 卡片按钮回调的裁决结果：answer 同 ConfirmAnswer 语义；
@@ -267,7 +267,9 @@ export class ConfirmationManager {
     // 别的对话，不能据此放行写操作；完整词（yes/no/确认/取消…）与中文单字（词表内的「否」）不受影响。
     // CLI 交互式确认仍保留单字母（终端无误触风险），那边直接用 CONFIRM_YES_RE/CONFIRM_NO_RE。
     if (/^[a-z]$/i.test(t)) return 'ignored';
-    if (CONFIRM_BATCH_RE.test(t) && p.req.batchKey) {
+    if (CONFIRM_BATCH_RE.test(t)) {
+      // 该确认不提供免问（无 batchKey）：如实区分，让 bot 层提示「每次都需要确认」而非笼统按非应答忽略
+      if (!p.req.batchKey) return 'batch_unsupported';
       this.finish(openId, p, 'batch');
       return 'approved_batch';
     }

@@ -178,8 +178,8 @@ async function main(): Promise<void> {
       });
       const out = await handlers.get('kanban_start_workspace')!({ repos: [{ repo_id: 'r1' }] });
       assert.ok(!out.includes('无法启动'), out);
-      // 确认卡片必须展示 prepare 补全后的参数，而不是调用前的旧值
-      assert.ok(confirmDetail.includes('"base_branch":"dev-main"'), `确认卡片缺 base_branch: ${confirmDetail}`);
+      // 确认卡片必须展示 prepare 补全后的参数（结构化中文展示：仓库 r1（分支：dev-main）），而不是调用前的旧值
+      assert.ok(confirmDetail.includes('分支：dev-main'), `确认卡片缺 base_branch: ${confirmDetail}`);
       assert.ok(receivedArgs.includes('"base_branch":"dev-main"'), `MCP 实参缺 base_branch: ${receivedArgs}`);
     } finally {
       server.closeAllConnections?.();

@@ -86,7 +86,7 @@ export function run(
         if (error?.bufferExceeded) {
           logExecFailure(command, args, error, stderr || '');
           resolve(
-            `命令执行失败：${error.bufferExceeded === 'stderr' ? '错误输出' : '输出'}过大（超过 4MB 上限），已截断中止。` +
+            `命令执行失败：${error.bufferExceeded === 'stderr' ? '错误输出' : '输出'}过大（超过大小上限，约 400 万字符），已截断中止。` +
               '请缩小输出范围后重试（如加强过滤条件、分页查询）。',
           );
           return;

@@ -226,7 +226,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HTA_WEEKLY_BRIEF` | 定时周报（仅 bot）：本地时间 `HH:MM`（如 `18:00`）每周向白名单用户（owner）推送本周迭代进展（迭代全量计数 + 本周完成/待审阅积压/失败分组；「本周完成」按任务最后更新时间落在本周统计）。未设置或非法值 = 关闭 |
 | `HTA_WEEKLY_BRIEF_DAY` | 定时周报的推送星期：`1`-`7`（1=周一…7=周日），默认 `5`（周五）；非法值启动时告警并按默认处理 |
 | `HTA_TURN_TIMEOUT_MIN` | 单轮对话的墙钟时间上限（分钟），默认 30；超时按「已中止」收尾并提示 |
-| `HTA_DEBUG` | `1` 时输出 kanban 子进程 / MCP 调试日志 |
+| `HTA_DEBUG` | `1` 时输出看板连接及各链路报错的原始调试信息（含英文原文，仅供排查） |
 
 加载顺序：项目 `.env` → 当前目录 `.env` → 用户目录 `.env`（后者覆盖；用户目录是向导写入目标），`HELIOS_TASK_AGENT_ENV` 最高。见 [.env.example](.env.example)。注意：**当前目录 `.env` 中的凭证/命令类高危键不参与覆盖**（`LLM_API_KEY`、`FEISHU_*`、`HELIOS_KANBAN_MCP_COMMAND/ARGS`、`HELIOS_KANBAN_PACKAGE`、`HELIOS_KANBAN_URL`、代理与 npm registry 等，防供应链/命令注入；被忽略时仅输出一行 `console.warn`）——这类键请写入 `~/.helios-task-agent/.env`（或 shell 环境 / 项目 `.env`）。
 
@@ -234,7 +234,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 
 1. 创建企业自建应用 → 启用机器人  
 2. 事件订阅 → **长连接** → `im.message.receive_v1`  
-3. （可选）回调订阅 → **长连接** → `card.action.trigger`（确认卡片按钮）；不配则纯文本确认，功能不变  
+3. （可选）回调订阅 → **长连接** → `card.action.trigger`（卡片按钮）；不配则确认走纯文本回复，但卡片上的「⏹ 停止」「AI 审查」「AI 诊断」等按钮不可用  
 4. 权限：读单聊消息、以应用身份发消息、添加消息表情回复（敲键盘回执，缺失时自动降级为文字占位）、**CardKit 卡片实体读写**（`cardkit:card`，进度卡片流式打字机动画用；未开通时自动降级为普通卡片更新，功能不变、无动画）→ 发布  
 5. 复制 App ID / App Secret  
 

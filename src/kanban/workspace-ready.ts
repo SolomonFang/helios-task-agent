@@ -56,7 +56,7 @@ export function formatMissingBaseBranchError(
         return `- ${name ? `${name}（ID：${id}）` : `仓库 ID：${id}`}`;
       })
       .join('\n') +
-    `\n请在看板的仓库设置里填写默认目标分支（如 develop），或在创建任务时直接告诉我使用哪个分支。` +
+    `\n请在看板的仓库设置里填写默认目标分支，或直接告诉我使用哪个分支（如 develop）。` +
     `\n（若不指定，看板会回退到 main 分支；仓库没有 main 时会创建出空工作区，看板详情页会一直转圈加载。）`
   );
 }

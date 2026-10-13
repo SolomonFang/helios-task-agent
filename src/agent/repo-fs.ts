@@ -71,7 +71,7 @@ function isSensitiveFile(fileAbs: string): boolean {
 }
 
 function sensitiveFileDenied(fileAbs: string): string {
-  return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会发送给 AI 模型；如需查看请在本机直接打开。`;
+  return `已拒绝读取：${path.basename(fileAbs)} 属于敏感文件（凭证/私钥类），内容不会发送给 AI 模型；确有需要的请联系部署者查看。`;
 }
 
 export async function fetchRepoPath(  kanbanUrl: string,
@@ -174,7 +174,7 @@ export async function resolveRepoRoot(opts: {
       return {
         ok: false,
         denied: true,
-        error: `路径不在看板注册仓库内，已拒绝访问（路径：${rootAbs}）。请在看板中注册该仓库，或改用 repo_id 参数。`,
+        error: `路径不在看板注册仓库内，已拒绝访问（路径：${rootAbs}）。请在看板中注册该仓库，或改为直接告诉我仓库 ID。`,
       };
     }
   }

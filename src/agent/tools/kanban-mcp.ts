@@ -21,9 +21,52 @@ const TASK_TYPE_LABELS: Record<string, string> = {
   chore: '杂务',
 };
 
-/** 闸门卡片 detail：create 类结构化展示（标题/项目/描述预览），其余保持命令行原文。 */
+/** 高频参数键的中文展示名（确认卡片面向用户，不落蛇形内部名；未收录的键原样展示）。 */
+const ARG_KEY_LABELS: Record<string, string> = {
+  task_id: '任务 ID',
+  taskId: '任务 ID',
+  workspace_id: '工作区 ID',
+  approval_id: '审批 ID',
+  project_id: '项目 ID',
+  projectId: '项目 ID',
+  title: '标题',
+  description: '描述',
+  priority: '优先级',
+  task_type: '类型',
+  status: '状态',
+  message: '消息内容',
+  reason: '原因',
+  repos: '仓库',
+};
+
+/** 单个参数值的中文展示：枚举映射中文，repos 数组展开为「仓库 ID（分支：…）」。 */
+function formatMcpArgValue(key: string, value: unknown): string {
+  if (key === 'priority' && typeof value === 'string') return PRIORITY_LABELS[value] ?? value;
+  if (key === 'task_type' && typeof value === 'string') return TASK_TYPE_LABELS[value] ?? value;
+  if (key === 'repos' && Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (!item || typeof item !== 'object') return String(item);
+        const row = item as Record<string, unknown>;
+        const branch = typeof row.base_branch === 'string' ? `（分支：${row.base_branch}）` : '';
+        return `${String(row.repo_id ?? '?')}${branch}`;
+      })
+      .join('、');
+  }
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+/** 闸门卡片 detail：结构化中文展示（操作名 + 逐参数中文键），不落蛇形工具名与 JSON 伪调用串。 */
 function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
-  if (!/create/i.test(toolName)) return summarizeBothEnds(`kanban_${toolName}(${JSON.stringify(args)})`);
+  if (!/create/i.test(toolName)) {
+    const lines = [`操作：${summarizeMcp(toolName, args)}`];
+    for (const [key, value] of Object.entries(args)) {
+      if (value === undefined || value === null || value === '') continue;
+      const label = ARG_KEY_LABELS[key] ?? key;
+      lines.push(`${label}：${summarizeBothEnds(formatMcpArgValue(key, value), 200, 100)}`);
+    }
+    return lines.join('\n');
+  }
   const title = typeof args.title === 'string' ? args.title : '';
   // create_project 的名称在 args.name（无 title 字段）
   const name = typeof args.name === 'string' ? args.name : '';

@@ -539,16 +539,21 @@ async function main(): Promise<void> {
   });
 
   // ---------- buildDiagnosisCard：重试按钮与终态 ----------
-  check('buildDiagnosisCard：带「↻ 按诊断结论重试」按钮；settledAt 后为无按钮终态', (() => {
+  check('buildDiagnosisCard：带「↻ 按诊断结论重试」按钮；settledAt 后为终态（有 url 时补「查看任务」入口）', (() => {
     const card = buildDiagnosisCard('任务X', '一、…', 'task-1');
     const vals = buttonValues(card);
     if (vals.length !== 1 || vals[0]!.hta_retry !== 'task-1' || vals[0]!.title !== '任务X') return false;
     const header = (card.header as { title: { content: string } }).title.content;
     if (!header.includes('AI 失败诊断')) return false;
     const settled = buildDiagnosisCard('任务X', '一、…', 'task-1', { settledAt: '2026-09-04 10:00:00' });
-    if (buttonValues(settled).length !== 0) return false; // 终态无按钮
+    if (buttonValues(settled).length !== 0) return false; // 无 url 时终态无按钮
     const settledHeader = (settled.header as { title: { content: string } }).title.content;
-    return settledHeader.includes('已按诊断结论重试');
+    if (!settledHeader.includes('已按诊断结论重试')) return false;
+    // 有 url 的终态：补「📋 查看任务」跳转按钮（注脚所指看板有真实入口），回传按钮仍消失
+    const settledUrl = buildDiagnosisCard('任务X', '一、…', 'task-1', { settledAt: '2026-09-04 10:00:00', url: 'http://kb.local/t/1' });
+    const flat = JSON.stringify(settledUrl);
+    if (!flat.includes('📋 查看任务') || !flat.includes('http://kb.local/t/1')) return false;
+    return buttonValues(settledUrl).length === 0; // 跳转按钮是 open_url 行为，无回传值
   })());
 
   check('buildWatchEventCard：失败卡片带「🔍 AI 诊断」按钮（hta_diagnose + attempt + url）', (() => {
@@ -609,7 +614,10 @@ async function main(): Promise<void> {
       clickDiagnose();
       await waitFor(() => channel.cards.length === 1, '诊断结果卡片');
       assert.equal(diagnosisCalls.length, 1);
-      assert.ok(channel.notifies.some((n) => n.text.includes('AI 诊断已开始')), '应有开始通知');
+      assert.ok(
+        !channel.notifies.some((n) => n.text.includes('AI 诊断已开始')),
+        '开始反馈由 toast + 进行中卡片承担，不再重复发文本通知',
+      );
       const diagCard = channel.cards[0]!.card;
       const retryBtn = buttonValues(diagCard).find((v) => v.hta_retry === 'task-1');
       assert.ok(retryBtn, '诊断卡片应带「按诊断结论重试」按钮');
@@ -773,7 +781,7 @@ async function main(): Promise<void> {
       (err: unknown) => {
         const m = err instanceof Error ? err.message : String(err);
         return (
-          m.startsWith('获取该任务的失败信息失败') &&
+          m.startsWith('无法获取该任务的失败信息') &&
           m.includes('看板不可达') &&
           !m.includes('fetch failed') &&
           !/（[^（）]*（/.test(m)

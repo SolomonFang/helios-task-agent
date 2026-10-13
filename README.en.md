@@ -221,7 +221,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HTA_WEEKLY_BRIEF` | Weekly brief (bot only): local `HH:MM` (e.g. `18:00`) — pushes the week's iteration progress (iteration-wide counts + done-this-week / in-review backlog / failed sections; "done this week" is counted by each task's last-updated time falling within the current week) to the allowlisted users (owner) once a week. Unset or invalid = off |
 | `HTA_WEEKLY_BRIEF_DAY` | Weekday for the weekly brief: `1`-`7` (1=Mon … 7=Sun), default `5` (Fri); invalid values warn at startup and fall back to the default |
 | `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
-| `HTA_DEBUG` | `1` = kanban/MCP debug logs |
+| `HTA_DEBUG` | `1` = raw debug output for kanban connectivity and pipeline errors (includes original English error text; troubleshooting only) |
 
 Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV` highest. See [.env.example](.env.example). Note: **credential/command-type high-risk keys in the cwd `.env` are ignored** (`LLM_API_KEY`, `FEISHU_*`, `HELIOS_KANBAN_MCP_COMMAND/ARGS`, `HELIOS_KANBAN_PACKAGE`, `HELIOS_KANBAN_URL`, proxy and npm registry keys, etc. — a supply-chain/command-injection guard; ignored keys only produce a one-line `console.warn`). Put such keys in `~/.helios-task-agent/.env` (or the shell environment / project `.env`).
 
@@ -229,7 +229,7 @@ Load order: project → cwd → home `.env` (later wins); `HELIOS_TASK_AGENT_ENV
 
 1. Company app → enable Bot  
 2. Events → **long connection** → `im.message.receive_v1`  
-3. (Optional) Callbacks → **long connection** → `card.action.trigger`  
+3. (Optional) Callbacks → **long connection** → `card.action.trigger` (card buttons); without it, write confirmations fall back to plain-text replies, but card buttons such as 「⏹ 停止」, "AI 审查" and "AI 诊断" stop responding  
 4. Permissions: read DMs, send as app, add message reactions (typing ack; falls back to a text placeholder without it), **CardKit card entity read/write** (`cardkit:card`, for the streaming typewriter animation of the progress card; without it the bot falls back to plain card updates — same features, no animation) → publish  
 5. Copy App ID / Secret  
 

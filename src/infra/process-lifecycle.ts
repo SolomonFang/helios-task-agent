@@ -72,10 +72,12 @@ export function installCrashGuards(shutdown: (exitCode?: number) => Promise<void
 /**
  * 向导内 Esc/Ctrl+C 取消（reject '已取消'）是中性操作：灰字提示并返回 true，不打成红色「配置失败」；
  * 退出码与收尾（关 readline / 是否退出进程）由调用方决定（CLI /config 不退出进程，启动向导以 0 退出）。
+ * opts.alreadySaved：取消前已有阶段落盘（bot 首次向导的模型配置在飞书阶段前已保存）——
+ * 此时「配置未变更」与磁盘事实相反，如实告知已保存部分不受影响、重跑可从剩余步骤继续。
  */
-export function handleWizardCancel(err: unknown): boolean {
+export function handleWizardCancel(err: unknown, opts: { alreadySaved?: boolean } = {}): boolean {
   if (errMessage(err) !== '已取消') return false;
-  console.log(c.gray('已取消，配置未变更'));
+  console.log(c.gray(opts.alreadySaved ? '已取消；此前已保存的配置不受影响，重新运行可从剩余步骤继续' : '已取消，配置未变更'));
   return true;
 }
 

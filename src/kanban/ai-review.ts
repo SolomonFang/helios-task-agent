@@ -143,7 +143,7 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
     console.error(`[ai-review] 无法定位代码目录，已尝试：\n${candidates.map((d) => `- ${d}`).join('\n')}`);
   }
   throw new Error(
-    '无法定位该任务的代码目录（工作区可能已清理，或原始仓库不可达）。请用「人工审查」打开看板 diff 查看变更。',
+    '无法定位该任务的代码目录（工作区可能已清理，或原始仓库不可达）。请点上方卡片上的「查看任务」打开看板改动详情人工查看。',
   );
 }
 

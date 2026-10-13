@@ -75,6 +75,8 @@ export interface ReviewJobs {
   tryStartRetry: (openId: string, taskId: string, title: string) => TryStartResult<'launching' | 'launched' | 'no-diagnosis'>;
   /** 文本「重试这个任务」确定性分支定位用：该用户最近一次诊断完成的任务（无记录为 undefined）。 */
   lastDiagnosis: (openId: string) => { taskId: string; title: string } | undefined;
+  /** 文本「重新审查这个任务」确定性分支定位用：该用户最近一次发起的 AI 审查（无记录为 undefined）。 */
+  lastReview: (openId: string) => { attemptId: string; title: string } | undefined;
   /** /stop：中断该用户进行中的 AI 审查/诊断，返回各自中断数（逐条收尾通知由作业自身发出）。 */
   abortForUser: (openId: string) => { reviews: number; diagnoses: number };
 }
@@ -100,14 +102,16 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
   const retryLaunching = new Set<string>();
   /** 每用户最近一次诊断完成的任务（文本「重试这个任务」确定性分支用；卡片按钮自带 taskId 不经过这里）。 */
   const lastDiagnosisByUser = new Map<string, { taskId: string; title: string }>();
+  /** 每用户最近一次发起的 AI 审查（文本「重新审查这个任务」确定性分支用；卡片按钮自带 attemptId 不经过这里）。 */
+  const lastReviewByUser = new Map<string, { attemptId: string; title: string }>();
   /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
   let aiReviewLlmNoticed = false;
 
   /** AI 审查的异步段（执行/投递/注入会话）；受理判定与去重落键在 tryStartAiReview 同步完成。 */
   const runAiReviewJob = async (openId: string, attemptId: string, title: string, ctl: AbortController): Promise<void> => {
     try {
-      // 首次触发时告知：AI 审查由第三方工具执行，会用到模型 API key（只提示一次，不刷屏）
-      // （仅在实际会派生主 key 时提示；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
+      // 开始反馈已由卡片回调的 toast + 「进行中」卡片承担，这里不再重复发文本通知（三重同义刷屏）；
+      // 仅首次触发且会派生主 key 时补发安全提示（每进程一次；用户已自配 OCR_LLM_URL / OCR 配置文件则不打扰）
       let llmNotice = '';
       if (!aiReviewLlmNoticed && ocrWillDeriveBotLlm()) {
         aiReviewLlmNoticed = true;
@@ -115,10 +119,12 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
           '\n⚠️ 安全提示：AI 审查由第三方工具执行，会使用你的模型 API key。' +
           '如需隔离，可以为它单独配置一个专用 key（在配置文件中设置 OCR_LLM_TOKEN，详见 README）。';
       }
-      await channel.notifyOpenId(
-        openId,
-        `🤖 AI 审查已开始：《${title}》\n正在调用代码审查工具（open-code-review）分析改动，完成后推送结果（首次使用需自动下载，耗时稍长）。${llmNotice}`,
-      );
+      if (llmNotice) {
+        await channel.notifyOpenId(
+          openId,
+          `🤖 AI 审查已开始：《${title}》\n正在调用代码审查工具（open-code-review）分析改动，完成后推送结果（首次使用需自动下载，耗时稍长）。${llmNotice}`,
+        );
+      }
       // /stop 可中断：竞速胜出后立即向用户收尾返回；signal 同时透传给 runAiReview，
       // 底层 ocr 子进程随 abort 被 execFile 立即 kill，不必等自身 15 分钟超时。
       // （Promise.race 已给 runAiReview 挂上反应，其后续 settle 不会成未处理 rejection。）
@@ -180,11 +186,11 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       if (ctl.signal.aborted) {
         await safeNotify(channel, openId, `⏹ AI 审查已中断：《${title}》`);
       } else {
-        // 失败原因截断防超长推送；底层文案自带真实出路（重新发起/人工审查）时不重复追加后缀。
+        // 失败原因截断防超长推送；底层文案自带真实出路（重新发起/人工查看指引）时不重复追加后缀。
         // 注意「重试」不算自带出路：底层文案里的重试指引若指向卡片按钮，按钮已随
         // 「进行中」卡片换掉，是必败指引——必须补上文本回复类出路，不能让它成为唯一出路
         const message = errMessage(err).slice(0, 200);
-        const hasOwnWayOut = ['重新发起', '人工审查'].some((w) => message.includes(w));
+        const hasOwnWayOut = ['重新发起', '查看任务'].some((w) => message.includes(w));
         const retryHint = hasOwnWayOut ? '' : '\n可回复「重新审查这个任务」再试一次。';
         await safeNotify(channel, openId, `⚠️ AI 审查失败：《${title}》\n${message}${retryHint}`);
       }
@@ -198,6 +204,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
    * accepted 时同步落去重键、void 启动异步段（回调方据此才敢同步换「进行中」卡片）。
    */
   const tryStartAiReview = (openId: string, attemptId: string, title: string): TryStartResult<'running' | 'over-limit'> => {
+    title = title.trim() || '未命名任务';
     if (aiReviewRunning.has(attemptId)) {
       void safeNotify(channel, openId, `🤖 《${title}》的 AI 审查正在进行中，请稍候…`);
       return { status: 'running', toast: 'AI 审查进行中，请稍候' };
@@ -213,6 +220,9 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     }
     const ctl = new AbortController();
     aiReviewRunning.set(attemptId, { openId, ctl });
+    // 受理成功即记录：文本「重新审查这个任务」确定性分支据此复用本次审查重新发起
+    if (lastReviewByUser.size >= DIAGNOSIS_STATE_MAX_ENTRIES) lastReviewByUser.clear();
+    lastReviewByUser.set(openId, { attemptId, title });
     void runAiReviewJob(openId, attemptId, title, ctl);
     return { status: 'accepted' };
   };
@@ -228,10 +238,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     url?: string,
   ): Promise<void> => {
     try {
-      await channel.notifyOpenId(
-        openId,
-        `🔍 AI 诊断已开始：《${title}》\n正在采集失败信息并调用模型分析（约几分钟内完成），完成后推送诊断结果。`,
-      );
+      // 开始反馈已由卡片回调的 toast + 「进行中」卡片承担，不再重复发文本通知（三重同义刷屏）
       const { text, attemptId: diagnosedAttemptId } = await runDiagnosis({
         kanbanUrl: cfg.kanbanUrl,
         taskId,
@@ -476,6 +483,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     tryStartDiagnosis,
     tryStartRetry,
     lastDiagnosis: (openId) => lastDiagnosisByUser.get(openId),
+    lastReview: (openId) => lastReviewByUser.get(openId),
     abortForUser,
   };
 }

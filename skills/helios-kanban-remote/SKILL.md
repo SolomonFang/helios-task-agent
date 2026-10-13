@@ -201,7 +201,7 @@ Requires only Node >= 20 (zero external dependencies). See `node scripts/hk.mjs 
 
 ## Out of scope（网页版操作）
 
-- 创建 / 合并合并请求（PR）、推送、变基（rebase）、冲突解决
+- 创建或合并「合并请求（PR）」、推送、变基（rebase）、冲突解决
 - 完整改动对比查看 / 在编辑器中打开
 - 与任务无关的独立多仓工作区创建（任务内多仓启动支持，见 Safety rule 5）
 
