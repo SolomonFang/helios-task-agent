@@ -7,7 +7,7 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { createBotHandlers, createRoundNoticeTracker, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers } from '../src/bot/handler';
+import { createBotHandlers, createRoundNoticeTracker, extractKanbanUrl, MAX_IMAGE_BYTES, MAX_USER_MESSAGE_CHARS, type BotHandlerDeps, type BotHandlers, type ConfirmCardBridge } from '../src/bot/handler';
 import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import { ImageTooLargeError } from '../src/channels/feishu';
 import { SessionRouter } from '../src/agent/session-router';
@@ -22,6 +22,7 @@ import { redactSnippet } from '../src/infra/audit';
 import { createProgressKit } from '../src/bot/progress-reporter';
 import {
   RESULT_CARD_MAX_BYTES,
+  buildConfirmCard,
   buildJobProcessingCard,
   buildProgressCard,
   buildProgressTerminalCard,
@@ -40,14 +41,18 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 10000): Pr
 
 // --- fake channel：实现 handler 实际用到的 FeishuChannel 方法子集，记录全部出站消息 ---
 
-/** 卡片拍平为文本（断言用）：header 标题 + 所有 div/note 文本拼接。 */
+/** 卡片拍平为文本（断言用）：header 标题 + body.elements 的文本拼接（2.0：markdown.content / div.text / 按钮文案）。 */
 function cardText(card: Record<string, unknown>): string {
   const parts: string[] = [];
   const header = card.header as { title?: { content?: string } } | undefined;
   if (header?.title?.content) parts.push(header.title.content);
-  for (const el of (card.elements as Array<Record<string, unknown>>) ?? []) {
+  const elements = ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ??
+    (card.elements as Array<Record<string, unknown>>) ??
+    []) as Array<Record<string, unknown>>;
+  for (const el of elements) {
+    if (typeof el.content === 'string') parts.push(el.content); // markdown 组件
     const t = el.text as { content?: string } | undefined;
-    if (t?.content) parts.push(t.content);
+    if (t?.content) parts.push(t.content); // div / button 文案
     for (const n of (el.elements as Array<{ content?: string }>) ?? []) {
       if (n.content) parts.push(n.content);
     }
@@ -55,16 +60,36 @@ function cardText(card: Record<string, unknown>): string {
   return parts.join('\n');
 }
 
-/** 从卡片 JSON 里收集全部按钮的 value（断言 action 协议用）。 */
+/** 从卡片 JSON 里收集全部回调按钮的 value（2.0：按钮平铺 body.elements，value 在 behaviors callback 里）。 */
 function buttonValues(card: Record<string, unknown>): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
-  for (const el of (card.elements as Array<Record<string, unknown>>) ?? []) {
+  const elements = ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ??
+    (card.elements as Array<Record<string, unknown>>) ??
+    []) as Array<Record<string, unknown>>;
+  for (const el of elements) {
+    if (el.tag !== 'button') continue;
+    // 兼容 1.0 直挂 value 与 2.0 behaviors 两种形态（断言范围以外部协议为准）
+    if (el.value && typeof el.value === 'object') out.push(el.value as Record<string, unknown>);
+    for (const b of (el.behaviors as Array<Record<string, unknown>>) ?? []) {
+      if (b.type === 'callback' && b.value && typeof b.value === 'object') out.push(b.value as Record<string, unknown>);
+    }
+  }
+  // 1.0 的 action 容器（如有残留）
+  for (const el of elements) {
     if (el.tag !== 'action') continue;
     for (const a of (el.actions as Array<Record<string, unknown>>) ?? []) {
       if (a.value && typeof a.value === 'object') out.push(a.value as Record<string, unknown>);
     }
   }
   return out;
+}
+
+/** 收集卡片的全部按钮元素（2.0：平铺在 body.elements）。 */
+function buttonsOf(card: Record<string, unknown>): Array<Record<string, unknown>> {
+  const elements = ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ?? []) as Array<
+    Record<string, unknown>
+  >;
+  return elements.filter((el) => el.tag === 'button');
 }
 
 /**
@@ -85,6 +110,11 @@ type ChannelUnderTest = Pick<
   | 'notifyCardOpenId'
   | 'lastEventAt'
   | 'connectionState'
+  | 'createCardEntity'
+  | 'sendCardEntity'
+  | 'updateCardEntity'
+  | 'streamCardElement'
+  | 'setCardStreaming'
 >;
 
 class FakeChannel implements ChannelUnderTest {
@@ -156,6 +186,55 @@ class FakeChannel implements ChannelUnderTest {
     if (gate && cardText(card).includes(gate.match)) await gate.promise;
     if (this.failUpdateIfIncludes && cardText(card).includes(this.failUpdateIfIncludes)) throw new Error('updateCard mock failure');
     this.updatedCards.push({ messageId, card });
+  }
+
+  // --- CardKit fake：实体生命周期全记录；updatedCards/updateCardCalls/门控/失败注入与 updateCard 同口径 ---
+  /** 模拟 CardKit 不可用（createCardEntity 抛错）：占位应降级 message 传输卡片。 */
+  failCardKit = false;
+  /** cardId → messageId（sendCardEntity 建立映射，实体更新回填 updatedCards 用）。 */
+  private entityMessages = new Map<string, string>();
+  /** cardId → hta_main 最新流式文本（streamCardElement 记录）。 */
+  streamUpdates: { cardId: string; elementId: string; content: string; sequence: number }[] = [];
+  /** 流式开关调用记录（收尾应先关流再发终态）。 */
+  streamingSettings: { cardId: string; on: boolean; sequence: number }[] = [];
+  /** 实体整卡更新记录（sequence 单调性断言用）。 */
+  entityUpdates: { cardId: string; card: Record<string, unknown>; sequence: number }[] = [];
+  private entitySeq = 0;
+
+  async createCardEntity(card: Record<string, unknown>): Promise<string> {
+    if (this.sendTextGate) await this.sendTextGate; // 占位发送窗口门控对流式占位同样生效
+    if (this.failCardKit) throw new Error('cardkit mock failure');
+    const cardId = `ent-${++this.entitySeq}`;
+    this.entityUpdates.push({ cardId, card, sequence: 0 });
+    return cardId;
+  }
+  async sendCardEntity(chatId: string, cardId: string): Promise<string | undefined> {
+    if (this.sendTextGate) await this.sendTextGate;
+    const id = `card-${++this.messageSeq}`;
+    this.entityMessages.set(cardId, id);
+    const initial = this.entityUpdates.find((u) => u.cardId === cardId)?.card ?? {};
+    this.sentCards.push({ chatId, id, card: initial });
+    return id;
+  }
+  async updateCardEntity(cardId: string, card: Record<string, unknown>, sequence: number): Promise<void> {
+    this.updateCardCalls++;
+    const gate = this.updateCardGate;
+    if (gate && cardText(card).includes(gate.match)) await gate.promise;
+    if (this.failUpdateIfIncludes && cardText(card).includes(this.failUpdateIfIncludes)) throw new Error('updateCardEntity mock failure');
+    this.entityUpdates.push({ cardId, card, sequence });
+    this.updatedCards.push({ messageId: this.entityMessages.get(cardId) ?? cardId, card });
+  }
+  async streamCardElement(cardId: string, elementId: string, content: string, sequence: number): Promise<void> {
+    if (this.failUpdateIfIncludes && content.includes(this.failUpdateIfIncludes)) throw new Error('streamCardElement mock failure');
+    this.streamUpdates.push({ cardId, elementId, content, sequence });
+    // 同步一份到 updatedCards（拍平文本断言跨传输模式共用）
+    this.updatedCards.push({
+      messageId: this.entityMessages.get(cardId) ?? cardId,
+      card: { schema: '2.0', body: { elements: [{ tag: 'markdown', content }] } },
+    });
+  }
+  async setCardStreaming(cardId: string, on: boolean, sequence: number): Promise<void> {
+    this.streamingSettings.push({ cardId, on, sequence });
   }
   async addReaction(messageId: string, _emojiType: string): Promise<string | undefined> {
     this.addReactionCalls++;
@@ -276,6 +355,8 @@ function setup(
   kanbanUrl = 'http://localhost:1',
   extra: Partial<Pick<BotHandlerDeps, 'reportServer' | 'aiReviewRunner' | 'diagnosisRunner' | 'followUpSender' | 'attemptIdFetcher' | 'progressHeartbeatMs' | 'imageFetcher' | 'roundNotices'>> & {
     visionEnabled?: boolean;
+    /** 合并单卡片模式：模拟 bot-main 的确认合并桥（确认卡片原地画到进度占位卡片上，并随终态释放占用）。 */
+    mergedConfirm?: boolean;
   } = {},
 ): Fixture {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-handler-'));
@@ -295,14 +376,31 @@ function setup(
   const confirmPrompts: Fixture['confirmPrompts'] = [];
   // 与 bot-main 同款：随确认发送记录每用户最近写操作 kind，供免问回执按 kind 细化措辞
   const lastWriteKind = new Map<string, ConfirmRequest['kind']>();
+  // 合并模式：与 bot-main 同款的空实现桥，由 createBotHandlers 填充为真实实现
+  const confirmBridge: ConfirmCardBridge | undefined = extra.mergedConfirm
+    ? { activeCardId: () => undefined, hold: () => {}, release: () => {}, paint: () => Promise.resolve() }
+    : undefined;
   // 短超时：用例失败时挂起的确认定时器不拖住进程
   const confirmations = new ConfirmationManager(
-    async (openId, _chatId, req, id) => {
+    async (openId, _chatId, req, id, timeoutMs) => {
       confirmPrompts.push({ openId, req, id });
       lastWriteKind.set(openId, req.kind);
+      // 合并模式（同 bot-main sendPrompt）：有存活进度卡则原地画确认卡（带停止按钮令牌）并占用
+      const pid = confirmBridge?.activeCardId(openId);
+      if (confirmBridge && pid) {
+        confirmBridge.hold(pid);
+        await confirmBridge.paint(pid, buildConfirmCard(req, id, timeoutMs, { stopToken: pid }));
+        return pid;
+      }
       return undefined;
     },
-    { timeoutMs: 5000 },
+    {
+      timeoutMs: 5000,
+      // 合并模式（同 bot-main onSettled）：确认终态释放卡片占用
+      ...(confirmBridge
+        ? { onSettled: (_o: string, _r: ConfirmRequest, _s: string, mid?: string) => { if (mid) confirmBridge.release(mid); } }
+        : {}),
+    },
   );
   const channel = new FakeChannel();
   // fake MCP：handler/supervisor 实际依赖的最小接口（tools 列表 + 健康探测），同样受类型检查保护；
@@ -331,6 +429,7 @@ function setup(
     ...(extra.progressHeartbeatMs ? { progressHeartbeatMs: extra.progressHeartbeatMs } : {}),
     ...(extra.imageFetcher ? { imageFetcher: extra.imageFetcher } : {}),
     ...(extra.roundNotices ? { roundNotices: extra.roundNotices } : {}),
+    ...(confirmBridge ? { confirmCardBridge: confirmBridge } : {}),
   });
   return { channel, router, confirmations, handlers, tmp, confirmPrompts };
 }
@@ -1327,6 +1426,7 @@ async function main(): Promise<void> {
       const f = setup(llm.baseUrl);
       // 文本降级链是文本占位的路径：关掉卡片占位，聚焦 updateText 分段语义（卡片模式另有专门用例）
       f.channel.failSendCard = true;
+      f.channel.failCardKit = true; // 先关 CardKit 才能落到消息传输/文本降级链
       const origErr = console.error;
       const errLogs: string[] = [];
       console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
@@ -1353,6 +1453,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：首段更新与直发都失败时占位消息更新为「回复投递失败」', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failSendCard = true; // 同上：本条用例覆盖文本占位的降级链
+      f.channel.failCardKit = true;
       const origErr = console.error;
       console.error = () => {};
       try {
@@ -1376,6 +1477,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：首段更新失败但直发成功时占位收尾为「处理结束」，不烂尾在「处理中」', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failSendCard = true; // 同上：本条用例覆盖文本占位的降级链
+      f.channel.failCardKit = true;
       const origErr = console.error;
       console.error = () => {}; // 首段更新失败会记日志，测试期间静音
       try {
@@ -1419,6 +1521,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：占位卡片发送失败降级为文本占位，投递走原文案路径', async () => {
       const f = setup(llm.baseUrl);
       f.channel.failSendCard = true;
+      f.channel.failCardKit = true; // 先关 CardKit 才能落到消息传输/文本降级链
       const origErr = console.error;
       console.error = () => {}; // 降级会记日志，测试期间静音
       try {
@@ -1436,6 +1539,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：占位卡片未取回 message id 时同样降级文本占位', async () => {
       const f = setup(llm.baseUrl);
       f.channel.sendCardReturnsUndefined = true;
+      f.channel.failCardKit = true;
       await f.handlers.handle(mkMsg('u1', '你好'));
       assert.ok(f.channel.sent.includes('⏳ 处理中…'), '未取回 id 应降级文本占位');
       assert.ok(f.channel.updated.includes('好的，已收到'), '文本模式投递最终回复');
@@ -1511,6 +1615,158 @@ async function main(): Promise<void> {
       } finally {
         stop();
       }
+    });
+
+    // ---------- progress：hold 占用抑制节流/心跳更新，paintConfirm 照常绘制，release 后恢复 ----------
+    await checkAsync('progress：hold 期间节流/心跳更新被抑制，paintConfirm 照常，release 后恢复', async () => {
+      const channel = new FakeChannel();
+      const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => null });
+      const msg = mkMsg('u1', 'x');
+      const id = await kit.sendPlaceholder(msg);
+      assert.ok(id?.startsWith('card-'), '占位应为卡片');
+      const injected = channel.updatedCards.length;
+      kit.holdCard(id!);
+      const activity = { lastEventAt: Date.now() - 1000 }; // 已静默超阈值，心跳会尝试刷新
+      const report = kit.createProgressReporter(id, activity);
+      const stop = kit.startProgressHeartbeat(id, activity, 'u1');
+      try {
+        report({ type: 'tool', name: 'kanban_create_task' });
+        await new Promise((r) => setTimeout(r, 120)); // 给节流/心跳留出发送窗口
+        assert.equal(channel.updatedCards.length, injected, 'held 期间节流/心跳更新应被抑制（确认按钮不被覆盖）');
+        // paintConfirm 不受 held 拦截，且返回真实成败
+        await kit.paintConfirm(id!, buildProgressCard({ steps: [], current: '等待确认', stopToken: id! }));
+        assert.equal(channel.updatedCards.length, injected + 1, 'paintConfirm 应照常绘制');
+        assert.ok(
+          cardText(channel.updatedCards.at(-1)!.card).includes('等待确认'),
+          'paintConfirm 应画出确认占用卡',
+        );
+        // progressSnapshot：按轨迹构建进度卡（确认批准后的同步换卡用）
+        const snap = kit.progressSnapshot(id!, '✅ 已批准，正在执行写操作…');
+        assert.ok(snap, '存活占位应有快照');
+        assert.ok(
+          cardText(snap!).includes('✅ 已批准，正在执行写操作'),
+          '快照应带注入的当前步骤标签',
+        );
+        assert.equal(buttonValues(snap!).find((v) => 'hta_stop' in v)?.hta_stop, id, '快照应保留停止按钮令牌');
+        kit.releaseCard(id!);
+        activity.lastEventAt = Date.now() - 1000;
+        await waitFor(() => channel.updatedCards.length > injected + 1, 'release 后心跳恢复更新');
+      } finally {
+        stop();
+      }
+    });
+
+    // ---------- progress：paintConfirm 失败暴露给调用方且更新链不断（后续结果卡照常落地） ----------
+    await checkAsync('progress：paintConfirm 绘制失败时 reject 供降级，更新链不受影响', async () => {
+      const channel = new FakeChannel();
+      channel.failUpdateIfIncludes = '确认卡会失败'; // updateCard 匹配卡片拍平文本后抛错
+      const origErr = console.error;
+      console.error = () => {};
+      try {
+        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
+        const msg = mkMsg('u1', 'x');
+        const id = await kit.sendPlaceholder(msg);
+        await assert.rejects(kit.paintConfirm(id!, buildResultCard('确认卡会失败')), 'paintConfirm 应暴露绘制失败');
+        // 链未断：deliverReply 照常落地结果卡
+        await kit.deliverReply(msg, id, '最终结果照常');
+        assert.ok(
+          channel.updatedCards.some((u) => cardText(u.card).includes('最终结果照常')),
+          'paint 失败后更新链应继续可用',
+        );
+      } finally {
+        console.error = origErr;
+      }
+    });
+
+    // ---------- progress：结果卡片带「查看详情」跳转按钮（resultUrl 提供时） ----------
+    await checkAsync('progress：deliverReply 带 resultUrl 时结果卡片含查看详情按钮与可达性注脚', async () => {
+      const channel = new FakeChannel();
+      const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
+      const msg = mkMsg('u1', 'x');
+      const id = await kit.sendPlaceholder(msg);
+      await kit.deliverReply(msg, id, '已完成', false, 'http://localhost:7964/projects/p1/tasks/t1');
+      const last = channel.updatedCards.at(-1)!.card;
+      const t = cardText(last);
+      assert.ok(t.includes('已完成'), '结果卡正文应保留');
+      const btn = buttonsOf(last)[0];
+      assert.ok(btn, '结果卡应有按钮');
+      const openUrl = (btn!.behaviors as Array<Record<string, unknown>>).find((b) => b.type === 'open_url');
+      assert.equal(openUrl?.default_url, 'http://localhost:7964/projects/p1/tasks/t1', '按钮应指向看板链接');
+      assert.ok(t.includes('链接仅本机可达'), `loopback 链接应带可达性注脚，实际：${t}`);
+      // 无 resultUrl：结果卡保持无按钮（现状行为）
+      const c2 = new FakeChannel();
+      const kit2 = createProgressKit({ channel: c2, heartbeatMs: 60_000, hasPendingConfirm: () => null });
+      const id2 = await kit2.sendPlaceholder(msg);
+      await kit2.deliverReply(msg, id2, '已完成');
+      const last2 = c2.updatedCards.at(-1)!.card;
+      assert.ok(buttonsOf(last2).length === 0, '无 resultUrl 时结果卡不应有按钮');
+    });
+
+    // ---------- progress：CardKit 流式主路径——步骤走流式更新（sequence 递增），收尾先关流再出结果卡 ----------
+    await checkAsync('progress：CardKit 流式模式步骤打字机更新，收尾先关流再整卡出结果', async () => {
+      const channel = new FakeChannel();
+      const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
+      const msg = mkMsg('u1', 'x');
+      const id = await kit.sendPlaceholder(msg);
+      assert.ok(id?.startsWith('card-'), '占位应返回消息 id（停止令牌语义不变）');
+      await waitFor(() => channel.entityUpdates.some((u) => u.sequence === 1), '令牌注入整卡更新（seq=1）');
+      const report = kit.createProgressReporter(id, { lastEventAt: Date.now() });
+      report({ type: 'tool', name: 'kanban_create_task' });
+      await waitFor(() => channel.streamUpdates.length === 1, '步骤应走流式更新');
+      assert.equal(channel.streamUpdates[0]!.elementId, 'hta_main', '流式更新锚定正文元素');
+      assert.ok(channel.streamUpdates[0]!.content.includes('看板操作'), '流式内容为步骤轨迹文本');
+      assert.equal(channel.streamUpdates[0]!.sequence, 2, 'sequence 应递增');
+      await kit.deliverReply(msg, id, '最终结果');
+      assert.deepEqual(
+        channel.streamingSettings.map((s) => [s.on, s.sequence]),
+        [[false, 3]],
+        '收尾应先关流式（seq=3）',
+      );
+      const lastUpdate = channel.entityUpdates.at(-1)!;
+      assert.equal(lastUpdate.sequence, 4, '结果卡整卡更新序列最后（seq=4）');
+      assert.ok(cardText(lastUpdate.card).includes('最终结果'), '结果卡整卡落地');
+    });
+
+    // ---------- progress：CardKit 不可用（未开权限等）降级 message 传输卡片，功能完整无动画 ----------
+    await checkAsync('progress：CardKit 创建失败降级 message 传输，全程无流式调用', async () => {
+      const channel = new FakeChannel();
+      channel.failCardKit = true;
+      const origErr = console.error;
+      console.error = () => {}; // 降级会记日志，测试期间静音
+      try {
+        const kit = createProgressKit({ channel, heartbeatMs: 60_000, hasPendingConfirm: () => null });
+        const msg = mkMsg('u1', 'x');
+        const id = await kit.sendPlaceholder(msg);
+        assert.ok(id?.startsWith('card-'), '降级后仍是卡片占位');
+        assert.equal(channel.streamUpdates.length, 0, '降级模式不得有流式调用');
+        const report = kit.createProgressReporter(id, { lastEventAt: Date.now() });
+        report({ type: 'tool', name: 'kanban_create_task' });
+        await waitFor(
+          () => channel.updatedCards.some((u) => cardText(u.card).includes('看板操作')),
+          '降级模式步骤走整卡更新',
+        );
+        await kit.deliverReply(msg, id, '结果文本');
+        assert.ok(cardText(channel.updatedCards.at(-1)!.card).includes('结果文本'), '结果卡落地');
+        assert.equal(channel.streamingSettings.length, 0, 'message 模式无关流调用');
+      } finally {
+        console.error = origErr;
+      }
+    });
+
+    // ---------- handler：extractKanbanUrl 提取首个看板同源链接（结果卡查看详情按钮用） ----------
+    await checkAsync('handler：extractKanbanUrl 只提取看板同源链接，尾跟中文标点不吞', async () => {
+      const kanban = 'http://localhost:7964';
+      assert.equal(
+        extractKanbanUrl('任务已启动，见 http://localhost:7964/projects/p/tasks/t1。', kanban),
+        'http://localhost:7964/projects/p/tasks/t1',
+      );
+      assert.equal(
+        extractKanbanUrl('先看 https://other.com/x 再看 http://localhost:7964/a', kanban),
+        'http://localhost:7964/a',
+        '应跳过非同源链接取首个看板链接',
+      );
+      assert.equal(extractKanbanUrl('没有链接', kanban), undefined);
+      assert.equal(extractKanbanUrl('http://localhost:7964/a', 'not a url'), undefined, 'kanbanUrl 不可解析时不得误配');
     });
 
     // ---------- progress：deliverReply 卡片模式——短回复原地换结果卡片；超长收尾 seeBelow + 分段文本 ----------
@@ -1714,6 +1970,7 @@ async function main(): Promise<void> {
     await checkAsync('handler：文本占位模式回归——心跳刷新与 /stop 收尾走原文案', async () => {
       const f = setup(llm.baseUrl, undefined, { progressHeartbeatMs: 40 });
       f.channel.failSendCard = true;
+      f.channel.failCardKit = true; // 先关 CardKit 才能落到消息传输/文本降级链
       const origErr = console.error;
       console.error = () => {}; // 卡片降级会记日志，测试期间静音
       try {
@@ -1783,6 +2040,82 @@ async function main(): Promise<void> {
       assert.ok(r2?.toast?.content.includes('已取消'), `实际：${r2?.toast?.content}`);
       assert.ok(r2?.card?.data && cardText(r2.card.data).includes('已取消'), '终态卡片应为已取消');
       assert.equal(buttonValues(r2!.card!.data).length, 0, '取消终态卡片不应再有按钮');
+      cleanup(f);
+    });
+
+    // ---------- 合并单卡片：确认卡原地画进度卡（不另发消息、带停止按钮），批准同步换回执行中卡 ----------
+    await checkAsync('handler：合并确认——确认卡原地更新进度卡，批准换回执行中卡，全程一条消息', async () => {
+      const f = setup(llm.baseUrl, 'http://localhost:1', { mergedConfirm: true });
+      llm.mode = 'hang';
+      const pA = f.handlers.handle(mkMsg('u1', '来个长任务'));
+      await waitFor(() => f.channel.sentCards.length === 1, '进度卡片已发出');
+      const pid = f.channel.sentCards[0]!.id;
+      const req: ConfirmRequest = { kind: 'kanban', summary: '创建任务', detail: 'create_task x', batchKey: 'create' };
+      const verdict = f.confirmations.request('u1', req);
+      await waitFor(() => f.confirmPrompts.length === 1, '确认请求已发出');
+      // 确认卡片原地画在进度卡上：不另发卡片消息（单卡片生命周期）
+      assert.equal(f.channel.sentCards.length, 1, '确认不应另发卡片消息');
+      await waitFor(
+        () => f.channel.updatedCards.some((u) => u.messageId === pid && cardText(u.card).includes('写操作确认')),
+        '进度卡应原地更新为写入确认卡',
+      );
+      await waitFor(() => f.confirmations.pendingForm('u1').hasCard, '确认卡片 id 已回填');
+      const confirmCard = f.channel.updatedCards.at(-1)!.card;
+      // 确认等待期间保留「⏹ 停止」按钮（令牌 = 占位消息 id，与进度卡停止按钮同一语义）
+      assert.equal(
+        buttonValues(confirmCard).find((v) => 'hta_stop' in v)?.hta_stop,
+        pid,
+        '确认卡应带停止按钮（轮次令牌）',
+      );
+      // 批准：同步换回「执行中」进度卡（非静态终态卡），且不再发文本回执
+      const notifyBase = f.channel.notifies.length;
+      const resp = f.handlers.onCardAction({
+        operator: { open_id: 'u1' },
+        action: { value: { hta_confirm: f.confirmPrompts[0]!.id, decision: 'yes' } },
+      });
+      assert.equal(resp?.toast?.content, '✅ 已批准，正在执行');
+      assert.ok(resp?.card?.data, '批准应同步换卡');
+      const t = cardText(resp!.card!.data);
+      assert.ok(t.includes('⏳ 处理中') && t.includes('✅ 已批准，正在执行写操作'), `应换回执行中进度卡，实际：${t}`);
+      assert.equal(f.channel.notifies.length, notifyBase, '合并场景不再发文本回执');
+      assert.equal(await verdict, 'once');
+      // 轮次完成：结果卡仍原地落在同一张卡上（一条消息走完全程）
+      llm.mode = 'ok';
+      llm.release();
+      await pA;
+      const last = f.channel.updatedCards.at(-1)!;
+      assert.equal(last.messageId, pid, '结果卡应原地落在同一张进度卡');
+      assert.ok(cardText(last.card).includes('好的，已收到'), '结果卡应包含回复正文');
+      assert.equal(f.channel.sent.length, 0, '短回复不应另发文本消息');
+      cleanup(f);
+    });
+
+    // ---------- 合并单卡片：取消——同步换红头终态卡，不发文本回执；轮次结果卡随后保序覆盖 ----------
+    await checkAsync('handler：合并确认取消——同步换红头终态卡且不发文本回执', async () => {
+      const f = setup(llm.baseUrl, 'http://localhost:1', { mergedConfirm: true });
+      llm.mode = 'hang';
+      const pA = f.handlers.handle(mkMsg('u1', '任务'));
+      await waitFor(() => f.channel.sentCards.length === 1, '进度卡片已发出');
+      const pid = f.channel.sentCards[0]!.id;
+      const verdict = f.confirmations.request('u1', { kind: 'kanban', summary: 's', detail: 'd' });
+      await waitFor(() => f.confirmPrompts.length === 1, '确认请求已发出');
+      await waitFor(
+        () => f.channel.updatedCards.some((u) => u.messageId === pid && cardText(u.card).includes('写操作确认')),
+        '确认卡已原地画出',
+      );
+      await waitFor(() => f.confirmations.pendingForm('u1').hasCard, '确认卡片 id 已回填');
+      const notifyBase = f.channel.notifies.length;
+      const resp = f.handlers.onCardAction({
+        operator: { open_id: 'u1' },
+        action: { value: { hta_confirm: f.confirmPrompts[0]!.id, decision: 'no' } },
+      });
+      assert.equal(resp?.toast?.content, '已取消，操作未执行');
+      assert.ok(resp?.card?.data && cardText(resp.card.data).includes('写操作已取消'), '应同步换红头终态卡');
+      assert.equal(f.channel.notifies.length, notifyBase, '合并场景不发文本回执');
+      assert.equal(await verdict, false);
+      llm.mode = 'ok';
+      llm.release();
+      await pA;
       cleanup(f);
     });
 
@@ -2023,6 +2356,29 @@ async function main(): Promise<void> {
       assert.ok(bt.includes('**加粗**'), '结果卡片应保留加粗排版');
       assert.ok(!bt.includes('<font') && bt.includes('＜font'), '类 HTML 标签应全角化');
       assert.ok(!bt.includes('~~') && bt.includes('～～'), '删除线应中和');
+      // 确认卡片：stopToken 提供时追加「⏹ 停止」按钮（合并单卡片场景确认等待期间保留中断入口）
+      const confirmReq: ConfirmRequest = { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' };
+      const confirmMerged = buildConfirmCard(confirmReq, 'cid', 120000, { stopToken: 'card-9' });
+      const cv = buttonValues(confirmMerged);
+      assert.equal(cv.find((v) => 'hta_stop' in v)?.hta_stop, 'card-9', '确认卡停止按钮应带轮次令牌');
+      assert.ok(cv.some((v) => v.hta_confirm === 'cid' && v.decision === 'yes'), '确认按钮仍在');
+      const confirmSolo = buildConfirmCard(confirmReq, 'cid', 120000);
+      assert.ok(
+        !buttonValues(confirmSolo).some((v) => 'hta_stop' in v),
+        '无 stopToken（独立确认卡）不追加停止按钮',
+      );
+      // 结果卡片：url 提供时带「查看详情」跳转按钮（open_url 行为，四端兜底）与可达性注脚
+      const resultUrl = buildResultCard('正文', undefined, { url: 'http://localhost:7964/x' });
+      const urlBtn = buttonsOf(resultUrl)[0];
+      assert.ok(urlBtn, '结果卡应有查看详情按钮');
+      const openUrl = (urlBtn!.behaviors as Array<Record<string, unknown>>).find((b) => b.type === 'open_url') as
+        | { default_url?: string; pc_url?: string }
+        | undefined;
+      assert.equal(openUrl?.default_url, 'http://localhost:7964/x', '按钮应指向看板链接');
+      assert.equal(openUrl?.pc_url, 'http://localhost:7964/x', 'open_url 全端兜底');
+      assert.ok((urlBtn!.text as { content?: string })?.content?.includes('查看详情'), '按钮文案');
+      assert.ok(cardText(resultUrl).includes('链接仅本机可达'), 'loopback 链接应带可达性注脚');
+      assert.ok(buttonsOf(result).length === 0, '无 url 时结果卡不应有按钮');
       // 终态卡片：头色与文案、一律无按钮
       for (const [kind, want, template] of [
         ['aborted', '已中断', 'grey'],
@@ -2050,10 +2406,7 @@ async function main(): Promise<void> {
       assert.ok(JSON.stringify(job).includes('http://kb.local/t/1'), '有 url 时应保留查看任务按钮');
       const jobNoUrl = buildJobProcessingCard('任务X', 'diagnosis');
       assert.ok(cardText(jobNoUrl).includes('AI 诊断进行中'));
-      assert.ok(
-        (jobNoUrl.elements as Array<{ tag: string }>).every((el) => el.tag !== 'action'),
-        '无 url 时进行中卡片不应有按钮',
-      );
+      assert.ok(buttonsOf(jobNoUrl).length === 0, '无 url 时进行中卡片不应有按钮');
     });
 
     // ---------- AI 审查：投递段（报告写盘/卡片推送）失败降级文本，不误报「AI 审查失败」 ----------

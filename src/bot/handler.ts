@@ -78,6 +78,23 @@ export function createRoundNoticeTracker(): RoundNoticeTracker {
 }
 
 /**
+ * 确认卡片合并桥（单卡片生命周期）：bot-main 先建 ConfirmationManager 后建 handlers，
+ * 而「当前轮次的进度占位卡片」只有 handler 侧持有（running 表 + progress kit）——
+ * bot-main 创建默认空实现挂进确认流程，createBotHandlers 启动时填充为真实实现。
+ * activeCardId 返回 undefined = 本轮无存活进度卡，确认走独立卡片/文本降级路径。
+ */
+export interface ConfirmCardBridge {
+  /** 该用户当前轮次存活进度卡片的消息 id（无/已收尾返回 undefined）。 */
+  activeCardId: (openId: string) => string | undefined;
+  /** 确认卡片占用进度卡（期间节流/心跳更新暂停，确认按钮不被覆盖）。 */
+  hold: (progressId: string) => void;
+  /** 确认终态后解除占用。 */
+  release: (progressId: string) => void;
+  /** 确认相关卡片原地绘制（入进度卡的有序更新链；reject 表示绘制失败，调用方据此降级）。 */
+  paint: (progressId: string, card: Record<string, unknown>) => Promise<void>;
+}
+
+/**
  * 表情回执永久性错误码（err.code，见 FeishuApiError）：缺权限/授权方式错误类重试不会自愈，降级禁用；
  * 其余（限流/网络抖动/消息被撤回等单条问题）视为瞬时，下条消息再试。
  * 99991668=应用未开通该 API 所需权限 scope；99991672=无接口数据权限；
@@ -93,6 +110,28 @@ const WS_STATE_LABEL: Record<string, string> = {
   failed: '连接失败',
   idle: '空闲',
 };
+
+/**
+ * 从回复文本提取首个指向看板的链接（origin 匹配 kanbanUrl），作结果卡片「🔗 查看详情」跳转按钮；
+ * 无匹配或 kanbanUrl 不可解析返回 undefined（结果卡保持无按钮）。
+ */
+export function extractKanbanUrl(text: string, kanbanUrl: string): string | undefined {
+  let origin: string;
+  try {
+    origin = new URL(kanbanUrl).origin;
+  } catch {
+    return undefined;
+  }
+  // URL 后紧跟中文标点/括号时不吞进链接（排除空白、引号、中英文括号与句读）
+  for (const m of text.matchAll(/https?:\/\/[^\s"'<>()\[\]（）［］【】。，；：、！？]+/g)) {
+    try {
+      if (new URL(m[0]).origin === origin) return m[0];
+    } catch {
+      /* 跳过不可解析片段 */
+    }
+  }
+  return undefined;
+}
 
 export interface BotHandlerDeps {
   channel: FeishuChannel;
@@ -117,6 +156,8 @@ export interface BotHandlerDeps {
   imageFetcher?: ImageFetcher;
   /** 轮次内插消息追踪（bot-main 在确认卡片/回执发送时 mark）；缺省时最终回复一律原地替换占位。 */
   roundNotices?: RoundNoticeTracker;
+  /** 确认卡片合并桥（bot-main 注入，createBotHandlers 填充实现）；缺省时确认一律走独立卡片/文本路径。 */
+  confirmCardBridge?: ConfirmCardBridge;
   /** 每用户最近一次写操作确认请求的 kind（bot-main 随确认发送记录）；用于免问回执按 kind 细化措辞。 */
   lastBatchKind?: (openId: string) => ConfirmKind | undefined;
 }
@@ -154,6 +195,17 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
 
   /** 每用户当前运行中的 agent 轮次；progressId 为轮次令牌（/stop 与卡片「⏹ 停止」中断用，令牌校验陈旧卡片杀不到新轮次）。 */
   const running = new Map<string, { ctl: AbortController; progressId?: string }>();
+  // 确认卡片合并桥填充（bot-main 的确认流程据此把确认卡片原地画到进度占位卡片上）：
+  // activeCardId 只认存活且未收尾的卡片占位；hold/release/paint 转调 progress kit
+  if (deps.confirmCardBridge) {
+    deps.confirmCardBridge.activeCardId = (openId) => {
+      const pid = running.get(openId)?.progressId;
+      return pid && progress.isActiveProgress(pid) ? pid : undefined;
+    };
+    deps.confirmCardBridge.hold = (pid) => progress.holdCard(pid);
+    deps.confirmCardBridge.release = (pid) => progress.releaseCard(pid);
+    deps.confirmCardBridge.paint = (pid, card) => progress.paintConfirm(pid, card);
+  }
   /** 敲键盘表情回执是否因权限等原因不可用（失败后不再重试，降级为仅占位消息）。 */
   let reactionUnsupported = false;
   /** 每用户尚未移除的敲键盘表情（/stop 丢弃排队消息时回调不会执行，需兜底清理）。 */
@@ -259,24 +311,49 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     const settledCard: CardActionResponse['card'] | undefined = settlement
       ? { type: 'raw', data: buildResolvedCard(settlement.req, settlement.settle) }
       : undefined;
+    // 合并单卡片场景：确认卡片原地画在当前轮次的进度占位卡片上（settlement.cardMessageId 即进度卡 id）。
+    // 批准后同步换回「执行中」进度卡（轮次会继续刷进度/结果卡）；拒绝换红头终态卡（结果卡随后保序覆盖）。
+    // 合并场景不再发 safeNotify 文本回执——toast + 原地换卡已足够，避免确认一次就多一条文本消息刷屏。
+    const mergedPid =
+      settlement?.cardMessageId && running.get(openId)?.progressId === settlement.cardMessageId
+        ? settlement.cardMessageId
+        : undefined;
+    const mergedExecutingCard = (label: string): CardActionResponse['card'] | undefined => {
+      const snapshot = mergedPid ? progress.progressSnapshot(mergedPid, label) : undefined;
+      return snapshot ? { type: 'raw', data: snapshot } : settledCard;
+    };
     if (answer === 'approved') {
+      if (mergedPid) {
+        return {
+          toast: { type: 'success', content: '✅ 已批准，正在执行' },
+          card: mergedExecutingCard('✅ 已批准，正在执行写操作…'),
+        };
+      }
       void safeNotify(channel, openId, '✅ 已批准，正在执行…');
       return { toast: { type: 'success', content: '✅ 已批准，正在执行' }, card: settledCard };
     }
     if (answer === 'approved_batch') {
       // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
+      const scopeWord = batchScopeWord(confirmations.lastBatchScope(openId));
+      if (mergedPid) {
+        // 合并场景无文本回执：免问撤销方式并进 toast，避免用户不知道该能力
+        return {
+          toast: { type: 'success', content: `✅ 已批准（${scopeWord}免问）· 回复「恢复确认」可撤销` },
+          card: mergedExecutingCard('✅ 已批准，正在执行写操作…'),
+        };
+      }
       void safeNotify(
         channel,
         openId,
         `✅ 已批准；${batchAckText(confirmations.lastBatchScope(openId), deps.lastBatchKind?.(openId))}，正在执行…（回复「恢复确认」可随时撤销）`,
       );
       return {
-        toast: { type: 'success', content: `✅ 已批准（${batchScopeWord(confirmations.lastBatchScope(openId))}免问）` },
+        toast: { type: 'success', content: `✅ 已批准（${scopeWord}免问）` },
         card: settledCard,
       };
     }
     if (answer === 'denied') {
-      void safeNotify(channel, openId, '已取消，操作未执行。');
+      if (!mergedPid) void safeNotify(channel, openId, '已取消，操作未执行。');
       return { toast: { type: 'info', content: '已取消，操作未执行' }, card: settledCard };
     }
     // 区分「这不是你的确认」与「确认已处理或已过期」：多白名单用户场景下 B 点 A 的卡片，
@@ -408,19 +485,37 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   /** 写操作确认的文字应答：已裁决/确认词兜底/挂起期短应答提醒均终结消息（返回 true），不再进入队列。 */
   const handleConfirmationReply = async (msg: InboundMessage, text: string): Promise<boolean> => {
     confirmations.noteChat(msg.senderId, msg.sessionId);
+    // 合并场景判定须在裁决前（resolve 后 pending 已摘除）：挂起确认带卡片且本轮有存活进度卡，
+    // 确认卡即画在进度卡上（pending 阻塞轮次，两者必属同轮；罕见的「独立确认卡 + 进度卡」
+    // 竞态下误判的代价只是把进度卡刷成执行中，独立确认卡仍由 onSettled 正常收终态）
+    const mergedPid =
+      confirmations.hasPending(msg.senderId) && pendingConfirmForm(msg.senderId).hasCard
+        ? deps.confirmCardBridge?.activeCardId(msg.senderId)
+        : undefined;
     const answer = confirmations.resolveFromText(msg.senderId, text);
     // 文字裁决落地后复位短应答提醒：下一份确认可再提醒一次
     if (answer !== 'ignored') confirmShortReplyReminded.delete(msg.senderId);
-    if (answer === 'approved') {
-      await channel.reply(msg, '✅ 已批准，正在执行…');
-      return true;
-    }
-    if (answer === 'approved_batch') {
+    // 合并场景不发文本回执：回执是插在占位之后的独立消息，结果卡原地更新后时间线倒挂
+    // （回执落在结果下方且措辞矛盾）。改为原地换卡：批准换回执行中进度卡（denied 的
+    // resolved 终态卡已由 onSettled 经 bridge.paint 画出，这里无需再画）
+    if (answer === 'approved' || answer === 'approved_batch') {
+      if (mergedPid) {
+        const scopeWord = batchScopeWord(confirmations.lastBatchScope(msg.senderId));
+        const noteOverride =
+          answer === 'approved_batch' ? `已批准（${scopeWord}免问）· 回复「恢复确认」可撤销 · /stop 可中断` : undefined;
+        const snapshot = progress.progressSnapshot(mergedPid, '✅ 已批准，正在执行写操作…', noteOverride);
+        if (snapshot) void deps.confirmCardBridge?.paint(mergedPid, snapshot).catch(() => {});
+        return true;
+      }
+      if (answer === 'approved') {
+        await channel.reply(msg, '✅ 已批准，正在执行…');
+        return true;
+      }
       await channel.reply(msg, `✅ 已批准；${batchAckText(confirmations.lastBatchScope(msg.senderId), deps.lastBatchKind?.(msg.senderId))}，正在执行…（回复「恢复确认」可随时撤销）`);
       return true;
     }
     if (answer === 'denied') {
-      await channel.reply(msg, '已取消，操作未执行。');
+      if (!mergedPid) await channel.reply(msg, '已取消，操作未执行。');
       return true;
     }
     // 确认词但无 pending（已超时/已处理）：即时提示，不要落入普通对话发给 LLM
@@ -532,7 +627,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       if (ctl.signal.aborted) {
         await progress.finalizeAborted(progressId, msg, '⏹ 已中断（未完成的操作未执行，可继续对话）。');
       } else {
-        await progress.deliverReply(msg, progressId, reply, deps.roundNotices?.has(openId) ?? false);
+        // 回复里首个看板链接 → 结果卡片「🔗 查看详情」跳转按钮（无匹配则不带按钮）
+        await progress.deliverReply(
+          msg,
+          progressId,
+          reply,
+          deps.roundNotices?.has(openId) ?? false,
+          extractKanbanUrl(reply || '', cfg.kanbanUrl),
+        );
       }
     } catch (err) {
       clearHeartbeat();

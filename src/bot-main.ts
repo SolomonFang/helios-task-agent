@@ -41,7 +41,7 @@ import { DailyBrief } from './bot/daily-brief';
 import { WeeklyBrief } from './bot/weekly-brief';
 import { runtimeFlags } from './config/runtime-flags';
 import { ReminderRunner, ReminderStore } from './agent/reminder';
-import { createBotHandlers, createRoundNoticeTracker } from './bot/handler';
+import { createBotHandlers, createRoundNoticeTracker, type ConfirmCardBridge } from './bot/handler';
 import { errMessage } from './infra/err';
 import type { AskFn, ChooseFn } from './types';
 import type { ChildProcess } from 'child_process';
@@ -344,14 +344,41 @@ async function main(): Promise<void> {
   // 决策/超时/作废后通过 onSettled 把卡片原地更新为终态（按钮消失，避免误点）
   // roundNotices：确认卡片/回执插在「处理中」占位之后时标记，最终回复改发新消息保持时间线顺序
   const roundNotices = createRoundNoticeTracker();
+  // 确认卡片合并桥（单卡片生命周期）：当前轮次有存活进度卡时，确认卡片原地更新进度卡，
+  // 不再另发消息；实现由 createBotHandlers 填充（confirmations 先于 handlers 构建，这里先给空实现，
+  // 空实现下 activeCardId 恒 undefined → 确认一律走独立卡片/文本路径，与旧行为一致）。
+  const confirmCardBridge: ConfirmCardBridge = {
+    activeCardId: () => undefined,
+    hold: () => {},
+    release: () => {},
+    paint: () => Promise.resolve(),
+  };
+  /** 确认已合并进进度卡的消息 id 集合（onSettled 分支与 handler 同步换卡判定用；settle 后删除）。 */
+  const mergedConfirms = new Set<string>();
   /** 每用户最近一次写操作确认请求的 kind（bot 批准回执按 kind 细化免问措辞；confirm.ts 未暴露该状态，这里随发送记录）。 */
   const lastWriteKind = new Map<string, ConfirmKind>();
   const confirmations = new ConfirmationManager(
     async (openId, chatId, req, id, timeoutMs) => {
-      roundNotices.mark(openId);
       // Map 无清理会无界增长：超上限整体清空（代价只是免问回执措辞回退为泛化文案）
       if (lastWriteKind.size >= 1000) lastWriteKind.clear();
       lastWriteKind.set(openId, req.kind);
+      // 单卡片生命周期：有存活进度卡时确认卡片原地画上去（带停止按钮令牌），并占用该卡
+      //（hold 期间进度刷新暂停，确认按钮不被覆盖）；合并成功不 mark roundNotices——
+      // 轮次没有插入独立消息，最终回复继续原地更新同一张卡
+      const progressCardId = confirmCardBridge.activeCardId(openId);
+      if (progressCardId) {
+        confirmCardBridge.hold(progressCardId);
+        try {
+          await confirmCardBridge.paint(progressCardId, buildConfirmCard(req, id, timeoutMs, { stopToken: progressCardId }));
+          mergedConfirms.add(progressCardId);
+          return progressCardId;
+        } catch (err) {
+          // 合并绘制失败：解除占用并落入既有「独立卡片 → 文本」降级链
+          confirmCardBridge.release(progressCardId);
+          console.error(`[confirm] 进度卡合并确认失败，降级独立卡片: ${errMessage(err)}`);
+        }
+      }
+      roundNotices.mark(openId);
       const sendText = () => {
         // 免问提示与卡片口径一致：粒度词与后果说明复用 guard 的统一文案；
         // 后果的「免问」改述为「不再逐次询问」，避免同句「免问」堆砌
@@ -397,6 +424,17 @@ async function main(): Promise<void> {
       },
       onSettled: (_openId, req, settle, cardMessageId) => {
         if (!cardMessageId) return;
+        if (mergedConfirms.delete(cardMessageId)) {
+          // 合并单卡片场景：确认卡片就是进度占位卡片，终态处理经 paint 入有序链（与后续结果卡保序）
+          confirmCardBridge.release(cardMessageId);
+          // 批准路径：同步回调已把卡片换回「执行中」进度卡，轮次会继续刷进度/结果卡，不再画静态终态
+          if (settle === 'once' || settle === 'batch') return;
+          // 拒绝/超时/作废：轮次 reply 可能滞后，先把卡片收为终态（结果卡随后保序覆盖）
+          confirmCardBridge.paint(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
+            console.error(`[confirm] 卡片终态更新失败: ${errMessage(err)}`);
+          });
+          return;
+        }
         void channel.updateCard(cardMessageId, buildResolvedCard(req, settle)).catch((err) => {
           const message = errMessage(err);
           console.error(`[confirm] 卡片终态更新失败: ${message}`);
@@ -498,6 +536,7 @@ async function main(): Promise<void> {
     reportServer,
     helpText: BOT_HELP,
     roundNotices,
+    confirmCardBridge,
     lastBatchKind: (openId) => lastWriteKind.get(openId),
   });
   channel.onCardAction = handlers.onCardAction;

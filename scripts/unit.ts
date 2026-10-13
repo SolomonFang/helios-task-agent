@@ -378,21 +378,13 @@ async function run(): Promise<void> {
   });
 
   check('确认卡片：可批量 3 按钮 / 破坏性 2 按钮 / 终态无按钮', (() => {
-    const withBatch = buildConfirmCard({ kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' }, 'id1', 120000) as {
-      elements: Array<{ tag: string; actions?: unknown[] }>;
-    };
-    const destructive = buildConfirmCard({ kind: 'kanban', summary: 's', detail: 'd' }, 'id2', 300000) as {
-      elements: Array<{ tag: string; actions?: unknown[] }>;
-    };
-    const actionOf = (c: typeof withBatch) => c.elements.find((e) => e.tag === 'action');
-    const resolved = buildResolvedCard({ kind: 'kanban', summary: 's', detail: 'd' }, 'timeout') as {
-      elements: Array<{ tag: string }>;
-    };
-    return (
-      actionOf(withBatch)?.actions?.length === 3 &&
-      actionOf(destructive)?.actions?.length === 2 &&
-      !resolved.elements.some((e) => e.tag === 'action')
-    );
+    // 2.0：按钮平铺 body.elements（无 action 容器）
+    type Card2 = { body: { elements: Array<{ tag: string }> } };
+    const buttonsOf = (c: Card2) => c.body.elements.filter((e) => e.tag === 'button');
+    const withBatch = buildConfirmCard({ kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' }, 'id1', 120000) as Card2;
+    const destructive = buildConfirmCard({ kind: 'kanban', summary: 's', detail: 'd' }, 'id2', 300000) as Card2;
+    const resolved = buildResolvedCard({ kind: 'kanban', summary: 's', detail: 'd' }, 'timeout') as Card2;
+    return buttonsOf(withBatch).length === 3 && buttonsOf(destructive).length === 2 && buttonsOf(resolved).length === 0;
   })());
 
   check('确认卡片：免问按钮与终态标题按粒度广告（类级「同类」/ 对象级「同对象」）', (() => {
@@ -401,9 +393,9 @@ async function run(): Promise<void> {
         { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope },
         'id1',
         120000,
-      ) as { elements: Array<{ tag: string; actions?: Array<{ text?: { content?: string } }> }> };
-      const action = card.elements.find((e) => e.tag === 'action');
-      return String(action?.actions?.[1]?.text?.content ?? '');
+      ) as { body: { elements: Array<{ tag: string; text?: { content?: string } }> } };
+      const buttons = card.body.elements.filter((e) => e.tag === 'button');
+      return String(buttons[1]?.text?.content ?? '');
     };
     const resolvedTitle = (scope?: 'kind' | 'object'): string => {
       const card = buildResolvedCard(
@@ -425,8 +417,9 @@ async function run(): Promise<void> {
     const card = buildConfirmCard(
       { kind: 'kanban', summary: '~~删~~ <font color="red">红</font> <at id=x>人</at>', detail: 'd' },
       'id1',
-    ) as { elements: Array<{ tag: string; text?: { content?: string } }> };
-    const content = card.elements.find((e) => e.text?.content?.includes('删'))?.text?.content ?? '';
+    ) as { body: { elements: Array<{ tag: string; content?: string }> } };
+    // 2.0：正文为首个 markdown 组件
+    const content = card.body.elements.find((e) => e.tag === 'markdown' && e.content?.includes('删'))?.content ?? '';
     return (
       content.includes('～～删～～') && // ~~ 删除线中和
       content.includes('＜font color="red"＞红＜/font＞') && // <font> 标签中和
@@ -1909,8 +1902,16 @@ async function run(): Promise<void> {
   check('待审阅卡片：有人工审查链接按钮，有 attemptId 时追加 AI 审查回传按钮', (() => {
     type Btn = { text?: { content?: string }; url?: string; value?: { hta_review?: string; title?: string } };
     const actionsOf = (card: Record<string, unknown>): Btn[] => {
-      const els = (card as { elements: Array<{ tag: string; actions?: Btn[] }> }).elements;
-      return els.find((e) => e.tag === 'action')?.actions ?? [];
+      // 2.0：按钮平铺 body.elements；url 在 open_url 行为、回传值在 callback 行为
+      const els = (card as { body: { elements: Array<{ tag: string; text?: Btn['text']; behaviors?: Array<{ type: string; default_url?: string; value?: Btn['value'] }> }> } }).body
+        .elements;
+      return els
+        .filter((e) => e.tag === 'button')
+        .map((b) => ({
+          text: b.text,
+          url: b.behaviors?.find((x) => x.type === 'open_url')?.default_url,
+          value: b.behaviors?.find((x) => x.type === 'callback')?.value,
+        }));
     };
     const base: WatchEvent = {
       kind: 'review',
@@ -4346,19 +4347,16 @@ async function run(): Promise<void> {
 
   // ---------- 看板事件卡片：failed 按钮名 + 链接可达性注脚 ----------
   check('看板事件卡片：failed 按钮为「查看任务」，带链接时注脚提示可达范围', (() => {
+    // 2.0：按钮平铺 body.elements，注脚为 markdown + text_size:notation
     const card = buildWatchEventCard({ kind: 'failed', title: 't', url: 'http://kanban/x', text: 'x' }) as {
-      elements: Array<{
-        tag: string;
-        actions?: Array<{ text?: { content?: string } }>;
-        elements?: Array<{ content?: string }>;
-      }>;
+      body: { elements: Array<{ tag: string; text?: { content?: string }; content?: string; text_size?: string }> };
     };
-    const btn = card.elements.find((e) => e.tag === 'action')?.actions?.[0]?.text?.content;
-    const note = card.elements.find((e) => e.tag === 'note');
-    return (
-      btn === '📋 查看任务' &&
-      Boolean(note?.elements?.some((n) => (n.content || '').includes('链接仅本机所在网络可达')))
-    );
+    const btn = card.body.elements.find((e) => e.tag === 'button')?.text?.content;
+    const noteText = card.body.elements
+      .filter((e) => e.tag === 'markdown' && e.text_size === 'notation')
+      .map((e) => e.content ?? '')
+      .join('\n');
+    return btn === '📋 查看任务' && noteText.includes('链接仅本机所在网络可达');
   })());
 
   // ---------- isLoopbackUrl：loopback 各形态 true，局域网/公网/非法 URL false ----------
@@ -4378,13 +4376,14 @@ async function run(): Promise<void> {
 
   // ---------- 看板事件卡片：loopback 链接注脚区分本机/局域网可达 ----------
   check('看板事件卡片：loopback 链接注脚提示仅本机可达（手机/局域网打不开）', (() => {
+    // 2.0：注脚为 markdown + text_size:notation
     const noteOf = (url: string) =>
       (buildWatchEventCard({ kind: 'done', title: 't', url, text: 'x' }) as {
-        elements: Array<{ tag: string; elements?: Array<{ content?: string }> }>;
-      }).elements
-        .find((e) => e.tag === 'note')
-        ?.elements?.map((n) => n.content || '')
-        .join('\n') || '';
+        body: { elements: Array<{ tag: string; content?: string; text_size?: string }> };
+      }).body.elements
+        .filter((e) => e.tag === 'markdown' && e.text_size === 'notation')
+        .map((n) => n.content || '')
+        .join('\n');
     const loop = noteOf('http://127.0.0.1:7964/tasks/1');
     const lan = noteOf('http://192.168.1.10:7964/tasks/1');
     return (

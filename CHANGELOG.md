@@ -4,6 +4,14 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Changed
+
+- 飞书卡片全部迁移至卡片 JSON 2.0（`src/bot/cards.ts`）：按钮平铺 `body.elements`（`action` 容器已废弃），回传走 `behaviors:[{type:'callback',value}]`、跳转走 `open_url` 行为；注脚改用 `markdown` + `notation` 字号（2.0 无 note 组件）；结果卡片新增「🔗 查看详情」跳转按钮（回复内含看板同源链接时）；需飞书客户端 ≥ 7.20
+- 一轮对话由一张卡片承载全生命周期（loading → 写入确认 → 执行中 → 结果，全程原地更新，不再另发确认卡片与批准回执文本）：写操作确认原地画在进度占位卡上（确认期间进度刷新挂起、按钮不被覆盖，「⏹ 停止」保留），批准同步换回执行中进度卡（`src/bot-main.ts`、`src/bot/handler.ts`、`src/bot/progress-reporter.ts`、`src/agent/confirm.ts`）
+- 进度占位卡优先走 CardKit 卡片实体 + `streaming_mode` 流式更新（步骤轨迹打字机动画、会话列表预览「[生成中…]」，收尾自动关流）；未开通 `cardkit:card` 权限或建卡失败时自动降级为普通卡片整卡更新（功能不变、无动画）（`src/channels/feishu.ts`、`src/bot/progress-reporter.ts`）
+
 ## [1.0.40] - 2026-10-10
 
 修复构建异常（package-lock 依赖锁定同步），无行为变更。

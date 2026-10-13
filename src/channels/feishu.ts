@@ -743,6 +743,69 @@ export class FeishuChannel implements AgentChannel {
     }
   }
 
+  /**
+   * CardKit：创建卡片实体（仅支持卡片 JSON 2.0；update_multi 必须为 true），返回 card_id。
+   * 实体有效期 14 天、仅可发送一次。需应用开通 cardkit 权限（未开通时调用方降级消息传输）。
+   */
+  async createCardEntity(card: Record<string, unknown>): Promise<string> {
+    const res = await this.client.cardkit.v1.card.create({
+      data: { type: 'card_json', data: JSON.stringify(card) },
+    });
+    if (res.code !== 0 || !res.data?.card_id) {
+      throw this.apiError('创建卡片实体', res);
+    }
+    return res.data.card_id;
+  }
+
+  /** CardKit：把卡片实体发到会话（content 引用 card_id），返回 message_id（停止令牌/后续消息操作用）。 */
+  async sendCardEntity(chatId: string, cardId: string): Promise<string | undefined> {
+    const res = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify({ type: 'card', data: { card_id: cardId } }),
+      },
+    });
+    if (res.code !== 0) {
+      throw this.apiError('发送', res);
+    }
+    return res.data?.message_id;
+  }
+
+  /** CardKit：整卡覆盖更新（sequence 单调递增，由调用方的卡片轨迹维护）。 */
+  async updateCardEntity(cardId: string, card: Record<string, unknown>, sequence: number): Promise<void> {
+    const res = await this.client.cardkit.v1.card.update({
+      path: { card_id: cardId },
+      data: { card: { type: 'card_json', data: JSON.stringify(card) }, sequence },
+    });
+    if (res.code !== 0) {
+      throw this.apiError('更新卡片实体', res);
+    }
+  }
+
+  /** CardKit：流式更新指定组件文本（全量传入；前缀扩展部分呈打字机效果；需卡片处于 streaming_mode）。 */
+  async streamCardElement(cardId: string, elementId: string, content: string, sequence: number): Promise<void> {
+    const res = await this.client.cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: elementId },
+      data: { content, sequence },
+    });
+    if (res.code !== 0) {
+      throw this.apiError('流式更新卡片', res);
+    }
+  }
+
+  /** CardKit：开关流式模式（收尾时关流，会话预览从「生成中」变为正文）。 */
+  async setCardStreaming(cardId: string, on: boolean, sequence: number): Promise<void> {
+    const res = await this.client.cardkit.v1.card.settings({
+      path: { card_id: cardId },
+      data: { settings: JSON.stringify({ streaming_mode: on }), sequence },
+    });
+    if (res.code !== 0) {
+      throw this.apiError('更新卡片配置', res);
+    }
+  }
+
   /** Proactive DM push to a user (watcher / timeout notices); chunked when long. */
   async notifyOpenId(openId: string, text: string): Promise<void> {
     for (const chunk of splitText(text)) {

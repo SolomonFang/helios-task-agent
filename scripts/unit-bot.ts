@@ -309,11 +309,14 @@ async function main(): Promise<void> {
 
   // ---------- buildAiReviewCard：注脚按 URL 是否 loopback 区分可达口径（与 buildWatchEventCard 一致） ----------
   const aiCardNote = (url: string): string => {
+    // 2.0：注脚为 markdown + text_size:notation（无 note 组件）
     const card = buildAiReviewCard('任务X', url, false) as {
-      elements: Array<{ tag: string; elements?: Array<{ content?: string }> }>;
+      body: { elements: Array<{ tag: string; content?: string; text_size?: string }> };
     };
-    const note = card.elements.find((e) => e.tag === 'note');
-    return note?.elements?.map((x) => x.content).join(' ') ?? '';
+    return card.body.elements
+      .filter((e) => e.tag === 'markdown' && e.text_size === 'notation')
+      .map((e) => e.content ?? '')
+      .join(' ');
   };
   check('buildAiReviewCard：loopback URL 注脚标注仅本机可达', aiCardNote('http://127.0.0.1:7964/r.html').includes('链接仅本机可达（手机/局域网打不开）'));
   check(

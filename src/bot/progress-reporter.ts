@@ -15,10 +15,23 @@ import {
   buildProgressCard,
   buildProgressTerminalCard,
   buildResultCard,
+  progressMainText,
 } from './cards';
 
 /** 占位/投递实际用到的 channel 方法子集（fake channel 单测同样满足）。 */
-export type ProgressChannel = Pick<FeishuChannel, 'sendText' | 'updateText' | 'reply' | 'sendCard' | 'updateCard'>;
+export type ProgressChannel = Pick<
+  FeishuChannel,
+  | 'sendText'
+  | 'updateText'
+  | 'reply'
+  | 'sendCard'
+  | 'updateCard'
+  | 'createCardEntity'
+  | 'sendCardEntity'
+  | 'updateCardEntity'
+  | 'streamCardElement'
+  | 'setCardStreaming'
+>;
 
 export interface ProgressKitDeps {
   channel: ProgressChannel;
@@ -45,12 +58,13 @@ export interface ProgressKit {
     activity: { lastEventAt: number },
     openId: string,
   ) => () => void;
-  /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。 */
+  /** 最终回复投递：有占位消息则替换之（超长自动拆分续发），占位缺失时回退 reply。resultUrl 提供时结果卡片带「🔗 查看详情」跳转按钮。 */
   deliverReply: (
     msg: InboundMessage,
     progressId: string | undefined,
     reply: string,
     interleaved?: boolean,
+    resultUrl?: string,
   ) => Promise<void>;
   /** 轮次中断收尾（/stop 与进度卡片「⏹ 停止」共用）：卡片模式换「已中断」终态卡片，文本模式保持原文案（失败回退 reply）。 */
   finalizeAborted: (progressId: string | undefined, msg: InboundMessage, text: string) => Promise<void>;
@@ -60,6 +74,14 @@ export interface ProgressKit {
   isActiveProgress: (progressId: string) => boolean;
   /** 卡片模式占位是否已收尾（结果/中断/失败已落地；hta_stop 据此区分「竞态点击只 toast」与「陈旧卡片收终态」）。 */
   isSettledProgress: (progressId: string) => boolean;
+  /** 写操作确认占用卡片：held 期间节流/心跳更新跳过（确认按钮不能被进度刷新覆盖）。 */
+  holdCard: (progressId: string) => void;
+  /** 确认终态后解除占用（批准/拒绝/超时/作废/中断各路径都要调到）。 */
+  releaseCard: (progressId: string) => void;
+  /** 确认占用期间的卡片绘制（确认卡/确认终态卡）：不受 held 拦截，入有序链保序；reject = 绘制失败（调用方降级）。 */
+  paintConfirm: (progressId: string, card: Record<string, unknown>) => Promise<void>;
+  /** 按轨迹当前步骤构建进度卡（确认批准后的同步换卡用）；轨迹不存在（文本占位等）返回 undefined。 */
+  progressSnapshot: (progressId: string, currentLabel?: string, noteOverride?: string) => Record<string, unknown> | undefined;
 }
 
 /** 卡片模式占位的内部轨迹：步骤（心跳/收尾据此重渲染卡片）与起始时间（结果卡片总用时）。 */
@@ -77,6 +99,26 @@ interface CardTrack {
   settled: boolean;
   /** 终态落地时间：settled 轨迹按 TTL 保留（见 SETTLED_TRACK_TTL_MS），供陈旧停止按钮判定。 */
   settledAt?: number;
+  /**
+   * 卡片被写操作确认占用（确认卡片原地画在进度卡上）：held 期间节流/心跳的非终态更新
+   * 一律跳过——否则会覆盖掉确认按钮。确认绘制走 paintConfirm（不受 held 拦截），
+   * 确认终态（批准/拒绝/超时/作废/中断）时由 bot 层 releaseCard 解除。
+   */
+  held?: boolean;
+  /**
+   * 卡片传输模式：cardkit = 卡片实体 + 流式更新（打字机动画，sequence 单调递增）；
+   * message = 消息级整卡更新（CardKit 不可用时的降级，无动画）。
+   */
+  transport: 'cardkit' | 'message';
+  /** CardKit 实体 id（cardkit 模式必有；卡片更新/流式/settings 都按 card_id 寻址）。 */
+  cardId?: string;
+  /** CardKit 更新序号（create 不计；update/content/settings 单调递增）。 */
+  seq: number;
+  /**
+   * cardkit 模式：确认卡/终态卡整卡覆盖后，实体上的 hta_main 锚点与流式态已被替换；
+   * 下一次进度更新必须整卡刷新（恢复 streaming 配置与锚点），不能走 streamCardElement。
+   */
+  needFullRefresh?: boolean;
 }
 
 /**
@@ -91,11 +133,76 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
   /** 占位 id → 卡片轨迹：在表即卡片模式（sendCard 成功）；文本占位不在表，全程走原文案路径。 */
   const cardTracks = new Map<string, CardTrack>();
 
-  /** 非终态卡片更新入该占位的更新链（fire-and-forget 但保序，见 CardTrack.chain）；已收尾的占位不再更新。 */
+  /** 整卡更新按传输模式分发：cardkit 走实体更新（sequence 递增），message 走消息更新。 */
+  const applyCard = (track: CardTrack, progressId: string, card: Record<string, unknown>): Promise<void> =>
+    track.transport === 'cardkit' && track.cardId
+      ? channel.updateCardEntity(track.cardId, card, ++track.seq)
+      : channel.updateCard(progressId, card);
+
+  /** 非终态卡片更新入该占位的更新链（fire-and-forget 但保序，见 CardTrack.chain）；已收尾或被确认占用的占位不再更新。 */
   const enqueueCardUpdate = (progressId: string, card: Record<string, unknown>): void => {
     const track = cardTracks.get(progressId);
-    if (!track || track.settled) return;
-    track.chain = track.chain.then(() => channel.updateCard(progressId, card)).catch(() => {});
+    if (!track || track.settled || track.held) return;
+    track.chain = track.chain.then(() => applyCard(track, progressId, card)).catch(() => {});
+  };
+
+  /**
+   * 进度步骤的流式文本更新（仅 cardkit 模式）：hta_main 元素全量文本，前缀扩展部分呈打字机动画；
+   * message 模式回退整卡更新。入有序链、fire-and-forget（held/settled 跳过）。
+   */
+  const enqueueStepsStream = (progressId: string): void => {
+    const track = cardTracks.get(progressId);
+    if (!track || track.settled || track.held) return;
+    if (track.transport === 'cardkit' && track.cardId && !track.needFullRefresh) {
+      const cardId = track.cardId;
+      const content = progressMainText({ steps: track.steps, current: track.current });
+      track.chain = track.chain.then(() => channel.streamCardElement(cardId, 'hta_main', content, ++track.seq)).catch(() => {});
+      return;
+    }
+    // 确认/终态整卡覆盖后的首次进度更新：整卡刷新恢复流式配置与 hta_main 锚点
+    track.needFullRefresh = false;
+    enqueueCardUpdate(
+      progressId,
+      buildProgressCard({ steps: track.steps, current: track.current, stopToken: progressId }),
+    );
+  };
+
+  /**
+   * 确认占用期间的卡片绘制（确认卡/确认终态卡）：不受 held 拦截，仍入有序链保证与后续结果卡的先后顺序。
+   * 返回的 Promise 暴露本次绘制的真实成败（确认卡画失败时调用方要降级独立卡片/文本）；
+   * 链本体永不 reject（失败不阻断后续进度/结果更新）。
+   */
+  const paintConfirm = (progressId: string, card: Record<string, unknown>): Promise<void> => {
+    const track = cardTracks.get(progressId);
+    if (!track || track.settled) return Promise.resolve();
+    // 确认/终态卡不含 hta_main 锚点与流式配置：整卡覆盖后标记，下一次进度更新强制整卡刷新恢复
+    if (track.transport === 'cardkit') track.needFullRefresh = true;
+    const painted = track.chain.then(() => applyCard(track, progressId, card));
+    track.chain = painted.catch(() => {});
+    return painted;
+  };
+
+  const holdCard = (progressId: string): void => {
+    const track = cardTracks.get(progressId);
+    if (track && !track.settled) track.held = true;
+  };
+
+  const releaseCard = (progressId: string): void => {
+    const track = cardTracks.get(progressId);
+    if (track) track.held = false;
+  };
+
+  /** 按轨迹当前步骤构建进度卡（确认批准后的同步换卡用）；轨迹不存在（文本占位等）返回 undefined。 */
+  const progressSnapshot = (progressId: string, currentLabel?: string, noteOverride?: string): Record<string, unknown> | undefined => {
+    const track = cardTracks.get(progressId);
+    if (!track || track.settled) return undefined;
+    return buildProgressCard({
+      steps: track.steps,
+      current: currentLabel ?? track.current,
+      elapsedSec: Math.round((Date.now() - track.startedAt) / 1000),
+      stopToken: progressId,
+      noteOverride,
+    });
   };
 
   /** 卡片模式终态发送前置：标记 settled（心跳/节流即刻停更）并排空在途更新链，保证终态最后到达。 */
@@ -108,19 +215,69 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     return true;
   };
 
+  /**
+   * 终态卡片绘制（结果/中断/失败/seeBelow 共用）：先 settle 排空在途更新；
+   * cardkit 模式先关流式（会话预览从「生成中」恢复为正文；终态卡 JSON 不含 streaming 配置，双保险）。
+   * reject 供调用方走既有降级（文本直发/reply 兜底）。
+   */
+  const paintTerminal = async (progressId: string, card: Record<string, unknown>): Promise<void> => {
+    const track = cardTracks.get(progressId);
+    if (!track) throw new Error('paintTerminal: 非卡片占位');
+    await settleCard(progressId);
+    if (track.transport === 'cardkit' && track.cardId) {
+      await channel
+        .setCardStreaming(track.cardId, false, ++track.seq)
+        .catch((err) => console.error(`[feishu] 关闭卡片流式模式失败（继续收尾）: ${errMessage(err)}`));
+      await channel.updateCardEntity(track.cardId, card, ++track.seq);
+      return;
+    }
+    await channel.updateCard(progressId, card);
+  };
+
   const sendPlaceholder = async (msg: InboundMessage): Promise<string | undefined> => {
     // settled 轨迹按 TTL 保留（陈旧停止按钮判定用，见 SETTLED_TRACK_TTL_MS），这里只清超期条目
     const now = Date.now();
     for (const [id, t] of cardTracks) {
       if (t.settled && now - (t.settledAt ?? 0) > SETTLED_TRACK_TTL_MS) cardTracks.delete(id);
     }
-    // 卡片占位优先：步骤轨迹可视化 + 「⏹ 停止」按钮；发送失败（或未取得 message id）降级为旧文本占位
+    // 优先 CardKit 流式卡片（打字机动画）：建实体 → 发消息引用实体 → 整卡更新注入停止按钮令牌
+    //（令牌即 message_id，发送后才能拿到）。任一步失败降级普通卡片（消息传输，无动画）
+    try {
+      const entityId = await channel.createCardEntity(buildProgressCard({ steps: [] }));
+      const messageId = await channel.sendCardEntity(msg.sessionId, entityId);
+      if (messageId) {
+        const track: CardTrack = {
+          steps: [],
+          startedAt: Date.now(),
+          chain: Promise.resolve(),
+          settled: false,
+          transport: 'cardkit',
+          cardId: entityId,
+          seq: 0,
+        };
+        cardTracks.set(messageId, track);
+        // 令牌注入失败则本轮停止按钮不可用（点击落入令牌不匹配分支，不会误伤），进度展示不受影响
+        track.chain = track.chain
+          .then(() => channel.updateCardEntity(entityId, buildProgressCard({ steps: [], stopToken: messageId }), ++track.seq))
+          .catch((err) => console.error(`[feishu] 占位卡片令牌注入失败（本轮停止按钮不可用）: ${errMessage(err)}`));
+        return messageId;
+      }
+    } catch (err) {
+      console.error(`[feishu] CardKit 流式卡片创建失败，降级普通卡片: ${errMessage(err)}`);
+    }
+    // 普通卡片占位（消息传输）：步骤轨迹可视化 + 「⏹ 停止」按钮；发送失败降级为旧文本占位
     try {
       const cardId = await channel.sendCard(msg.sessionId, buildProgressCard({ steps: [] }));
       if (cardId) {
-        cardTracks.set(cardId, { steps: [], startedAt: Date.now(), chain: Promise.resolve(), settled: false });
-        // 停止按钮的轮次令牌就是占位消息 id（发送后才能拿到）：补一次带令牌的更新；
-        // 失败则本轮停止按钮不可用（点击落入令牌不匹配分支，不会误伤），进度展示不受影响
+        cardTracks.set(cardId, {
+          steps: [],
+          startedAt: Date.now(),
+          chain: Promise.resolve(),
+          settled: false,
+          transport: 'message',
+          seq: 0,
+        });
+        // 停止按钮的轮次令牌就是占位消息 id（发送后才能拿到）：补一次带令牌的更新
         await channel
           .updateCard(cardId, buildProgressCard({ steps: [], stopToken: cardId }))
           .catch((err) => console.error(`[feishu] 占位卡片令牌注入失败（本轮停止按钮不可用）: ${errMessage(err)}`));
@@ -156,7 +313,8 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
         const now = activity.lastEventAt;
         if (now - lastPush < 2000) return; // 飞书消息更新限流
         lastPush = now;
-        enqueueCardUpdate(progressId, buildProgressCard({ steps: track.steps, current: track.current, stopToken: progressId }));
+        // cardkit 模式流式更新步骤文本（打字机动画）；message 模式整卡更新
+        enqueueStepsStream(progressId);
         return;
       }
       const now = activity.lastEventAt;
@@ -209,6 +367,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     progressId: string | undefined,
     reply: string,
     interleaved = false,
+    resultUrl?: string,
   ): Promise<void> => {
     const text = reply || '（无回复）';
     const chunks = splitText(text);
@@ -219,10 +378,9 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       // 或卡片模式下超长（超 RESULT_CARD_MAX_BYTES 不进卡片，飞书卡片请求体体积上限按字节计）。
       // 占位收尾为短终态（中性措辞：正文可能是「已中止」等，不宜恒称「已完成」），正文另发新消息落在时间线末尾（分段各自兜底）。
       if (track) {
-        await settleCard(progressId);
-        await channel
-          .updateCard(progressId, buildProgressTerminalCard('seeBelow'))
-          .catch((err) => console.error(`[feishu] 占位收尾更新失败: ${errMessage(err)}`));
+        await paintTerminal(progressId, buildProgressTerminalCard('seeBelow')).catch((err) =>
+          console.error(`[feishu] 占位收尾更新失败: ${errMessage(err)}`),
+        );
       } else {
         await channel
           .updateText(progressId, '处理结束，结果见下方 ⬇️')
@@ -246,13 +404,13 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     }
 
     if (progressId && track) {
-      // 卡片模式短回复：原地换结果卡片（lark_md 渲染），一条卡片承载全部内容、不再分段；
-      // 先发终态前排空更新链：在途的心跳/节流更新若晚到会把结果卡刷回「处理中」
-      await settleCard(progressId);
+      // 卡片模式短回复：原地换结果卡片（markdown 渲染），一条卡片承载全部内容、不再分段；
+      // paintTerminal 先发终态前排空更新链（在途的心跳/节流更新若晚到会把结果卡刷回「处理中」），
+      // cardkit 模式先关流式再整卡覆盖
       try {
-        await channel.updateCard(
+        await paintTerminal(
           progressId,
-          buildResultCard(text, { elapsedSec: Math.round((Date.now() - track.startedAt) / 1000) }),
+          buildResultCard(text, { elapsedSec: Math.round((Date.now() - track.startedAt) / 1000) }, { url: resultUrl }),
         );
         return;
       } catch (err) {
@@ -264,7 +422,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       try {
         await channel.sendText(msg.sessionId, chunks[0]!);
         firstDelivered = true;
-        await channel.updateCard(progressId, buildProgressTerminalCard('seeBelow')).catch(() => {});
+        await paintTerminal(progressId, buildProgressTerminalCard('seeBelow')).catch(() => {});
       } catch (err2) {
         console.error(`[feishu] 首段直接发送也失败: ${errMessage(err2)}`);
       }
@@ -283,7 +441,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
           .catch((err) => console.error(`[feishu] 分段失败提示也未送达: ${errMessage(err)}`));
       }
       if (!firstDelivered) {
-        await channel.updateCard(progressId, buildProgressTerminalCard('deliverFailed')).catch(() => {});
+        await paintTerminal(progressId, buildProgressTerminalCard('deliverFailed')).catch(() => {});
       }
       return;
     }
@@ -338,11 +496,11 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     // 缺 progressId（占位发送失败）时不再 reply 兜底：中断回执由 /stop 的 reply / 停止按钮的 toast 承担，
     // abort 必经 stopUserWork，这里再投递几乎必然重复
     if (!progressId) return;
-    if (await settleCard(progressId)) {
-      // 卡片占位：换「已中断」终态卡片（停止按钮随之消失）；更新失败回退文本 reply
-      await channel
-        .updateCard(progressId, buildProgressTerminalCard('aborted'))
-        .catch(() => channel.reply(msg, text).catch(() => {}));
+    if (cardTracks.has(progressId)) {
+      // 卡片占位：换「已中断」终态卡片（停止按钮随之消失；cardkit 模式先关流式）；更新失败回退文本 reply
+      await paintTerminal(progressId, buildProgressTerminalCard('aborted')).catch(() =>
+        channel.reply(msg, text).catch(() => {}),
+      );
       return;
     }
     await channel.updateText(progressId, text).catch(() => channel.reply(msg, text).catch(() => {}));
@@ -351,8 +509,8 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
   const finalizeFailed = async (progressId: string | undefined): Promise<void> => {
     // 无 progressId 时无需动作：调用方随后会 reply 失败详情（用户面不静默）
     if (!progressId) return;
-    if (await settleCard(progressId)) {
-      await channel.updateCard(progressId, buildProgressTerminalCard('failed')).catch(() => {});
+    if (cardTracks.has(progressId)) {
+      await paintTerminal(progressId, buildProgressTerminalCard('failed')).catch(() => {});
       return;
     }
     await channel.updateText(progressId, '⚠️ 处理失败，详见下方').catch(() => {});
@@ -378,5 +536,9 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     finalizeFailed,
     isActiveProgress,
     isSettledProgress,
+    holdCard,
+    releaseCard,
+    paintConfirm,
+    progressSnapshot,
   };
 }

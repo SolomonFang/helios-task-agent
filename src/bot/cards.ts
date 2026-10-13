@@ -1,13 +1,22 @@
 /**
- * 飞书交互卡片（legacy card schema）构建统一收口：
+ * 飞书交互卡片（卡片 JSON 2.0 schema）构建统一收口：
  * - 写操作确认卡片 / 确认终态卡片（buildConfirmCard / buildResolvedCard）
  * - 进度占位卡片 / 结果卡片 / 进度终态卡片（buildProgressCard / buildResultCard / buildProgressTerminalCard）
  * - AI 审查/诊断/重试「进行中」卡片（buildJobProcessingCard，按钮点击后同步换卡，按钮即时消失）
  * - 看板事件通知卡片（buildWatchEventCard，含停滞提醒与失败「AI 诊断」按钮）
  * - AI 审查结果卡片（buildAiReviewCard）
  * - 失败诊断结果卡片（buildDiagnosisCard，含「按诊断结论重试」按钮与重试后终态）
- * 共同约定（baseCardConfig）：宽屏模式 + enable_forward:false——卡片内含本机链接
- * 与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发。
+ *
+ * 2.0 结构约定（对照官方 card-2.0-schema）：
+ * - 根结构 {schema:'2.0', config, header, body:{elements}}；elements 平铺组件
+ * - 按钮不用 1.0 的 action 容器（2.0 已废弃），逐个平铺 body.elements；
+ *   回传 behaviors:[{type:'callback',value}]，跳转 behaviors:[{type:'open_url',…}]；
+ *   主次规范：单按钮 primary_filled + width fill，多按钮首个 primary_filled、其余 default
+ * - 2.0 无 note 组件：注脚一律 markdown + text_size:'notation'
+ * - config：width_mode:'fill' + enable_forward:false + update_multi:true（cardkit 要求共享卡片）——
+ *   卡片内含本机链接与写操作按钮，被转发后链接不可达、按钮语义越权，一律禁止转发
+ * - 进度占位卡（buildProgressCard）带 streaming_mode 配置与 element_id 锚点（hta_main 正文 / hta_stop 按钮），
+ *   供 CardKit 流式更新（打字机动画）；其余状态卡片不带 streaming 配置，整卡覆盖即关闭流式态
  */
 
 import { batchScopeWord, kindLabel, type ConfirmRequest, type ConfirmSettle } from '../agent/guard';
@@ -23,20 +32,66 @@ import {
 import { statusLabel } from '../kanban/summary';
 import { DIAGNOSIS_CARD_MAX_CHARS } from '../kanban/failure-diagnosis';
 
-/** 全部卡片的共同 config：宽屏 + 禁止转发（见文件头注释）。 */
+/** 全部卡片的共同 config：宽屏（fill）+ 禁止转发 + 共享卡片（见文件头注释）。 */
 function baseCardConfig(): Record<string, unknown> {
-  return { wide_screen_mode: true, enable_forward: false };
+  return { width_mode: 'fill', enable_forward: false, update_multi: true };
 }
 
-/** lark_md 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
+/** 进度占位卡的流式配置：streaming_mode + 打字机节奏 + 会话列表预览文案（收尾整卡覆盖/ settings 关闭）。 */
+function streamingCardConfig(): Record<string, unknown> {
+  return {
+    ...baseCardConfig(),
+    streaming_mode: true,
+    streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' },
+    summary: { content: '[生成中…]' },
+  };
+}
+
+/** 注脚组件（2.0 无 note）：markdown + notation 字号。 */
+function noteEl(content: string): Record<string, unknown> {
+  return { tag: 'markdown', content, text_size: 'notation' };
+}
+
+/** 正文富文本组件。elementId 供 CardKit 流式更新定位（进度卡固定 hta_main）。 */
+function mdEl(content: string, elementId?: string): Record<string, unknown> {
+  return elementId ? { tag: 'markdown', content, element_id: elementId } : { tag: 'markdown', content };
+}
+
+/** 纯文本组件（2.0 保留 div；外部数据防 markdown 误解析用）。 */
+function textEl(content: string): Record<string, unknown> {
+  return { tag: 'div', text: { tag: 'plain_text', content } };
+}
+
+/** 回调按钮（2.0：behaviors 回传；type 默认 default，主操作由调用方传 primary_filled）。 */
+function callbackButton(text: string, value: Record<string, unknown>, type = 'default'): Record<string, unknown> {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: text },
+    type,
+    behaviors: [{ type: 'callback', value }],
+  };
+}
+
+/** 跳转按钮（2.0：open_url 行为，四端 url 兜底）。 */
+function linkButton(text: string, url: string, type = 'primary_filled'): Record<string, unknown> {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: text },
+    type,
+    width: 'fill',
+    behaviors: [{ type: 'open_url', default_url: url, pc_url: url, ios_url: url, android_url: url }],
+  };
+}
+
+/** lark_md/markdown 代码块包裹命令详情；三连反引号会破坏围栏，先转义。 */
 function detailCodeBlock(detail: string): string {
   return '```\n' + detail.replace(/```/g, "'''") + '\n```';
 }
 
 /**
- * 嵌入 lark_md 的用户数据（任务标题等）：星号/反引号/括号全角化并中和 [ ] 链接语法，
+ * 嵌入 markdown 的用户数据（任务标题等）：星号/反引号/括号全角化并中和 [ ] 链接语法，
  * 同时中和 ~~（删除线）、<font color>/<at id> 等类 HTML 标签语法（< > 全角化），
- * 避免误触加粗/代码/链接/删除线/标签解析破坏排版。
+ * 避免误触加粗/代码/链接/删除线/标签解析破坏排版（2.0 markdown 这些语法是真渲染）。
  */
 function mdSafe(s: string): string {
   return s
@@ -51,38 +106,36 @@ function mdSafe(s: string): string {
     .replace(/\)/g, '）');
 }
 
-/** Interactive card shown for a pending write operation (legacy card schema). */
-export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 120000): Record<string, unknown> {
+/** Interactive card shown for a pending write operation（卡片 JSON 2.0）。 */
+export function buildConfirmCard(
+  req: ConfirmRequest,
+  id: string,
+  timeoutMs = 120000,
+  opts?: { stopToken?: string },
+): Record<string, unknown> {
   const isLark = req.kind === 'lark';
   const kindText = kindLabel(req.kind);
   const timeoutSec = Math.round(timeoutMs / 1000);
-  const actions: Record<string, unknown>[] = [
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '✅ 确认执行（仅此次）' },
-      type: 'primary',
-      value: { hta_confirm: id, decision: 'yes' },
-    },
+  const buttons: Record<string, unknown>[] = [
+    callbackButton('✅ 确认执行（仅此次）', { hta_confirm: id, decision: 'yes' }, 'primary_filled'),
   ];
   if (req.batchKey) {
-    actions.push({
-      tag: 'button',
+    buttons.push(
       // 粒度如实标注：对象级免问（删除/审批等）只说「同对象」，避免用户误以为整个类都放行
-      text: { tag: 'plain_text', content: `🔁 ${batchScopeWord(req.batchScope)}免问（本会话）` },
-      value: { hta_confirm: id, decision: 'batch' },
-    });
+      callbackButton(`🔁 ${batchScopeWord(req.batchScope)}免问（本会话）`, { hta_confirm: id, decision: 'batch' }),
+    );
   }
-  actions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: '✖️ 取消' },
-    // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
-    value: { hta_confirm: id, decision: 'no' },
-  });
+  // 取消是安全操作，不用 danger 红——红色留给真正的破坏性动作本身（卡片 header 橙色已承担警示）
+  buttons.push(callbackButton('✖️ 取消', { hta_confirm: id, decision: 'no' }));
+  if (opts?.stopToken) {
+    buttons.push({ ...callbackButton('⏹ 停止', { hta_stop: opts.stopToken }), element_id: 'hta_stop' });
+  }
   // 精简版注脚：有效期（含超时后果，与文本降级版口径一致）与文本回复方式合并为一行
   const replyHint = req.batchKey
     ? `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「${batchScopeWord(req.batchScope)}免问」/「取消」`
     : `${timeoutSec} 秒内有效（超时自动拒绝） · 回复「确认」/「取消」`;
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: {
       // 写操作确认一律橙色警示头（蓝色只用于纯信息场景，如待审批通知）；
@@ -90,12 +143,15 @@ export function buildConfirmCard(req: ConfirmRequest, id: string, timeoutMs = 12
       template: 'orange',
       title: { tag: 'plain_text', content: `${isLark ? '✉️' : '🔧'} ${kindText} · 写操作确认${req.destructive ? ' · 高危' : ''}` },
     },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      { tag: 'div', text: { tag: 'lark_md', content: detailCodeBlock(req.detail) } },
-      { tag: 'action', actions },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: replyHint }] },
-    ],
+    body: {
+      direction: 'vertical',
+      elements: [
+        mdEl(`**${mdSafe(req.summary)}**`),
+        mdEl(detailCodeBlock(req.detail)),
+        ...buttons,
+        noteEl(replyHint),
+      ],
+    },
   };
 }
 
@@ -132,16 +188,20 @@ export function buildResolvedCard(req: ConfirmRequest, settle: ConfirmSettle): R
   const m = meta[settle];
   const time = new Date().toLocaleString('zh-CN', { hour12: false });
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: {
       template: m.template,
       title: { tag: 'plain_text', content: m.title },
     },
-    elements: [
-      // 终态卡片原地替换确认卡片，命令细节用户刚看过，不再重复展示
-      { tag: 'div', text: { tag: 'lark_md', content: `**${mdSafe(req.summary)}**` } },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: `${m.note} · ${time}` }] },
-    ],
+    body: {
+      direction: 'vertical',
+      elements: [
+        // 终态卡片原地替换确认卡片，命令细节用户刚看过，不再重复展示
+        mdEl(`**${mdSafe(req.summary)}**`),
+        noteEl(`${m.note} · ${time}`),
+      ],
+    },
   };
 }
 
@@ -173,6 +233,20 @@ export interface ProgressCardState {
    * 重启后的旧卡片/上一轮的停止按钮杀不到新轮次；占位初帧尚无 id 时缺省（点击静默忽略）。
    */
   stopToken?: string;
+  /** 注脚覆盖（合并场景文本裁决的免问撤销提示等）；缺省按 elapsedSec/waitingConfirm 默认注脚。 */
+  noteOverride?: string;
+}
+
+/**
+ * 进度卡正文（步骤轨迹文本）：buildProgressCard 的 hta_main 元素与 CardKit 流式更新共用同一份文本，
+ * 前缀扩展（追加步骤行）触发打字机动画。
+ */
+export function progressMainText(state: Pick<ProgressCardState, 'steps' | 'current'>): string {
+  const recent = state.steps.slice(-PROGRESS_CARD_MAX_STEPS);
+  // 步骤标签来自 toolActionLabel 的内部文案，过 mdSafe 仅为纵深防御
+  const lines = recent.map((s) => `✓ ${mdSafe(s)}`);
+  if (state.current) lines.push(`⏳ ${mdSafe(state.current)}`);
+  return lines.length ? lines.join('\n') : '⏳ 正在理解需求…';
 }
 
 /**
@@ -190,53 +264,61 @@ function waitingConfirmNote(form: { hasCard: boolean; batchKey: boolean }): stri
 /**
  * 进度占位卡片（替代纯文本「⏳ 处理中…」）：蓝头 + 步骤轨迹，随工具调用原地更新；
  * 「⏹ 停止」按钮经 card.action.trigger 同步中断当前轮次（hta_stop）。
+ * 带 streaming 配置与 hta_main/hta_stop 锚点：CardKit 流式更新（打字机动画）用；
+ * 消息传输降级路径同样可发（streaming 配置在普通卡片上无害，终态卡整卡覆盖即清除）。
  */
 export function buildProgressCard(state: ProgressCardState): Record<string, unknown> {
-  const recent = state.steps.slice(-PROGRESS_CARD_MAX_STEPS);
-  // 步骤标签来自 toolActionLabel 的内部文案，过 mdSafe 仅为纵深防御
-  const lines = recent.map((s) => `✓ ${mdSafe(s)}`);
-  if (state.current) lines.push(`⏳ ${mdSafe(state.current)}`);
   const confirmForm = state.waitingConfirm === true ? { hasCard: true, batchKey: false } : state.waitingConfirm;
-  const note = confirmForm
-    ? waitingConfirmNote(confirmForm)
-    : typeof state.elapsedSec === 'number'
-      ? `已等待 ${state.elapsedSec} 秒 · 回复 /stop 也可中断`
-      : '回复 /stop 也可中断';
+  const note =
+    state.noteOverride ??
+    (confirmForm
+      ? waitingConfirmNote(confirmForm)
+      : typeof state.elapsedSec === 'number'
+        ? `已等待 ${state.elapsedSec} 秒 · 回复 /stop 也可中断`
+        : '回复 /stop 也可中断');
   return {
-    config: baseCardConfig(),
+    schema: '2.0',
+    config: streamingCardConfig(),
     header: {
       template: state.waitingConfirm ? 'orange' : 'blue',
       title: { tag: 'plain_text', content: state.waitingConfirm ? '⏳ 等待你处理上方的写操作确认' : '⏳ 处理中' },
     },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: lines.length ? lines.join('\n') : '⏳ 正在理解需求…' } },
-      {
-        tag: 'action',
-        actions: [{ tag: 'button', text: { tag: 'plain_text', content: '⏹ 停止' }, value: { hta_stop: state.stopToken ?? '' } }],
-      },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: note }] },
-    ],
+    body: {
+      direction: 'vertical',
+      elements: [
+        mdEl(progressMainText(state), 'hta_main'),
+        { ...callbackButton('⏹ 停止', { hta_stop: state.stopToken ?? '' }, 'danger'), element_id: 'hta_stop' },
+        noteEl(note),
+      ],
+    },
   };
 }
 
 /**
- * 结果卡片：正文为 LLM 回复的 lark_md 渲染——最小中和（同 diagnosisMdSafe 口径：
- * < > 全角化、~~ 中和；加粗/列表/代码块等排版保留）。
+ * 结果卡片：正文为 LLM 回复的 markdown 渲染——最小中和（同 diagnosisMdSafe 口径：
+ * < > 全角化、~~ 中和；加粗/列表/代码块等排版保留；2.0 markdown 额外支持表格/标题真渲染）。
  * 头部措辞中性（「处理结束」）：正文可能是「（无回复）」「已达上限」等非成功内容，恒称「已完成」是谎称（T31 口径）。
- * legacy lark_md 只支持部分 Markdown：`#` 标题、`>` 引用、行内代码、表格等会原样显示
- * （可接受，不丢内容；不要指望它们被渲染）。
  */
-export function buildResultCard(reply: string, meta?: { elapsedSec?: number }): Record<string, unknown> {
-  const elements: Array<Record<string, unknown>> = [
-    { tag: 'div', text: { tag: 'lark_md', content: diagnosisMdSafe(reply || '（无回复）') } },
-  ];
-  if (meta?.elapsedSec !== undefined) {
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `总用时约 ${meta.elapsedSec} 秒` }] });
+export function buildResultCard(
+  reply: string,
+  meta?: { elapsedSec?: number },
+  opts?: { url?: string },
+): Record<string, unknown> {
+  const elements: Array<Record<string, unknown>> = [mdEl(diagnosisMdSafe(reply || '（无回复）'))];
+  if (opts?.url) {
+    // 「查看详情」跳转按钮（单按钮：primary_filled + width fill，官方主次规范）
+    elements.push(linkButton('🔗 查看详情', opts.url));
   }
+  const notes: string[] = [];
+  if (meta?.elapsedSec !== undefined) notes.push(`总用时约 ${meta.elapsedSec} 秒`);
+  // 看板链接跑在本机：注明可达范围（与 buildJobProcessingCard/buildWatchEventCard 同口径）
+  if (opts?.url) notes.push(linkReachNote(opts.url));
+  if (notes.length) elements.push(noteEl(notes.join(' · ')));
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: { template: 'green', title: { tag: 'plain_text', content: '处理结束' } },
-    elements,
+    body: { direction: 'vertical', elements },
   };
 }
 
@@ -255,9 +337,10 @@ export function buildProgressTerminalCard(kind: 'aborted' | 'failed' | 'seeBelow
     stale: { template: 'grey', title: '⏹ 该轮次已结束', note: '机器人可能已重启；如需中断当前任务，请用最新进度卡片上的「⏹ 停止」或回复 /stop。' },
   }[kind];
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: { template: meta.template, title: { tag: 'plain_text', content: meta.title } },
-    elements: [{ tag: 'note', elements: [{ tag: 'plain_text', content: meta.note }] }],
+    body: { direction: 'vertical', elements: [noteEl(meta.note)] },
   };
 }
 
@@ -279,38 +362,22 @@ export function buildJobProcessingCard(
   const elements: Array<Record<string, unknown>> = [
     // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底，别让用户死等卡片；
     // 作业是进程内状态，机器人重启后静默消亡，卡片不能永久谎称「进行中」
-    {
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: `${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，若长时间无结果请重新发起。`,
-      },
-    },
+    mdEl(`${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，若长时间无结果请重新发起。`),
   ];
   if (url) {
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '📋 查看任务' },
-          type: 'primary',
-          url,
-          multi_url: { url, android_url: url, ios_url: url, pc_url: url },
-        },
-      ],
-    });
+    elements.push(linkButton('📋 查看任务', url));
     // 看板链接跑在本机：注明可达范围（与 buildWatchEventCard 同口径）
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: linkReachNote(url) }] });
+    elements.push(noteEl(linkReachNote(url)));
   }
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: { template: 'blue', title: { tag: 'plain_text', content: `${meta.heading}：《${title}》` } },
-    elements,
+    body: { direction: 'vertical', elements },
   };
 }
 
-/** 看板事件通知的飞书卡片（legacy schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
+/** 看板事件通知的飞书卡片（2.0 schema，与确认卡片风格一致：色头 + 摘要 + 链接按钮 + 提示注脚）。 */
 export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
   const meta: Record<WatchEventKind, { template: string; title: string }> = {
     review: { template: 'yellow', title: '🔍 看板任务待审阅' },
@@ -332,17 +399,17 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     const lines = items.map((l) => `· ${l}`);
     // 列表被截断时补一行剩余数量，与标题计数对齐
     if (total > items.length) lines.push(`· …还有 ${total - items.length} 个`);
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: lines.join('\n') } });
+    elements.push(textEl(lines.join('\n')));
     elements.push({ tag: 'hr' });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '回复「待审批」处理' }] });
+    elements.push(noteEl('回复「待审批」处理'));
   } else {
     // 任务标题来自看板数据，可能含 markdown 字符：用 plain_text 避免误解析（与审批列表同一处理）
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: `《${e.title}》` } });
+    elements.push(textEl(`《${e.title}》`));
     if (e.projectName) {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: `项目：${e.projectName}` } });
+      elements.push(textEl(`项目：${e.projectName}`));
     }
     if (e.transition) {
-      // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文；原文过 mdSafe 再进 lark_md 内联代码
+      // 状态键翻成中文标签（进行中/待审阅/已完成…），未知状态回退原文；原文过 mdSafe 再进 markdown 内联代码
       const hasArrow = e.transition.includes('→');
       const rendered = mdSafe(
         e.transition
@@ -352,45 +419,43 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
       );
       // 无「→」时是 watcher 塞的进展短语（如「跟进执行完成」），不是状态流转，标签用「进展」
       const label = hasArrow ? '状态变更' : '进展';
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${label}** \`${rendered}\`` } });
+      elements.push(mdEl(`**${label}** \`${rendered}\``));
     }
     if (e.kind === 'failed') {
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content: WATCH_HINT_FAILED_LOG } });
+      elements.push(textEl(WATCH_HINT_FAILED_LOG));
     }
     if (e.extra) {
       // stale 的 extra 是停滞时长说明（自带完整语义），done 的 extra 是结果摘要
       const content = e.kind === 'stale' ? e.extra : `结果摘要：${e.extra}`;
-      elements.push({ tag: 'div', text: { tag: 'plain_text', content } });
+      elements.push(textEl(content));
     }
     if (e.url) {
       const btn = e.kind === 'review' ? '🔍 人工审查' : e.kind === 'done' ? '👀 查看结果' : '📋 查看任务';
-      const actions: Array<Record<string, unknown>> = [
-        { tag: 'button', text: { tag: 'plain_text', content: btn }, type: 'primary', url: e.url },
-      ];
+      // 主按钮（跳转）primary_filled，其余（回传按钮）default——官方主次规范
+      elements.push(linkButton(btn, e.url));
       // AI 审查：回传按钮（card.action.trigger），bot 侧调 open-code-review 跑该 attempt 的 diff
       if (e.kind === 'review' && e.attemptId) {
-        actions.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: '🤖 AI 审查' },
+        elements.push(
           // 标题超 50 字符截断时补省略号，下游《标题》展示不至于残缺得无声无息；
           // url 一并带上：点击后换成的「进行中」卡片据此保留「查看任务」入口
-          value: { hta_review: e.attemptId, title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title, url: e.url },
-        });
+          callbackButton('🤖 AI 审查', {
+            hta_review: e.attemptId,
+            title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title,
+            url: e.url,
+          }),
+        );
       }
       // AI 诊断：回传按钮，bot 侧采集失败信息调 LLM 生成中文诊断（按钮语义同 AI 审查，点击即授权）
       if (e.kind === 'failed' && e.taskId) {
-        actions.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: '🔍 AI 诊断' },
-          value: {
+        elements.push(
+          callbackButton('🔍 AI 诊断', {
             hta_diagnose: e.taskId,
             attempt: e.attemptId,
             title: e.title.length > 50 ? `${e.title.slice(0, 50)}…` : e.title,
             url: e.url,
-          },
-        });
+          }),
+        );
       }
-      elements.push({ tag: 'action', actions });
     }
     const hints: Partial<Record<WatchEventKind, string>> = {
       review: WATCH_HINT_REVIEW,
@@ -406,14 +471,15 @@ export function buildWatchEventCard(e: WatchEvent): Record<string, unknown> {
     );
     if (notes.length) {
       elements.push({ tag: 'hr' });
-      elements.push({ tag: 'note', elements: notes.map((t) => ({ tag: 'plain_text', content: t })) });
+      for (const t of notes) elements.push(noteEl(t));
     }
   }
 
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: { template: m.template, title: { tag: 'plain_text', content: m.title } },
-    elements,
+    body: { direction: 'vertical', elements },
   };
 }
 
@@ -425,6 +491,7 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
   // 链接可达性与 buildWatchEventCard 同口径（见 linkReachNote）
   const linkNote = linkReachNote(url);
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: {
       template: pass ? 'green' : 'yellow',
@@ -433,38 +500,14 @@ export function buildAiReviewCard(title: string, url: string, pass: boolean): Re
         content: pass ? `✅ AI 审查全部通过：《${title}》` : `🤖 AI 审查完成：《${title}》`,
       },
     },
-    elements: [
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: pass ? '本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。',
-        },
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '📄 查看完整报告' },
-            type: 'primary',
-            url,
-            multi_url: { url, android_url: url, ios_url: url, pc_url: url },
-          },
-        ],
-      },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'plain_text',
-            content: pass
-              ? `可继续追问审查结论 · ${linkNote}`
-              : `可回复「按审查意见修一下」 · ${linkNote}`,
-          },
-        ],
-      },
-    ],
+    body: {
+      direction: 'vertical',
+      elements: [
+        mdEl(pass ? '本次变更未发现任何问题。' : '审查完成，详细意见见完整报告。'),
+        linkButton('📄 查看完整报告', url),
+        noteEl(pass ? `可继续追问审查结论 · ${linkNote}` : `可回复「按审查意见修一下」 · ${linkNote}`),
+      ],
+    },
   };
 }
 
@@ -474,10 +517,9 @@ function buttonTitle(title: string): string {
 }
 
 /**
- * 诊断结论（LLM 输出）进 lark_md 前的最小中和：诊断材料含失败日志/任务描述等外部可控数据，
+ * 诊断结论（LLM 输出）进 markdown 前的最小中和：诊断材料含失败日志/任务描述等外部可控数据，
  * 经 LLM 复述后 <font color>/<at id> 类标签与 ~~ 删除线会真实渲染（可伪造警示或钓鱼样式），
  * < > 全角化、~~ 中和；星号/括号等正常 markdown 排版保留（诊断三段式排版依赖加粗与列表）。
- * 注意 legacy lark_md 只支持部分 Markdown：`#` 标题、`>` 引用、行内代码、表格等会原样显示。
  */
 function diagnosisMdSafe(s: string): string {
   return s.replace(/</g, '＜').replace(/>/g, '＞').replace(/~~/g, '～～');
@@ -503,42 +545,30 @@ export function buildDiagnosisCard(
       : diagnosis,
   );
   const elements: Array<Record<string, unknown>> = [
-    // 诊断结论是 LLM 输出（markdown 为预期格式）：最小中和后按 lark_md 渲染（见 diagnosisMdSafe）
-    { tag: 'div', text: { tag: 'lark_md', content: text } },
+    // 诊断结论是 LLM 输出（markdown 为预期格式）：最小中和后按 markdown 渲染（见 diagnosisMdSafe）
+    mdEl(text),
   ];
   if (opts?.settledAt) {
     elements.push({ tag: 'hr' });
     if (opts.followUpExcerpt) {
-      // 外部内容（LLM 诊断复述）用 plain_text，不经 lark_md 渲染
-      elements.push({
-        tag: 'div',
-        text: { tag: 'plain_text', content: `已发送的跟进指令：\n${opts.followUpExcerpt}` },
-      });
+      // 外部内容（LLM 诊断复述）用 plain_text，不经 markdown 渲染
+      elements.push(textEl(`已发送的跟进指令：\n${opts.followUpExcerpt}`));
     }
-    elements.push({
-      tag: 'note',
-      elements: [{ tag: 'plain_text', content: `已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。` }],
-    });
+    elements.push(
+      noteEl(`已于 ${opts.settledAt} 按以上结论发起重试，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。`),
+    );
   } else {
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '↻ 按诊断结论重试' },
-          type: 'primary',
-          value: { hta_retry: taskId, title: buttonTitle(title), ...(opts?.url ? { url: opts.url } : {}) },
-        },
-      ],
-    });
-    elements.push({
-      tag: 'note',
-      elements: [
-        { tag: 'plain_text', content: '重试会把以上诊断结论作为跟进指令发给任务执行方（点击即发起，不再二次确认）' },
-      ],
-    });
+    elements.push(
+      callbackButton(
+        '↻ 按诊断结论重试',
+        { hta_retry: taskId, title: buttonTitle(title), ...(opts?.url ? { url: opts.url } : {}) },
+        'primary_filled',
+      ),
+    );
+    elements.push(noteEl('重试会把以上诊断结论作为跟进指令发给任务执行方（点击即发起，不再二次确认）'));
   }
   return {
+    schema: '2.0',
     config: baseCardConfig(),
     header: {
       template: opts?.settledAt ? 'grey' : 'blue',
@@ -547,6 +577,6 @@ export function buildDiagnosisCard(
         content: opts?.settledAt ? `↻ 已按诊断结论重试：《${title}》` : `🔍 AI 失败诊断：《${title}》`,
       },
     },
-    elements,
+    body: { direction: 'vertical', elements },
   };
 }

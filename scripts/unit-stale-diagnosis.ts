@@ -106,13 +106,22 @@ function makeCfg(kanbanUrl: string): AgentConfig {
   };
 }
 
-/** 从卡片 JSON 里收集全部按钮的 value（断言 action 协议用）。 */
+/** 从卡片 JSON 里收集全部回调按钮的 value（2.0：按钮平铺 body.elements，value 在 behaviors callback 里）。 */
 function buttonValues(card: Record<string, unknown>): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
-  for (const el of (card.elements as Array<Record<string, unknown>>) ?? []) {
-    if (el.tag !== 'action') continue;
-    for (const a of (el.actions as Array<Record<string, unknown>>) ?? []) {
-      if (a.value && typeof a.value === 'object') out.push(a.value as Record<string, unknown>);
+  const elements = ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ??
+    (card.elements as Array<Record<string, unknown>>) ??
+    []) as Array<Record<string, unknown>>;
+  for (const el of elements) {
+    if (el.tag === 'button') {
+      for (const b of (el.behaviors as Array<Record<string, unknown>>) ?? []) {
+        if (b.type === 'callback' && b.value && typeof b.value === 'object') out.push(b.value as Record<string, unknown>);
+      }
+    }
+    if (el.tag === 'action') {
+      for (const a of (el.actions as Array<Record<string, unknown>>) ?? []) {
+        if (a.value && typeof a.value === 'object') out.push(a.value as Record<string, unknown>);
+      }
     }
   }
   return out;
@@ -828,31 +837,27 @@ async function main(): Promise<void> {
   });
 
   check('buildDiagnosisCard：LLM 输出最小中和（标签/删除线），截断注记给出路，注脚称「任务执行方」', (() => {
-    const card = buildDiagnosisCard('任务X', '一、<font color="red">警告</font> ~~伪造~~ **保留加粗**', 'task-1') as {
-      elements: Array<{ tag: string; text?: { content?: string }; elements?: Array<{ content?: string }> }>;
-    };
-    const body = card.elements[0]!.text?.content ?? '';
-    const note =
-      card.elements
-        .find((e) => e.tag === 'note')
-        ?.elements?.map((n) => n.content || '')
-        .join('\n') ?? '';
+    // 2.0：正文为首个 markdown 组件（content），注脚为 markdown + text_size:notation
+    type Card2 = { body: { elements: Array<{ tag: string; content?: string; text_size?: string }> } };
+    const card = buildDiagnosisCard('任务X', '一、<font color="red">警告</font> ~~伪造~~ **保留加粗**', 'task-1') as Card2;
+    const body = card.body.elements[0]!.content ?? '';
+    const note = card.body.elements
+      .filter((e) => e.tag === 'markdown' && e.text_size === 'notation')
+      .map((n) => n.content || '')
+      .join('\n');
     if (body.includes('<font') || body.includes('~~') || body.includes('</')) return false;
     if (!body.includes('＜font') || !body.includes('～～') || !body.includes('**保留加粗**')) return false;
     if (!note.includes('任务执行方') || note.includes('执行 Agent')) return false;
-    const long = buildDiagnosisCard('任务X', 'x'.repeat(DIAGNOSIS_CARD_MAX_CHARS + 10), 'task-1') as {
-      elements: Array<{ text?: { content?: string } }>;
-    };
-    return (long.elements[0]!.text?.content ?? '').includes('过长已截断，完整结论可直接追问');
+    const long = buildDiagnosisCard('任务X', 'x'.repeat(DIAGNOSIS_CARD_MAX_CHARS + 10), 'task-1') as Card2;
+    return (long.body.elements[0]!.content ?? '').includes('过长已截断，完整结论可直接追问');
   })());
 
   check('buildWatchEventCard：失败注脚主推「AI 诊断」按钮；stale 注脚复用 WATCH_HINT_STALE', (() => {
+    // 2.0：注脚为若干 markdown + text_size:notation
+    type Card2 = { body: { elements: Array<{ tag: string; content?: string; text_size?: string }> } };
     const noteOf = (e: WatchEvent): string =>
-      (
-        (buildWatchEventCard(e) as { elements: Array<{ tag: string; elements?: Array<{ content?: string }> }> }).elements.find(
-          (el) => el.tag === 'note',
-        )?.elements ?? []
-      )
+      (buildWatchEventCard(e) as Card2).body.elements
+        .filter((el) => el.tag === 'markdown' && el.text_size === 'notation')
         .map((n) => n.content || '')
         .join('\n');
     const failed = noteOf({ kind: 'failed', title: 't', url: 'http://kanban/x', taskId: 't1', text: 'x' });

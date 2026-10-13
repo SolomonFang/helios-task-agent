@@ -23,10 +23,12 @@ export type ConfirmAnswer = 'approved' | 'approved_batch' | 'denied' | 'ignored'
  * 卡片按钮回调的裁决结果：answer 同 ConfirmAnswer 语义；
  * settlement 在裁决落地时携带（ignored 无）——确认请求 + 终态，
  * 供 bot 层同步构建终态卡片（buildResolvedCard）随回调返回值即时换卡，不等异步 updateCard。
+ * cardMessageId 为确认卡片所在消息 id：与当前轮次进度占位相同即是「合并单卡片」场景
+ * （批准后应换回执行中进度卡而非静态终态卡，见 handler 的 hta_confirm 分支）。
  */
 export interface CardResolveResult {
   answer: ConfirmAnswer;
-  settlement?: { req: ConfirmRequest; settle: ConfirmSettle };
+  settlement?: { req: ConfirmRequest; settle: ConfirmSettle; cardMessageId?: string };
 }
 
 interface Pending {
@@ -285,16 +287,17 @@ export class ConfirmationManager {
     const p = this.pendings.get(openId);
     if (!p || p.id !== confirmId) return { answer: 'ignored' };
     const req = p.req;
+    const cardMessageId = p.cardMessageId;
     if (decision === 'batch' && p.req.batchKey) {
       this.finish(openId, p, 'batch');
-      return { answer: 'approved_batch', settlement: { req, settle: 'batch' } };
+      return { answer: 'approved_batch', settlement: { req, settle: 'batch', cardMessageId } };
     }
     if (decision === 'yes') {
       this.finish(openId, p, 'once');
-      return { answer: 'approved', settlement: { req, settle: 'once' } };
+      return { answer: 'approved', settlement: { req, settle: 'once', cardMessageId } };
     }
     this.finish(openId, p, false);
-    return { answer: 'denied', settlement: { req, settle: 'denied' } };
+    return { answer: 'denied', settlement: { req, settle: 'denied', cardMessageId } };
   }
 
   /** /stop 等场景一并取消挂起的确认（按拒绝处理）。返回是否确实有 pending 被取消。 */
