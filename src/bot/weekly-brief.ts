@@ -7,12 +7,13 @@ import { collectWorkSummary, isKnownStatus, statusLabel, type WorkSummaryData, t
 /**
  * 定时周报：HTA_WEEKLY_BRIEF=HH:MM（本地时间）开启，默认关闭；
  * HTA_WEEKLY_BRIEF_DAY=1-7（1=周一…7=周日）指定周几推送，默认 5（周五），非法值告警并按默认处理。
- * 机制与晨报（daily-brief.ts）完全对齐：bot 运行期间每分钟检查一次是否到点；到点（当周当周
- * 设定星期且过了设定时刻）且当天未推送过则给 owner 推一条本周迭代进展（复用 work_summary 采集）。
- * 「上次推送日期 + 已送达 owner」落盘（原子写），重启当周当天不重复推；部分 owner 推送失败时
- * 下一 tick 只补投未送达的。看板不可达 / 采集失败 / 推送失败：本次跳过并记日志，按 1→2→4…分钟
- * 指数退避（封顶 30 分钟）再试，当天内有效。owner 未认领（白名单为空）时不推、不标记。
- * 仅 bot 形态装配（CLI 不引本模块）。
+ * 机制与晨报（daily-brief.ts）对齐：bot 运行期间每分钟检查一次是否到点；设定星期当天过了
+ * 设定时刻即给 owner 推一条本周迭代进展（复用 work_summary 采集）；错过推送日（进程当天没开）
+ * 时当周后续日期补推一次并在正文注明补发，跨周不补（进入新一周后等当周推送日）。
+ * 「最近一次推送日期 + 已送达 owner」落盘（原子写），当周不重复推（含补推日）；部分 owner
+ * 推送失败时下一 tick 只补投未送达的（补推日同样认当周的送达记录）。看板不可达 / 采集失败 /
+ * 推送失败：本次跳过并记日志，按 1→2→4…分钟指数退避（封顶 30 分钟）再试，当周内有效。
+ * owner 未认领（白名单为空）时不推、不标记。仅 bot 形态装配（CLI 不引本模块）。
  */
 
 export interface WeeklyBriefTime {
@@ -87,6 +88,9 @@ function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatu
   return lines;
 }
 
+/** 星期展示文案（下标 0=周一…6=周日，与 isoWeekday 的 1-7 错一位）。 */
+const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
 /**
  * 周报文本（纯函数便于单测）：头部为迭代全量计数（与晨报同口径），正文聚焦「这周干得怎么样」——
  * 本周完成 / 待审阅积压 / 失败三个分组。
@@ -95,8 +99,10 @@ function listSection(label: string, tasks: WorkSummaryTask[], opts?: { showStatu
  * 通常就是转入已完成的那一刻；updated_at 无法解析的任务保守不计入（宁缺毋假）。
  * 分组计数用 totals.doneThisWeek（采集侧截断前全量口径，与头部计数行一致）；标题列表仍是
  * data.tasks 的截断样本。旧采集缺该字段时回退样本计数（只少报不谎报）。
+ * opts.makeUpDay：补推日（原定推送星期，1=周一…7=周日）——错过推送日后当周补推时必须
+ * 注明补发，否则用户会困惑「今天不是推送日怎么收到周报」。
  */
-export function buildWeeklyBriefText(data: WorkSummaryData, now: Date): string {
+export function buildWeeklyBriefText(data: WorkSummaryData, now: Date, opts?: { makeUpDay?: number }): string {
   const weekStart = startOfWeek(now);
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
@@ -120,6 +126,9 @@ export function buildWeeklyBriefText(data: WorkSummaryData, now: Date): string {
     `📅 看板周报 · ${data.sinceLabel}（${localDateStr(weekStart)} 至 ${localDateStr(rangeEnd)}）`,
     `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done}${doneNote} · 失败 ${data.totals.failed}${failedNote}`,
   ];
+  if (opts?.makeUpDay) {
+    lines.push(`📮 补发：原定每${WEEKDAY_LABELS[opts.makeUpDay - 1] ?? ''}的周报延迟到今天推送。`);
+  }
   if (!data.tasks.length) {
     lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
   } else {
@@ -162,9 +171,9 @@ export function buildWeeklyBriefText(data: WorkSummaryData, now: Date): string {
 }
 
 interface WeeklyBriefState {
-  /** 最近一次推送的本地日期（YYYY-MM-DD）：推送只发生在设定星期，与今天相同则只补投未送达 owner。 */
+  /** 最近一次推送的本地日期（YYYY-MM-DD）：落在本周内则当周不再全量重推，只补投未送达 owner。 */
   date: string;
-  /** 当天已送达的 owner open_id（部分失败时下一 tick 只补投未送达的，避免重复刷屏）。 */
+  /** 当周已送达的 owner open_id（部分失败时下一 tick 只补投未送达的，避免重复刷屏）。 */
   delivered: string[];
 }
 
@@ -258,30 +267,37 @@ export class WeeklyBrief {
     this.nextRetryAt = nowMs + backoffMin * 60 * 1000;
   }
 
-  /** 单 tick：是当周设定星期、到点且当天未全员送达才推送。 */
+  /** 单 tick：到点（设定日当天过设定时刻，或错过后的当周补推日）且当周未全员送达才推送。 */
   private async tick(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
       const now = this.opts.now?.() ?? new Date();
-      // 只在设定星期推送：错过当天（进程整天没开）本周不再补推，等下一周
-      if (isoWeekday(now) !== this.opts.day) return;
+      const wd = isoWeekday(now);
       const { hour, minute } = this.opts.time;
-      // 到点判定用「当前时间 ≥ 当天设定时刻」：进程在到点后拉起（或恰好错过那一分钟）当天仍可补推
-      if (now.getHours() < hour || (now.getHours() === hour && now.getMinutes() < minute)) return;
+      // 设定星期当天需到点（进程在到点后拉起、或恰好错过那一分钟，当天仍可补推）；
+      // 错过设定日（进程当天没开）时当周后续日期补推一次——补推日不再受时刻门限制，
+      // 启动即检查即补（周刊早报比守着原时刻更有价值）；跨周不补，等当周推送日。
+      // 设定日为周日（7）时没有更晚的当周日期，天然无补推窗口
+      const isScheduledDay = wd === this.opts.day;
+      if (isScheduledDay) {
+        if (now.getHours() < hour || (now.getHours() === hour && now.getMinutes() < minute)) return;
+      } else if (wd < this.opts.day) return;
       const owners = this.opts.owners();
-      if (!owners.length) return; // owner 未认领不推、不标记（认领后当天到点仍可补推）
+      if (!owners.length) return; // owner 未认领不推、不标记（认领后当周到点仍可补推）
       const today = localDateStr(now);
-      const delivered = this.state?.date === today ? this.state.delivered : [];
+      // 判重口径是「当周」而非「当天」：补推日也要认出设定日已送达的 owner，只补投未送达的
+      const weekStartStr = localDateStr(startOfWeek(now));
+      const delivered = this.state && this.state.date >= weekStartStr ? this.state.delivered : [];
       const targets = owners.filter((o) => !delivered.includes(o));
-      if (!targets.length) return; // 当天已全员送达
+      if (!targets.length) return; // 当周已全员送达
       if (now.getTime() < this.nextRetryAt) return; // 失败退避中，等下一个窗口
 
       const health = this.opts.healthCheck
         ? await this.opts.healthCheck()
         : (await fetchKanbanHealth(this.opts.kanbanUrl)) === 'ok';
       if (!health) {
-        // 看板不可达：跳过本次推送（不推「不可达」消息打扰用户），不标记，退避后当天内再试
+        // 看板不可达：跳过本次推送（不推「不可达」消息打扰用户），不标记，退避后当周内再试
         this.markFailure(now.getTime());
         this.opts.log?.(`看板不可达，本次周报跳过（退避后再试）`);
         return;
@@ -301,7 +317,7 @@ export class WeeklyBrief {
         this.opts.log?.(`周报采集失败，本次跳过：${errMessage(err)}`);
         return;
       }
-      const text = buildWeeklyBriefText(data, now);
+      const text = buildWeeklyBriefText(data, now, isScheduledDay ? undefined : { makeUpDay: this.opts.day });
       const sent = [...delivered];
       let failed = 0;
       for (const owner of targets) {
@@ -321,7 +337,7 @@ export class WeeklyBrief {
       } else {
         this.failStreak = 0;
         this.nextRetryAt = 0;
-        this.opts.log?.(`周报已送达 ${targets.length} 个 owner`);
+        this.opts.log?.(`周报已送达 ${targets.length} 个 owner${isScheduledDay ? '' : '（补发）'}`);
       }
     } catch (err) {
       this.opts.log?.(`周报检查失败：${errMessage(err)}`);

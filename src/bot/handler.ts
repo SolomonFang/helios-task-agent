@@ -163,6 +163,8 @@ export interface BotHandlerDeps {
   confirmCardBridge?: ConfirmCardBridge;
   /** 每用户最近一次写操作确认请求的 kind（bot-main 随确认发送记录）；用于免问回执按 kind 细化措辞。 */
   lastBatchKind?: (openId: string) => ConfirmKind | undefined;
+  /** 进行中作业（AI 审查/诊断/重试）落盘路径：重启后补发中断通知；缺省不持久化（测试场景）。 */
+  reviewJobsStatePath?: string;
 }
 
 export interface BotHandlers {
@@ -170,6 +172,8 @@ export interface BotHandlers {
   handle: (msg: FeishuInboundMessage) => Promise<void>;
   /** 卡片按钮回调（确认卡片 / AI 审查 / 进度卡片停止）；返回值作为同步响应即时生效（toast + 原地换卡）。 */
   onCardAction: (action: CardAction) => CardActionResponse | void;
+  /** 启动后补发「机器人重启导致作业中断」通知（无遗留作业时无操作）；长连接就绪后调用一次。 */
+  notifyInterruptedJobs: () => Promise<void>;
 }
 
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
@@ -187,6 +191,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     diagnosisRunner: deps.diagnosisRunner,
     followUpSender: deps.followUpSender,
     attemptIdFetcher: deps.attemptIdFetcher,
+    statePath: deps.reviewJobsStatePath,
   });
   // 进度占位/静默心跳/最终回复投递
   const progress = createProgressKit({
@@ -908,5 +913,5 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     await enqueueMessage(fmsg, text, cmd);
   };
 
-  return { handle, onCardAction };
+  return { handle, onCardAction, notifyInterruptedJobs: reviewJobs.notifyInterruptedJobs };
 }

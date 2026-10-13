@@ -125,9 +125,10 @@ Stale-task nudge (`HTA_STALE_NUDGE_HOURS=8`, off by default): pushes a reminder 
 ~/.helios-task-agent/watch-state.json      # kanban push snapshot
 ~/.helios-task-agent/stale-nudge-state.json # stale-task nudge state (no duplicate nudge per stale stage)
 ~/.helios-task-agent/daily-brief-state.json # daily-brief last-push date (no duplicate push same day)
-~/.helios-task-agent/weekly-brief-state.json # weekly-brief last-push date (no duplicate push same day)
+~/.helios-task-agent/weekly-brief-state.json # weekly-brief last-push date (no duplicate push within the same week; a missed push day is made up once later that week)
 ~/.helios-task-agent/sessions/             # per-user conversation history (restored on restart; /clear wipes it)
 ~/.helios-task-agent/skills/               # user skills (target of /skills install)
+~/.helios-task-agent/review-jobs.json   # in-flight AI review/diagnosis/retry jobs (interrupted-job notice on restart)
 ~/.helios-task-agent/reviews/              # AI-review reports (HTML, cleaned up after 30 days)
 ~/.helios-task-agent/reports/              # work-summary reports
 ~/.helios-task-agent/update-check.json     # update-check cache (24h)
@@ -218,7 +219,7 @@ via the `skill_doc` tool (progressive disclosure).
 | `HTA_UPDATE_CHECK` / `HTA_UPDATE_REGISTRY` | Startup npm update check (default on; registry follows `npm config`) |
 | `LLM_VISION` | `1` = bot accepts image messages: the image is downloaded and sent with that single request (**model must support image input**; images are never written to disk or conversation history; 10MB cap). Default off — image messages get the text-only rejection |
 | `HTA_DAILY_BRIEF` | Daily brief (bot only): local `HH:MM` (e.g. `09:30`) — pushes the current-iteration kanban overview (in-progress / todo / in-review / done / failed; all tasks when `HELIOS_KANBAN_ITERATION` is unset) to the allowlisted users (owner) every day. Unset or invalid = off |
-| `HTA_WEEKLY_BRIEF` | Weekly brief (bot only): local `HH:MM` (e.g. `18:00`) — pushes the week's iteration progress (iteration-wide counts + done-this-week / in-review backlog / failed sections; "done this week" is counted by each task's last-updated time falling within the current week) to the allowlisted users (owner) once a week. Unset or invalid = off |
+| `HTA_WEEKLY_BRIEF` | Weekly brief (bot only): local `HH:MM` (e.g. `18:00`) — pushes the week's iteration progress (iteration-wide counts + done-this-week / in-review backlog / failed sections; "done this week" is counted by each task's last-updated time falling within the current week) to the allowlisted users (owner) once a week. If the configured day is missed (bot offline that day), the brief is made up once on a later day within the same week (marked as a make-up), not carried across weeks. Unset or invalid = off |
 | `HTA_WEEKLY_BRIEF_DAY` | Weekday for the weekly brief: `1`-`7` (1=Mon … 7=Sun), default `5` (Fri); invalid values warn at startup and fall back to the default |
 | `HTA_TURN_TIMEOUT_MIN` | Wall-clock limit (minutes) for a single agent turn, default 30; on timeout the turn is aborted with a notice |
 | `HTA_DEBUG` | `1` = raw debug output for kanban connectivity and pipeline errors (includes original English error text; troubleshooting only) |

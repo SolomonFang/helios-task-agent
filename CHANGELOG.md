@@ -6,8 +6,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- 机器人重启后补发「作业中断」通知：AI 审查 / 失败诊断 / 按诊断结论重试的进行中作业按受理/完结落盘 `review-jobs.json`（重启后作业不可恢复）；重启并建立长连接后向发起人补发中断通知——按用户聚合一条、按作业类型给文本可达的重新发起路径（「重新审查这个任务」/「为什么失败」），「进行中」卡片不再永久谎称「完成后推送结果」；通知投递失败的记录保留到下次启动补投（重复优于丢失），文本分支的定位记录（lastReview/lastDiagnosis）随落盘回填（`src/bot/review-jobs.ts`、`src/bot/handler.ts`、`src/bot-main.ts`；「进行中」卡片注脚同步更正，`src/bot/cards.ts`）
+
 ### Changed
 
+- 创建任务的写操作确认卡片解析项目名：项目字段从裸 UUID（「项目 ID：…」）升级为「项目：名称（ID：…）」，用户可核对任务落点；best-effort 解析（GET /projects/<id>，3s 超时，命中 60s 缓存、失败 15s 负面缓存），取不到时保持「项目 ID」原样展示，解析失败不阻断确认（`src/agent/tools/kanban-mcp.ts`，对应 docs/ued-issues.md F20 后续项）
+- 定时周报错过推送日补推：设定推送日当天机器人未在线时，当周后续日期补推一次并在正文注明「📮 补发」（补推日不受设定时刻限制，启动检查即补；跨周不补，等当周推送日）；送达判重口径从「当天」扩到「当周」，补推日只补投当周未送达的 owner（`src/bot/weekly-brief.ts`，对应 docs/ued-issues.md T42）
 - 飞书卡片全部迁移至卡片 JSON 2.0（`src/bot/cards.ts`）：按钮平铺 `body.elements`（`action` 容器已废弃），回传走 `behaviors:[{type:'callback',value}]`、跳转走 `open_url` 行为；注脚改用 `markdown` + `notation` 字号（2.0 无 note 组件）；结果卡片新增「🔗 查看详情」跳转按钮（回复内含看板同源链接时）；需飞书客户端 ≥ 7.20
 - 一轮对话由一张卡片承载全生命周期（loading → 写入确认 → 执行中 → 结果，全程原地更新，不再另发确认卡片与批准回执文本）：写操作确认原地画在进度占位卡上（确认期间进度刷新挂起、按钮不被覆盖，「⏹ 停止」保留），批准同步换回执行中进度卡（`src/bot-main.ts`、`src/bot/handler.ts`、`src/bot/progress-reporter.ts`、`src/agent/confirm.ts`）
 - 进度占位卡优先走 CardKit 卡片实体 + `streaming_mode` 流式更新（步骤轨迹打字机动画、会话列表预览「[生成中…]」，收尾自动关流）；未开通 `cardkit:card` 权限或建卡失败时自动降级为普通卡片整卡更新（功能不变、无动画）（`src/channels/feishu.ts`、`src/bot/progress-reporter.ts`）

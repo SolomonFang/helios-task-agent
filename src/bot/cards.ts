@@ -382,8 +382,8 @@ export function buildJobProcessingCard(
   }[kind];
   const elements: Array<Record<string, unknown>> = [
     // 作业失败/中断时卡片不会自己再变（结果推送走新消息）：注脚如实兜底并给出文本可达的出路，别让用户死等卡片；
-    // 作业是进程内状态，机器人重启后静默消亡，卡片不能永久谎称「进行中」
-    mdEl(`${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会使本次作业中断且不通知，${meta.stuck}。`),
+    // 作业是进程内状态，机器人重启会中断作业（重启后补发中断通知），卡片不能永久谎称「进行中」
+    mdEl(`${meta.note}\n结果或失败通知会以新消息推送。\n机器人重启会中断本次作业（重启后会推送中断通知），${meta.stuck}。`),
   ];
   if (url) {
     elements.push(linkButton('📋 查看任务', url));

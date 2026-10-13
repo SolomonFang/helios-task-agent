@@ -2613,7 +2613,7 @@ async function main(): Promise<void> {
       const jt = cardText(job);
       assert.ok(jt.includes('AI 审查进行中') && jt.includes('任务X'), `实际：${jt}`);
       assert.ok(jt.includes('以新消息推送'), '进行中卡片应如实说明结果以新消息推送（作业失败卡片不会自己再变）');
-      assert.ok(jt.includes('机器人重启会使本次作业中断且不通知'), '进行中卡片应如实说明重启后作业静默消亡');
+      assert.ok(jt.includes('机器人重启会中断本次作业（重启后会推送中断通知）'), '进行中卡片应如实说明重启中断与补通知');
       assert.ok(JSON.stringify(job).includes('http://kb.local/t/1'), '有 url 时应保留查看任务按钮');
       // 按 kind 补文本可达出路（作业失败/重启后卡片不会自己再变）：review 重新审查短语与 handler 确定性拦截一致
       assert.ok(jt.includes('可回复「重新审查这个任务」'), `review 出路，实际：${jt}`);

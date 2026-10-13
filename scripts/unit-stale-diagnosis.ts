@@ -1,6 +1,8 @@
 // 停滞任务提醒（stale nudge）与失败 AI 诊断/重试的单测：
 // - 停滞判定边界：恰好 N 小时 / 未到期 / 状态流转重置 / 24h 再提醒 / 重启不重复
 // - 诊断按钮 action 路由、同一 attempt 防重复诊断、重试 follow-up 指令含诊断结论、重试防重
+// - 进行中作业落盘（受理即写/完结摘除）与机器人重启后的中断补通知（聚合、出路、失败保留补投、
+//   文本定位回填）
 // - 诊断组合 signal（调用方中断/超时兜底，不依赖 AbortSignal.any）、重试会话按 created_at 取最新、
 //   LLM 失败路径中文化。仅用本地 mock server 与注入执行器，无外部网络。
 // Run: npx tsx scripts/unit-stale-diagnosis.ts
@@ -30,7 +32,7 @@ import { ConfirmationManager } from '../src/agent/confirm';
 import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import type { FeishuChannel } from '../src/channels/feishu';
+import type { FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import type { AgentConfig } from '../src/types';
 import { check, checkAsync, finish, modeOk } from './testkit';
 
@@ -74,11 +76,18 @@ const tickOf = (w: KanbanWatcher) => (w as unknown as { tick: () => Promise<void
 // （sendCard 为进度占位链路的接口面，本套件不触发，占位满足 ProgressChannel 收窄后的类型）
 class FakeChannel {
   notifies: { openId: string; text: string }[] = [];
+  replies: { openId: string; text: string }[] = [];
   cards: { openId: string; card: Record<string, unknown> }[] = [];
   updatedCards: { messageId: string; card: Record<string, unknown> }[] = [];
+  /** 置 true 时 notifyOpenId 抛错（中断通知投递失败补投用例用）。 */
+  notifyFails = false;
   private seq = 0;
   async notifyOpenId(openId: string, text: string): Promise<void> {
+    if (this.notifyFails) throw new Error('network down');
     this.notifies.push({ openId, text });
+  }
+  async reply(msg: { senderId: string }, text: string): Promise<void> {
+    this.replies.push({ openId: msg.senderId, text });
   }
   async notifyCardOpenId(openId: string, card: Record<string, unknown>): Promise<string | undefined> {
     this.cards.push({ openId, card });
@@ -880,6 +889,139 @@ async function main(): Promise<void> {
     });
     return stale.includes(WATCH_HINT_STALE);
   })());
+
+  // ---------- 进行中作业落盘与重启中断通知 ----------
+  const mkJobsHandlers = (
+    channel: FakeChannel,
+    tmp: string,
+    statePath: string,
+    runners: {
+      diagnosisRunner?: () => Promise<{ text: string; attemptId: string }>;
+      aiReviewRunner?: () => Promise<string>;
+    } = {},
+  ) => {
+    const cfg = makeCfg('http://127.0.0.1:1');
+    const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
+    const confirmations = new ConfirmationManager(async () => undefined, { timeoutMs: 1000 });
+    const fakeMcp = { tools: [] } as unknown as KanbanMcp;
+    const supervisor = new McpSupervisor({ mcp: fakeMcp, initiallyAlive: false });
+    return createBotHandlers({
+      channel: channel as unknown as FeishuChannel,
+      router,
+      confirmations,
+      cfg,
+      mcp: fakeMcp,
+      supervisor,
+      reportServer: null,
+      helpText: 'HELP',
+      diagnosisRunner: runners.diagnosisRunner,
+      aiReviewRunner: runners.aiReviewRunner,
+      reviewJobsStatePath: statePath,
+    });
+  };
+  const readJobsFile = (statePath: string): Array<Record<string, unknown>> =>
+    JSON.parse(fs.readFileSync(statePath, 'utf8')) as Array<Record<string, unknown>>;
+  let jobMsgSeq = 0;
+  const mkJobMsg = (senderId: string, text: string): FeishuInboundMessage => ({
+    sessionId: `chat-${senderId}`,
+    senderId,
+    text,
+    messageId: `jm-${++jobMsgSeq}`,
+    messageType: 'text',
+  });
+
+  await checkAsync('进行中作业落盘：受理即写记录、完结摘除（重启补通知的数据源）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-jobs-'));
+    try {
+      const statePath = path.join(tmp, 'review-jobs.json');
+      let release!: (v: { text: string; attemptId: string }) => void;
+      const gate = new Promise<{ text: string; attemptId: string }>((r) => {
+        release = r;
+      });
+      const handlers = mkJobsHandlers(new FakeChannel(), tmp, statePath, { diagnosisRunner: async () => gate });
+      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
+      await waitFor(() => fs.existsSync(statePath), '受理后落盘');
+      const running = readJobsFile(statePath);
+      assert.equal(running.length, 1);
+      assert.equal(running[0]!.kind, 'diagnosis');
+      assert.equal(running[0]!.openId, 'u1');
+      assert.equal(running[0]!.key, 'task-1');
+      assert.equal(running[0]!.title, '修复登录');
+      release({ text: '诊断结论', attemptId: 'att-1' });
+      await waitFor(() => readJobsFile(statePath).length === 0, '完结后摘除记录');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('重启后补发作业中断通知（按用户聚合、含文本可达出路）并清档；文本定位回填', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-jobs-'));
+    try {
+      const statePath = path.join(tmp, 'review-jobs.json');
+      const never = new Promise<never>(() => {});
+      // 上次进程：一项诊断 + 一项审查进行中时进程消亡（runner 永不返回，记录留在盘上）
+      const dead = mkJobsHandlers(new FakeChannel(), tmp, statePath, {
+        diagnosisRunner: () => never,
+        aiReviewRunner: () => never,
+      });
+      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
+      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'att-9', title: '任务X' } } });
+      await waitFor(() => fs.existsSync(statePath) && readJobsFile(statePath).length === 2, '两条进行中记录落盘');
+
+      // 重启：新实例加载遗留记录
+      const channel2 = new FakeChannel();
+      const alive = mkJobsHandlers(channel2, tmp, statePath, { aiReviewRunner: async () => '审查结论：无问题' });
+      await alive.notifyInterruptedJobs();
+      assert.equal(channel2.notifies.length, 1, '按用户聚合为一条通知');
+      const notice = channel2.notifies[0]!.text;
+      assert.ok(notice.includes('机器人重启'), `应如实定性: ${notice}`);
+      assert.ok(notice.includes('AI 诊断《修复登录》') && notice.includes('AI 审查《任务X》'), `应列清两条作业: ${notice}`);
+      assert.ok(notice.includes('为什么失败') && notice.includes('重新审查这个任务'), `出路须文本可达: ${notice}`);
+      assert.ok(notice.includes('原推送卡片上的按钮'), `应保留卡片出路: ${notice}`);
+      assert.equal(readJobsFile(statePath).length, 0, '投递成功后遗留记录清档');
+
+      // 文本定位回填：重启后「重新审查这个任务」仍能定位到被中断的审查（确定性分支，不经模型）
+      await alive.handle(mkJobMsg('u1', '重新审查这个任务'));
+      assert.ok(
+        channel2.replies.some((r) => r.text.includes('正在重新发起 AI 审查：《任务X》')),
+        `回填后文本分支应能重新发起，实际：${channel2.replies.map((r) => r.text).join(' | ')}`,
+      );
+      // 诊断回填：「重试这个任务」能定位任务但诊断结论未持久化，如实引导重新诊断
+      await alive.handle(mkJobMsg('u1', '重试这个任务'));
+      await waitFor(
+        () => channel2.notifies.some((n) => n.text.includes('找不到《修复登录》的诊断结论')),
+        '回填后重试应给出带任务名的如实指引',
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('中断通知投递失败的记录保留到下次启动补投（重复优于丢失）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-jobs-'));
+    try {
+      const statePath = path.join(tmp, 'review-jobs.json');
+      fs.writeFileSync(
+        statePath,
+        JSON.stringify([{ kind: 'diagnosis', openId: 'u1', key: 'task-1', title: '修复登录', startedAt: '2026-10-13T09:00:00' }]),
+      );
+      const failing = new FakeChannel();
+      failing.notifyFails = true;
+      const h1 = mkJobsHandlers(failing, tmp, statePath);
+      await h1.notifyInterruptedJobs();
+      assert.equal(failing.notifies.length, 0);
+      assert.equal(readJobsFile(statePath).length, 1, '投递失败不得清档');
+      // 下次启动（网络恢复）：新实例读到保留的记录并补投成功
+      const channel2 = new FakeChannel();
+      const h2 = mkJobsHandlers(channel2, tmp, statePath);
+      await h2.notifyInterruptedJobs();
+      assert.equal(channel2.notifies.length, 1, '恢复后应补投');
+      assert.ok(channel2.notifies[0]!.text.includes('修复登录'));
+      assert.equal(readJobsFile(statePath).length, 0, '补投成功后清档');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   finish();
 }

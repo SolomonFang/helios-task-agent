@@ -3,6 +3,7 @@ import type { ToolHandler } from '../../types';
 import { classifyMcp, isDestructive, summarizeMcp, wrapUntrusted } from '../guard';
 import { extractSourceUrls } from '../source-registry';
 import { fillHkStartBranches, type RepoStartInput } from '../../kanban/workspace-ready';
+import { apiGet } from '../../kanban/http';
 import { errMessage } from '../../infra/err';
 import { summarizeBothEnds } from './shared';
 import type { GatedWrite } from './gated-write';
@@ -56,8 +57,34 @@ function formatMcpArgValue(key: string, value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
+/** 项目名解析缓存（键 kanbanUrl|projectId）：项目名低频变化，命中 60s 内复用；失败负面缓存 15s，看板不可达时每次创建不至于都白等超时。 */
+const projectNameCache = new Map<string, { name?: string; at: number }>();
+
+/**
+ * 创建确认卡片用：把 project_id 解析成项目名（best-effort，3s 超时，失败返回 undefined）。
+ * 取不到时确认卡片保持「项目 ID」原样展示——解析失败绝不能阻断写操作确认。
+ */
+async function resolveProjectName(kanbanUrl: string, projectId: string, signal?: AbortSignal): Promise<string | undefined> {
+  const cacheKey = `${kanbanUrl}|${projectId}`;
+  const hit = projectNameCache.get(cacheKey);
+  const now = Date.now();
+  if (hit && now - hit.at < (hit.name ? 60_000 : 15_000)) return hit.name;
+  let name: string | undefined;
+  try {
+    const raw = (await apiGet(kanbanUrl, `/projects/${encodeURIComponent(projectId)}`, { signal, timeoutMs: 3000 })) as
+      | Record<string, unknown>
+      | null;
+    if (raw && typeof raw.name === 'string' && raw.name) name = raw.name;
+  } catch {
+    /* 项目名取不到就保持 ID 展示（只少报不谎报） */
+  }
+  if (projectNameCache.size > 200) projectNameCache.clear(); // 项目数量有限，兜底防无界
+  projectNameCache.set(cacheKey, { name, at: now });
+  return name;
+}
+
 /** 闸门卡片 detail：结构化中文展示（操作名 + 逐参数中文键），不落蛇形工具名与 JSON 伪调用串。 */
-function formatMcpDetail(toolName: string, args: Record<string, unknown>): string {
+function formatMcpDetail(toolName: string, args: Record<string, unknown>, projectName?: string): string {
   if (!/create/i.test(toolName)) {
     const lines = [`操作：${summarizeMcp(toolName, args)}`];
     for (const [key, value] of Object.entries(args)) {
@@ -80,7 +107,7 @@ function formatMcpDetail(toolName: string, args: Record<string, unknown>): strin
     // 空标题省略整行，不渲染裸「标题：」
     title ? `标题：${title}` : '',
     name ? `名称：${name}` : '',
-    project ? `项目 ID：${project}` : '',
+    project ? (projectName ? `项目：${projectName}（ID：${project}）` : `项目 ID：${project}`) : '',
     // 未命中中文映射时省略该行，不把英文枚举透传到确认卡片
     priorityLabel ? `优先级：${priorityLabel}` : '',
     taskTypeLabel ? `类型：${taskTypeLabel}` : '',
@@ -197,18 +224,22 @@ export function makeKanbanMcpHandler({
     const isCreate = /create/i.test(tool.name) && !/project/i.test(tool.name);
     const isStart = /start_workspace/i.test(tool.name);
     const { key: batchKey, scope: batchScope } = batchKeyForMcp(tool.name, args);
+    // 创建任务的确认卡片要核对落点：裸 UUID 无从核对，best-effort 解析项目名
+    //（3s 超时 + 缓存；取不到保持「项目 ID」原样展示，解析失败不阻断确认）
+    const projectIdRaw = String(args.project_id ?? args.projectId ?? '');
+    const projectName = isCreate && projectIdRaw ? await resolveProjectName(kanbanUrl, projectIdRaw, ctx?.signal) : undefined;
     return runGatedWrite({
       kind: 'kanban',
       summary,
       // start 前置补全会原地改写 args.repos（补 base_branch），detail 取 getter 在闸门/审计时
       // 按最终参数重算（确认卡片须展示实际执行的参数，同 hk 路径，见 makeHkCliHandler）
-      detail: () => formatMcpDetail(tool.name, args),
+      detail: () => formatMcpDetail(tool.name, args, projectName),
       isCreate,
       isStart,
       urls: isCreate ? extractSourceUrls(JSON.stringify(args)) : [],
       title: typeof args.title === 'string' ? args.title : '',
       // 查重粒度 (来源 URL, 项目)：同来源拆到多项目时按 project_id 区分（口径同 formatMcpDetail）
-      projectId: String(args.project_id ?? args.projectId ?? '') || undefined,
+      projectId: projectIdRaw || undefined,
       batchKey,
       batchScope,
       destructive: isDestructive(tool.name),

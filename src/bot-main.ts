@@ -544,6 +544,7 @@ async function main(): Promise<void> {
     roundNotices,
     confirmCardBridge,
     lastBatchKind: (openId) => lastWriteKind.get(openId),
+    reviewJobsStatePath: path.join(defaultDataHome(), 'review-jobs.json'),
   });
   channel.onCardAction = handlers.onCardAction;
 
@@ -573,6 +574,10 @@ async function main(): Promise<void> {
     await shutdown(1);
   }
   console.log(c.ok('长连接已就绪。手机飞书搜索机器人 → 私聊即可。'));
+
+  // 上次进程遗留的进行中作业（AI 审查/诊断/重试）已随重启消亡：补发中断通知并给重新发起路径，
+  // 不能让「进行中」卡片永久谎称「完成后推送结果」；投递失败的记录保留到下次启动补投
+  await handlers.notifyInterruptedJobs();
 
   // 运行期开关统一解析（非法值告警集中在 config/runtime-flags.ts）
   const flags = runtimeFlags((m) => console.warn(c.warn(m)));

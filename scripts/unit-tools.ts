@@ -4,7 +4,8 @@
  * hk_cli 脚本用户目录优先、包内兜底；MCP start_workspace 确认卡片 detail
  * 展示前置补全后的最终参数；SourceRegistry 按 mtime 缓存盘上解析结果；
  * hk_cli/lark_cli 批量免问 key 分级（启动类级、其余绑定操作对象 id）；hk 创建标题跳过 flag 取值；
- * MCP 非法工具名跳过注册；localToolSummary 按 memory 启用标志拼接。
+ * MCP 非法工具名跳过注册；localToolSummary 按 memory 启用标志拼接；
+ * 创建确认卡片把项目 UUID 解析为项目名（缓存复用、失败保持 ID 展示）。
  * 运行：tsx scripts/unit-tools.ts
  */
 import assert from 'assert';
@@ -542,6 +543,57 @@ async function main(): Promise<void> {
       assert.equal(warns.filter((w) => w.includes('inputSchema 形态非法')).length, 2, `畸形两次应 warn 两次：${JSON.stringify(warns)}`);
     } finally {
       console.warn = origWarn;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 创建确认卡片解析项目名（best-effort，取不到保持「项目 ID」） ----------
+  await checkAsync('kanban-mcp：创建确认 detail 把项目 UUID 解析为项目名（缓存复用；失败保持 ID 展示且不阻断）', async () => {
+    // mock 看板：/api/projects/proj-a 有名字，其余 404
+    let projectHits = 0;
+    const server = http.createServer((req, res) => {
+      const url = req.url || '';
+      if (url.startsWith('/api/projects/proj-a')) {
+        projectHits++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: { id: 'proj-a', name: '中控' } }));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const tmp = tmpHome('proj-name');
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const details: string[] = [];
+      const confirm: ConfirmFn = async (req) => {
+        details.push(req.detail);
+        return 'once';
+      };
+      const mcp = fakeMcp('create_task');
+      const create = buildTools({
+        mcp,
+        kanbanUrl: base,
+        confirm,
+        registry: new SourceRegistry(tmp),
+        auditHome: tmp,
+        createCounter: { count: 0 },
+      }).handlers.get('kanban_create_task')!;
+      const r1 = await create({ title: 't1', project_id: 'proj-a' });
+      assert.ok(!r1.includes(CAP_HINT), r1);
+      assert.ok(details[0]!.includes('项目：中控（ID：proj-a）'), `项目名应解析进确认卡片: ${details[0]}`);
+      await create({ title: 't2', project_id: 'proj-a' });
+      assert.ok(details[1]!.includes('项目：中控（ID：proj-a）'), '缓存命中仍展示项目名');
+      assert.equal(projectHits, 1, '60s 缓存内不得重复请求 /projects');
+      // 未命中（404）：保持「项目 ID」展示，创建不被解析失败阻断
+      const r3 = await create({ title: 't3', project_id: 'proj-b' });
+      assert.ok(!r3.includes(CAP_HINT), r3);
+      assert.ok(details[2]!.includes('项目 ID：proj-b'), `解析失败保持 ID 展示: ${details[2]}`);
+      assert.ok(!details[2]!.includes('项目：'), details[2]!);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((r) => server.close(r));
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

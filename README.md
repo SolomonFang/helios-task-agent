@@ -126,9 +126,10 @@ npm i -g @larksuite/cli && lark-cli auth login
 ~/.helios-task-agent/watch-state.json      # 看板推送快照
 ~/.helios-task-agent/stale-nudge-state.json # 停滞任务提醒状态（同一阶段不重复提醒）
 ~/.helios-task-agent/daily-brief-state.json # 定时晨报推送日期（当天不重复推）
-~/.helios-task-agent/weekly-brief-state.json # 定时周报推送日期（当周当天不重复推）
+~/.helios-task-agent/weekly-brief-state.json # 定时周报推送日期（当周不重复推；错过推送日当周后续日期补推一次）
 ~/.helios-task-agent/sessions/             # 会话历史（每用户一个文件，重启后恢复上下文；/clear 同步清除）
 ~/.helios-task-agent/skills/               # 用户技能目录（/skills install 安装到这里）
+~/.helios-task-agent/review-jobs.json   # 进行中的 AI 审查/诊断/重试作业（重启后补发中断通知）
 ~/.helios-task-agent/reviews/              # AI 审查报告（HTML，30 天自动清理）
 ~/.helios-task-agent/reports/              # 工作总结报告
 ~/.helios-task-agent/update-check.json     # 更新检查缓存（24h）
@@ -223,7 +224,7 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 | `HTA_UPDATE_REGISTRY` | 更新检查用的 npm registry（默认跟随 `npm config get registry`） |
 | `LLM_VISION` | `1` 时 bot 支持图片消息：下载图片随当次请求发给模型（**需模型支持图片输入**；图片不进会话历史、不落盘，单张上限 10MB）。默认关，关闭时图片消息仍提示仅支持文字 |
 | `HTA_DAILY_BRIEF` | 定时晨报（仅 bot）：本地时间 `HH:MM`（如 `09:30`）每天向白名单用户（owner）推送当前迭代看板概览（进行中/待办/待审阅/已完成/失败；未配置 `HELIOS_KANBAN_ITERATION` 时范围为全部任务）。未设置或非法值 = 关闭 |
-| `HTA_WEEKLY_BRIEF` | 定时周报（仅 bot）：本地时间 `HH:MM`（如 `18:00`）每周向白名单用户（owner）推送本周迭代进展（迭代全量计数 + 本周完成/待审阅积压/失败分组；「本周完成」按任务最后更新时间落在本周统计）。未设置或非法值 = 关闭 |
+| `HTA_WEEKLY_BRIEF` | 定时周报（仅 bot）：本地时间 `HH:MM`（如 `18:00`）每周向白名单用户（owner）推送本周迭代进展（迭代全量计数 + 本周完成/待审阅积压/失败分组；「本周完成」按任务最后更新时间落在本周统计）；错过推送日（机器人当天没开）当周后续日期补推一次并注明补发，跨周不补。未设置或非法值 = 关闭 |
 | `HTA_WEEKLY_BRIEF_DAY` | 定时周报的推送星期：`1`-`7`（1=周一…7=周日），默认 `5`（周五）；非法值启动时告警并按默认处理 |
 | `HTA_TURN_TIMEOUT_MIN` | 单轮对话的墙钟时间上限（分钟），默认 30；超时按「已中止」收尾并提示 |
 | `HTA_DEBUG` | `1` 时输出看板连接及各链路报错的原始调试信息（含英文原文，仅供排查） |

@@ -3,8 +3,11 @@
  * 卡片按钮回调触发的长耗时作业在消息串行队列外运行——并发上限、去重键表、
  * AbortController 登记（/stop 中断）、结果投递降级与会话注入都收口在这里，
  * handler 只剩按钮分发。
+ * 进行中作业按受理/完结落盘（statePath 配置时）：进程重启后作业不可恢复，
+ * 启动时读取遗留记录补发中断通知并给重新发起路径（投递失败的记录保留到下次启动补投）。
  */
 
+import fs from 'fs';
 import type { FeishuChannel } from '../channels/feishu';
 import type { SessionRouter } from '../agent/session-router';
 import { runAiReview, ocrWillDeriveBotLlm } from '../kanban/ai-review';
@@ -21,6 +24,7 @@ import type { ReportServer } from '../report/report-server';
 import { wrapUntrusted } from '../agent/guard';
 import type { AgentConfig } from '../types';
 import { errMessage } from '../infra/err';
+import { writeFileAtomicPrivateSync } from '../infra/private-file';
 import { safeNotify } from './notify';
 
 /** AI 审查全局并发上限：每个审查是最长 15 分钟的子进程，不同 attempt 叠加会拖垮机器。 */
@@ -56,6 +60,8 @@ export interface ReviewJobsDeps {
   followUpSender?: typeof sendDiagnosisFollowUp;
   /** 测试注入用：替换重试时的 attemptId 补拉（默认 latestAttemptId 走看板 REST）。 */
   attemptIdFetcher?: typeof latestAttemptId;
+  /** 进行中作业落盘路径（重启后补发中断通知用）；缺省不持久化（测试场景）。 */
+  statePath?: string;
 }
 
 /**
@@ -79,6 +85,8 @@ export interface ReviewJobs {
   lastReview: (openId: string) => { attemptId: string; title: string } | undefined;
   /** /stop：中断该用户进行中的 AI 审查/诊断，返回各自中断数（逐条收尾通知由作业自身发出）。 */
   abortForUser: (openId: string) => { reviews: number; diagnoses: number };
+  /** 启动后补发「机器人重启导致作业中断」通知（无遗留作业时无操作）；通道就绪后调用一次。 */
+  notifyInterruptedJobs: () => Promise<void>;
 }
 
 export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
@@ -106,6 +114,107 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
   const lastReviewByUser = new Map<string, { attemptId: string; title: string }>();
   /** 首次 AI 审查的 LLM 配置告知是否已发送（每进程一次，避免刷屏）。 */
   let aiReviewLlmNoticed = false;
+
+  /**
+   * 进行中作业的落盘与重启补通知（statePath 配置时启用）：
+   * 受理时落、完结时摘，文件始终反映「当前进行中」；启动时读到的记录 = 上次进程消亡中断的作业，
+   * notifyInterruptedJobs 补发中断通知（投递失败的保留到下次启动补投，重复优于丢失）。
+   */
+  interface RunningJobRecord {
+    kind: 'review' | 'diagnosis' | 'retry';
+    openId: string;
+    /** 作业对象标识（review=attemptId，diagnosis/retry=taskId）：重启后据此回填文本定位（重新审查/重试这个任务）。 */
+    key: string;
+    title: string;
+    startedAt: string;
+  }
+  /** 当前进行中的作业（键 kind:key）：受理时落、完结时摘，随时可整体落盘。 */
+  const runningJobs = new Map<string, RunningJobRecord>();
+  /** 上次进程遗留的进行中作业：启动时读取，notifyInterruptedJobs 补发通知后清空。 */
+  const interruptedJobs: RunningJobRecord[] = [];
+  if (deps.statePath) {
+    try {
+      if (fs.existsSync(deps.statePath)) {
+        const raw = JSON.parse(fs.readFileSync(deps.statePath, 'utf8')) as unknown;
+        for (const j of Array.isArray(raw) ? raw : []) {
+          const rec = j as Partial<RunningJobRecord> | null;
+          if (
+            rec &&
+            (rec.kind === 'review' || rec.kind === 'diagnosis' || rec.kind === 'retry') &&
+            typeof rec.openId === 'string' &&
+            rec.openId &&
+            typeof rec.key === 'string' &&
+            rec.key &&
+            typeof rec.title === 'string'
+          ) {
+            interruptedJobs.push({
+              kind: rec.kind,
+              openId: rec.openId,
+              key: rec.key,
+              title: rec.title,
+              startedAt: typeof rec.startedAt === 'string' ? rec.startedAt : '',
+            });
+          }
+        }
+      }
+    } catch {
+      /* 损坏文件按无遗留处理 */
+    }
+    // 被中断的作业回填文本定位：重启后「重新审查这个任务」「重试这个任务」仍能定位到对象
+    for (const j of interruptedJobs) {
+      if (j.kind === 'review') lastReviewByUser.set(j.openId, { attemptId: j.key, title: j.title });
+      else if (j.kind === 'diagnosis') lastDiagnosisByUser.set(j.openId, { taskId: j.key, title: j.title });
+    }
+  }
+  /** 落盘当前进行中作业（extra 合并写入：中断通知未送达的遗留记录随下次启动补投）。 */
+  const persistRunningJobs = (extra: RunningJobRecord[] = []): void => {
+    if (!deps.statePath) return;
+    try {
+      writeFileAtomicPrivateSync(deps.statePath, JSON.stringify([...runningJobs.values(), ...extra], null, 2) + '\n');
+    } catch {
+      /* best-effort：写盘失败只是重启后漏通知，不阻断作业 */
+    }
+  };
+  const trackJob = (rec: RunningJobRecord): void => {
+    runningJobs.set(`${rec.kind}:${rec.key}`, rec);
+    persistRunningJobs();
+  };
+  const untrackJob = (kind: RunningJobRecord['kind'], key: string): void => {
+    if (runningJobs.delete(`${kind}:${key}`)) persistRunningJobs();
+  };
+  /** 重启后补发中断通知：遗留作业已随进程消亡，如实告知并按 kind 给文本可达的重新发起路径。 */
+  const notifyInterruptedJobs = async (): Promise<void> => {
+    const jobs = interruptedJobs.splice(0);
+    if (!jobs.length) return;
+    // 按用户聚合：一条消息列清所有被中断的作业，避免逐条刷屏
+    const byUser = new Map<string, RunningJobRecord[]>();
+    for (const j of jobs) {
+      const list = byUser.get(j.openId) ?? [];
+      list.push(j);
+      byUser.set(j.openId, list);
+    }
+    const kindLabel = { review: 'AI 审查', diagnosis: 'AI 诊断', retry: '按诊断结论重试' } as const;
+    // 出路必须文本可达：原卡片上的按钮仍存在于聊天记录，但文本路径不依赖翻卡片
+    const kindHint = {
+      review: '回复「重新审查这个任务」重新发起',
+      diagnosis: '回复「为什么失败」重新诊断',
+      retry: '重试可能未发出：回复「为什么失败」重新诊断后，再回复「重试这个任务」',
+    } as const;
+    const unsent: RunningJobRecord[] = [];
+    for (const [openId, userJobs] of byUser) {
+      const lines = userJobs.map((j) => `· ${kindLabel[j.kind]}《${j.title}》：${kindHint[j.kind]}`);
+      try {
+        await channel.notifyOpenId(
+          openId,
+          `⚠️ 机器人重启，以下进行中的作业已被中断：\n${lines.join('\n')}\n也可重新点击原推送卡片上的按钮重新发起。`,
+        );
+      } catch (err) {
+        console.error(`[review-jobs] 中断通知投递失败(${openId.slice(0, 4)}…): ${errMessage(err)}`);
+        unsent.push(...userJobs); // 投递失败保留记录，下次启动补投（重复优于丢失）
+      }
+    }
+    persistRunningJobs(unsent);
+  };
 
   /** AI 审查的异步段（执行/投递/注入会话）；受理判定与去重落键在 tryStartAiReview 同步完成。 */
   const runAiReviewJob = async (openId: string, attemptId: string, title: string, ctl: AbortController): Promise<void> => {
@@ -196,6 +305,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       }
     } finally {
       aiReviewRunning.delete(attemptId);
+      untrackJob('review', attemptId);
     }
   };
 
@@ -220,6 +330,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     }
     const ctl = new AbortController();
     aiReviewRunning.set(attemptId, { openId, ctl });
+    trackJob({ kind: 'review', openId, key: attemptId, title, startedAt: new Date().toISOString() });
     // 受理成功即记录：文本「重新审查这个任务」确定性分支据此复用本次审查重新发起
     if (lastReviewByUser.size >= DIAGNOSIS_STATE_MAX_ENTRIES) lastReviewByUser.clear();
     lastReviewByUser.set(openId, { attemptId, title });
@@ -306,6 +417,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       }
     } finally {
       diagnosisRunning.delete(taskId);
+      untrackJob('diagnosis', taskId);
     }
   };
 
@@ -342,6 +454,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     }
     const ctl = new AbortController();
     diagnosisRunning.set(taskId, { openId, ctl });
+    trackJob({ kind: 'diagnosis', openId, key: taskId, title, startedAt: new Date().toISOString() });
     void runDiagnosisJob(openId, taskId, attemptId, title, dedupeKey, ctl, url);
     return { status: 'accepted' };
   };
@@ -420,6 +533,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       await safeNotify(channel, openId, `⚠️ 重试发起失败：《${title}》\n${message}${retryHint}`);
     } finally {
       retryLaunching.delete(taskId);
+      untrackJob('retry', taskId);
     }
   };
 
@@ -454,6 +568,7 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
       return { status: 'launched', toast: launchedToast };
     }
     retryLaunching.add(taskId);
+    trackJob({ kind: 'retry', openId, key: taskId, title, startedAt: new Date().toISOString() });
     void runRetryJob(openId, taskId, title, result);
     return { status: 'accepted' };
   };
@@ -485,5 +600,6 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     lastDiagnosis: (openId) => lastDiagnosisByUser.get(openId),
     lastReview: (openId) => lastReviewByUser.get(openId),
     abortForUser,
+    notifyInterruptedJobs,
   };
 }

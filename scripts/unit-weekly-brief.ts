@@ -2,8 +2,9 @@
  * 定时周报（src/bot/weekly-brief.ts）单测：
  * - HH:MM 解析（合法/非法/边界）
  * - 星期解析（1-7，默认周五，非法抛错由启动告警兜底）
- * - 周报文本（「本周完成」按 updated_at 是否落在本周过滤、各分组与兜底文案）
- * - 只在设定星期触发、当天只推一次（注入假时钟与假推送函数）
+ * - 周报文本（「本周完成」按 updated_at 是否落在本周过滤、各分组与兜底文案、补发标注）
+ * - 只在设定星期到点触发；错过推送日（进程当天没开）当周后续日期补推一次并注明补发，
+ *   补推日不受时刻门限制、认当周送达记录只补投未送达 owner，跨周不补；当周只推一次
  * - 看板不可达的降级路径（跳过不推、不标记，恢复后当天补推）
  * - 推送部分失败的补投（下一 tick 只补未送达 owner）
  * - 连续失败的指数退避（窗口内不重复采集/推送）
@@ -223,12 +224,23 @@ async function main(): Promise<void> {
     assert.ok(friday.includes('（2026-08-31 至 2026-09-04）'), `周五推送终点为周五: ${friday.split('\n')[0]}`);
   });
 
-  // ---------- 星期触发 / 当天只推一次 ----------
-  await checkAsync('WeeklyBrief：只在设定星期到点触发，当天后续 tick 不重复推；下周同一天再推', async () => {
+  await checkAsync('buildWeeklyBriefText：makeUpDay 注明补发（原定推送星期中文化），缺省不出现', () => {
+    const data = fakeSummary([fakeTask({ id: 'a', title: '任务A', status: 'inprogress' })]);
+    const saturday = at(9, 0, 5); // 周六补推（原定周五）
+    const text = buildWeeklyBriefText(data, saturday, { makeUpDay: 5 });
+    assert.ok(text.includes('📮 补发：原定每周五的周报延迟到今天推送。'), `补发标注: ${text}`);
+    assert.ok(text.indexOf('📮 补发') > text.indexOf('📅 看板周报'), '补发标注在头部之后');
+    assert.ok(!buildWeeklyBriefText(data, saturday).includes('📮 补发'), '缺省不带补发标注');
+    const mondayMakeUp = buildWeeklyBriefText(data, new Date(2026, 8, 1, 9, 0), { makeUpDay: 1 });
+    assert.ok(mondayMakeUp.includes('原定每周一的周报'), `周一文案: ${mondayMakeUp}`);
+  });
+
+  // ---------- 星期触发 / 当周只推一次 ----------
+  await checkAsync('WeeklyBrief：设定星期到点触发，当周后续 tick 不重复推；下周同一天再推', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));
     try {
       const sent: string[] = [];
-      let now = at(18, 0, 3); // 周四已到点：不是设定星期
+      let now = at(18, 0, 3); // 周四已到点：还没到本周推送日
       const brief = new WeeklyBrief({
         time: { hour: 18, minute: 0 },
         day: 5,
@@ -252,15 +264,66 @@ async function main(): Promise<void> {
       await tick();
       assert.equal(sent.length, 1);
       assert.ok(sent[0]!.includes('📅 看板周报'));
+      assert.ok(!sent[0]!.includes('📮 补发'), '设定日当天推送不带补发标注');
       now = at(18, 1, 4);
       await tick(); // 当天已推，不重复
+      now = at(19, 0, 5); // 周六：当周已送达，不重复
+      await tick();
+      now = at(10, 0, 6); // 周日：同样不重复
       await tick();
       assert.equal(sent.length, 1);
-      now = at(19, 0, 5); // 周六（若周五进程没开，错过当天本周不再补推）
-      const brief2 = new WeeklyBrief({
+      now = at(18, 0, 11); // 下周五到点再推
+      await tick();
+      assert.equal(sent.length, 2);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 错过推送日：当周补推 ----------
+  await checkAsync('WeeklyBrief：错过推送日（进程当天没开）当周后续日期补推一次并注明补发，补推日不受时刻门限制', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));
+    try {
+      const sent: string[] = [];
+      const logs: string[] = [];
+      let now = at(9, 0, 5); // 周六早上拉起（原定周五 18:00）：补推，不受 18:00 时刻门限制
+      const brief = new WeeklyBrief({
         time: { hour: 18, minute: 0 },
         day: 5,
-        statePath: path.join(tmp, 'weekly-brief-state2.json'),
+        statePath: path.join(tmp, 'weekly-brief-state.json'),
+        kanbanUrl: 'http://unused',
+        owners: () => ['o1'],
+        notifyOwner: async (_o, text) => {
+          sent.push(text);
+        },
+        now: () => now,
+        healthCheck: async () => true,
+        collect: async () => fakeSummary([fakeTask({ status: 'inprogress' })]),
+        log: (m) => logs.push(m),
+      });
+      const tick = tickOf(brief);
+      await tick();
+      assert.equal(sent.length, 1, '错过周五后周六应补推');
+      assert.ok(sent[0]!.includes('📮 补发：原定每周五的周报延迟到今天推送。'), `补推须注明补发: ${sent[0]}`);
+      assert.ok(logs.some((l) => l.includes('（补发）')), `送达日志应标注补发: ${logs}`);
+      await tick(); // 当周不重复
+      now = at(10, 0, 6); // 周日同样不重复
+      await tick();
+      assert.equal(sent.length, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('WeeklyBrief：跨周不补推（上周错过的新一周周一不补，等当周推送日）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));
+    try {
+      const sent: string[] = [];
+      let now = at(8, 0, 7); // 下周一：上周错过的周报不补
+      const brief = new WeeklyBrief({
+        time: { hour: 18, minute: 0 },
+        day: 5,
+        statePath: path.join(tmp, 'weekly-brief-state.json'),
         kanbanUrl: 'http://unused',
         owners: () => ['o1'],
         notifyOwner: async (_o, text) => {
@@ -270,9 +333,45 @@ async function main(): Promise<void> {
         healthCheck: async () => true,
         collect: async () => fakeSummary([]),
       });
-      await tickOf(brief2)();
-      assert.equal(sent.length, 1, '错过设定星期后本周其他天不推');
-      now = at(18, 0, 11); // 下周五到点再推
+      const tick = tickOf(brief);
+      await tick();
+      assert.equal(sent.length, 0, '跨周不补推');
+      now = at(18, 0, 11); // 本周五正常推
+      await tick();
+      assert.equal(sent.length, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('WeeklyBrief：补推日认当周送达记录，只补投未送达 owner（不刷屏已送达的）', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-weekly-'));
+    try {
+      const sent: string[] = [];
+      let o2Down = true;
+      let now = at(18, 10, 4); // 周五到点：o1 送达，o2 失败
+      const brief = new WeeklyBrief({
+        time: { hour: 18, minute: 0 },
+        day: 5,
+        statePath: path.join(tmp, 'weekly-brief-state.json'),
+        kanbanUrl: 'http://unused',
+        owners: () => ['o1', 'o2'],
+        notifyOwner: async (o, text) => {
+          if (o === 'o2' && o2Down) throw new Error('o2 unreachable');
+          sent.push(`${o}:${text.includes('📮 补发')}`);
+        },
+        now: () => now,
+        healthCheck: async () => true,
+        collect: async () => fakeSummary([]),
+      });
+      const tick = tickOf(brief);
+      await tick();
+      assert.deepEqual(sent, ['o1:false'], '周五正常推送不带补发标注');
+      o2Down = false;
+      now = at(10, 0, 5); // 周六补推：只补 o2，且带补发标注
+      await tick();
+      assert.deepEqual(sent, ['o1:false', 'o2:true'], '补推日只补投未送达 owner');
+      now = at(11, 0, 6); // 周日：当周已全员送达，不再推
       await tick();
       assert.equal(sent.length, 2);
     } finally {
