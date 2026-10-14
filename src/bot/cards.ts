@@ -11,7 +11,7 @@
  * - 根结构 {schema:'2.0', config, header, body:{elements}}；elements 平铺组件
  * - 按钮不用 1.0 的 action 容器（2.0 已废弃），逐个平铺 body.elements；
  *   回传 behaviors:[{type:'callback',value}]，跳转 behaviors:[{type:'open_url',…}]；
- *   主次规范：单按钮 primary_filled + width fill，多按钮首个 primary_filled、其余 default
+ *   主次规范：主按钮（跳转/主操作）primary_filled、其余 default；宽度一律按内容自适应，不撑满整行
  *   （例外：停止/取消为非破坏动作，一律 default 不做强焦点——红色只留给破坏性操作本身的警示）
  * - 2.0 无 note 组件：注脚一律 markdown + text_size:'notation'
  * - config：width_mode:'fill' + enable_forward:false + update_multi:true（cardkit 要求共享卡片）——
@@ -73,13 +73,12 @@ function callbackButton(text: string, value: Record<string, unknown>, type = 'de
   };
 }
 
-/** 跳转按钮（2.0：open_url 行为，四端 url 兜底）。 */
+/** 跳转按钮（2.0：open_url 行为，四端 url 兜底）。宽度按内容自适应（与回传按钮一致），不撑满整行。 */
 function linkButton(text: string, url: string, type = 'primary_filled'): Record<string, unknown> {
   return {
     tag: 'button',
     text: { tag: 'plain_text', content: text },
     type,
-    width: 'fill',
     behaviors: [{ type: 'open_url', default_url: url, pc_url: url, ios_url: url, android_url: url }],
   };
 }
@@ -325,7 +324,7 @@ export function buildResultCard(
 ): Record<string, unknown> {
   const elements: Array<Record<string, unknown>> = [mdEl(diagnosisMdSafe(reply || '（无回复）'))];
   if (opts?.url) {
-    // 「查看任务」跳转看板任务页（单按钮：primary_filled + width fill，官方主次规范；命名与进行中/看板事件卡同口径）
+    // 「查看任务」跳转看板任务页（跳转为主操作：primary_filled；命名与进行中/看板事件卡同口径）
     elements.push(linkButton('📋 查看任务', opts.url));
   }
   const notes: string[] = [];
