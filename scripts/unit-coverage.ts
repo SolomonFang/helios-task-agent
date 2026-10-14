@@ -592,7 +592,12 @@ async function run(): Promise<void> {
     const confirm = createCliConfirm(async () => 'n', noopSpinner, (l) => logs.push(l));
     await confirm({ kind: 'kanban', summary: '创建看板任务「\x1b[1;31m标题\x1b[0m」', detail: 'args \x1b[2K\x07detail' });
     const joined = logs.join('\n');
-    assert.ok(!joined.includes('\x1b') && !joined.includes('\x07'), `闸口打印不得含 ANSI/控制字符，实际：${JSON.stringify(joined)}`);
+    // 只断言注入序列被剥离：闸门自身的告警配色（c.warn/c.gray）在 TTY 下合法含转义，
+    // 不属于污染——若断言全文无 \x1b，套件在交互终端（stdio: 'inherit' 继承 TTY）下会误失败
+    assert.ok(
+      !joined.includes('\x1b[1;31m') && !joined.includes('\x1b[2K') && !joined.includes('\x07'),
+      `闸口打印不得含注入的 ANSI/控制字符，实际：${JSON.stringify(joined)}`,
+    );
     assert.ok(joined.includes('标题') && joined.includes('detail'), '剥离后正文内容应保留');
   });
 

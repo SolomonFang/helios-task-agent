@@ -113,6 +113,7 @@ import {
   clearedText,
 } from '../src/commands';
 import { renderReply, printBanner, Spinner } from '../src/infra/ui';
+import { stripAnsi } from '../src/infra/ansi';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { statusLabel } from '../src/kanban/status';
 import type { WorkSummaryData } from '../src/kanban/summary';
@@ -4329,7 +4330,8 @@ async function run(): Promise<void> {
   })());
 
   check('renderReply：表格单元格含 `code` / **bold** 时列宽按渲染后文本对齐', (() => {
-    const out = renderReply('| 名称 | 状态 |\n| --- | --- |\n| `a` | 完成 |\n| 长名字bb | **进行中** |');
+    // TTY 下 inline code/bold 会上色（\x1b 转义），列对齐才是被测属性：剥离装饰转义后再精确比较
+    const out = stripAnsi(renderReply('| 名称 | 状态 |\n| --- | --- |\n| `a` | 完成 |\n| 长名字bb | **进行中** |'));
     const rows = out.split('\n');
     return rows.length === 4 && rows[2] === `a${' '.repeat(9)}完成  ` && rows[3] === '长名字bb  进行中';
   })());
