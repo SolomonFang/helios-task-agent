@@ -123,18 +123,165 @@ export function buildToolsLines(
 }
 
 /** 进度展示的工具动作文案：内部工具名不直接暴露给用户，常见工具映射为中文动作，未知名称回落「调用工具」（CLI spinner 与 bot 进度占位共用，实现与 bot handler 一致）。 */
-export function toolActionLabel(name: string): string {
+export function toolActionLabel(name: string, args?: Record<string, unknown>): string {
   if (name === 'repo_fs') return '读文件';
-  if (name === 'hk_cli' || name.startsWith('kanban_')) return '看板操作';
-  if (name === 'lark_cli') return '飞书操作';
+  if (name === 'hk_cli') return hkCliActionLabel(args);
+  if (name.startsWith('kanban_')) return kanbanMcpActionLabel(name);
+  if (name === 'lark_cli') return larkCliActionLabel(args);
   if (name === 'work_summary' || name === 'daily_report' || name === 'iteration_retro') return '生成报告';
   if (name.startsWith('memory_')) return '读写记忆';
   if (name === 'reminder_set') return '设置提醒';
   if (name === 'reminder_cancel') return '取消提醒';
   if (name === 'reminder_list') return '查看提醒';
   if (name.startsWith('reminder_')) return '设置提醒';
+  if (name === 'skill_doc') return '查看技能文档';
   if (name.startsWith('skill_')) return '运行技能';
   return '调用工具';
+}
+
+/** lark_cli 进度标签的资源域映射（argv[0] 子命令 → 中文对象名）。 */
+const LARK_PROGRESS_DOMAINS: Record<string, string> = {
+  im: '消息',
+  chat: '群聊',
+  doc: '文档',
+  docx: '文档',
+  wiki: '知识库文档',
+  drive: '云空间文件',
+  sheets: '表格',
+  base: '多维表格',
+  bitable: '多维表格',
+  calendar: '日程',
+  task: '任务',
+  contact: '通讯录',
+  mail: '邮件',
+  minutes: '妙记',
+  note: '会议纪要',
+  slides: '幻灯片',
+  okr: 'OKR',
+  vc: '会议',
+  approval: '审批',
+  attendance: '考勤',
+  whiteboard: '画板',
+};
+
+/** lark_cli 进度标签的动作映射（argv[1] → 中文动词）。 */
+const LARK_PROGRESS_ACTIONS: Record<string, string> = {
+  send: '发送',
+  reply: '回复',
+  create: '创建',
+  update: '更新',
+  delete: '删除',
+  list: '列出',
+  get: '查看',
+  read: '读取',
+  search: '搜索',
+  download: '下载',
+  upload: '上传',
+  export: '导出',
+  import: '导入',
+};
+
+/**
+ * lark_cli 的进度动作细分：进度卡片一律「飞书操作」时，多步飞书调用排成一列毫无区分度。
+ * 按子命令组合出具体动作（读取飞书文档 / 发送飞书消息…）；子命令未命中回落「飞书操作」，
+ * 动作未命中回落「飞书X操作」；--help 等自查命令单独标注。
+ */
+function larkCliActionLabel(args?: Record<string, unknown>): string {
+  const argv = Array.isArray(args?.args) ? (args.args as unknown[]).filter((a): a is string => typeof a === 'string') : [];
+  const first = argv[0];
+  if (!first) return '飞书操作';
+  if (first.startsWith('-')) return argv.includes('--version') ? '检查飞书命令行' : '查看飞书命令用法';
+  const domain = LARK_PROGRESS_DOMAINS[first];
+  if (!domain) return '飞书操作';
+  const sub = argv[1] && !argv[1].startsWith('-') ? argv[1] : '';
+  // --help 只在子命令位（无真实子命令时）标注「查看用法」：写命令载荷恰好含 --help 字样不得误标
+  if (!sub && (argv[1] === '--help' || argv[1] === '-h')) return `查看飞书${domain}用法`;
+  const action = LARK_PROGRESS_ACTIONS[sub];
+  return action ? `${action}飞书${domain}` : `飞书${domain}操作`;
+}
+
+/**
+ * 看板 MCP 工具进度标签的动词/对象映射：工具名为服务端定义的蛇形串（list_projects、
+ * start_workspace…），按正则抽取动词 + 对象组合中文动作；未命中回落「看板操作」，
+ * 不透传英文工具名原文（与 guard.summarizeMcp 的确认摘要口径同源异形：那边带标题，
+ * 进度行要短，只给动作）。
+ */
+const KANBAN_PROGRESS_VERBS: [RegExp, string][] = [
+  [/^list/i, '列出'],
+  [/^(get|read|describe|fetch)/i, '查看'],
+  [/^(search|query)/i, '搜索'],
+  [/^create/i, '创建'],
+  [/^update/i, '更新'],
+  [/^delete/i, '删除'],
+  [/^cancel/i, '取消'],
+  [/^start/i, '启动'],
+  [/^stop/i, '停止'],
+  [/^approve/i, '批准'],
+  [/^deny/i, '拒绝'],
+  [/^archive/i, '归档'],
+  [/^merge/i, '合并'],
+];
+
+const KANBAN_PROGRESS_NOUNS: [RegExp, string][] = [
+  [/task/i, '任务'],
+  [/project/i, '项目'],
+  [/workspace/i, '工作区'],
+  [/approval/i, '审批'],
+  [/tag/i, '标签'],
+  [/repo/i, '仓库'],
+  [/branch/i, '分支'],
+];
+
+function kanbanMcpActionLabel(name: string): string {
+  const bare = name.replace(/^kanban_/, '');
+  // 与 hk_cli 备用通道同操作同措辞（MCP 掉线切换通道时标签不变，也不打断 ×N 合并）
+  if (/^health/i.test(bare)) return '检查看板服务';
+  if (/^info/i.test(bare)) return '查看看板信息';
+  if (/^follow/i.test(bare)) return '向任务发送跟进消息';
+  const verb = KANBAN_PROGRESS_VERBS.find(([re]) => re.test(bare))?.[1];
+  const noun = KANBAN_PROGRESS_NOUNS.find(([re]) => re.test(bare))?.[1];
+  return verb && noun ? `${verb}看板${noun}` : '看板操作';
+}
+
+/** hk_cli 进度标签的命令映射（备用通道子命令 → 中文动作，含只读子命令；确认摘要表只覆盖写操作）。 */
+const HK_PROGRESS_LABELS: Record<string, string> = {
+  'tasks list': '列出看板任务',
+  'tasks get': '查看看板任务',
+  'tasks create': '创建看板任务',
+  'tasks update': '更新看板任务',
+  'tasks delete': '删除看板任务',
+  'tasks cancel': '取消看板任务',
+  tasks: '看板任务操作',
+  'projects create': '创建看板项目',
+  'projects update': '更新看板项目',
+  // hk.mjs 的 projects 无子命令即列表（见 guard.classifyHk 口径），未知子命令落此项属无害偏读标签
+  projects: '列出看板项目',
+  start: '启动看板工作区',
+  'create-and-start': '创建看板任务并启动工作区',
+  stop: '停止看板工作区',
+  'follow-up': '向任务发送跟进消息',
+  // 与 kanban_* MCP 通道同操作同措辞（approve/deny 经动词+对象组合为「批准/拒绝看板审批」）
+  approve: '批准看板审批',
+  deny: '拒绝看板审批',
+  status: '查看看板任务状态',
+  health: '检查看板服务',
+  info: '查看看板信息',
+  repos: '列出看板仓库',
+  branches: '列出看板分支',
+  workspaces: '列出看板工作区',
+  tags: '列出看板标签',
+  approvals: '列出看板审批',
+};
+
+function hkCliActionLabel(args?: Record<string, unknown>): string {
+  const argv = Array.isArray(args?.args) ? (args.args as unknown[]).filter((a): a is string => typeof a === 'string') : [];
+  const cmd = argv[0];
+  if (!cmd) return '看板操作';
+  // prompt 教模型不确定时先 ["--help"] 自发现：与 lark 侧对称单独标注，不落最泛的「看板操作」
+  if (cmd === '--help' || cmd === '-h') return '查看备用通道用法';
+  if (cmd.startsWith('-')) return '看板操作';
+  const sub = argv[1] && !argv[1].startsWith('-') ? argv[1] : '';
+  return HK_PROGRESS_LABELS[sub ? `${cmd} ${sub}` : cmd] ?? HK_PROGRESS_LABELS[cmd] ?? '看板操作';
 }
 
 /** /skills 内容行；空目录时 CLI 只给提示、bot 保留标题（headerWhenEmpty）。 */

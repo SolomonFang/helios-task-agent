@@ -111,6 +111,7 @@ import {
   llmFailureParts,
   CLEARED_TEXT,
   clearedText,
+  toolActionLabel,
 } from '../src/commands';
 import { renderReply, printBanner, Spinner } from '../src/infra/ui';
 import { stripAnsi } from '../src/infra/ansi';
@@ -659,7 +660,7 @@ async function run(): Promise<void> {
       tools: [],
       handlers,
     });
-    assert.ok(reply2.includes('工具调用已达上限 100 次'), reply2);
+    assert.ok(reply2.includes('操作步骤已达上限 100 步'), reply2);
   });
 
   await checkAsync('runAgentTurn 墙钟超时：工具执行中到点，剩余调用补占位响应', async () => {
@@ -4091,6 +4092,47 @@ async function run(): Promise<void> {
       clearedText() === CLEARED_TEXT &&
       clearedText(0) === CLEARED_TEXT &&
       clearedText(2) === '对话历史已清空（记忆保留）；2 项免问授权已一并恢复逐次确认。'
+    );
+  })());
+
+  check('toolActionLabel：lark_cli/hk_cli 按子命令、kanban_* 按工具名细分动作，无参/未知回落通用文案', (() => {
+    return (
+      toolActionLabel('lark_cli', { args: ['doc', 'get', 'doxcnX'] }) === '查看飞书文档' &&
+      toolActionLabel('lark_cli', { args: ['im', 'send', 'ou_x', 'hi'] }) === '发送飞书消息' &&
+      toolActionLabel('lark_cli', { args: ['task', 'list'] }) === '列出飞书任务' &&
+      toolActionLabel('lark_cli', { args: ['wiki', 'read', 'wikcnX'] }) === '读取飞书知识库文档' &&
+      toolActionLabel('lark_cli', { args: ['calendar'] }) === '飞书日程操作' &&
+      toolActionLabel('lark_cli', { args: ['doc', '--help'] }) === '查看飞书文档用法' &&
+      toolActionLabel('lark_cli', { args: ['--help'] }) === '查看飞书命令用法' &&
+      toolActionLabel('lark_cli', { args: ['--version'] }) === '检查飞书命令行' &&
+      toolActionLabel('lark_cli', { args: ['nonexistent', 'list'] }) === '飞书操作' &&
+      toolActionLabel('lark_cli', { args: 'not-array' as unknown as string[] }) === '飞书操作' &&
+      toolActionLabel('lark_cli') === '飞书操作' &&
+      toolActionLabel('lark_cli', {}) === '飞书操作' &&
+      // 看板两通道按工具名/子命令细分动作
+      toolActionLabel('kanban_create_task', { title: 'x' }) === '创建看板任务' &&
+      toolActionLabel('kanban_list_projects') === '列出看板项目' &&
+      toolActionLabel('kanban_get_task') === '查看看板任务' &&
+      toolActionLabel('kanban_start_workspace') === '启动看板工作区' &&
+      toolActionLabel('kanban_follow_up_task') === '向任务发送跟进消息' &&
+      toolActionLabel('kanban_health') === '检查看板服务' &&
+      toolActionLabel('kanban_frobnicate') === '看板操作' &&
+      toolActionLabel('hk_cli', { args: ['tasks', 'list'] }) === '列出看板任务' &&
+      toolActionLabel('hk_cli', { args: ['tasks', 'create', '标题'] }) === '创建看板任务' &&
+      toolActionLabel('hk_cli', { args: ['start', 'ws-1'] }) === '启动看板工作区' &&
+      toolActionLabel('hk_cli', { args: ['status', 'task-1'] }) === '查看看板任务状态' &&
+      toolActionLabel('hk_cli', { args: ['health'] }) === '检查看板服务' &&
+      toolActionLabel('hk_cli', { args: ['approve', 'ap-1'] }) === '批准看板审批' &&
+      toolActionLabel('hk_cli', { args: ['--help'] }) === '查看备用通道用法' &&
+      toolActionLabel('hk_cli') === '看板操作' &&
+      // 只读技能文档不得显示「运行技能」
+      toolActionLabel('skill_doc') === '查看技能文档' &&
+      toolActionLabel('skill_exec') === '运行技能' &&
+      // --help 只在子命令位标注「查看用法」，写命令载荷含 --help 字样不误标
+      toolActionLabel('lark_cli', { args: ['im', 'send', 'ou_x', '--help'] }) === '发送飞书消息' &&
+      // 其余工具的既有映射不受 args 影响
+      toolActionLabel('repo_fs') === '读文件' &&
+      toolActionLabel('unknown_tool') === '调用工具'
     );
   })());
 

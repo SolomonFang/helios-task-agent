@@ -254,6 +254,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (rec) {
       rec.ctl.abort();
       running.delete(openId);
+      // 进度卡立即停刷：「已中断」终态要等轮次收尾（finalizeAborted）才落地，
+      // 窗口内心跳/在途节流更新不得把终态刷回「处理中」（held 不挡 paintTerminal 终态收尾）
+      if (rec.progressId) progress.holdCard(rec.progressId);
     }
     return { hadRound: Boolean(rec), gateCancelled, dropped, reviewsAborted, diagnosesAborted };
   };
@@ -335,8 +338,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       settlement?.cardMessageId && running.get(openId)?.progressId === settlement.cardMessageId
         ? settlement.cardMessageId
         : undefined;
-    const mergedExecutingCard = (label: string): CardActionResponse['card'] | undefined => {
-      const snapshot = mergedPid ? progress.progressSnapshot(mergedPid, label) : undefined;
+    const mergedExecutingCard = (label: string, noteOverride?: string): CardActionResponse['card'] | undefined => {
+      const snapshot = mergedPid ? progress.progressSnapshot(mergedPid, label, noteOverride) : undefined;
       return snapshot ? { type: 'raw', data: snapshot } : settledCard;
     };
     if (answer === 'approved') {
@@ -353,10 +356,14 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       // 粒度如实告知：按 scope（类级/对象级）+ kind（操作类别）细化免问范围措辞
       const scopeWord = batchScopeWord(confirmations.lastBatchScope(openId));
       if (mergedPid) {
-        // 合并场景无文本回执：免问撤销方式并进 toast，避免用户不知道该能力
+        // 合并场景无文本回执：免问撤销方式并进 toast；noteOverride 同时把批次标记记入轨迹，
+        // 此后进度卡重建与结果卡注脚持续携带撤销指引（与文本裁决路径同口径，按钮路径不再漏）
         return {
           toast: { type: 'success', content: `✅ 已批准（${scopeWord}免问）· 回复「恢复确认」可撤销` },
-          card: mergedExecutingCard('✅ 已批准，正在执行写操作…'),
+          card: mergedExecutingCard(
+            '✅ 已批准，正在执行写操作…',
+            `已批准（${scopeWord}免问）· 回复「恢复确认」可撤销 · /stop 可中断`,
+          ),
         };
       }
       void safeNotify(
@@ -522,7 +529,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           answer === 'approved_batch' ? `已批准（${scopeWord}免问）· 回复「恢复确认」可撤销 · /stop 可中断` : undefined;
         const snapshot = progress.progressSnapshot(mergedPid, '✅ 已批准，正在执行写操作…', noteOverride);
         if (snapshot) {
-          void deps.confirmCardBridge?.paint(mergedPid, snapshot).catch(() => {});
+          // 换卡失败不得零反馈（用户回完确认卡片却原地不动）：落文本回执，与下方快照不可得分支同口径
+          const receipt =
+            answer === 'approved'
+              ? '✅ 已批准，正在执行…'
+              : `✅ 已批准；${batchAckText(confirmations.lastBatchScope(msg.senderId), deps.lastBatchKind?.(msg.senderId))}，正在执行…（回复「恢复确认」可随时撤销）`;
+          void deps.confirmCardBridge?.paint(mergedPid, snapshot).catch(() => channel.reply(msg, receipt).catch(() => {}));
           return true;
         }
         // 快照不可得（轨迹已收尾的极端竞态）：落回文本回执，不让用户无反馈
@@ -676,10 +688,12 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           : llmFailureParts(message, text, 'bot');
         const failText = [parts.head, parts.friendly, parts.tail].filter(Boolean).join('\n');
         await progress.finalizeFailed(progressId);
-        // 失败文案投递本身再失败：用户端完全静默，至少落日志（不再往外抛）
-        await channel
-          .reply(msg, failText)
-          .catch((e) => console.error(`[feishu] 失败文案投递也未送达: ${errMessage(e)}`));
+        // 失败文案投递本身再失败：占位卡「失败详情见下方」即成谎称，改画自包含终态（不得让下方什么都不有的卡片指路）；
+        // 终态重画再失败则用户端完全静默，至少落日志（不再往外抛）
+        await channel.reply(msg, failText).catch(async (e) => {
+          console.error(`[feishu] 失败文案投递也未送达: ${errMessage(e)}`);
+          await progress.finalizeFailedNoDetail(progressId);
+        });
       }
     } finally {
       supervisor.exitTurn();

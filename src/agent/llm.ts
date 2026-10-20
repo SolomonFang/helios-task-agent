@@ -327,32 +327,34 @@ export async function runAgentTurn({
         }
         if (toolCallCount > MAX_TOOL_CALLS) {
           fillUnanswered(messages, toolCalls.slice(i));
-          return `（本轮工具调用已达上限 ${MAX_TOOL_CALLS} 次，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
+          return `（本轮操作步骤已达上限 ${MAX_TOOL_CALLS} 步，已中止。已完成的操作不受影响，可问我「刚才完成了哪些操作」确认进度；也可缩小任务范围分步执行。）`;
         }
         const name = call.function.name;
         const handler = handlers.get(name);
         let result: string | undefined;
-        reportProgress({ type: 'tool', name });
-        if (!handler) {
-          // 内部工具名不落用户面（黑话），只提示改用已有工具
-          result = '错误：没有这个工具，请改用已有工具重试';
-        } else {
-          let args: Record<string, unknown> = {};
-          try {
-            args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
-          } catch (err) {
+        // 参数解析提前到进度上报之前：进度标签按参数细分动作（如 lark_cli 子命令 → 读文档/发消息）。
+        // 解析失败不影响上报（args 空对象兜底，标签回落通用动作），用户面错误仍在 handler 分支给出。
+        let args: Record<string, unknown> = {};
+        try {
+          args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
+        } catch (err) {
+          if (handler) {
             // 原始解析错误（英文）进日志，用户面只给可执行的修正方向
             console.error(`[llm] 工具参数解析失败: ${errMessage(err)}`);
             result = '错误：工具参数格式有误，请修正后重新调用';
           }
-          if (result === undefined) {
-            try {
-              result = String(await handler(args, { signal: turnSignal }));
-            } catch (err) {
-              const message = errMessage(err);
-              // 行首文案被 guard.ts STRONG_FAILURE_LINE_ZH_RE 匹配，改动须同步该正则
-              result = `工具调用失败：${message}`;
-            }
+        }
+        reportProgress({ type: 'tool', name, args });
+        if (!handler) {
+          // 内部工具名不落用户面（黑话），只提示改用已有工具
+          result = '错误：没有这个工具，请改用已有工具重试';
+        } else if (result === undefined) {
+          try {
+            result = String(await handler(args, { signal: turnSignal }));
+          } catch (err) {
+            const message = errMessage(err);
+            // 行首文案被 guard.ts STRONG_FAILURE_LINE_ZH_RE 匹配，改动须同步该正则
+            result = `工具调用失败：${message}`;
           }
         }
         messages.push({

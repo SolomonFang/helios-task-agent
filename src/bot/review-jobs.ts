@@ -469,10 +469,15 @@ export function createReviewJobs(deps: ReviewJobsDeps): ReviewJobs {
     title = title.trim() || '未命名任务';
     const dedupeKey = `${taskId}:${attemptId || 'latest'}`;
     if (diagnosedKeys.has(dedupeKey)) {
+      // 重试已发起后诊断卡片已原地置为无按钮终态：再指引「点卡片上的重试按钮」是指向不存在的按钮（V1 同型漏网）。
+      // retryLaunching 按 taskId 粒度；retryLaunched 键为 taskId:attemptId（attemptId 可能在诊断后才补拉到），按前缀匹配
+      const retryStarted = retryLaunching.has(taskId) || [...retryLaunched].some((k) => k.startsWith(`${taskId}:`));
       // 指引按结果实际形态分支：诊断卡片推送失败走文本降级时没有卡片按钮可点
-      const tip = diagnosisResults.get(taskId)?.cardMessageId
-        ? '结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。'
-        : '结果见上方消息；回复「重试这个任务」可按结论重启。';
+      const tip = retryStarted
+        ? '重试已按诊断结论发起过，任务进展会继续推送；如长时间无进展，请到看板查看或手动重新发起。'
+        : diagnosisResults.get(taskId)?.cardMessageId
+          ? '结果见上方诊断卡片；点卡片上的「↻ 按诊断结论重试」可按结论重启任务。'
+          : '结果见上方消息；回复「重试这个任务」可按结论重启。';
       void safeNotify(channel, openId, `🔍 《${title}》这次失败已诊断过，${tip}`);
       return { status: 'diagnosed', toast: '已诊断过，结果见上方' };
     }

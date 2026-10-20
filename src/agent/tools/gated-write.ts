@@ -158,6 +158,12 @@ export function makeGatedWriter({
       auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: gate.reason }, auditHome);
       return gate.message;
     }
+    // 批准到手后、执行前再查一次轮次信号：闸门等待期间轮次可能已被 /stop/墙钟中断
+    //（确认实现未接入 signal 时闸门不会提前收尾），此时执行写操作会与「已中止」的轮次收尾相悖
+    if (p.signal?.aborted) {
+      auditLog({ user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'denied' }, auditHome);
+      return '⏹ 已中断（操作未执行，可继续对话）。';
+    }
     let result = await p.execute();
     if (p.isStart && !looksLikeStrongFailure(result)) {
       result = await appendWorkspaceReadyCheck(result, kanbanUrl, p.signal);

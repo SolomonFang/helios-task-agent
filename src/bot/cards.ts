@@ -219,12 +219,12 @@ export const RESULT_CARD_MAX_BYTES = 28000;
  */
 export const BATCH_ACTIVE_NOTE = '免问生效中 · 回复「恢复确认」可撤销';
 
-/** 进度卡片展示的最近步骤数上限：长任务的步骤轨迹不无限变长。 */
+/** 进度卡片展示的最近步骤组数上限（连续同名步骤已合并为一组）：长任务的步骤轨迹不无限变长。 */
 const PROGRESS_CARD_MAX_STEPS = 5;
 
 /** 进度卡片状态：步骤轨迹（已完成 ✓ / 当前 ⏳）+ 已等待秒数；waitingConfirm 为写操作确认挂起变体。 */
 export interface ProgressCardState {
-  /** 已完成步骤（工具动作标签，按发生顺序；卡片内只展示最近 PROGRESS_CARD_MAX_STEPS 步）。 */
+  /** 已完成步骤（工具动作标签，按发生顺序；卡片内连续同名合并后只展示最近 PROGRESS_CARD_MAX_STEPS 组）。 */
   steps: string[];
   /** 当前进行中的步骤；无 = 等待/思考中。 */
   current?: string;
@@ -250,9 +250,17 @@ export interface ProgressCardState {
  * 前缀扩展（追加步骤行）触发打字机动画。
  */
 export function progressMainText(state: Pick<ProgressCardState, 'steps' | 'current'>): string {
-  const recent = state.steps.slice(-PROGRESS_CARD_MAX_STEPS);
+  // 连续重复步骤合并为「×N」：同一资源的多次读写（如反复读飞书任务详情）排成一列同名行毫无信息量。
+  // 先合并再截窗：窗口按合并后的组数计，重复序列不会挤掉更早的不同步骤。
+  const groups: { label: string; count: number }[] = [];
+  for (const s of state.steps) {
+    const last = groups[groups.length - 1];
+    if (last && last.label === s) last.count++;
+    else groups.push({ label: s, count: 1 });
+  }
+  const recent = groups.slice(-PROGRESS_CARD_MAX_STEPS);
   // 步骤标签来自 toolActionLabel 的内部文案，过 mdSafe 仅为纵深防御
-  const lines = recent.map((s) => `✓ ${mdSafe(s)}`);
+  const lines = recent.map((g) => `✓ ${mdSafe(g.label)}${g.count > 1 ? ` ×${g.count}` : ''}`);
   if (state.current) lines.push(`⏳ ${mdSafe(state.current)}`);
   return lines.length ? lines.join('\n') : '⏳ 正在理解需求…';
 }
@@ -346,15 +354,18 @@ export function buildResultCard(
  * 进度占位的终态卡片（无按钮，原地替换进度卡片）：
  * aborted = 用户中断；failed = 处理失败（详情另发消息）；seeBelow = 已完成但结果较长/轮次中有插入消息，正文在下方分段；
  * deliverFailed = 结果投递彻底失败（下方什么都没有，不得谎称「见下方」）；
+ * failedNoDetail = 处理失败且失败详情投递也失败（自包含出路，「详情见下方」不得谎称）；
  * stale = 陈旧进度卡片（机器人重启/上一轮次）被点到停止按钮时顺手收尾，不烂尾在「处理中」。
  */
-export function buildProgressTerminalCard(kind: 'aborted' | 'failed' | 'seeBelow' | 'deliverFailed' | 'stale'): Record<string, unknown> {
+export function buildProgressTerminalCard(kind: 'aborted' | 'failed' | 'seeBelow' | 'deliverFailed' | 'failedNoDetail' | 'stale'): Record<string, unknown> {
   const meta = {
     aborted: { template: 'grey', title: '⏹ 已中断', note: '未完成的操作未执行，可继续对话。' },
     failed: { template: 'red', title: '⚠️ 处理失败', note: '失败详情见下方消息，可修正后重试。' },
     seeBelow: { template: 'green', title: '处理结束，结果见下方 ⬇️', note: '完整内容见下方消息。' },
     deliverFailed: { template: 'red', title: '⚠️ 回复投递失败', note: '请把刚才的问题再发一次。' },
-    stale: { template: 'grey', title: '⏹ 该轮次已结束', note: '机器人可能已重启；如需中断当前任务，请用最新进度卡片上的「⏹ 停止」或回复 /stop。' },
+    failedNoDetail: { template: 'red', title: '⚠️ 处理失败', note: '失败详情也未能送达，请把刚才的问题再发一次。' },
+    // 该轮次并非用户中断（多为重启/上一轮自然结束）：不用 ⏹（与「已中断」同图标会误读），改中性 ℹ️
+    stale: { template: 'grey', title: 'ℹ️ 该轮次已结束', note: '机器人可能已重启；如需中断当前任务，请用最新进度卡片上的「⏹ 停止」或回复 /stop。' },
   }[kind];
   return {
     schema: '2.0',

@@ -63,7 +63,7 @@ export type ToolHandlers = Map<string, ToolHandler>;
 
 export type ProgressInfo =
   | { type: 'think' | 'continue' }
-  | { type: 'tool'; name: string };
+  | { type: 'tool'; name: string; args?: Record<string, unknown> };
 
 export interface LlmClientConfig {
   llmBaseUrl: string;

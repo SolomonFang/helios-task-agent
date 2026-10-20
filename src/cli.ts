@@ -99,6 +99,8 @@ export const ASK_TIMEOUT: unique symbol = Symbol('ask-timeout');
  * 闸门询问期间按 Ctrl+C = 拒绝该写操作（随后整个任务被中断）；
  * 超时未操作按拒绝处理（对齐飞书 bot：普通写 120s / 破坏性 300s）。
  * getCtl 返回当前运行轮次的 AbortController（无轮次时为 null）。
+ * extraSignal：调用方附加的轮次级信号（llm 墙钟看门狗合并信号），abort 同样按非回答路径收尾——
+ * 墙钟到点时确认不得继续挂到确认超时（ConfirmFn 契约，见 guard.ts）。
  * cancelPending：abort/超时等非回答路径收尾时调用，取消底层挂起的行读 waiter，
  * 否则陈旧 waiter 会吞掉主循环下一次 ask 之前用户敲入的一行。
  */
@@ -106,11 +108,11 @@ export function createAskWithAbort(
   ask: AskFn,
   getCtl: () => AbortController | null,
   cancelPending?: () => void,
-): (promptText: string, timeoutMs?: number) => Promise<string | null | typeof ASK_TIMEOUT> {
-  return (promptText, timeoutMs) => {
+): (promptText: string, timeoutMs?: number, extraSignal?: AbortSignal) => Promise<string | null | typeof ASK_TIMEOUT> {
+  return (promptText, timeoutMs, extraSignal) => {
     const ctl = getCtl();
-    if (!ctl && !timeoutMs) return ask(promptText);
-    if (ctl?.signal.aborted) return Promise.resolve(null);
+    if (!ctl && !timeoutMs && !extraSignal) return ask(promptText);
+    if (ctl?.signal.aborted || extraSignal?.aborted) return Promise.resolve(null);
     return new Promise((resolve) => {
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
@@ -122,10 +124,12 @@ export function createAskWithAbort(
         settled = true;
         if (timer) clearTimeout(timer);
         ctl?.signal.removeEventListener('abort', onAbort);
+        extraSignal?.removeEventListener('abort', onAbort);
         if (stale) cancelPending?.();
         resolve(v);
       };
       ctl?.signal.addEventListener('abort', onAbort, { once: true });
+      extraSignal?.addEventListener('abort', onAbort, { once: true });
       if (timeoutMs) {
         timer = setTimeout(() => finish(ASK_TIMEOUT, true), timeoutMs);
         timer.unref();
@@ -147,12 +151,12 @@ export function createAskWithAbort(
  * print/now 可注入（默认 console.log / Date.now），供单测替代。
  */
 export function createCliConfirm(
-  askWithAbort: (promptText: string, timeoutMs?: number) => Promise<string | null | typeof ASK_TIMEOUT>,
+  askWithAbort: (promptText: string, timeoutMs?: number, extraSignal?: AbortSignal) => Promise<string | null | typeof ASK_TIMEOUT>,
   spinner: { start(text?: string): unknown; stop(): unknown },
   print: (line: string) => void = (l) => console.log(l),
   now: () => number = Date.now,
 ): ConfirmFn {
-  return async (req: ConfirmRequest) => {
+  return async (req: ConfirmRequest, signal?: AbortSignal) => {
     spinner.stop();
     print('');
     print(c.warn(`⚠️ 写操作请求（${kindLabel(req.kind)}${req.destructive ? ' · 高危' : ''}）：${stripAnsi(req.summary)}`));
@@ -169,14 +173,22 @@ export function createCliConfirm(
       return false;
     };
     for (;;) {
+      // 轮次已中断（/stop/墙钟）则不再发问：闸门按拒绝收尾，不等确认超时（ConfirmFn 契约）
+      if (signal?.aborted) return false;
       const remainingMs = deadline - now();
-      if (remainingMs <= 0) return timeoutFinish();
+      if (remainingMs <= 0) {
+        // 窗口耗尽也要重启 spinner：闸门返回后轮次可能还在继续跑，不能全程静默（与下方回答后同口径）
+        spinner.start('思考中…（Ctrl+C 中断）');
+        return timeoutFinish();
+      }
       const ans = await askWithAbort(
         c.warn(`允许执行？【${options}】（${Math.round(remainingMs / 1000)} 秒未操作自动拒绝） `),
         remainingMs,
+        signal,
       );
       spinner.start('思考中…（Ctrl+C 中断）');
       if (ans === ASK_TIMEOUT) return timeoutFinish();
+      // 轮次信号中断（Ctrl+C / 墙钟到点）时 askWithAbort 回落 null：与空回车同按取消收尾
       const t = (ans || '').trim().toLowerCase();
       // 无 batchKey 的操作不支持同类免问：提示后重新等待输入，而不是落到「已取消」（行为与意图相反）
       if (!req.batchKey && CONFIRM_BATCH_RE.test(t)) {
@@ -650,7 +662,7 @@ export async function main(): Promise<void> {
       const reply = await session.handleUserMessage(
         line,
         (info) => {
-          if (info.type === 'tool') spinner.setText(`${toolActionLabel(info.name)} …（Ctrl+C 中断）`);
+          if (info.type === 'tool') spinner.setText(`${toolActionLabel(info.name, info.args)} …（Ctrl+C 中断）`);
           else spinner.setText('思考中…（Ctrl+C 中断）');
         },
         ctl.signal,
@@ -660,7 +672,8 @@ export async function main(): Promise<void> {
     } catch (err) {
       spinner.stop();
       if (ctl.signal.aborted) {
-        console.log(c.gray('\n⏹ 已中断当前任务（进程未退出，可继续对话）。'));
+        // 与 llm.ts 的优雅中断收尾同一措辞：同一事件两套文案会被读成两个事件（bot 端同口径）
+        console.log(c.gray('\n⏹ 已中断（未完成的操作未执行，可继续对话）。'));
       } else {
         const message = errMessage(err);
         const parts = llmFailureParts(message, line, 'cli');

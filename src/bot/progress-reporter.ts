@@ -71,6 +71,8 @@ export interface ProgressKit {
   finalizeAborted: (progressId: string | undefined, msg: InboundMessage, text: string) => Promise<void>;
   /** 轮次失败收尾：卡片模式换「处理失败」终态卡片，文本模式保持「详见下方」文案（失败详情由调用方另行投递）。 */
   finalizeFailed: (progressId: string | undefined) => Promise<void>;
+  /** 失败详情投递也失败时的自包含终态：占位卡不得停在谎称「失败详情见下方」的 failed 终态。 */
+  finalizeFailedNoDetail: (progressId: string | undefined) => Promise<void>;
   /** 卡片模式占位是否存活且未收尾（hta_stop 轮次令牌校验用；文本占位/已终态返回 false）。 */
   isActiveProgress: (progressId: string) => boolean;
   /** 卡片模式占位是否已收尾（结果/中断/失败已落地；hta_stop 据此区分「竞态点击只 toast」与「陈旧卡片收终态」）。 */
@@ -337,7 +339,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
         if (info.type !== 'tool') return;
         // 步骤轨迹：新工具事件把上一个「当前步骤」归入已完成（卡片内只展示最近几步）
         if (track.current) track.steps.push(track.current);
-        track.current = toolActionLabel(info.name);
+        track.current = toolActionLabel(info.name, info.args);
         const now = activity.lastEventAt;
         if (now - lastPush < 2000) return; // 飞书消息更新限流
         lastPush = now;
@@ -348,7 +350,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       const now = activity.lastEventAt;
       if (now - lastPush < 2000) return; // 飞书消息更新限流
       lastPush = now;
-      const text = info.type === 'tool' ? `⏳ 处理中…（${toolActionLabel(info.name)}）` : '⏳ 思考中…';
+      const text = info.type === 'tool' ? `⏳ 处理中…（${toolActionLabel(info.name, info.args)}）` : '⏳ 思考中…';
       void channel.updateText(progressId, text).catch(() => {});
     };
   };
@@ -551,6 +553,15 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     await channel.updateText(progressId, '⚠️ 处理失败，详见下方').catch(() => {});
   };
 
+  const finalizeFailedNoDetail = async (progressId: string | undefined): Promise<void> => {
+    if (!progressId) return;
+    if (cardTracks.has(progressId)) {
+      await paintTerminal(progressId, buildProgressTerminalCard('failedNoDetail')).catch(() => {});
+      return;
+    }
+    await channel.updateText(progressId, '⚠️ 处理失败，且失败详情也未能送达，请把刚才的问题再发一次。').catch(() => {});
+  };
+
   const isActiveProgress = (progressId: string): boolean => {
     const t = cardTracks.get(progressId);
     return Boolean(t && !t.settled);
@@ -569,6 +580,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     deliverReply,
     finalizeAborted,
     finalizeFailed,
+    finalizeFailedNoDetail,
     isActiveProgress,
     isSettledProgress,
     holdCard,

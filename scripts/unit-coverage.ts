@@ -609,6 +609,57 @@ async function run(): Promise<void> {
     );
   })());
 
+  await checkAsync('cliConfirm：轮次 signal 已中断时立即按拒绝收尾，不再发问', async () => {
+    let asked = false;
+    const confirm = createCliConfirm(
+      async () => {
+        asked = true;
+        return 'y';
+      },
+      noopSpinner,
+      () => {},
+    );
+    const ctl = new AbortController();
+    ctl.abort();
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm, ctl.signal);
+    assert.ok(!res.allowed, `已中断应按拒绝收尾，实际：${JSON.stringify(res)}`);
+    assert.equal(asked, false, '轮次已中断不得再发问');
+  });
+
+  await checkAsync('cliConfirm：确认挂起期间轮次 signal 中断（墙钟到点），闸门即刻收尾且 waiter 被取消', async () => {
+    const reader = createFakeLineReader();
+    const askWithAbort = createAskWithAbort(reader.ask, () => null, reader.cancelPending);
+    const confirm = createCliConfirm(askWithAbort, noopSpinner, () => {});
+    const ctl = new AbortController();
+    const gate = passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm, ctl.signal);
+    await new Promise((r) => setTimeout(r, 20)); // 闸门已挂起等待回答
+    ctl.abort(); // 墙钟看门狗到点：不得继续挂到确认超时（最长 300s）
+    const res = await gate;
+    assert.ok(!res.allowed, `中断后闸门应按拒绝收尾，实际：${JSON.stringify(res)}`);
+    // 中断路径取消挂起 waiter：中断后用户敲入的行留给下一次 ask，不被陈旧 waiter 吞掉
+    reader.feed('中断后的输入');
+    assert.equal(await askOrTimeout(reader.ask), '中断后的输入');
+  });
+
+  await checkAsync('cliConfirm：超时窗口耗尽收尾时重启 spinner（闸门返回后轮次可能仍在跑，不能全程静默）', async () => {
+    let starts = 0;
+    const spinner = { start: () => starts++, stop: () => {} };
+    let now = 1_000_000;
+    const confirm = createCliConfirm(
+      async () => {
+        now += 200_000; // 回答耗时超过 120s 窗口 → 重问循环入口即耗尽
+        return '随便说说';
+      },
+      spinner,
+      () => {},
+      () => now,
+    );
+    const res = await passGate({ kind: 'kanban', summary: 's', detail: 'd' }, confirm);
+    assert.ok(!res.allowed && res.reason === 'timeout', `窗口耗尽应归因 timeout，实际：${JSON.stringify(res)}`);
+    // 回答后重启一次 + 窗口耗尽收尾重启一次
+    assert.ok(starts >= 2, `窗口耗尽收尾应重启 spinner，实际 start 次数：${starts}`);
+  });
+
   // ================= 盲区 4：config-wizard 非交互部分 + 链路 =================
 
   check('resolveAllowedOpenIds：回车保留现状 / 新列表覆盖 / 换绑场景 "-" 清除 / 非换绑场景 "-" 忽略', (() => {
