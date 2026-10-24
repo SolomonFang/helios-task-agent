@@ -142,10 +142,39 @@ interface CardTrack {
  */
 const SETTLED_TRACK_TTL_MS = 60_000;
 
+interface TextTrack {
+  chain: Promise<void>;
+  settled: boolean;
+  settledAt?: number;
+}
+
 export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
   const { channel, heartbeatMs, hasPendingConfirm } = deps;
   /** 占位 id → 卡片轨迹：在表即卡片模式（sendCard 成功）；文本占位不在表，全程走原文案路径。 */
   const cardTracks = new Map<string, CardTrack>();
+  const textTracks = new Map<string, TextTrack>();
+
+  const getTextTrack = (progressId: string): TextTrack => {
+    let track = textTracks.get(progressId);
+    if (!track) {
+      track = { chain: Promise.resolve(), settled: false };
+      textTracks.set(progressId, track);
+    }
+    return track;
+  };
+
+  const enqueueTextUpdate = (progressId: string, text: string): void => {
+    const track = getTextTrack(progressId);
+    if (track.settled) return;
+    track.chain = track.chain.then(() => channel.updateText(progressId, text)).catch(() => {});
+  };
+
+  const settleText = async (progressId: string): Promise<void> => {
+    const track = getTextTrack(progressId);
+    track.settled = true;
+    track.settledAt = Date.now();
+    await track.chain;
+  };
 
   /** 整卡更新按传输模式分发：cardkit 走实体更新（sequence 递增），message 走消息更新。 */
   const applyCard = (track: CardTrack, progressId: string, card: Record<string, unknown>): Promise<void> =>
@@ -270,6 +299,9 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     for (const [id, t] of cardTracks) {
       if (t.settled && now - (t.settledAt ?? 0) > SETTLED_TRACK_TTL_MS) cardTracks.delete(id);
     }
+    for (const [id, t] of textTracks) {
+      if (t.settled && now - (t.settledAt ?? 0) > SETTLED_TRACK_TTL_MS) textTracks.delete(id);
+    }
     // 优先 CardKit 流式卡片（打字机动画）：建实体 → 发消息引用实体 → 整卡更新注入停止按钮令牌
     //（令牌即 message_id，发送后才能拿到）。任一步失败降级普通卡片（消息传输，无动画）
     try {
@@ -351,7 +383,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       if (now - lastPush < 2000) return; // 飞书消息更新限流
       lastPush = now;
       const text = info.type === 'tool' ? `⏳ 处理中…（${toolActionLabel(info.name, info.args)}）` : '⏳ 思考中…';
-      void channel.updateText(progressId, text).catch(() => {});
+      enqueueTextUpdate(progressId, text);
     };
   };
 
@@ -388,7 +420,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
           ? `⏳ 等待你处理下方的写操作确认…（点卡片按钮或回复${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）`
           : `⏳ 等待你回复写操作确认（${confirmForm.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」'}；回复 /stop 可中断）…`
         : `⏳ 仍在处理…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒；/stop 可中断）`;
-      void channel.updateText(progressId, text).catch(() => {});
+      enqueueTextUpdate(progressId, text);
     }, heartbeatMs);
     timer.unref();
     return () => clearInterval(timer);
@@ -404,6 +436,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
     const text = reply || '（无回复）';
     const chunks = splitText(text);
     const track = progressId ? cardTracks.get(progressId) : undefined;
+    if (progressId && !track) await settleText(progressId);
 
     if (progressId && (interleaved || (track !== undefined && Buffer.byteLength(text, 'utf8') > RESULT_CARD_MAX_BYTES))) {
       // 占位无法承载正文的两类情况：轮次中插入了确认卡片等独立消息（原地改会时序颠倒）、
@@ -540,6 +573,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       );
       return;
     }
+    await settleText(progressId);
     await channel.updateText(progressId, text).catch(() => channel.reply(msg, text).catch(() => {}));
   };
 
@@ -550,6 +584,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       await paintTerminal(progressId, buildProgressTerminalCard('failed')).catch(() => {});
       return;
     }
+    await settleText(progressId);
     await channel.updateText(progressId, '⚠️ 处理失败，详见下方').catch(() => {});
   };
 
@@ -559,6 +594,7 @@ export function createProgressKit(deps: ProgressKitDeps): ProgressKit {
       await paintTerminal(progressId, buildProgressTerminalCard('failedNoDetail')).catch(() => {});
       return;
     }
+    await settleText(progressId);
     await channel.updateText(progressId, '⚠️ 处理失败，且失败详情也未能送达，请把刚才的问题再发一次。').catch(() => {});
   };
 

@@ -1,20 +1,14 @@
 import path from 'path';
 import { LARK_CLI_INSTALL_HINT } from '../../infra/deps';
-import { resolveSkillDir } from '../skills';
 import { execFileCompat } from '../../infra/proc';
 import { minimalChildEnv } from '../../infra/proc-env';
 import { packageRoot } from '../../infra/paths';
 
-/** hk.mjs 包内兜底路径（用户目录无覆盖版本时使用，见 resolveHkScript）。 */
+/** hk_cli 只执行随包发布的可信脚本，不受用户同名技能覆盖影响。 */
 const HK_SCRIPT = path.join(packageRoot, 'skills', 'helios-kanban-remote', 'scripts', 'hk.mjs');
 
-/**
- * hk.mjs 定位：与 skill_doc 同一套 resolveSkillDir（用户目录优先覆盖），找不到回退包内路径。
- * 每次调用重新解析：运行中新装/更新用户技能即时生效，且与 skill_doc 读到的文档版本一致。
- */
 export function resolveHkScript(): string {
-  const dir = resolveSkillDir('helios-kanban-remote');
-  return dir ? path.join(dir, 'scripts', 'hk.mjs') : HK_SCRIPT;
+  return HK_SCRIPT;
 }
 
 const MAX_OUTPUT = 8000;

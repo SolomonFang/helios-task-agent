@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   createAccessChecker,
   createMessageDedupe,
+  extractOwnerPairingCode,
   FeishuChannel,
   filterIncomingMessage,
   GROUP_MENTION_COOLDOWN_MS,
@@ -154,7 +155,7 @@ async function main(): Promise<void> {
     assert.equal(isCardActionAllowed({ operator: { open_id: '' } }, allowed), false, '空 open_id 应拒绝');
   });
 
-  // ---------- 接入判定：白名单 / owner 认领 / fail-closed ----------
+  // ---------- 接入判定：白名单 / 一次性配对认领 / fail-closed ----------
   await checkAsync('access：白名单内用户放行，名单外拒绝', async () => {
     const access = createAccessChecker(['ou_owner']);
     const blocked = new Set<string>();
@@ -166,35 +167,53 @@ async function main(): Promise<void> {
     assert.equal(deny.claimed, false);
   });
 
-  await checkAsync('access：空白名单首个用户认领成功并放行，之后名单外用户拒绝', async () => {
-    const access = createAccessChecker([]);
+  await checkAsync('access：空白名单必须配对，普通首聊与错误码均不能抢绑', async () => {
+    const access = createAccessChecker([], 'local-one-time-code');
     const blocked = new Set<string>();
-    const first = resolveAccess(access, blocked, 'ou_first', { persistClaim: () => true });
-    assert.equal(first.decision, 'allow');
-    assert.equal(first.claimed, true, '首个用户应触发认领');
-    assert.equal(first.claimRevoked, false);
-    assert.deepEqual(access.list(), ['ou_first'], '认领后应进入白名单');
-    const second = resolveAccess(access, blocked, 'ou_second', { persistClaim: () => true });
-    assert.equal(second.decision, 'deny', '认领完成后其他用户应拒绝');
-    assert.equal(second.claimed, false);
+    let persists = 0;
+    const hooks = { persistClaim: () => (persists++, true) };
+    const first = resolveAccess(access, blocked, 'ou_attacker', hooks);
+    assert.equal(first.decision, 'deny');
+    assert.equal(first.pairingRequired, true);
+    const wrong = resolveAccess(access, blocked, 'ou_attacker', hooks, 'wrong-code');
+    assert.equal(wrong.pairingFailed, true);
+    assert.equal(persists, 0, '未配对不得写白名单');
+    assert.deepEqual(access.list(), []);
+    assert.equal(extractOwnerPairingCode('配对码 local-one-time-code'), 'local-one-time-code');
+    assert.equal(extractOwnerPairingCode('/pair local-one-time-code'), 'local-one-time-code');
+    assert.equal(extractOwnerPairingCode('你好'), undefined);
+    const firstOwner = resolveAccess(access, blocked, 'ou_first', hooks, 'local-one-time-code');
+    assert.equal(firstOwner.decision, 'allow');
+    assert.equal(firstOwner.claimed, true);
+    assert.equal(persists, 1);
+    const second = resolveAccess(access, blocked, 'ou_second', hooks, 'local-one-time-code');
+    assert.equal(second.decision, 'deny', '配对码认领成功后不得重复使用');
+    assert.deepEqual(access.list(), ['ou_first']);
+  });
+
+  await checkAsync('access：空白名单缺本地配对码时 fail-closed', async () => {
+    const access = createAccessChecker([]);
+    const r = resolveAccess(access, new Set(), 'ou_first', { persistClaim: () => true });
+    assert.equal(r.decision, 'deny');
+    assert.equal(r.pairingRequired, true);
+    assert.deepEqual(access.list(), []);
   });
 
   await checkAsync('access：认领未持久化（返回 false）fail-closed 撤销并阻断', async () => {
-    const access = createAccessChecker([]);
+    const access = createAccessChecker([], 'pair-code');
     const blocked = new Set<string>();
-    const r = resolveAccess(access, blocked, 'ou_first', { persistClaim: () => false });
+    const r = resolveAccess(access, blocked, 'ou_first', { persistClaim: () => false }, 'pair-code');
     assert.equal(r.decision, 'deny', '未持久化应拒绝');
     assert.equal(r.claimed, true);
     assert.equal(r.claimRevoked, true, '应撤销内存放行');
     assert.deepEqual(access.list(), [], '撤销后白名单应为空');
     assert.ok(blocked.has('ou_first'), '应加入阻断集');
-    // 阻断集中的用户即使之后出现在白名单语义下也一律拒绝
-    const again = resolveAccess(access, blocked, 'ou_first', { persistClaim: () => true });
+    const again = resolveAccess(access, blocked, 'ou_first', { persistClaim: () => true }, 'pair-code');
     assert.equal(again.decision, 'deny', '阻断集中的用户应始终拒绝');
   });
 
   await checkAsync('access：认领 hook 抛异常同样 fail-closed，并回报错误文案', async () => {
-    const access = createAccessChecker([]);
+    const access = createAccessChecker([], 'pair-code');
     const blocked = new Set<string>();
     const errors: string[] = [];
     const r = resolveAccess(access, blocked, 'ou_first', {
@@ -202,7 +221,7 @@ async function main(): Promise<void> {
         throw new Error('disk full');
       },
       onClaimError: (msg) => errors.push(msg),
-    });
+    }, 'pair-code');
     assert.equal(r.decision, 'deny', 'hook 抛错应拒绝');
     assert.equal(r.claimRevoked, true, 'hook 抛错应撤销放行');
     assert.deepEqual(access.list(), [], '撤销后白名单应为空');
@@ -211,10 +230,10 @@ async function main(): Promise<void> {
   });
 
   await checkAsync('access：阻断集超 1000 上限时整体清空（无界增长防护）', async () => {
-    const access = createAccessChecker([]);
+    const access = createAccessChecker([], 'pair-code');
     const blocked = new Set<string>();
     for (let i = 0; i < 1000; i++) blocked.add(`ou_old${i}`);
-    const r = resolveAccess(access, blocked, 'ou_new', { persistClaim: () => false });
+    const r = resolveAccess(access, blocked, 'ou_new', { persistClaim: () => false }, 'pair-code');
     assert.equal(r.claimRevoked, true);
     assert.equal(blocked.size, 1, '超上限应整体清空后仅保留新条目');
     assert.ok(blocked.has('ou_new'));

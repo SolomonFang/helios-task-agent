@@ -4,7 +4,7 @@
 // 真实 spawn 进程组 + 本地 mock 看板 API。Run: npx tsx scripts/unit-kanban.ts
 
 import assert from 'node:assert/strict';
-import { execFile, spawn, type ChildProcess } from 'child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -19,7 +19,7 @@ import {
   type RepoStartInput,
 } from '../src/kanban/workspace-ready';
 import { apiGet, fetchKanbanHealth, KanbanHttpError, taskPageUrl } from '../src/kanban/http';
-import { findOcrCommand, resolveReviewTarget } from '../src/kanban/ai-review';
+import { findOcrCommand, resolveReviewTarget, runAiReview } from '../src/kanban/ai-review';
 import { KanbanMcp } from '../src/kanban/mcp';
 import { checkLarkCli, checkLarkCliAsync } from '../src/infra/deps';
 import { checkAsync, finish, writeFakeCli } from './testkit';
@@ -470,6 +470,93 @@ async function main(): Promise<void> {
       );
     } finally {
       await mock.close();
+    }
+  });
+
+  await checkAsync('runAiReview：多仓逐仓执行并汇总；第二仓失败整体失败且默认日志不落审查输出', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-unit-multi-review-'));
+    const repoA = path.join(tmp, 'repo-a');
+    const repoB = path.join(tmp, 'repo-b');
+    const bin = path.join(tmp, 'bin');
+    const ocrLog = path.join(tmp, 'ocr.log');
+    const failB = path.join(tmp, 'fail-b');
+    fs.mkdirSync(bin, { recursive: true });
+    execFileSync('git', ['init', repoA], { stdio: 'ignore' });
+    execFileSync('git', ['init', repoB], { stdio: 'ignore' });
+    writeFakeCli(bin, 'ocr', {
+      sh: [
+        'if [ "$1" = "version" ]; then echo ocr-stub; exit 0; fi',
+        'if [ "$1" = "review" ]; then',
+        `  echo "$@" >> '${ocrLog}'`,
+        `  case "$*" in *repo-b*) if [ -f '${failB}' ]; then echo SECRET-REVIEW-OUTPUT >&2; exit 1; fi ;; esac`,
+        '  echo "[ocr] Summary: 1 file reviewed, 0 comment(s)"',
+        '  exit 0',
+        'fi',
+        'exit 1',
+      ].join('\n'),
+      cmd: [
+        'if "%1"=="version" (echo ocr-stub & exit /b 0)',
+        'if "%1"=="review" (',
+        `  echo %* >> "${ocrLog}"`,
+        '  echo %* | findstr /c:"repo-b" >nul',
+        `  if not errorlevel 1 if exist "${failB}" (echo SECRET-REVIEW-OUTPUT 1>&2 & exit /b 1)`,
+        '  echo [ocr] Summary: 1 file reviewed, 0 comment(s)',
+        '  exit /b 0',
+        ')',
+        'exit /b 1',
+      ].join('\r\n'),
+    });
+    const mock = await contractMock((url) => {
+      if (url === '/api/task-attempts/multi') {
+        return { body: { success: true, data: { container_ref: null, branch: 'feature-x' } } };
+      }
+      if (url === '/api/task-attempts/multi/repos') {
+        return {
+          body: {
+            success: true,
+            data: [
+              { path: repoA, name: 'repo-a', target_branch: 'main-a' },
+              { path: repoB, name: 'repo-b', target_branch: 'main-b' },
+            ],
+          },
+        };
+      }
+      return { status: 404, body: {} };
+    });
+    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ''}` };
+    try {
+      const result = await runAiReview({
+        kanbanUrl: mock.baseUrl,
+        attemptId: 'multi',
+        llm: { baseUrl: '', apiKey: '', model: '' },
+        env,
+      });
+      assert.ok(result.includes('仓库 1/2：repo-a') && result.includes('仓库 2/2：repo-b'), result);
+      assert.ok(result.includes('all repositories reviewed, 0 comment(s)'), result);
+      const calls = fs.readFileSync(ocrLog, 'utf8');
+      assert.ok(calls.indexOf('repo-a') < calls.indexOf('repo-b'), `应顺序逐仓执行：${calls}`);
+      assert.ok(calls.includes('--from main-a --to feature-x') && calls.includes('--from main-b --to feature-x'), calls);
+
+      fs.writeFileSync(failB, '1');
+      const prevDebug = process.env.HTA_DEBUG;
+      const errorLogs: string[] = [];
+      const originalError = console.error;
+      delete process.env.HTA_DEBUG;
+      console.error = (...args: unknown[]) => errorLogs.push(args.map(String).join(' '));
+      try {
+        await assert.rejects(
+          () => runAiReview({ kanbanUrl: mock.baseUrl, attemptId: 'multi', llm: { baseUrl: '', apiKey: '', model: '' }, env }),
+          /repo-b.*未完整完成/,
+        );
+      } finally {
+        console.error = originalError;
+        if (prevDebug === undefined) delete process.env.HTA_DEBUG;
+        else process.env.HTA_DEBUG = prevDebug;
+      }
+      assert.ok(!errorLogs.join('\n').includes('SECRET-REVIEW-OUTPUT'), `默认日志不得含审查输出：${errorLogs.join('\n')}`);
+    } finally {
+      await mock.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

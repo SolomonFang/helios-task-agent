@@ -246,6 +246,7 @@ async function main() {
         HTA_SAFETY_SPACED: 'hello world', // 含空格
         HTA_SAFETY_COMMENT: 'token #1', // 含 " #"
         HTA_SAFETY_QUOTE: "O'Neill", // 含单引号
+        HELIOS_KANBAN_MCP_ARGS: JSON.stringify(['-y', 'helios-kanban@latest', '--mcp', '--label', 'hello world']),
       };
       writeEnvFile(values, envPath);
       const parsed = dotenv.parse(fs.readFileSync(envPath));
@@ -269,6 +270,11 @@ async function main() {
       const raw = fs.readFileSync(envPath, 'utf8');
       const dquoteLine = raw.split('\n').find((l) => l.startsWith('HTA_SAFETY_DQUOTE='))!;
       assert.ok(dquoteLine.startsWith(`HTA_SAFETY_DQUOTE='`), '含双引号的值应单引号序列化');
+      assert.throws(
+        () => writeEnvFile({ HTA_SAFETY_UNSUPPORTED: `both ' and " with space` }, envPath),
+        /无法由 dotenv 无损保存/,
+        '无法无损表示的组合应拒绝写入，而不是重启后读到不同值',
+      );
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -423,6 +429,8 @@ async function main() {
       assert.equal(keys[3], 'hk:start', '不同任务的 start 应共用类级免问 key');
       assert.ok(keys[4]?.includes(idA) && keys[5]?.includes(idB), 'delete 仍须绑定任务标识');
       assert.notEqual(keys[4], keys[5], '不同任务的 delete 不得共用免问 key');
+      await hk({ args: ['tasks', 'update', '--title', '缺少任务 ID'] });
+      assert.equal(keys[6], undefined, '缺对象 UUID 时不得退化为类级免问 key');
     } finally {
       fs.rmSync(auditTmp, { recursive: true, force: true });
     }
@@ -601,9 +609,9 @@ async function main() {
     return ok.every(isValidGitRef) && bad.every((r) => !isValidGitRef(r));
   })());
 
-  // ---------- helios-kanban 默认包规格跟随 @latest ----------
+  // ---------- helios-kanban 默认包规格跟随 latest，可显式钉版本 ----------
   check(
-    'DEFAULT_KANBAN_PACKAGE 默认 @latest 跟随最新版，HELIOS_KANBAN_PACKAGE 可覆盖钉版本',
+    'DEFAULT_KANBAN_PACKAGE 默认跟随 latest，HELIOS_KANBAN_PACKAGE 可显式覆盖',
     DEFAULT_KANBAN_PACKAGE === 'helios-kanban@latest' &&
       kanbanPackageSpec({}) === DEFAULT_KANBAN_PACKAGE &&
       kanbanPackageSpec({ HELIOS_KANBAN_PACKAGE: 'helios-kanban@0.1.36' }) === 'helios-kanban@0.1.36',

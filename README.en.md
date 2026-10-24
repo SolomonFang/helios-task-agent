@@ -27,7 +27,7 @@ The wizard only asks for one LLM preset + API key (kanban defaults can be skippe
 
 ## Install
 
-Requires: Node.js ≥ 20, macOS / Linux / Windows.
+Requires: Node.js ≥ 22, macOS / Linux / Windows.
 
 ```bash
 npm i -g helios-task-agent
@@ -43,7 +43,7 @@ helios-task-agent --version   # show installed version
 
 **Auto update check**: startup probes npm for a newer version (result cached 24h, silently skipped offline; follows your configured npm registry/mirror) and offers to update in place with a link to the changelog. Disable with `HTA_UPDATE_CHECK=0`; manual update: `npm i -g helios-task-agent@latest`.
 
-**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (tracks the latest release by default — override with `HELIOS_KANBAN_PACKAGE` to pin a version; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
+**No need to preinstall helios-kanban**: when the local board is unreachable, the agent auto-spawns it via `npx -y helios-kanban@latest` (always uses the latest published version by default; pin an explicit version with `HELIOS_KANBAN_PACKAGE` if needed; listens on `127.0.0.1` by default). Point `HELIOS_KANBAN_URL` at an existing instance, or set `HELIOS_KANBAN_AUTO_START=0` to disable auto-start.
 
 **Feishu reads need lark-cli** (without it, Feishu task/doc reads are unavailable; kanban features are unaffected):
 
@@ -86,7 +86,7 @@ Feishu Task Center / docs / group chats
 | Session create cap | Max **50** kanban creates per session; `/clear` resets |
 | Read allowlist | `lark_cli` reads (list/get/search…) free; writes/unknown → gate; `api` GET only exempt; `update` (self-upgrade) and `--help` with extra args count as writes |
 | Untrusted wrap | External output (`lark_cli`, kanban MCP / `hk_cli`, `repo_fs`) plus kanban-event and AI-review context injections are wrapped UNTRUSTED; injected “instructions” ignored; rejected writes must not be retried via another tool |
-| Owner claim | Empty `FEISHU_ALLOWED_OPEN_IDS` → first DM user becomes owner (written to `.env`); others rejected once |
+| Owner claim | With an empty `FEISHU_ALLOWED_OPEN_IDS`, the terminal shows a one-time pairing code. The user must DM `配对码 <code>` (or `/pair <code>`) to become owner and persist the allowlist; an ordinary first DM cannot claim the bot. Restarting rotates the code. A configured allowlist behaves as before |
 | Source dedupe | URL → task map per user in `synced-sources.json`; self-heals after deletes; unreachable kanban conservatively blocks |
 | Audit log | Approvals/denies/dup blocks (`blocked_dup`)/no-gate/results → `audit.log` (JSONL) |
 | Workspace ready | Fills `base_branch` on start; detects silent setup failures |
@@ -95,7 +95,7 @@ Feishu Task Center / docs / group chats
 
 Polls ~every 60s. Pushes on in-review (diff link), done (summary), cancel, failure, new approvals — and injects session context so you can reply in-thread.
 
-In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the kanban diff view; "🤖 AI 审查" (AI review) calls [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) on that attempt's diff (same scope as the kanban diff view: merge-base(target)..attempt branch), requires Simplified-Chinese output, renders the full result as an HTML report (written to the data dir `reviews/`, hosted by the bot's built-in static server), and pushes only the report link to Feishu (long results are no longer truncated) — the result is also injected into the session, so you can reply "按审查意见修一下" (fix per the review).
+In-review cards carry two buttons: "🔍 人工审查" (manual review) opens the kanban diff view; "🤖 AI 审查" (AI review) calls [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) on that attempt's diff (same scope as the kanban diff view: merge-base(target)..attempt branch), requires Simplified-Chinese output, renders the full result as an HTML report (written to the data dir `reviews/`, hosted by the bot's built-in static server), and pushes only the report link to Feishu (long results are no longer truncated) — the result is also injected into the session, so you can reply "按审查意见修一下" (fix per the review). Multi-repository attempts are reviewed sequentially per repository and aggregated by repository; any repository failure fails the whole review, so partial output is never presented as an all-pass result.
 
 Failure cards carry a "🔍 AI 诊断" (AI diagnosis) button: the bot collects what the kanban actually returns for the failed attempt (task description / failure summary / diff stats) and asks the model for a Chinese diagnosis (failure-cause classification + key evidence + suggested fix), pushed as a result card and injected into the session; the diagnosis card carries a "↻ 按诊断结论重试" (retry per diagnosis) button — one click sends the diagnosis (cause + fix suggestions) to the executing agent as a follow-up prompt and restarts the task (the click itself is explicit authorization, no second confirmation; the button settles to a terminal state once the retry is launched). The diagnosis LLM config follows the same derivation as AI review (`OCR_LLM_*` per-item override, falling back to the bot's model config) with a 6-minute overall timeout; LLM outages/timeouts produce an explicit Chinese failure notice.
 
@@ -202,11 +202,11 @@ via the `skill_doc` tool (progressive disclosure).
 |----------|---------|
 | `LLM_*` | Required (wizard can write) |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | Required for bot |
-| `FEISHU_ALLOWED_OPEN_IDS` | Allowlist; empty → first DM user is owner (first-come-first-served — anyone who can find the bot could claim it, so configure it explicitly) |
+| `FEISHU_ALLOWED_OPEN_IDS` | Optional open_id allowlist; when empty, owner claim requires the one-time pairing code printed in the local terminal (ordinary first DMs have no access); restart rotates the code |
 | `HELIOS_KANBAN_URL` | Default `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | Auto-spawn local board; `0` off |
-| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp` |
-| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, default `helios-kanban@latest` (tracks the latest release); set a pinned version to override |
+| `HELIOS_KANBAN_MCP_COMMAND` / `ARGS` | Default `npx` + `-y helios-kanban@latest --mcp`; ARGS accepts a JSON string array to preserve spaces inside arguments, as well as legacy whitespace splitting |
+| `HELIOS_KANBAN_PACKAGE` | Package spec for auto-start / default MCP, `helios-kanban@latest` by default; set an explicit version to pin it |
 | `HELIOS_KANBAN_HOST` | Listen address for the auto-started board, default `127.0.0.1` (the board has no auth — think twice before `0.0.0.0`) |
 | `HELIOS_REPORT_HOST` | Listen address for the review-report static server, default `127.0.0.1` (does **not** follow `HELIOS_KANBAN_HOST`; reports contain code diffs — change only if you really need to expose them) |
 | `OCR_PACKAGE` | Package spec npx pulls when `ocr` is missing, default pinned `@alibaba-group/open-code-review@1.8.0` |

@@ -183,6 +183,8 @@ export interface BotHandlers {
   onCardAction: (action: CardAction) => CardActionResponse | void;
   /** 启动后补发「机器人重启导致作业中断」通知（无遗留作业时无操作）；长连接就绪后调用一次。 */
   notifyInterruptedJobs: () => Promise<void>;
+  /** 进程退出时中断全部队列外作业（须在 channel.stop 前调用）。 */
+  stopAll: () => void;
 }
 
 export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
@@ -231,20 +233,22 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
   const confirmShortReplyReminded = new Set<string>();
   /** 每用户入队串行链：「排队检查 + 回执 + 敲键盘表情 + router.enqueue」串行执行，保持 handle 调用顺序（见 enqueueMessage）。 */
   const enqueueChains = new Map<string, Promise<void>>();
+  /** 下载中的图片也计入队列容量；全局最多两张并发下载，避免 WS 并发绕过背压。 */
+  const imageQueueReservations = new Map<string, number>();
+  const imageDownloads = new Map<string, number>();
+  let totalImageDownloads = 0;
 
   /**
    * /stop 与进度卡片「⏹ 停止」共用的中断清理：取消确认闸口、丢弃排队消息、中断该用户的
-   * AI 审查/诊断、兜底清理敲键盘表情、中断当前轮次。返回各项处置结果供调用方拼回执。
+   * AI 审查/诊断/重试、兜底清理敲键盘表情、中断当前轮次。返回各项处置结果供调用方拼回执。
    */
   const stopUserWork = (
     openId: string,
-  ): { hadRound: boolean; gateCancelled: boolean; dropped: number; reviewsAborted: number; diagnosesAborted: number } => {
+  ): { hadRound: boolean; gateCancelled: boolean; dropped: number; reviewsAborted: number; diagnosesAborted: number; retriesAborted: number } => {
     const rec = running.get(openId);
-    // 工具可能正挂在确认等待上：闸口随轮次一并取消（按拒绝收尾并留痕）
     const gateCancelled = confirmations.cancel(openId);
     const dropped = router.cancelQueued(openId);
-    // AI 审查/失败诊断在串行队列外运行（卡片回调触发），单独登记单独中断（各有带标题的逐条收尾通知）
-    const { reviews: reviewsAborted, diagnoses: diagnosesAborted } = reviewJobs.abortForUser(openId);
+    const { reviews: reviewsAborted, diagnoses: diagnosesAborted, retries: retriesAborted } = reviewJobs.abortForUser(openId);
     // 被丢弃的排队消息不会执行回调，其敲键盘表情在这里兜底移除（含正在中断的那条）
     const stray = pendingTyping.get(openId);
     if (stray?.length) {
@@ -254,11 +258,9 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     if (rec) {
       rec.ctl.abort();
       running.delete(openId);
-      // 进度卡立即停刷：「已中断」终态要等轮次收尾（finalizeAborted）才落地，
-      // 窗口内心跳/在途节流更新不得把终态刷回「处理中」（held 不挡 paintTerminal 终态收尾）
       if (rec.progressId) progress.holdCard(rec.progressId);
     }
-    return { hadRound: Boolean(rec), gateCancelled, dropped, reviewsAborted, diagnosesAborted };
+    return { hadRound: Boolean(rec), gateCancelled, dropped, reviewsAborted, diagnosesAborted, retriesAborted };
   };
 
   const onCardAction = (action: CardAction): CardActionResponse | void => {
@@ -290,6 +292,15 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
         card: { type: 'raw', data: buildProgressTerminalCard('stale') },
       };
     }
+    // 队列外作业卡片按发卡对象绑定：白名单只证明可以使用机器人，不代表可以操作他人的诊断/审查。
+    // 旧卡片或伪造 payload 没有可靠归属，一律 fail-closed；同步 toast + 文本通知，不换卡。
+    if ((value.hta_review || value.hta_diagnose || value.hta_retry) && value.owner !== openId) {
+      const tip = value.owner
+        ? '这是其他用户发起的诊断/审查操作，只有发起人可以操作。'
+        : '该按钮来自旧版或缺少归属信息，已安全拒绝；请通过最新卡片或文本命令重新发起。';
+      void safeNotify(channel, openId, tip);
+      return { toast: { type: 'warning', content: tip } };
+    }
     // 「AI 审查」按钮：受理判定（去重/并发上限）在 review-jobs 同步完成——只有 accepted 才换「进行中」卡片，
     // 否则按钮保留（早退场景换卡会把指引文案变死路）；作业为异步长耗时，回调需快速 ACK
     if (value.hta_review) {
@@ -314,7 +325,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     }
     if (value.hta_retry) {
       const title = String(value.title || '');
-      const r = reviewJobs.tryStartRetry(openId, String(value.hta_retry), title);
+      const r = reviewJobs.tryStartRetry(openId, String(value.diagnosisId || ''), title);
       if (r.status !== 'accepted') return { toast: { type: 'info', content: r.toast } };
       return {
         toast: { type: 'info', content: '正在发起重试…' },
@@ -390,22 +401,24 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     return { toast: { type: 'warning', content: tip } };
   };
 
-  /** /stop：中断当前轮次与 AI 审查、取消写操作闸门、丢弃排队消息并兜底清理其敲键盘表情。 */
+  /** /stop：中断当前轮次与队列外作业、取消写操作闸门并丢弃排队消息。 */
   const handleStop = async (msg: InboundMessage): Promise<void> => {
-    const { hadRound, gateCancelled, dropped, reviewsAborted, diagnosesAborted } = stopUserWork(msg.senderId);
+    const { hadRound, gateCancelled, dropped, reviewsAborted, diagnosesAborted, retriesAborted } = stopUserWork(msg.senderId);
     const stopped: string[] = [];
-    // 被中断的 AI 审查各有带标题的逐条通知（见 review-jobs 的中断收尾），这里不再计数组播
     if (gateCancelled) stopped.push('待确认的写操作已一并取消');
     if (dropped) stopped.push(`已丢弃 ${dropped} 条排队消息`);
     if (hadRound) {
-      // 回执与被中断轮次的占位终态同一文案：措辞不一会被读成两个事件
       const extra = stopped.length ? `\n${stopped.join('，')}。` : '';
       await channel.reply(msg, `⏹ 已中断（未完成的操作未执行，可继续对话）。${extra}`);
     } else if (stopped.length) {
       await channel.reply(msg, `⏹ ${stopped.join('，')}。`);
-    } else if (reviewsAborted || diagnosesAborted) {
-      // 仅 AI 审查/失败诊断被中断：逐条通知即回执，这里补一条汇总避免 /stop 无应答
-      await channel.reply(msg, '⏹ 已中断进行中的 AI 审查/诊断。');
+    } else if (reviewsAborted || diagnosesAborted || retriesAborted) {
+      await channel.reply(
+        msg,
+        retriesAborted
+          ? '⏹ 已中断进行中的 AI 审查/诊断/重试；已发出的重试请求无法撤回。'
+          : '⏹ 已中断进行中的 AI 审查/诊断。',
+      );
     } else {
       await channel.reply(msg, '当前没有正在执行的任务。');
     }
@@ -732,6 +745,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     text: string,
     cmd: string | null,
     image?: InlineImage,
+    onEnqueued?: () => void,
   ): Promise<void> => {
     const msg: InboundMessage = fmsg;
     const openId = msg.senderId;
@@ -743,27 +757,31 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     let taskDone: Promise<void> | undefined;
     const prev = enqueueChains.get(openId) ?? Promise.resolve();
     const step = prev.then(async () => {
-      // 排队上限：积压已满时直接拒收（在加敲键盘表情之前，避免残留表情无人清理）
-      if (router.queueFull(openId)) {
+      // 下载中的图片已预留容量；当前这张图片的预留额在正式入队时等量移交，不重复计数。
+      const reserved = (imageQueueReservations.get(openId) || 0) - (image ? 1 : 0);
+      if (router.queueFull(openId, reserved)) {
         await channel.reply(msg, '⚠️ 排队消息已满，请等前面的任务处理完再发（或 /stop 中断当前任务并清空排队）。');
         return;
       }
-      // 回执：闸门挂起或已有任务在跑时立即告知，避免"消息发出去没反应"
+      const notify = async (text: string): Promise<void> => {
+        try {
+          await channel.reply(msg, text);
+        } catch (err) {
+          console.warn(`[feishu] 排队辅助回执发送失败，消息仍继续处理: ${errMessage(err)}`);
+        }
+      };
+      // 辅助回执失败不得阻断主消息入队。
       if (confirmations.hasPending(openId)) {
-        // 指引按本次确认的实际形态分支：文本降级（无卡片）不提按钮；支持免问的确认补「免问」应答词
         const form = pendingConfirmForm(openId);
         const answers = form.batchKey ? '「确认」/「取消」/「免问」' : '「确认」/「取消」';
-        await channel.reply(
-          msg,
+        await notify(
           form.hasCard
             ? `⚠️ 有未处理的写操作确认卡片：请先点按钮（或回复${answers}，超时自动拒绝）。本条消息已排队，会按顺序处理。`
             : `⚠️ 有未处理的写操作确认：请回复${answers}（超时自动拒绝）。本条消息已排队，会按顺序处理。`,
         );
       } else if (router.busy(openId)) {
-        // 回执带排队位置：queuedCount 为已排在前面的条数（不含正在执行的那条，由后半句覆盖）
         const ahead = router.queuedCount(openId);
-        await channel.reply(
-          msg,
+        await notify(
           ahead > 0
             ? `📥 已收到并排队（前面还有 ${ahead} 条），当前任务完成后依次处理。`
             : '📥 已收到并排队，当前任务完成后依次处理。',
@@ -786,6 +804,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
           // （/stop 的 pendingTyping 兜底清理覆盖竞态：先于钩子跑过时这里会跳过重复移除）
           () => void cleanupTyping(),
         );
+        onEnqueued?.();
       } catch (err) {
         // enqueue 同步抛错：消息未入队，两个回调都不会执行，敲键盘表情须就地清理
         await cleanupTyping();
@@ -810,26 +829,8 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
    */
   const handleImageMessage = async (fmsg: FeishuInboundMessage): Promise<void> => {
     const msg: InboundMessage = fmsg;
-    let img: { data: Buffer; mimeType: string };
-    try {
-      img = await fetchImage(fmsg.messageId, fmsg.imageKey!);
-    } catch (err) {
-      if (err instanceof ImageTooLargeError) {
-        await channel.reply(msg, '⚠️ 图片太大了（超过 10MB 上限）：请压缩后再发，或把关键信息打字发给我。');
-        return;
-      }
-      // 失败原因只进日志（可能含请求细节），给用户的是通用友好提示
-      console.error(`[feishu] 图片下载失败: ${errMessage(err)}`);
-      await channel.reply(msg, '⚠️ 图片下载失败了，请稍后重发；也可以把图片里的关键信息打字发给我。');
-      return;
-    }
-    if (img.data.length > MAX_IMAGE_BYTES) {
-      const mb = (img.data.length / 1024 / 1024).toFixed(1);
-      await channel.reply(msg, `⚠️ 图片太大了（${mb}MB，上限 10MB）：请压缩后再发，或把关键信息打字发给我。`);
-      return;
-    }
+    const openId = msg.senderId;
     const caption = (msg.text || '').trim();
-    // 随图文字同样受单条长度上限约束（理论上 image 消息无配文，防御异常客户端）
     if (caption.length > MAX_USER_MESSAGE_CHARS) {
       await channel.reply(
         msg,
@@ -837,11 +838,60 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       );
       return;
     }
-    const image: InlineImage = {
-      dataUrl: `data:${img.mimeType};base64,${img.data.toString('base64')}`,
-      prompt: caption || '请分析这张图片并回应。',
+    const reserved = imageQueueReservations.get(openId) || 0;
+    if (router.queueFull(openId, reserved)) {
+      await channel.reply(msg, '⚠️ 排队消息已满，图片未下载。请等前面的任务处理完再发（或 /stop 清空排队）。');
+      return;
+    }
+    if ((imageDownloads.get(openId) || 0) >= 1 || totalImageDownloads >= 2) {
+      await channel.reply(msg, '⚠️ 图片下载通道正忙，请稍后重发；也可以先把图片里的关键信息打字发给我。');
+      return;
+    }
+    imageQueueReservations.set(openId, reserved + 1);
+    imageDownloads.set(openId, (imageDownloads.get(openId) || 0) + 1);
+    totalImageDownloads++;
+    const releaseReservation = () => {
+      const left = (imageQueueReservations.get(openId) || 1) - 1;
+      if (left > 0) imageQueueReservations.set(openId, left);
+      else imageQueueReservations.delete(openId);
     };
-    await enqueueMessage(fmsg, caption ? `[图片] ${caption}` : '[图片]', null, image);
+    let image: InlineImage | undefined;
+    try {
+      let img: { data: Buffer; mimeType: string } | null;
+      try {
+        img = await fetchImage(fmsg.messageId, fmsg.imageKey!);
+      } catch (err) {
+        if (err instanceof ImageTooLargeError) {
+          await channel.reply(msg, '⚠️ 图片太大了（超过 10MB 上限）：请压缩后再发，或把关键信息打字发给我。');
+          return;
+        }
+        console.error(`[feishu] 图片下载失败: ${errMessage(err)}`);
+        await channel.reply(msg, '⚠️ 图片下载失败了，请稍后重发；也可以把图片里的关键信息打字发给我。');
+        return;
+      }
+      if (img.data.length > MAX_IMAGE_BYTES) {
+        const mb = (img.data.length / 1024 / 1024).toFixed(1);
+        await channel.reply(msg, `⚠️ 图片太大了（${mb}MB，上限 10MB）：请压缩后再发，或把关键信息打字发给我。`);
+        return;
+      }
+      const dataUrl = `data:${img.mimeType};base64,${img.data.toString('base64')}`;
+      img = null;
+      image = { dataUrl, prompt: caption || '请分析这张图片并回应。' };
+    } finally {
+      const left = (imageDownloads.get(openId) || 1) - 1;
+      if (left > 0) imageDownloads.set(openId, left);
+      else imageDownloads.delete(openId);
+      totalImageDownloads--;
+    }
+    let enqueued = false;
+    try {
+      await enqueueMessage(fmsg, caption ? `[图片] ${caption}` : '[图片]', null, image, () => {
+        enqueued = true;
+        releaseReservation();
+      });
+    } finally {
+      if (!enqueued) releaseReservation();
+    }
   };
 
   /** 消息入口：类型/长度门禁 → 确认应答 → 即时命令分发 → 串行排队。 */
@@ -910,7 +960,7 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
       const last = reviewJobs.lastDiagnosis(msg.senderId);
       if (last) {
         // 受理判定同步完成（去重/无结论会如实通知）；accepted 时立即给受理回执（作业异步，结果随后推送）
-        const r = reviewJobs.tryStartRetry(msg.senderId, last.taskId, last.title);
+        const r = reviewJobs.tryStartRetry(msg.senderId, last.diagnosisId, last.title);
         if (r.status === 'accepted') await channel.reply(msg, '↻ 正在发起重试，请稍候…');
       } else {
         // 原失败卡片的「AI 诊断」按钮点击后已随「进行中」卡片消失，出路走文本回复
@@ -942,5 +992,5 @@ export function createBotHandlers(deps: BotHandlerDeps): BotHandlers {
     await enqueueMessage(fmsg, text, cmd);
   };
 
-  return { handle, onCardAction, notifyInterruptedJobs: reviewJobs.notifyInterruptedJobs };
+  return { handle, onCardAction, notifyInterruptedJobs: reviewJobs.notifyInterruptedJobs, stopAll: reviewJobs.stopAll };
 }

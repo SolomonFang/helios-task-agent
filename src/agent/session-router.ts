@@ -114,9 +114,9 @@ export class SessionRouter {
     return this.queuedCounts.get(openId) || 0;
   }
 
-  /** 排队是否已达上限（handler 据此拒收并提示「排队已满」，不再入队）。 */
-  queueFull(openId: string): boolean {
-    return this.queuedCount(openId) >= SessionRouter.MAX_QUEUED;
+  /** 排队是否已达上限；reserved 计入已预留但尚未正式入队的图片等消息。 */
+  queueFull(openId: string, reserved = 0): boolean {
+    return this.queuedCount(openId) + reserved >= SessionRouter.MAX_QUEUED;
   }
 
   /**

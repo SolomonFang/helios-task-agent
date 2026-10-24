@@ -1,9 +1,9 @@
 /**
  * 工具层单测（buildTools / AgentSession 接线 / SourceRegistry）：
  * 单会话创建上限跨工具闭包重建存活、clearHistory 显式重置；
- * hk_cli 脚本用户目录优先、包内兜底；MCP start_workspace 确认卡片 detail
+ * hk_cli 固定执行包内可信脚本，skill_exec 仍走独立确认闸门；MCP start_workspace 确认卡片 detail
  * 展示前置补全后的最终参数；SourceRegistry 按 mtime 缓存盘上解析结果；
- * hk_cli/lark_cli 批量免问 key 分级（启动类级、其余绑定操作对象 id）；hk 创建标题跳过 flag 取值；
+ * hk_cli/lark_cli 批量免问 key 分级（启动/创建类级、其余绑定操作对象 id，缺 id 不免问）；hk 创建标题跳过 flag 取值；
  * MCP 非法工具名跳过注册；localToolSummary 按 memory 启用标志拼接；
  * 创建确认卡片把项目 UUID 解析为项目名（缓存复用、失败保持 ID 展示）。
  * 运行：tsx scripts/unit-tools.ts
@@ -19,7 +19,7 @@ import { run } from '../src/agent/tools/shared';
 import { AgentSession } from '../src/agent/session';
 import { SourceRegistry } from '../src/agent/source-registry';
 import { MemoryStore } from '../src/agent/memory';
-import type { ConfirmFn } from '../src/agent/guard';
+import { withBatchApproval, type ConfirmFn } from '../src/agent/guard';
 import type { KanbanMcp } from '../src/kanban/mcp';
 import { checkAsync, finish } from './testkit';
 import type { AgentConfig, ToolHandlers } from '../src/types';
@@ -64,7 +64,9 @@ async function main(): Promise<void> {
     const tmp = tmpHome('cap');
     try {
       const counter: CreateCounter = { count: 0 };
-      const mcp = fakeMcp('create_task');
+      const mcp = fakeMcp('create_task', async () =>
+        JSON.stringify({ task_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }),
+      );
       const mk = (): ToolHandlers =>
         buildTools({
           mcp,
@@ -98,11 +100,16 @@ async function main(): Promise<void> {
     const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
     process.env.HELIOS_TASK_AGENT_HOME = tmp; // registry/audit 落临时目录，不污染真实数据目录
     try {
-      const session = new AgentSession(cfg, fakeMcp('create_task'), true, {
-        userId: 'u1',
-        memory: new MemoryStore(tmp),
-        confirm: approveAll,
-      });
+      const session = new AgentSession(
+        cfg,
+        fakeMcp('create_task', async () => JSON.stringify({ task_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' })),
+        true,
+        {
+          userId: 'u1',
+          memory: new MemoryStore(tmp),
+          confirm: approveAll,
+        },
+      );
       const createOf = () =>
         (session as unknown as { handlers: ToolHandlers }).handlers.get('kanban_create_task')!;
       for (let i = 0; i < 50; i++) await createOf()({ title: `t${i}` });
@@ -118,25 +125,35 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- 任务2：hk_cli 脚本用户目录优先，移除后回退包内 ----------
-  await checkAsync('hk_cli：用户目录技能脚本优先（与 skill_doc 一致），包内兜底', async () => {
+  // ---------- 任务2：hk_cli 固定包内脚本；用户脚本只能经 skill_exec 确认闸门执行 ----------
+  await checkAsync('hk_cli：用户恶意 hk.mjs 不在 health/read 执行，skill_exec 确认闸门不受影响', async () => {
     const tmp = tmpHome('hk');
     const prevHome = process.env.HELIOS_TASK_AGENT_HOME;
     process.env.HELIOS_TASK_AGENT_HOME = tmp;
     try {
       const skillDir = path.join(tmp, 'skills', 'helios-kanban-remote');
+      const marker = path.join(tmp, 'user-script-executed');
       fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
       fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: helios-kanban-remote\ndescription: fake\n---\n');
-      fs.writeFileSync(path.join(skillDir, 'scripts', 'hk.mjs'), 'console.log("HK_USER_SCRIPT_MARKER");\n');
-      const { handlers } = buildTools({ mcp: null, kanbanUrl: KANBAN_URL });
+      fs.writeFileSync(
+        path.join(skillDir, 'scripts', 'hk.mjs'),
+        `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(marker)}, 'executed');\nconsole.log('HK_USER_SCRIPT_MARKER');\n`,
+      );
+      const { handlers } = buildTools({ mcp: null, kanbanUrl: KANBAN_URL, auditHome: tmp });
       const hk = handlers.get('hk_cli')!;
-      const outUser = await hk({ args: ['health'] });
-      assert.ok(outUser.includes('HK_USER_SCRIPT_MARKER'), `应执行用户目录脚本: ${outUser}`);
-      // 移除用户版 → 回退包内脚本（输出不得再含用户标记）
-      fs.rmSync(skillDir, { recursive: true, force: true });
+      const outHealth = await hk({ args: ['health'] });
+      const outRead = await hk({ args: ['tasks', 'list'] });
+      assert.ok(!fs.existsSync(marker), 'hk_cli health/read 不得执行用户目录脚本');
+      assert.ok(!outHealth.includes('HK_USER_SCRIPT_MARKER') && !outRead.includes('HK_USER_SCRIPT_MARKER'));
       const outPkg = await hk({ args: ['--help'] });
-      assert.ok(!outPkg.includes('HK_USER_SCRIPT_MARKER'), '应回退包内脚本');
-      assert.ok(outPkg.length > 0);
+      assert.ok(!outPkg.includes('HK_USER_SCRIPT_MARKER') && outPkg.length > 0, '应执行包内脚本');
+
+      const skillExec = handlers.get('skill_exec')!;
+      await skillExec({ skill: 'helios-kanban-remote', script: 'scripts/hk.mjs' });
+      assert.ok(!fs.existsSync(marker), 'skill_exec 无确认通道时不得执行用户脚本');
+      const approved = buildTools({ mcp: null, kanbanUrl: KANBAN_URL, confirm: approveAll, auditHome: tmp }).handlers.get('skill_exec')!;
+      const outApproved = await approved({ skill: 'helios-kanban-remote', script: 'scripts/hk.mjs' });
+      assert.ok(fs.existsSync(marker) && outApproved.includes('HK_USER_SCRIPT_MARKER'), 'skill_exec 经确认仍应执行用户脚本');
     } finally {
       if (prevHome === undefined) delete process.env.HELIOS_TASK_AGENT_HOME;
       else process.env.HELIOS_TASK_AGENT_HOME = prevHome;
@@ -219,8 +236,8 @@ async function main(): Promise<void> {
     }
   });
 
-  // ---------- hk_cli batchKey：start/create-and-start 类级免问；stop/approve/deny/follow-up 对象级 ----------
-  await checkAsync('hk_cli 批量免问 key：start 类级（不同任务同 key），stop/approve/deny/follow-up 绑定操作对象 id', async () => {
+  // ---------- hk_cli batchKey：start/create 类级免问；其余写操作绑定对象 UUID，缺 UUID 不免问 ----------
+  await checkAsync('hk_cli 批量免问 key：start/create 类级，其余写操作绑定对象 UUID，缺 UUID 不提供 key', async () => {
     const tmp = tmpHome('hkkey');
     try {
       const seen: Array<{ batchKey: string | undefined; batchScope: string | undefined }> = [];
@@ -243,6 +260,9 @@ async function main(): Promise<void> {
       // --branch 已带：start 前置补全直接放行（无需 HTTP），确认闸门先于执行
       await hk({ args: ['start', taskA, '--repo', repoB, '--branch', 'dev'] });
       await hk({ args: ['start', taskB, '--branch', 'dev'] });
+      await hk({ args: ['create-and-start', taskA, '--branch', 'dev'] });
+      await hk({ args: ['tasks', 'create', '--project', taskA, '新任务'] });
+      await hk({ args: ['tasks', 'update', '--title', '缺少任务 ID'] });
       await hk({ args: ['stop', wsA] });
       await hk({ args: ['approve', apA] });
       await hk({ args: ['deny', apA] });
@@ -250,9 +270,12 @@ async function main(): Promise<void> {
       assert.deepEqual(
         seen,
         [
-          // 启动类级免问：不同任务同 key，批量启动工作区不再逐次弹确认；key 不含 --repo 的 repo id
+          // 启动/创建类级免问；start key 不含 --repo id，create key 不绑定目标项目 id
           { batchKey: 'hk:start', batchScope: 'kind' },
           { batchKey: 'hk:start', batchScope: 'kind' },
+          { batchKey: 'hk:create-and-start', batchScope: 'kind' },
+          { batchKey: 'hk:tasks create', batchScope: 'kind' },
+          { batchKey: undefined, batchScope: 'kind' },
           // sub 本身含 argv[1]（既有格式），对象 id 再经 extractUuid(argv[1]) 绑定一次
           { batchKey: `hk:stop ${wsA}:${wsA}`, batchScope: 'object' },
           { batchKey: `hk:approve ${apA}:${apA}`, batchScope: 'object' },
@@ -262,6 +285,30 @@ async function main(): Promise<void> {
         `实际 seen=${JSON.stringify(seen)}`,
       );
       assert.ok(!seen[0]!.batchKey!.includes(repoB), `start 的 key 不得绑到 --repo id: ${seen[0]!.batchKey}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- hk_cli 缺 UUID 的「同类免问」不得缓存，后续 UUID 操作仍须确认 ----------
+  await checkAsync('hk_cli 批量授权：首次无 ID 请求无 batchKey，之后 UUID 操作仍询问', async () => {
+    const tmp = tmpHome('hk-no-id-batch');
+    try {
+      const taskId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      const seen: Array<string | undefined> = [];
+      let asks = 0;
+      const confirm = withBatchApproval(async (req) => {
+        asks++;
+        seen.push(req.batchKey);
+        return asks === 1 ? 'batch' : false;
+      });
+      const { handlers } = buildTools({ mcp: null, kanbanUrl: KANBAN_URL, confirm, auditHome: tmp });
+      const hk = handlers.get('hk_cli')!;
+      await hk({ args: ['tasks', 'delete'] }); // 无 ID：hk 本地参数校验失败，不发起看板请求
+      assert.equal(confirm.activeBatchApprovals(), 0, '无 batchKey 时不得记录同类免问授权');
+      await hk({ args: ['tasks', 'delete', taskId] });
+      assert.equal(asks, 2, '后续 UUID 操作仍须询问');
+      assert.deepEqual(seen, [undefined, `hk:tasks delete:${taskId}`]);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

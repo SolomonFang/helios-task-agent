@@ -38,7 +38,7 @@ import { createAccessChecker, FeishuChannel, parsePostContent, splitText } from 
 import { extractSourceUrls, kanbanTaskExists, SourceRegistry } from '../src/agent/source-registry';
 import { MemoryStore } from '../src/agent/memory';
 import { resolveUnderRoot, runRepoFs } from '../src/agent/repo-fs';
-import { ensureEnvLoaded, loadEnvFiles, writeEnvFile } from '../src/config/config';
+import { ensureEnvLoaded, loadEnvFiles, parseMcpArgs, writeEnvFile } from '../src/config/config';
 import { buildTools } from '../src/agent/tools';
 import { buildSystemPrompt, MEMORY_CLOSE, MEMORY_OPEN } from '../src/agent/prompt';
 import {
@@ -76,7 +76,7 @@ import {
 } from '../src/kanban/http';
 import { McpSupervisor } from '../src/bot/supervisor';
 import { WsAlerter } from '../src/bot/ws-alerter';
-import { ensureKanbanRunning, fetchHealth } from '../src/kanban/kanban-ensure';
+import { ensureKanbanRunning, fetchHealth, kanbanPortForUrl } from '../src/kanban/kanban-ensure';
 import { minimalChildEnv } from '../src/infra/proc-env';
 import {
   checkLarkCli,
@@ -91,6 +91,7 @@ import {
 import {
   buildOcrEnv,
   buildReviewBackground,
+  combineReviewResults,
   findOcrCommand,
   pickTaskDescription,
   resolveReviewTarget,
@@ -390,7 +391,7 @@ async function run(): Promise<void> {
     return buttonsOf(withBatch).length === 3 && buttonsOf(destructive).length === 2 && buttonsOf(resolved).length === 0;
   })());
 
-  check('确认卡片：免问按钮与终态标题按粒度广告（类级「同类」/ 对象级「同对象」）', (() => {
+  check('确认卡片：免问按钮与终态按粒度展示（类级「同类」/ 对象级「同对象」）', (() => {
     const btnText = (scope?: 'kind' | 'object'): string => {
       const card = buildConfirmCard(
         { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope },
@@ -400,19 +401,14 @@ async function run(): Promise<void> {
       const buttons = card.body.elements.filter((e) => e.tag === 'button');
       return String(buttons[1]?.text?.content ?? '');
     };
-    const resolvedTitle = (scope?: 'kind' | 'object'): string => {
-      const card = buildResolvedCard(
-        { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope },
-        'batch',
-      ) as { header: { title: { content: string } } };
-      return card.header.title.content;
-    };
+    const resolvedText = (scope?: 'kind' | 'object'): string =>
+      JSON.stringify(buildResolvedCard({ kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k', batchScope: scope }, 'batch'));
     return (
       btnText('kind').includes('同类免问') &&
-      btnText(undefined).includes('同类免问') && // 缺省按类级文案（与既有行为一致）
+      btnText(undefined).includes('同类免问') &&
       btnText('object').includes('同对象免问') &&
-      resolvedTitle('object').includes('同对象免问') &&
-      resolvedTitle('kind').includes('同类免问')
+      resolvedText('object').includes('同对象免问') &&
+      resolvedText('kind').includes('同类免问')
     );
   })());
 
@@ -875,9 +871,14 @@ async function run(): Promise<void> {
     return out.includes('标题') && out.includes('文档(https://x.feishu.cn/docx/1)') && out.includes('@张三') && out.includes('[图片]') && out.includes('const a = 1;');
   })());
 
-  check('accessChecker 认领与白名单', (() => {
-    const a = createAccessChecker([]);
-    const claimed = a.check('u1') === 'claim' && a.check('u1') === 'allow' && a.check('u2') === 'deny';
+  check('accessChecker 配对认领与白名单', (() => {
+    const a = createAccessChecker([], 'one-time');
+    const claimed =
+      a.check('u1') === 'pair-required' &&
+      a.check('u1', 'wrong') === 'pair-invalid' &&
+      a.check('u1', 'one-time') === 'claim' &&
+      a.check('u1') === 'allow' &&
+      a.check('u2', 'one-time') === 'deny';
     const b = createAccessChecker(['u9']);
     return claimed && b.check('u9') === 'allow' && b.check('u1') === 'deny';
   })());
@@ -1926,15 +1927,17 @@ async function run(): Promise<void> {
     const withId = actionsOf(buildWatchEventCard({ ...base, attemptId: 'att-1' }));
     const withoutId = actionsOf(buildWatchEventCard(base));
     const done = actionsOf(buildWatchEventCard({ ...base, kind: 'done', attemptId: 'att-1' }));
+    const reviewButton = withId.find((b) => b.value?.hta_review);
+    const taskButton = withId.find((b) => b.url);
     return (
       withId.length === 2 &&
-      withId[0]!.url === base.url &&
-      withId[0]!.text?.content === '📋 查看任务' &&
-      withId[1]!.value?.hta_review === 'att-1' &&
-      withId[1]!.value?.title === '测试任务' &&
-      withId[1]!.text?.content === '🤖 AI 审查' &&
-      withoutId.length === 1 && // 无 attemptId 不渲染 AI 审查
-      done.length === 1 // 非 review 事件不渲染 AI 审查
+      taskButton?.url === base.url &&
+      taskButton?.text?.content === '📋 查看任务' &&
+      reviewButton?.value?.hta_review === 'att-1' &&
+      reviewButton?.value?.title === '测试任务' &&
+      reviewButton?.text?.content === '🤖 AI 审查' &&
+      withoutId.length === 1 &&
+      done.length === 1
     );
   })());
 
@@ -2032,6 +2035,18 @@ async function run(): Promise<void> {
 
   check('sanitizeCliOutput 去 ANSI 与回车', (() => {
     return sanitizeCliOutput('\x1b[32mok\x1b[0m\r\nnext') === 'ok\nnext';
+  })());
+
+  check('多仓审查汇总：全部通过才可判 all-pass，混合结果不得被单仓 0 comment 误判', (() => {
+    const allPass = combineReviewResults([
+      { repoName: 'a', text: '[ocr] Summary: 1 file reviewed, 0 comment(s)' },
+      { repoName: 'b', text: '[ocr] Summary: 2 files reviewed, 0 comment(s)' },
+    ]);
+    const mixed = combineReviewResults([
+      { repoName: 'a', text: '[ocr] Summary: 1 file reviewed, 0 comment(s)' },
+      { repoName: 'b', text: '[ocr] Summary: 1 file reviewed, 2 comment(s)\n发现风险' },
+    ]);
+    return isAllPass(allPass) && !isAllPass(mixed) && allPass.includes('仓库 1/2：a') && mixed.includes('仓库 2/2：b');
   })());
 
   // ---------- AI 审查：HTML 报告渲染 ----------
@@ -3202,7 +3217,7 @@ async function run(): Promise<void> {
     assert.ok(stderr.includes(`http://127.0.0.1:${freePort}`), '应带目标地址');
   });
 
-  // ---------- npx 包规格：kanban 默认 @latest、ocr 钉版本，env 均可覆盖 ----------
+  // ---------- npx 包规格：kanban 默认 latest，ocr 默认钉版本，env 均可覆盖 ----------
   check('npx 包规格默认值且 env 可覆盖', (() => {
     return (
       kanbanPackageSpec({}) === 'helios-kanban@latest' &&
@@ -3210,6 +3225,35 @@ async function run(): Promise<void> {
       ocrPackageSpec({}).includes('open-code-review@') &&
       !ocrPackageSpec({}).endsWith('@latest') &&
       ocrPackageSpec({ OCR_PACKAGE: 'x@1' }) === 'x@1'
+    );
+  })());
+
+  check('MCP args：JSON 数组保留空格，旧空白格式兼容，非法 JSON fail-closed', (() => {
+    const json = parseMcpArgs(' ["-y","helios-kanban@latest","--mcp","--label","hello world"] ');
+    const legacy = parseMcpArgs('-y helios-kanban@latest --mcp');
+    let malformed = false;
+    let nonString = false;
+    try {
+      parseMcpArgs('["unterminated"');
+    } catch {
+      malformed = true;
+    }
+    try {
+      parseMcpArgs('["ok", 1]');
+    } catch {
+      nonString = true;
+    }
+    return json[4] === 'hello world' && legacy.length === 3 && malformed && nonString;
+  })());
+
+  check('看板默认端口：所有回环形态缺省 7964，远端按协议，显式端口优先', (() => {
+    return (
+      kanbanPortForUrl('http://localhost') === '7964' &&
+      kanbanPortForUrl('http://127.0.1.2') === '7964' &&
+      kanbanPortForUrl('http://[::1]') === '7964' &&
+      kanbanPortForUrl('http://[::1]:9000') === '9000' &&
+      kanbanPortForUrl('https://kanban.example.com') === '443' &&
+      kanbanPortForUrl('http://kanban.example.com') === '80'
     );
   })());
 
@@ -4236,12 +4280,12 @@ async function run(): Promise<void> {
   });
 
   // ---------- accessChecker.unclaim：fail-closed 撤销认领 ----------
-  check('accessChecker.unclaim：撤销认领后名额恢复，他人可重新认领', (() => {
-    const a = createAccessChecker([]);
-    const claimed = a.check('u1') === 'claim';
+  check('accessChecker.unclaim：撤销认领后名额恢复，他人可重新配对认领', (() => {
+    const a = createAccessChecker([], 'one-time');
+    const claimed = a.check('u1', 'one-time') === 'claim';
     a.unclaim('u1');
     a.unclaim('nobody'); // 幂等：撤销未认领的用户无效果
-    const reclaim = a.check('u2') === 'claim' && a.check('u1') === 'deny';
+    const reclaim = a.check('u2', 'one-time') === 'claim' && a.check('u1') === 'deny';
     return claimed && reclaim && a.list().join(',') === 'u2';
   })());
 

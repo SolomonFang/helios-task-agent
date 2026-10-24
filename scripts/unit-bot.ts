@@ -9,7 +9,7 @@ import path from 'path';
 import type { AddressInfo } from 'net';
 import { Readable } from 'stream';
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { parseBotArgs } from '../src/bot-main';
+import { parseBotArgs, redactReminderLog } from '../src/bot-main';
 import { UPDATE_YES_RE, UPDATE_YES_WORDS, promptVersionUpdate } from '../src/infra/update-check';
 import { FeishuChannel, FEISHU_HTTP_TIMEOUT_MS, FEISHU_IMAGE_DOWNLOAD_TIMEOUT_MS, createFeishuHttpInstance } from '../src/channels/feishu';
 import { buildAiReviewCard } from '../src/bot/cards';
@@ -117,6 +117,13 @@ async function waitMcpConnecting(pid: number, timeoutMs = 20000): Promise<void> 
 }
 
 async function main(): Promise<void> {
+  check('bot 提醒日志默认脱敏正文，保留状态与脱敏 uid', (() => {
+    const secret = '不要落日志的提醒正文';
+    const delivered = redactReminderLog(`提醒已送达（ou_1…34）：${secret}`);
+    const unpersisted = redactReminderLog(`提醒已送达但落盘失败（ou_1…34），存储恢复前不再重复推送：${secret}`);
+    return delivered.includes('正文已脱敏') && unpersisted.includes('正文已脱敏') && !delivered.includes(secret) && !unpersisted.includes(secret);
+  })());
+
   // ---------- bot 参数解析（--rebind / --reconfig） ----------
   check('parseBotArgs：无参数', (() => {
     const r = parseBotArgs([]);
@@ -348,6 +355,23 @@ async function main(): Promise<void> {
     'buildAiReviewCard：局域网 URL 注脚标注所在网络可达（report-server 绑 0.0.0.0 时手机可达）',
     aiCardNote('http://192.168.1.10:7964/r.html').includes('链接仅本机所在网络可达'),
   );
+  check('buildAiReviewCard：长标题在正文加粗，报告为唯一次按钮且无 primary_filled', (() => {
+    const title = '需要审查的超长任务标题'.repeat(10);
+    const card = buildAiReviewCard(title, 'http://kb.local/report', true) as {
+      header: { title: { content: string } };
+      body: { elements: Array<{ tag: string; content?: string; type?: string }> };
+    };
+    const elements = card.body.elements;
+    const buttons = elements.filter((el) => el.tag === 'button');
+    return (
+      !card.header.title.content.includes(title) &&
+      elements[0]?.content === `**《${title}》**` &&
+      elements.map((el) => el.tag).join(',') === 'markdown,markdown,hr,button,markdown' &&
+      buttons.length === 1 &&
+      buttons[0]?.type === 'default' &&
+      buttons.every((el) => el.type !== 'primary_filled')
+    );
+  })());
 
   // ---------- 进程退出码：崩溃路径为 1，正常信号路径为 0 ----------
   const feishuEnv = { FEISHU_APP_ID: 'cli_x', FEISHU_APP_SECRET: 's', FEISHU_ALLOWED_OPEN_IDS: 'ou_x' };

@@ -36,8 +36,12 @@ export interface FeishuCardAction {
       hta_review?: string;
       /** 「AI 诊断」按钮：失败任务 id；attempt 为「同一 attempt 只诊断一次」的粒度（可无）。 */
       hta_diagnose?: string;
-      /** 「按诊断结论重试」按钮：失败任务 id（诊断结论由 bot 侧按 taskId 查）。 */
+      /** 「按诊断结论重试」按钮：失败任务 id；diagnosisId 精确指定该次诊断结论。 */
       hta_retry?: string;
+      /** 诊断结果稳定标识：旧卡片只能读取并重试这次诊断，不得回落到该任务的最新结果。 */
+      diagnosisId?: string;
+      /** 卡片归属 open_id：诊断/审查/重试仅允许发卡对象操作，旧卡片缺失时安全拒绝。 */
+      owner?: string;
       /** 进度卡片「⏹ 停止」按钮：值为占位消息 id（轮次令牌），回调据此校验按钮属于当前轮次；空串是令牌注入帧失败的形态，走专门的「暂不可用」分支。 */
       hta_stop?: string;
       attempt?: string;
@@ -58,7 +62,7 @@ export interface CardActionResponse {
   card?: { type: 'raw'; data: Record<string, unknown> };
 }
 
-export type AccessDecision = 'allow' | 'claim' | 'deny';
+export type AccessDecision = 'allow' | 'claim' | 'pair-required' | 'pair-invalid' | 'deny';
 
 /** 飞书 REST 单请求超时：覆盖发消息/卡片/表情等全部 REST 调用（含 SDK 内部取 token）。 */
 export const FEISHU_HTTP_TIMEOUT_MS = 20000;
@@ -123,32 +127,37 @@ export function createFeishuHttpInstance(timeoutMs: number): Lark.HttpInstance {
 }
 
 /** open_id 日志脱敏（与 notify.ts 的通知失败日志同口径：只留头部摘要）。 */
-function maskOpenId(openId: string): string {
+export function maskOpenId(openId: string): string {
   return `${openId.slice(0, 4)}…`;
 }
 
+/** 私聊配对码只接受独立命令，避免普通聊天被误当成配对提交。 */
+export function extractOwnerPairingCode(text: string): string | undefined {
+  return /^\s*(?:配对码|\/pair)\s+([A-Za-z0-9-]+)\s*$/i.exec(text)?.[1];
+}
+
 /**
- * Owner-claim access control: with an empty allowlist, the FIRST user to DM
- * the bot becomes the owner (persisted to .env by the caller); everyone else
- * is denied. With a configured allowlist, only listed users pass.
+ * 空白名单时必须持有本地终端显示的一次性配对码才能认领 owner；
+ * 已配置白名单的放行/拒绝行为不变。缺失本地配对码时 fail-closed，不回退首聊认领。
  */
-export function createAccessChecker(initialAllowed: string[]): {
-  check: (openId: string) => AccessDecision;
+export function createAccessChecker(initialAllowed: string[], ownerPairingCode = ''): {
+  check: (openId: string, submittedPairingCode?: string) => AccessDecision;
   list: () => string[];
   /** 撤销运行时认领（owner 绑定未持久化时 fail-closed 用）。 */
   unclaim: (openId: string) => void;
 } {
   const allowed = new Set(initialAllowed.filter(Boolean));
+  const expectedPairingCode = ownerPairingCode.trim();
   let claimable = allowed.size === 0;
   return {
-    check(openId: string): AccessDecision {
+    check(openId: string, submittedPairingCode?: string): AccessDecision {
       if (allowed.has(openId)) return 'allow';
-      if (claimable) {
-        claimable = false;
-        allowed.add(openId);
-        return 'claim';
-      }
-      return 'deny';
+      if (!claimable) return 'deny';
+      if (!expectedPairingCode || !submittedPairingCode) return 'pair-required';
+      if (submittedPairingCode !== expectedPairingCode) return 'pair-invalid';
+      claimable = false;
+      allowed.add(openId);
+      return 'claim';
     },
     list(): string[] {
       return [...allowed];
@@ -244,10 +253,13 @@ export function createMessageDedupe(ttlMs: number): MessageDedupe {
 export interface AccessResolution {
   /** 最终放行判定（claim 持久化成功按 allow）。 */
   decision: 'allow' | 'deny';
-  /** 本次事件首次触发 owner 认领。 */
+  /** 本次事件通过配对码触发 owner 认领。 */
   claimed: boolean;
   /** 认领未持久化：已撤销内存放行并加入阻断集（fail-closed）。 */
   claimRevoked: boolean;
+  /** 尚未配对：需要终端配对码 / 提交的配对码不正确。 */
+  pairingRequired: boolean;
+  pairingFailed: boolean;
 }
 
 export interface AccessHooks {
@@ -258,17 +270,17 @@ export interface AccessHooks {
 }
 
 /**
- * 消息发送者的接入判定（fail-closed）：
- * 白名单内放行；空白名单时首个用户触发认领，认领未持久化则撤销内存放行、
- * 加入 claimBlocked 阻断集并按拒绝处理；阻断集中的用户一律拒绝。
+ * 消息发送者的接入判定（fail-closed）：白名单内放行；空白名单须配对码匹配才认领。
+ * 认领未持久化则撤销内存放行、加入 claimBlocked 阻断集并按拒绝处理。
  */
 export function resolveAccess(
   access: ReturnType<typeof createAccessChecker>,
   claimBlocked: Set<string>,
   openId: string,
   hooks: AccessHooks,
+  submittedPairingCode?: string,
 ): AccessResolution {
-  const first = access.check(openId);
+  const first = access.check(openId, submittedPairingCode);
   let claimed = false;
   let claimRevoked = false;
   let decision: 'allow' | 'deny';
@@ -281,10 +293,8 @@ export function resolveAccess(
       hooks.onClaimError?.(errMessage(err));
     }
     if (!persisted) {
-      // fail-closed：绑定未写回 .env，撤销内存放行并阻断重试（重启前该用户按拒绝处理）
       claimRevoked = true;
       access.unclaim(openId);
-      // Set 无清理会无界增长：超上限整体清空（代价只是老条目重新判定一次）
       if (claimBlocked.size >= 1000) claimBlocked.clear();
       claimBlocked.add(openId);
     }
@@ -293,7 +303,13 @@ export function resolveAccess(
     decision = first === 'allow' ? 'allow' : 'deny';
   }
   if (claimBlocked.has(openId)) decision = 'deny';
-  return { decision, claimed, claimRevoked };
+  return {
+    decision,
+    claimed,
+    claimRevoked,
+    pairingRequired: first === 'pair-required',
+    pairingFailed: first === 'pair-invalid',
+  };
 }
 
 /**
@@ -429,14 +445,14 @@ export class FeishuChannel implements AgentChannel {
   onCardAction?: (data: FeishuCardAction) => CardActionResponse | void;
   /** WS 长连接状态变化钩子（进入重连/重连成功/重连耗尽），由 bot 层接告警。 */
   onWsStateChange?: (state: 'reconnecting' | 'reconnected' | 'failed', err?: Error) => void;
-  /** First DM user claimed ownership (empty allowlist); persist + welcome in the bot layer.
+  /** 配对成功的用户认领 owner 后，由 bot 层持久化并发送欢迎消息。
    *  返回 false（或抛错）= 绑定未持久化：channel 撤销内存放行并阻断重试（fail-closed）。 */
   onOwnerClaim?: (openId: string) => boolean;
 
-  constructor(cfg: FeishuBotConfig, opts?: { wsFirstConnectTimeoutMs?: number }) {
+  constructor(cfg: FeishuBotConfig, opts?: { wsFirstConnectTimeoutMs?: number; ownerPairingCode?: string }) {
     this.cfg = cfg;
     this.wsFirstConnectTimeoutMs = opts?.wsFirstConnectTimeoutMs ?? FEISHU_WS_FIRST_CONNECT_TIMEOUT_MS;
-    this.access = createAccessChecker(cfg.allowedOpenIds);
+    this.access = createAccessChecker(cfg.allowedOpenIds, opts?.ownerPairingCode);
     // SDK 内部 axios 默认 timeout=0（永不超时）：一个挂死的 TCP 连接会让 reply/updateText
     // 永久 pending，卡死用户队列与 watcher 推送。用 per-client httpInstance（委托 defaultHttpInstance
     // 并注入默认超时，见 createFeishuHttpInstance）覆盖全部 REST 调用（含 SDK 内部取 token），
@@ -516,20 +532,48 @@ export class FeishuChannel implements AgentChannel {
             return;
           }
           const { openId } = filtered;
+          const text =
+            filtered.messageType === 'text'
+              ? parseTextContent(filtered.content)
+              : filtered.messageType === 'post'
+                ? parsePostContent(filtered.content)
+                : '';
 
-          const gate = resolveAccess(this.access, this.claimBlocked, openId, {
-            persistClaim: (id) => (this.onOwnerClaim ? this.onOwnerClaim(id) : true),
-            onClaimError: (msg) => console.error(`[feishu] owner claim hook error: ${msg}`),
-          });
-          if (gate.claimed) console.log(`[feishu] owner claimed by ${maskOpenId(openId)}`);
+          const gate = resolveAccess(
+            this.access,
+            this.claimBlocked,
+            openId,
+            {
+              persistClaim: (id) => (this.onOwnerClaim ? this.onOwnerClaim(id) : true),
+              onClaimError: (msg) => console.error(`[feishu] owner claim hook error: ${msg}`),
+            },
+            extractOwnerPairingCode(text),
+          );
           if (gate.claimRevoked) {
             console.error(`[feishu] owner 绑定未持久化，已撤销内存放行: ${maskOpenId(openId)}`);
-            return; // 告警文案由 onOwnerClaim 侧发送；触发认领的这条消息不再处理
+            return;
+          }
+          if (gate.claimed && gate.decision === 'allow') {
+            console.log(`[feishu] owner paired and claimed by ${maskOpenId(openId)}`);
+            return; // 配对码是一次性秘密，不进入 LLM 会话；欢迎消息由 onOwnerClaim 发送
+          }
+          if (gate.pairingRequired || gate.pairingFailed) {
+            const noticeKey = `${openId}:${gate.pairingFailed ? 'invalid' : 'required'}`;
+            if (!this.deniedNotified.has(noticeKey)) {
+              if (this.deniedNotified.size >= 1000) this.deniedNotified.clear();
+              this.deniedNotified.add(noticeKey);
+              void this.notifyOpenId(
+                openId,
+                gate.pairingFailed
+                  ? '配对码不正确，本次绑定未生效。请查看部署终端当前显示的一次性配对码，再发送「配对码 <配对码>」。'
+                  : '本实例尚未绑定部署者。请查看部署终端显示的一次性配对码，并私聊发送「配对码 <配对码>」；普通首条私聊不会自动获得权限。',
+              ).catch(() => {});
+            }
+            return;
           }
           if (gate.decision === 'deny') {
             console.warn(`[feishu] ignore open_id not in allowlist: ${maskOpenId(openId)}`);
             if (!this.deniedNotified.has(openId)) {
-              // Set 无清理会无界增长：超上限整体清空（代价只是老用户再收一次提醒）
               if (this.deniedNotified.size >= 1000) this.deniedNotified.clear();
               this.deniedNotified.add(openId);
               void this.notifyOpenId(
@@ -542,13 +586,6 @@ export class FeishuChannel implements AgentChannel {
           }
 
           if (this.dedupe.isDuplicate(filtered.messageId, now)) return;
-
-          const text =
-            filtered.messageType === 'text'
-              ? parseTextContent(filtered.content)
-              : filtered.messageType === 'post'
-                ? parsePostContent(filtered.content)
-                : '';
 
           const inbound: FeishuInboundMessage = {
             sessionId: filtered.chatId,
@@ -899,7 +936,7 @@ export class FeishuChannel implements AgentChannel {
       if (!chatId) return;
       // 白名单外用户不邀请私聊（先邀请、私聊后再拒绝自相矛盾）。
       // 不用 access.check()：它有 owner 认领副作用，群里陌生人不许借此抢占 owner；
-      // 白名单仍为空（尚未认领）时照常邀请，首个私聊者再走认领流程。
+      // 白名单仍为空（尚未认领）时照常邀请，私聊后仍须提交本地一次性配对码。
       const senderOpenId = data.sender?.sender_id?.open_id || '';
       const allowed = this.access.list();
       if (senderOpenId && allowed.length > 0 && !allowed.includes(senderOpenId)) {

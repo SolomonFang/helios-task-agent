@@ -6,10 +6,10 @@
  * 只做分发：argv 原样透传给 bot-main 的 main()，参数解析 / 校验 / --help 文案
  * 以 bot-main.ts 的 parseBotArgs 为唯一来源（此处不再重复一份）。
  */
-// package.json engines 声明 node>=20：低于 20 直接报错退出，不在旧运行时上跑出莫名错误
+// package.json engines 声明 node>=22：低于 22 直接报错退出，不在旧运行时上跑出莫名错误
 const nodeMajor = Number(process.versions.node.split('.')[0]);
-if (nodeMajor < 20) {
-  console.error(`helios-task-agent 需要 Node.js 20 或更高版本（当前 ${process.version}），请升级后重试。`);
+if (nodeMajor < 22) {
+  console.error(`helios-task-agent 需要 Node.js 22 或更高版本（当前 ${process.version}），请升级后重试。`);
   process.exit(1);
 }
 

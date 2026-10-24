@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { defaultDataHome } from '../infra/paths';
-import { writeFileAtomicPrivateSync } from '../infra/private-file';
+import { ensurePrivateDirSync, writeFileAtomicPrivateSync } from '../infra/private-file';
 import { errMessage } from '../infra/err';
 
 /**
@@ -252,34 +252,81 @@ export class ReminderStore {
     }
   }
 
-  /**
-   * 读-改-写：每次操作都从磁盘重读再应用单个变更后原子写回。文件在 CLI 与 bot 间共享，
-   * 重读合避免盲写全量覆盖丢掉另一进程的更新（与 memory.ts 的 journal 重放同思路，
-   * 这里每次只改一条记录，重读+单点变更即可，无需 journal）。
-   * 已知限制：无跨进程文件锁，两进程同一瞬间写仍可能互相覆盖（与 memory.ts 相同）。
-   * 返回 false 仅表示写盘 IO 失败：调用方必须显式报错，不得谎报成功。
-   * fn 与收尾清理抛出的编程错误直接向上抛——吞成 false 会掩盖 bug（误判为磁盘故障）。
-   */
-  private mutate(fn: (file: ReminderFile) => void): boolean {
-    const file = this.load();
-    fn(file);
-    for (const uid of Object.keys(file.users)) {
-      const list = file.users[uid]!;
-      // 已终结记录限量保留（丢弃最旧）；全空的桶整个删掉，防文件无界增长
-      const done = list.filter((r) => r.status !== 'pending');
-      if (done.length > MAX_DONE_PER_USER) {
-        const drop = new Set(done.slice(0, done.length - MAX_DONE_PER_USER).map((r) => r.id));
-        file.users[uid] = list.filter((r) => !drop.has(r.id));
+  private lockMutation(): (() => void) | null {
+    const lockPath = `${this.filePath}.lock`;
+    try {
+      ensurePrivateDirSync(path.dirname(this.filePath));
+    } catch (err) {
+      console.error(`[reminder] 提醒存储写入失败: ${errMessage(err)}`);
+      return null;
+    }
+    const acquire = (): (() => void) => {
+      const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      try {
+        fs.writeFileSync(fd, token);
+        fs.closeSync(fd);
+      } catch (err) {
+        try {
+          fs.closeSync(fd);
+          fs.unlinkSync(lockPath);
+        } catch {
+          /* 保留原始异常 */
+        }
+        throw err;
       }
-      if (!file.users[uid]!.length) delete file.users[uid];
+      return () => {
+        try {
+          if (fs.readFileSync(lockPath, 'utf8') === token) fs.unlinkSync(lockPath);
+        } catch {
+          /* 锁已由崩溃清理路径移除 */
+        }
+      };
+    };
+    const sleep = new Int32Array(new SharedArrayBuffer(4));
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        return acquire();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+          console.error(`[reminder] 提醒存储锁创建失败: ${errMessage(err)}`);
+          return null;
+        }
+      }
+      Atomics.wait(sleep, 0, 0, 5);
+    }
+    console.error(`[reminder] 提醒存储锁长时间未释放，已停止写入以防数据覆盖；确认其他 CLI/bot 进程已退出后可删除残留锁：${lockPath}`);
+    return null;
+  }
+
+  /** 跨进程锁包住完整读-改-写；锁被占用时显式失败，由调用方重试，不覆盖另一进程的更新。 */
+  private mutate(fn: (file: ReminderFile) => void): boolean {
+    const unlock = this.lockMutation();
+    if (!unlock) {
+      console.error('[reminder] 提醒存储正被另一进程写入，本次变更未保存');
+      return false;
     }
     try {
-      writeFileAtomicPrivateSync(this.filePath, JSON.stringify(file, null, 2) + '\n');
-      return true;
-    } catch (err) {
-      // 仅写盘 IO 失败落这里：返回 false 让调用方显式报错，但至少留痕，不得静默吞掉
-      console.error(`[reminder] 提醒存储写入失败: ${errMessage(err)}`);
-      return false;
+      const file = this.load();
+      fn(file);
+      for (const uid of Object.keys(file.users)) {
+        const list = file.users[uid]!;
+        const done = list.filter((r) => r.status !== 'pending');
+        if (done.length > MAX_DONE_PER_USER) {
+          const drop = new Set(done.slice(0, done.length - MAX_DONE_PER_USER).map((r) => r.id));
+          file.users[uid] = list.filter((r) => !drop.has(r.id));
+        }
+        if (!file.users[uid]!.length) delete file.users[uid];
+      }
+      try {
+        writeFileAtomicPrivateSync(this.filePath, JSON.stringify(file, null, 2) + '\n');
+        return true;
+      } catch (err) {
+        console.error(`[reminder] 提醒存储写入失败: ${errMessage(err)}`);
+        return false;
+      }
+    } finally {
+      unlock();
     }
   }
 
@@ -303,10 +350,6 @@ export class ReminderStore {
   add(userId: string, text: string, triggerAt: number): Reminder {
     const trimmed = truncateReminderText(text);
     if (!trimmed) throw new Error('提醒内容不能为空');
-    const pending = this.list(userId);
-    if (pending.length >= MAX_ACTIVE_PER_USER) {
-      throw new Error(`待触发提醒已达上限（${MAX_ACTIVE_PER_USER} 条），请先取消不再需要的提醒`);
-    }
     const reminder: Reminder = {
       id: newId(),
       text: trimmed,
@@ -315,6 +358,10 @@ export class ReminderStore {
       status: 'pending',
     };
     const ok = this.mutate((file) => {
+      const pending = (file.users[userId] || []).filter((r) => r.status === 'pending');
+      if (pending.length >= MAX_ACTIVE_PER_USER) {
+        throw new Error(`待触发提醒已达上限（${MAX_ACTIVE_PER_USER} 条），请先取消不再需要的提醒`);
+      }
       (file.users[userId] || (file.users[userId] = [])).push(reminder);
     });
     if (!ok) throw new Error('提醒保存失败，本次设置未保存成功，请再试一次');
@@ -410,11 +457,8 @@ export class ReminderRunner {
   private readonly opts: ReminderRunnerOptions;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
-  /**
-   * 已投递但落盘失败的提醒（uid:id）：磁盘持续故障期间内存兜底去重，
-   * 避免每轮 tick 重复推送同一条；进程重启后可能补推一次（重复优于丢失）。
-   */
-  private readonly deliveredUnpersisted = new Set<string>();
+  /** 已投递但落盘失败的提醒及下次补写时刻：不重复推送，但持续尝试落 delivered。 */
+  private readonly deliveredUnpersisted = new Map<string, number>();
 
   constructor(opts: ReminderRunnerOptions) {
     this.opts = opts;
@@ -448,14 +492,24 @@ export class ReminderRunner {
         // 跨形态桶分流：不可投递的 uid 原样保留 pending（不动 failCount/nextRetryAt），等另一形态进程投递
         if (this.opts.deliverable && !this.opts.deliverable(userId)) continue;
         const dedupeKey = `${userId}:${reminder.id}`;
-        if (this.deliveredUnpersisted.has(dedupeKey)) continue; // 已投递仅落盘失败：内存兜底不重复推送
+        const retryWriteAt = this.deliveredUnpersisted.get(dedupeKey);
+        if (retryWriteAt !== undefined) {
+          if (nowMs < retryWriteAt) continue;
+          if (this.opts.store.markDelivered(userId, reminder.id, nowMs)) {
+            this.deliveredUnpersisted.delete(dedupeKey);
+            this.opts.log?.(`提醒送达状态已补写（${maskUserId(userId)}，${reminder.id}）`);
+          } else {
+            this.deliveredUnpersisted.set(dedupeKey, nowMs + 30_000);
+          }
+          continue;
+        }
         try {
           await this.opts.deliver(userId, buildReminderText(reminder));
           if (this.opts.store.markDelivered(userId, reminder.id, nowMs)) {
-            this.opts.log?.(`提醒已送达（${maskUserId(userId)}）：${reminder.text.slice(0, 50)}`);
+            this.opts.log?.(`提醒已送达（${maskUserId(userId)}，${reminder.id}）`);
           } else {
-            this.deliveredUnpersisted.add(dedupeKey);
-            this.opts.log?.(`提醒已送达但落盘失败（${maskUserId(userId)}），存储恢复前不再重复推送：${reminder.text.slice(0, 50)}`);
+            this.deliveredUnpersisted.set(dedupeKey, nowMs + 30_000);
+            this.opts.log?.(`提醒已送达但落盘失败（${maskUserId(userId)}，${reminder.id}），将补写状态且不重复推送`);
           }
         } catch (err) {
           if (this.opts.store.markFailed(userId, reminder.id, nowMs)) {

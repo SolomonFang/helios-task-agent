@@ -165,6 +165,7 @@ export function makeGatedWriter({
       return '⏹ 已中断（操作未执行，可继续对话）。';
     }
     let result = await p.execute();
+    const created = p.isCreate && !looksLikeStrongFailure(result) && Boolean(extractUuid(result));
     if (p.isStart && !looksLikeStrongFailure(result)) {
       result = await appendWorkspaceReadyCheck(result, kanbanUrl, p.signal);
     }
@@ -173,8 +174,8 @@ export function makeGatedWriter({
       { user: uid, kind: p.kind, summary: p.summary, detail: p.detail(), decision: 'approved', ok, resultSnippet: result },
       auditHome,
     );
-    if (ok && p.urls.length) recordSources(p.urls, result, p.title, p.projectId);
-    if (ok && p.isCreate) createCounter.count++;
+    if ((ok || created) && p.urls.length) recordSources(p.urls, result, p.title, p.projectId);
+    if (created) createCounter.count++;
     return wrapUntrusted(result);
   };
 }

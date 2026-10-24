@@ -16,6 +16,8 @@ import assert from 'node:assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawn } from 'child_process';
+import { pathToFileURL } from 'url';
 import { checkAsync, finish } from './testkit';
 import {
   MAX_ACTIVE_PER_USER,
@@ -208,6 +210,63 @@ async function main(): Promise<void> {
       assert.ok(fs.readdirSync(tmp).some((f) => f.startsWith('reminders.json.corrupt-')), '应有损坏备份');
       assert.equal(new ReminderStore(tmp).list('u1').length, 1);
     } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('ReminderStore：多进程并发写不丢更新，锁冲突可显式重试', async () => {
+    const tmp = tmpHome('multiprocess');
+    try {
+      const moduleUrl = pathToFileURL(path.resolve('src/agent/reminder.ts')).href;
+      const workers = Array.from({ length: 6 }, (_, worker) => {
+        const source = `
+          const { ReminderStore } = await import(${JSON.stringify(moduleUrl)});
+          const store = new ReminderStore(${JSON.stringify(tmp)});
+          for (let i = 0; i < 5; i++) {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                store.add(${JSON.stringify(`u${worker}`)}, ${JSON.stringify(`worker-${worker}-item`)} + i, Date.now() + 3600000);
+                break;
+              } catch (err) {
+                if (attempt >= 100) throw err;
+                await new Promise((resolve) => setTimeout(resolve, 10));
+              }
+            }
+          }
+        `;
+        return new Promise<void>((resolve, reject) => {
+          const child = spawn(process.execPath, ['--import', 'tsx', '-e', source], { stdio: ['ignore', 'ignore', 'pipe'] });
+          let stderr = '';
+          child.stderr.on('data', (chunk) => { stderr += chunk; });
+          child.on('error', reject);
+          child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`worker ${worker} 失败：${stderr}`)));
+        });
+      });
+      await Promise.all(workers);
+      const store = new ReminderStore(tmp);
+      for (let worker = 0; worker < 6; worker++) assert.equal(store.list(`u${worker}`).length, 5);
+      assert.equal(fs.existsSync(path.join(tmp, 'reminders.json.lock')), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('ReminderStore：异常残留锁 fail-closed，不自动删除也不覆盖现有数据', () => {
+    const tmp = tmpHome('stale-lock');
+    const origErr = console.error;
+    try {
+      const store = new ReminderStore(tmp);
+      store.add('u1', '保留我', NOW_MS + 60000);
+      const lockPath = path.join(tmp, 'reminders.json.lock');
+      fs.writeFileSync(lockPath, '99999999');
+      fs.utimesSync(lockPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+      console.error = () => {};
+      assert.throws(() => store.add('u1', '不得覆盖', NOW_MS + 60000), /提醒保存失败/);
+      assert.equal(store.markDelivered('u1', 'r1', NOW_MS), false);
+      assert.deepEqual(store.list('u1').map((r) => r.text), ['保留我']);
+      assert.ok(fs.existsSync(lockPath), '残留锁只能由部署者确认进程退出后人工清理');
+    } finally {
+      console.error = origErr;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -520,31 +579,38 @@ async function main(): Promise<void> {
     const tmp = tmpHome('markfail');
     try {
       const store = new ReminderStore(tmp);
-      store.add('u1', '落不了盘的', NOW_MS - 1000); // 已到点
+      store.add('u1', '落不了盘的', NOW_MS - 1000);
       const logs: string[] = [];
       const sent: string[] = [];
-      // 包一层 store：due 正常读盘，markDelivered 模拟持续写盘失败（提醒在盘上保持 pending）
+      let nowMs = NOW_MS;
+      let persist = false;
       const flaky = {
-        due: (nowMs: number) => store.due(nowMs),
-        markDelivered: () => false,
-        markFailed: (u: string, id: string, nowMs: number) => store.markFailed(u, id, nowMs),
+        due: (now: number) => store.due(now),
+        markDelivered: (u: string, id: string, now: number) => persist ? store.markDelivered(u, id, now) : false,
+        markFailed: (u: string, id: string, now: number) => store.markFailed(u, id, now),
       } as unknown as ReminderStore;
       const runner = new ReminderRunner({
         store: flaky,
         deliver: async (_u, text) => {
           sent.push(text);
         },
-        now: () => new Date(NOW_MS),
+        now: () => new Date(nowMs),
         log: (m) => logs.push(m),
       });
       const tick = tickOf(runner);
-      await tick(); // 投递成功但落盘失败：告警 + 内存记下不再重推
+      await tick();
       assert.equal(sent.length, 1);
-      assert.ok(logs.some((m) => m.includes('落盘失败')), `已送达未落盘应告警：${logs.join(' | ')}`);
-      await tick(); // 磁盘故障期间不每轮（默认 15s）重复推送同一条
+      assert.ok(logs.some((m) => m.includes('落盘失败')));
       await tick();
       assert.equal(sent.length, 1, '已投递但落盘失败的提醒不得重复推送');
+      persist = true;
+      nowMs += 30_000;
+      await tick();
+      assert.equal(sent.length, 1, '补写 delivered 不得重新投递');
+      assert.equal(store.list('u1').length, 0, '存储恢复后必须补写 delivered');
+      assert.ok(logs.some((m) => m.includes('送达状态已补写')));
 
+      store.add('u1', '退避写失败', nowMs - 1000);
       // markFailed 落盘失败：退避记不上会每轮立即重试，必须告警
       const failLogs: string[] = [];
       let calls = 0;
@@ -559,7 +625,7 @@ async function main(): Promise<void> {
           calls++;
           throw new Error('channel down');
         },
-        now: () => new Date(NOW_MS),
+        now: () => new Date(nowMs),
         log: (m) => failLogs.push(m),
       });
       await tickOf(failRunner)();

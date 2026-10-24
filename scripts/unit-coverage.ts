@@ -389,12 +389,14 @@ async function run(): Promise<void> {
         const click = () =>
           handlers.onCardAction({
             operator: { open_id: 'u1' },
-            action: { value: { hta_review: 'att-1', title: '审查任务标题' } },
+            action: { value: { hta_review: 'att-1', title: '审查任务标题', owner: 'u1' } },
           });
 
         click();
         // 开始文本通知仅在首次安全提示时发送（刷屏治理）：进行中判定改看 ocr 是否已被拉起
-        await waitFor(() => fs.existsSync(ocrLog), '审查开始（ocr 已拉起）');
+        await waitFor(() => fs.existsSync(ocrLog), '审查开始（ocr 已拉起）').catch((err: unknown) => {
+          throw new Error(`${err instanceof Error ? err.message : String(err)}；现有通知：${channel.notifies.map((n) => n.text).join(' | ')}`);
+        });
         click(); // 审查进行中连点同一 attempt：应走去重提示，不重复执行
         await waitFor(
           () => channel.notifies.some((n) => n.text.includes('AI 审查正在进行中')),

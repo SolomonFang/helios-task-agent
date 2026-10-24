@@ -383,13 +383,14 @@ async function main(): Promise<void> {
   );
   check('短文本不拆', splitText('短', 3000).join('') === '短');
 
-  // ---- owner 认领 ----
-  const ac = createAccessChecker([]);
+  // ---- owner 配对认领 ----
+  const ac = createAccessChecker([], 'one-time-code');
   check(
-    '白名单为空：首个用户认领 owner，其余拒绝',
-    ac.check('ou_first') === 'claim' &&
+    '白名单为空：一次性配对码认领 owner，普通首聊与其余用户拒绝',
+    ac.check('ou_first') === 'pair-required' &&
+      ac.check('ou_first', 'one-time-code') === 'claim' &&
       ac.check('ou_first') === 'allow' &&
-      ac.check('ou_second') === 'deny' &&
+      ac.check('ou_second', 'one-time-code') === 'deny' &&
       ac.list().join(',') === 'ou_first',
   );
   const ac2 = createAccessChecker(['ou_a']);

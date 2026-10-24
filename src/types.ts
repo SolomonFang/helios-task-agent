@@ -1,5 +1,5 @@
 import type OpenAI from 'openai';
-import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ChatCompletionFunctionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
 /** App config loaded from .env / wizard. */
 export interface AgentConfig {
@@ -53,7 +53,7 @@ export type AskFn = (prompt: string) => Promise<string | null>;
 export type ChooseFn = (presets: LlmPreset[]) => Promise<number>;
 
 export type ChatMessage = ChatCompletionMessageParam;
-export type OpenAiTool = ChatCompletionTool;
+export type OpenAiTool = ChatCompletionFunctionTool;
 export interface ToolContext {
   /** Aborted by /stop — long-running handlers should pass it to subprocess/API calls. */
   signal?: AbortSignal;

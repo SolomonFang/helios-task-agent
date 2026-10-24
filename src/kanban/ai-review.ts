@@ -54,6 +54,8 @@ function isAttemptRow(v: unknown): v is AttemptRow {
 export interface ReviewTarget {
   /** 本地 git 仓库目录（优先 workspace 内的仓库目录，兜底看板注册的原始仓库 path）。 */
   repoDir: string;
+  /** 看板仓库名；多仓汇总输出用于分节。 */
+  repoName?: string;
   /** diff 起点（target_branch）；缺失时 ocr 退化为工作区模式。 */
   fromRef?: string;
   /** diff 终点（attempt 分支）。 */
@@ -92,46 +94,8 @@ async function isGitRepo(dir: string): Promise<boolean> {
   }
 }
 
-/**
- * 定位 attempt 的代码目录与 diff 引用。
- * 候选顺序：container_ref/agent_working_dir → container_ref/<repo name> → container_ref
- * 本身 → 看板注册的原始仓库 path（use_worktree=false 时 agent 直接在原仓库提交）。
- */
-export async function resolveReviewTarget(kanbanUrl: string, attemptId: string): Promise<ReviewTarget> {
-  const raw: unknown = await apiGet(kanbanUrl, `/task-attempts/${attemptId}`);
-  if (!isAttemptRow(raw)) {
-    throw new Error('找不到该任务的执行环境记录，可能已被看板清理。可在看板上重新发起该任务后再试。');
-  }
-  const attempt: AttemptRow = raw;
-  let repos: AttemptRepoRow[] = [];
-  try {
-    // 宽容校验：字段缺失/null 容忍（看板版本间字段可能不同），类型不符或返回非数组时抛错，
-    // 由下方 catch 兜底为「无 repos 信息」，不阻断 workspace 目录路径
-    repos = validateRows<AttemptRepoRow>(`/task-attempts/${attemptId}/repos`, await apiGet(kanbanUrl, `/task-attempts/${attemptId}/repos`), {
-      path: 'string',
-      name: 'string',
-      target_branch: 'string',
-    });
-  } catch {
-    /* repos 端点失败不阻断，仍可尝试 workspace 目录 */
-  }
-  const container = typeof attempt.container_ref === 'string' ? attempt.container_ref.trim() : '';
-  const workdir = typeof attempt.agent_working_dir === 'string' ? attempt.agent_working_dir.trim() : '';
-  const candidates: string[] = [];
-  if (container && workdir) candidates.push(path.join(container, workdir));
-  if (container) {
-    for (const r of repos) {
-      const name = (r.name || '').trim();
-      if (name) candidates.push(path.join(container, name));
-    }
-    candidates.push(container);
-  }
-  for (const r of repos) {
-    const p = (r.path || '').trim();
-    if (p) candidates.push(p);
-  }
-  // 候选目录并行探测（bot 事件循环路径：逐个串行 await isGitRepo 会叠加阻塞）；
-  // 命中后仍按候选顺序取首个，优先级语义不变。目录存在性用异步 access，不用同步 existsSync
+/** 并行探测候选目录，但按候选顺序取首个命中，保持路径优先级稳定。 */
+async function firstGitRepo(candidates: string[]): Promise<string | undefined> {
   const hits = await Promise.all(
     candidates.map(async (dir) => {
       try {
@@ -142,20 +106,85 @@ export async function resolveReviewTarget(kanbanUrl: string, attemptId: string):
       return (await isGitRepo(dir)) ? dir : null;
     }),
   );
-  const repoDir = hits.find((d): d is string => Boolean(d));
-  if (repoDir) {
-    const fromRef = repos.map((r) => (r.target_branch || '').trim()).find(Boolean) || undefined;
-    const toRef = (attempt.branch || '').trim() || undefined;
-    const taskId = typeof attempt.task_id === 'string' ? attempt.task_id.trim() || undefined : undefined;
-    return { repoDir, fromRef, toRef, taskId };
+  return hits.find((d): d is string => Boolean(d));
+}
+
+/**
+ * 定位 attempt 的全部仓库。多仓时每个 repos 条目独立解析目录与 target_branch，
+ * 不再把首仓目录和另一仓分支混用，也不会漏掉后续仓库。
+ */
+export async function resolveReviewTargets(kanbanUrl: string, attemptId: string): Promise<ReviewTarget[]> {
+  const raw: unknown = await apiGet(kanbanUrl, `/task-attempts/${attemptId}`);
+  if (!isAttemptRow(raw)) {
+    throw new Error('找不到该任务的执行环境记录，可能已被看板清理。可在看板上重新发起该任务后再试。');
   }
-  // 宿主机绝对路径清单只进日志（对用户无意义且泄露本机目录结构）；用户面只留中文结论与可执行指引
-  if (candidates.length) {
-    console.error(`[ai-review] 无法定位代码目录，已尝试：\n${candidates.map((d) => `- ${d}`).join('\n')}`);
+  const attempt: AttemptRow = raw;
+  let repos: AttemptRepoRow[] = [];
+  try {
+    repos = validateRows<AttemptRepoRow>(`/task-attempts/${attemptId}/repos`, await apiGet(kanbanUrl, `/task-attempts/${attemptId}/repos`), {
+      path: 'string',
+      name: 'string',
+      target_branch: 'string',
+    });
+  } catch {
+    /* repos 端点失败不阻断，仍可尝试 workspace 目录 */
   }
-  throw new Error(
-    '无法定位该任务的代码目录（工作区可能已清理，或原始仓库不可达）。请点上方卡片上的「查看任务」打开看板改动详情人工查看。',
-  );
+  const container = typeof attempt.container_ref === 'string' ? attempt.container_ref.trim() : '';
+  const workdir = typeof attempt.agent_working_dir === 'string' ? attempt.agent_working_dir.trim() : '';
+  const toRef = (attempt.branch || '').trim() || undefined;
+  const taskId = typeof attempt.task_id === 'string' ? attempt.task_id.trim() || undefined : undefined;
+  const targets: ReviewTarget[] = [];
+  const unresolved: string[] = [];
+
+  if (!repos.length) {
+    const candidates: string[] = [];
+    if (container && workdir) candidates.push(path.join(container, workdir));
+    if (container) candidates.push(container);
+    const repoDir = await firstGitRepo(candidates);
+    if (repoDir) targets.push({ repoDir, toRef, taskId });
+  } else {
+    for (let i = 0; i < repos.length; i++) {
+      const repo = repos[i]!;
+      const name = (repo.name || '').trim() || path.basename((repo.path || '').trim()) || `仓库 ${i + 1}`;
+      const candidates: string[] = [];
+      if (container && workdir && (repos.length === 1 || workdir === name || path.basename(workdir) === name)) {
+        candidates.push(path.join(container, workdir));
+      }
+      if (container && (repo.name || '').trim()) candidates.push(path.join(container, (repo.name || '').trim()));
+      const original = (repo.path || '').trim();
+      if (original) candidates.push(original);
+      const repoDir = await firstGitRepo(candidates);
+      if (!repoDir) {
+        unresolved.push(name);
+        continue;
+      }
+      targets.push({
+        repoDir,
+        repoName: name,
+        fromRef: (repo.target_branch || '').trim() || undefined,
+        toRef,
+        taskId,
+      });
+    }
+  }
+
+  if (unresolved.length || !targets.length) {
+    const suffix = unresolved.length ? `（${unresolved.join('、')}）` : '';
+    throw new Error(
+      `无法定位该任务的代码目录${suffix}（工作区可能已清理，或原始仓库不可达）。` +
+        '为确保审查完整，本次未执行审查；请恢复工作区后重试，或点上方卡片上的「查看任务」逐仓人工查看。',
+    );
+  }
+  return targets;
+}
+
+/** 单仓兼容入口；多仓调用方必须使用 resolveReviewTargets，避免误审首仓。 */
+export async function resolveReviewTarget(kanbanUrl: string, attemptId: string): Promise<ReviewTarget> {
+  const targets = await resolveReviewTargets(kanbanUrl, attemptId);
+  if (targets.length !== 1) {
+    throw new Error('该任务包含多个仓库，请使用逐仓审查入口，不能只审查首个仓库。');
+  }
+  return targets[0]!;
 }
 
 /** 用户是否已在 OCR 侧配置好 provider/llm（已配置则尊重，不再注入派生环境变量）。 */
@@ -274,65 +303,78 @@ export function buildReviewBackground(title: string, description: string): strin
   return parts.join('\n');
 }
 
-/** 执行 AI 审查，返回完整文本结果（不截断，完整内容供 HTML 报告使用）；失败抛出带排查信息的中文错误。 */
-export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
-  const target = await resolveReviewTarget(opts.kanbanUrl, opts.attemptId);
-  const ocr = await findOcrCommand(opts.env);
-  const args = [...ocr.prefixArgs, 'review', '--repo', target.repoDir];
-  if (target.fromRef && target.toRef) {
-    if (!isValidGitRef(target.fromRef) || !isValidGitRef(target.toRef)) {
-      console.error(`[ai-review] 看板返回的分支名不合法：from=${target.fromRef}, to=${target.toRef}`);
-      throw new Error('看板返回的分支名不合法，请在看板检查该任务仓库的分支设置。');
-    }
-    args.push('--from', target.fromRef, '--to', target.toRef);
-  }
-  args.push('--audience', 'agent', '--format', 'text');
-  // 需求上下文：卡片只带标题，任务描述按 task_id 现场拉取（取不到不阻断审查）
-  const description = target.taskId ? await fetchTaskDescription(opts.kanbanUrl, target.taskId) : '';
-  args.push('--background', buildReviewBackground(opts.title || '', description));
+const ZERO_COMMENTS_RE = /(?<!\d)0\s*comment\(s\)/i;
 
-  const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
-  let stdout = '';
-  let stderr = '';
-  try {
-    const out = await execFileP(ocr.cmd, args, {
-      cwd: target.repoDir,
-      env: buildOcrEnv(opts.llm, opts.env),
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      killSignal: 'SIGTERM',
-      signal: opts.signal,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    stdout = out.stdout || '';
-    stderr = out.stderr || '';
-  } catch (err) {
-    // execFileCompat 三种路径都置 killed=true（见 proc.ts 注释）：须先查 bufferExceeded、
-    // 再查调用方中断，最后才按超时定性
-    const e = err as {
-      killed?: boolean;
-      bufferExceeded?: 'stdout' | 'stderr';
-      stdout?: string;
-      stderr?: string;
-      message?: string;
-    };
-    // 完整输出只进日志，不倾倒给终端用户；用户面给中文定性 + 自救指引
-    const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
-    if (full) console.error(`[ai-review] 代码审查工具完整输出：\n${full}`);
-    if (e.bufferExceeded) {
-      // 看板 Web 没有「缩小审查范围」入口：出路改人工查看改动详情；不带「重试」字样，
-      // 让 handler 统一追加可执行的文本重试指引
-      throw new Error('AI 审查输出过大已终止（可能变更范围过大），请到看板打开该任务的改动详情人工查看；若反复出现，请联系部署者查看日志定位。');
+/** 多仓结果分节；只有所有仓库都明确零意见时才保留供报告卡片判定的整体 0 comment(s)。 */
+export function combineReviewResults(results: Array<{ repoName?: string; text: string }>): string {
+  if (results.length === 1) return results[0]!.text;
+  const allPass = results.every((r) => ZERO_COMMENTS_RE.test(r.text));
+  const sections = results.map((r, i) => {
+    const text = r.text.replace(new RegExp(ZERO_COMMENTS_RE.source, 'gi'), 'no comments');
+    return `## 仓库 ${i + 1}/${results.length}：${r.repoName || `仓库 ${i + 1}`}\n\n${text}`;
+  });
+  if (allPass) sections.push('[ocr] Summary: all repositories reviewed, 0 comment(s)');
+  return sections.join('\n\n');
+}
+
+/** 执行 AI 审查：多仓逐仓顺序执行并汇总；任一失败即整体失败，绝不以部分结果冒充全部通过。 */
+export async function runAiReview(opts: RunAiReviewOptions): Promise<string> {
+  const targets = await resolveReviewTargets(opts.kanbanUrl, opts.attemptId);
+  for (const target of targets) {
+    if (target.fromRef && target.toRef && (!isValidGitRef(target.fromRef) || !isValidGitRef(target.toRef))) {
+      console.error(`[ai-review] 看板返回的分支名不合法：from=${target.fromRef}, to=${target.toRef}`);
+      throw new Error(`看板返回的${target.repoName ? `仓库「${target.repoName}」` : ''}分支名不合法，请在看板检查该任务仓库的分支设置。`);
     }
-    if (opts.signal?.aborted) {
-      throw new Error('已中断');
-    }
-    if (e.killed) {
-      // 重试指引由 handler 统一追加，这里不再自带，避免两句重复
-      throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
-    }
-    throw new Error('代码审查工具执行失败，可回复「重新审查这个任务」重新发起审查；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。');
   }
-  const text = sanitizeCliOutput(stdout).trim() || sanitizeCliOutput(stderr).trim();
-  return text || '（代码审查工具未产生输出：可能没有可审查的变更）';
+
+  const ocr = await findOcrCommand(opts.env);
+  const description = targets[0]!.taskId ? await fetchTaskDescription(opts.kanbanUrl, targets[0]!.taskId) : '';
+  const background = buildReviewBackground(opts.title || '', description);
+  const childEnv = buildOcrEnv(opts.llm, opts.env);
+  const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
+  const startedAt = Date.now();
+  const results: Array<{ repoName?: string; text: string }> = [];
+
+  for (const target of targets) {
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (opts.signal?.aborted) throw new Error('已中断');
+    if (remainingMs <= 0) throw new Error(`AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
+    const args = [...ocr.prefixArgs, 'review', '--repo', target.repoDir];
+    if (target.fromRef && target.toRef) args.push('--from', target.fromRef, '--to', target.toRef);
+    args.push('--audience', 'agent', '--format', 'text', '--background', background);
+    const repoLabel = targets.length > 1 ? `仓库「${target.repoName || target.repoDir}」` : '';
+    try {
+      const out = await execFileP(ocr.cmd, args, {
+        cwd: target.repoDir,
+        env: childEnv,
+        encoding: 'utf8',
+        timeout: remainingMs,
+        killSignal: 'SIGTERM',
+        signal: opts.signal,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      const text = sanitizeCliOutput(out.stdout || '').trim() || sanitizeCliOutput(out.stderr || '').trim();
+      results.push({ repoName: target.repoName, text: text || '（代码审查工具未产生输出：可能没有可审查的变更）' });
+    } catch (err) {
+      const e = err as {
+        killed?: boolean;
+        bufferExceeded?: 'stdout' | 'stderr';
+        stdout?: string;
+        stderr?: string;
+      };
+      // 审查输出可能含代码与密钥：默认不落原文，仅显式调试时输出。
+      const full = sanitizeCliOutput(e.stderr || e.stdout || '').trim();
+      if (full && process.env.HTA_DEBUG) console.error(`[ai-review] ${repoLabel}代码审查工具完整输出：\n${full}`);
+      if (e.bufferExceeded) {
+        throw new Error(`${repoLabel}AI 审查输出过大已终止（可能变更范围过大），请到看板打开该任务的改动详情人工查看；若反复出现，请联系部署者查看日志定位。`);
+      }
+      if (opts.signal?.aborted) throw new Error('已中断');
+      if (e.killed) throw new Error(`${repoLabel}AI 审查超时（${Math.round(timeoutMs / 60000)} 分钟），已终止。`);
+      if (targets.length > 1) {
+        throw new Error(`${repoLabel}代码审查工具执行失败，本次多仓审查未完整完成，未返回部分结果。可回复「重新审查这个任务」重新发起；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。`);
+      }
+      throw new Error('代码审查工具执行失败，可回复「重新审查这个任务」重新发起审查；若持续失败，请联系部署者检查代码审查工具（open-code-review）的配置。');
+    }
+  }
+  return combineReviewResults(results);
 }

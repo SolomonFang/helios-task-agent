@@ -218,6 +218,22 @@ export const PRESETS: LlmPreset[] = [
   },
 ];
 
+/** MCP 参数优先按 JSON 字符串数组解析（保留参数内空白），否则兼容旧的空白分隔格式。 */
+export function parseMcpArgs(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('[')) return trimmed.split(/\s+/).filter(Boolean);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error('HELIOS_KANBAN_MCP_ARGS 的 JSON 数组格式无效，请检查引号与逗号');
+  }
+  if (!Array.isArray(parsed) || parsed.some((arg) => typeof arg !== 'string')) {
+    throw new Error('HELIOS_KANBAN_MCP_ARGS 使用 JSON 格式时必须是字符串数组');
+  }
+  return parsed;
+}
+
 export function currentConfig(): AgentConfig {
   ensureEnvLoaded(); // 懒初始化：未显式初始化时保证 .env 已加载（幂等，见上）
   return {
@@ -225,7 +241,7 @@ export function currentConfig(): AgentConfig {
     llmApiKey: process.env.LLM_API_KEY || '',
     llmModel: process.env.LLM_MODEL || '',
     mcpCommand: process.env.HELIOS_KANBAN_MCP_COMMAND || 'npx',
-    mcpArgs: (process.env.HELIOS_KANBAN_MCP_ARGS || `-y ${kanbanPackageSpec()} --mcp`).split(/\s+/).filter(Boolean),
+    mcpArgs: parseMcpArgs(process.env.HELIOS_KANBAN_MCP_ARGS || `-y ${kanbanPackageSpec()} --mcp`),
     kanbanUrl: process.env.HELIOS_KANBAN_URL || 'http://localhost:7964',
     kanbanProjectId: process.env.HELIOS_KANBAN_PROJECT_ID || '',
     kanbanRepoId: process.env.HELIOS_KANBAN_REPO_ID || '',
@@ -281,14 +297,9 @@ function parseEnvFile(filePath: string): Record<string, string> {
     const key = body.slice(0, eq).trim();
     let val = body.slice(eq + 1).trim();
     if (val.startsWith('"')) {
-      // 双引号值取到配对闭引号（其后可跟行内注释，与 dotenv 一致忽略），
-      // 并按 serializeEnvValue 的写法对称反转义（单趟扫描，\\ 最后判定）
+      // 与 dotenv@16 对齐：双引号值只展开 \n / \r，不反转义 \" 与 \\。
       const m = val.match(/^"((?:\\[\s\S]|[^"\\])*)"/);
-      if (m) {
-        val = m[1]!.replace(/\\(.)/gs, (_, c: string) =>
-          c === 'n' ? '\n' : c === 'r' ? '\r' : c === '"' || c === '\\' ? c : `\\${c}`,
-        );
-      }
+      if (m) val = m[1]!.replace(/\\([nr])/g, (_, c: string) => (c === 'n' ? '\n' : '\r'));
     } else if (val.startsWith("'")) {
       const m = val.match(/^'([^']*)'/);
       if (m) val = m[1]!;
@@ -304,18 +315,16 @@ function parseEnvFile(filePath: string): Record<string, string> {
 }
 
 /**
- * 写 .env 时的值序列化：不含空白/#/引号/换行时直写（保持既有输出风格）。
- * 含 \ 或 " 的值优先单引号包裹：dotenv@16 对双引号值只展开 \n \r、不反转义 \" \\，
- * 双引号转义写法当前会话（parseEnvFile）正确、重启加载（dotenv）却会读到带反斜杠的
- * 字面量，凭证静默失效；单引号值在 dotenv 与 parseEnvFile 里都是原样取内层，写读对称。
- * 其余情况双引号包裹并转义（此时值不含 \ 与 "，只产出 dotenv 会展开的 \n \r 转义，
- * 写读仍对称）。例外：值同时含 ' 与 \ 或 " 时无法单引号包裹，回退双引号转义，
- * dotenv 重启读回不反转义——本项目写入的均为 URL/key/id 等简单值，不触及。
+ * 写 .env 时保证 process.env、parseEnvFile 与 dotenv 三处读回一致。
+ * 无空白/#/双引号/反斜杠时值可直写（单引号在裸值中不是特殊字符）；含双引号或
+ * 反斜杠且不含单引号/换行时用单引号包裹；其余可用双引号并只转义换行。
+ * dotenv 语法无法无损表示剩余组合，明确拒绝而不是写盘后静默改值。
  */
 function serializeEnvValue(v: string): string {
-  if (v !== '' && !/[\s#"'\\]/.test(v)) return v;
-  if (/[\\"]/.test(v) && !v.includes("'") && !/[\r\n]/.test(v)) return `'${v}'`;
-  return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
+  if (v !== '' && !/[\s#"\\]/.test(v)) return v;
+  if (!v.includes("'") && !/[\r\n]/.test(v)) return `'${v}'`;
+  if (!/[\\"]/.test(v)) return `"${v.replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
+  throw new Error('配置值同时包含单引号、双引号或反斜杠及空白/换行，无法由 dotenv 无损保存；请改用不含该组合的值');
 }
 
 /**

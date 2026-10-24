@@ -64,15 +64,17 @@ function messageChars(m: ChatMessage): number {
  */
 function dropOldestTurn(messages: ChatMessage[]): boolean {
   if (messages.length <= 3) return false;
+  let firstTurn = 1;
+  while (messages[firstTurn]?.role === 'system') firstTurn++;
   let idx = -1;
-  for (let i = 2; i < messages.length; i++) {
+  for (let i = firstTurn + 1; i < messages.length; i++) {
     if (messages[i]!.role === 'user') {
       idx = i;
       break;
     }
   }
   if (idx === -1) return false;
-  messages.splice(1, idx - 1);
+  messages.splice(firstTurn, idx - firstTurn);
   sanitizeToolPairs(messages);
   return true;
 }
@@ -277,6 +279,7 @@ export async function runAgentTurn({
         let recovered = false;
         for (let attempt = 0; attempt < 3 && !recovered; attempt++) {
           if (!dropOldestTurn(messages)) break;
+          insertTruncationNote(messages);
           try {
             resp = await createReq();
             recovered = true;
@@ -288,8 +291,6 @@ export async function runAgentTurn({
           }
         }
         if (!recovered) throw err;
-        // 自愈丢轮同样要告知模型历史不完整（与 trimHistory 同一注记机制）
-        insertTruncationNote(messages);
         reportProgress({ type: 'continue' });
       }
       if (!resp) throw new Error('模型请求失败');

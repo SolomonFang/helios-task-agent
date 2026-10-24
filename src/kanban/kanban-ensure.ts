@@ -4,6 +4,7 @@ import { kanbanPackageSpec, kanbanManualStartHint } from '../infra/deps';
 import { killProcessTree, processTreeAlive, spawnCompat } from '../infra/proc';
 import { minimalChildEnv } from '../infra/proc-env';
 import { probeKanbanHealth } from './http';
+import { isLoopbackHostname } from '../infra/url-utils';
 
 export interface KanbanEnsureResult {
   /** True if we spawned a new process. */
@@ -14,7 +15,17 @@ export interface KanbanEnsureResult {
 }
 
 function isLocalHost(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0';
+  return isLoopbackHostname(hostname) || hostname === '0.0.0.0';
+}
+
+/** 看板自动拉起端口：本机回环 URL 未显式指定时使用看板默认端口，而非 HTTP(S) 80/443。 */
+export function kanbanPortForUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return u.port || (isLoopbackHostname(u.hostname) || u.hostname === '0.0.0.0' ? '7964' : u.protocol === 'https:' ? '443' : '80');
+  } catch {
+    return '7964';
+  }
 }
 
 /**
@@ -60,17 +71,12 @@ export async function ensureKanbanRunning(
   }
 
   let hostname = 'localhost';
-  let port = '7964';
   try {
-    const u = new URL(url);
-    hostname = u.hostname;
-    // 显式端口优先；本机地址（localhost/127.0.0.1）未带端口时回退看板默认端口 7964
-    // （localhost 的 80/443 上没有看板，按协议默认端口会让自动启动以错误端口拉起）；
-    // 远端地址未带端口才按协议默认 443/80
-    port = u.port || (hostname === 'localhost' || hostname === '127.0.0.1' ? '7964' : u.protocol === 'https:' ? '443' : '80');
+    hostname = new URL(url).hostname;
   } catch {
-    /* keep defaults */
+    /* keep default */
   }
+  const port = kanbanPortForUrl(url);
 
   if (!autoStart) {
     throw new Error(

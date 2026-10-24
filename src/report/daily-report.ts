@@ -12,7 +12,13 @@ import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-card
 import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
-import { isWithinDate, localDate, type DailyReportData, type WorkSummaryTask } from '../kanban/summary';
+import {
+  isWithinDate,
+  localDate,
+  taskCollectionIncompleteNote,
+  type DailyReportData,
+  type WorkSummaryTask,
+} from '../kanban/summary';
 
 /**
  * 解析日报目标日期：缺省 / 「今天」/「昨天」/ YYYY-MM-DD；无法识别或未来日期返回 null
@@ -126,8 +132,11 @@ export function renderDailyHtml(data: DailyReportData): string {
   ]
     .filter(Boolean)
     .join('\n');
-  const body = sections || '<p class="empty">（当日没有看板活动记录，也没有进行中的任务）</p>';
+  const body = sections ||
+    `<p class="empty">（${data.incomplete ? '成功采集的项目中，' : ''}当日没有看板活动记录，也没有进行中的任务）</p>`;
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
   const notes = [
+    ...(incompleteNote ? [incompleteNote] : []),
     '「当日」按部署机器本地时区日界统计。',
     '「今日完成」口径：状态已完成且最后更新时间在当日（看板无「完成时间」字段，与周报「本周完成」同一口径）。',
     '「今日失败」按最近一次执行失败标记统计，与状态分组正交（同一任务可同时属于其他分组）。',
@@ -195,6 +204,8 @@ export function buildDailyMaterial(
     `计数：今日完成 ${counts.doneToday} · 进行中 ${counts.inProgress} · 今日失败 ${counts.failedToday} · 今日新待审阅 ${counts.inReviewToday}`,
     '（「今日完成」口径：状态已完成且最后更新时间在当日，与周报「本周完成」同一口径；看板无「完成时间」字段）',
   );
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
+  if (incompleteNote) lines.push(incompleteNote);
   const listGroup = (label: string, tasks: WorkSummaryTask[], total: number, extra?: (t: WorkSummaryTask) => string) => {
     if (!total) return;
     lines.push('', `【${label}】${total} 个`);
@@ -231,7 +242,12 @@ export function buildDailyMaterial(
     lines.push('改动统计：看板未提供当日任务的改动数据，日报中不要编造代码量。');
   }
   if (!data.tasks.length) {
-    lines.push('', '当日没有任何看板活动记录，也没有进行中的任务。请如实说明当天无看板数据，不要编造工作内容。');
+    lines.push(
+      '',
+      data.incomplete
+        ? '成功采集的项目中，当日没有任何看板活动记录，也没有进行中的任务。请如实说明，不要编造工作内容。'
+        : '当日没有任何看板活动记录，也没有进行中的任务。请如实说明当天无看板数据，不要编造工作内容。',
+    );
   }
   return lines.join('\n');
 }

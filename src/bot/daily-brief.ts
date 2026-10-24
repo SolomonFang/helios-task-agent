@@ -1,4 +1,4 @@
-import type { WorkSummaryData } from '../kanban/summary';
+import { taskCollectionIncompleteNote, type WorkSummaryData } from '../kanban/summary';
 import { isKnownStatus } from '../kanban/status';
 import {
   BriefScheduler,
@@ -34,8 +34,11 @@ export function buildDailyBriefText(data: WorkSummaryData, now: Date): string {
     `☀️ 看板晨报 · ${data.sinceLabel}（${localDateStr(now)}）`,
     `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done} · 失败 ${data.totals.failed}${failedNote}`,
   ];
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
+  if (incompleteNote) lines.push(incompleteNote);
   if (!data.tasks.length) {
-    lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
+    const empty = data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。';
+    lines.push('', data.incomplete ? `成功采集的项目中，${empty}` : empty);
   } else {
     let anySection = false;
     for (const section of [

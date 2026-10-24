@@ -81,10 +81,10 @@ async function main(): Promise<void> {
       // truncation note 注入存储侧（system 角色，紧跟 system prompt；不重复注入由 insertTruncationNote 保证）
       assert.equal(messages[1]!.role, 'system');
       assert.equal(messages[1]!.content, HISTORY_TRUNCATED_NOTE);
-      // 重试请求载荷不再含已丢轮次（裁剪注记在恢复成功后才注入历史，供后续轮次使用，
-      // 故本断言只查已丢内容不进载荷）
+      // 恢复请求本身就要携带裁剪注记，不能等成功响应后才补进历史
       const retryPayload = JSON.parse(seen[1]!.body).messages as Array<{ role: string; content: unknown }>;
       assert.ok(!JSON.stringify(retryPayload).includes('第一轮问题'), '重试载荷不应含已丢内容');
+      assert.ok(retryPayload.some((m) => typeof m.content === 'string' && m.content.includes(HISTORY_TRUNCATED_NOTE)), '重试载荷必须含历史裁剪注记');
     } finally {
       await stopServer(server);
     }
@@ -165,8 +165,8 @@ async function main(): Promise<void> {
       assert.equal(seen.length, 4, '原始请求 + 3 次丢轮重试后放弃');
       assert.deepEqual(
         messages.map((m) => m.content),
-        ['sys', '当前问题'],
-        '3 轮丢尽后只剩 system 与当前轮',
+        ['sys', HISTORY_TRUNCATED_NOTE, '当前问题'],
+        '3 轮丢尽后只剩 system、裁剪注记与当前轮',
       );
     } finally {
       await stopServer(server);

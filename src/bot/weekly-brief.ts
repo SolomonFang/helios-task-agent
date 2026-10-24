@@ -1,4 +1,4 @@
-import type { WorkSummaryData } from '../kanban/summary';
+import { taskCollectionIncompleteNote, type WorkSummaryData } from '../kanban/summary';
 import { isKnownStatus } from '../kanban/status';
 import {
   BriefScheduler,
@@ -76,11 +76,14 @@ export function buildWeeklyBriefText(data: WorkSummaryData, now: Date, opts?: { 
     `📅 看板周报 · ${data.sinceLabel}（${localDateStr(weekStart)} 至 ${localDateStr(rangeEnd)}）`,
     `进行中 ${data.totals.inprogress} · 待办 ${data.totals.todo} · 待审阅 ${data.totals.inreview} · 已完成 ${data.totals.done}${doneNote} · 失败 ${data.totals.failed}${failedNote}`,
   ];
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
+  if (incompleteNote) lines.push(incompleteNote);
   if (opts?.makeUpDay) {
     lines.push(`📮 补发：原定每${WEEKDAY_LABELS[opts.makeUpDay - 1] ?? ''}的周报延迟到今天推送。`);
   }
   if (!data.tasks.length) {
-    lines.push('', data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。');
+    const empty = data.iteration ? '这个迭代还没有任务。' : '看板上还没有任务。';
+    lines.push('', data.incomplete ? `成功采集的项目中，${empty}` : empty);
   } else {
     if (!doneThisWeekTotal) lines.push('', '本周暂无新完成的任务。');
     let anySection = false;

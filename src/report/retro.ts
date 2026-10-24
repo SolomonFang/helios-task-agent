@@ -12,7 +12,12 @@ import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-card
 import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { reportsDir } from './report';
 import { isKnownStatus, statusLabel } from '../kanban/status';
-import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
+import {
+  taskCollectionIncompleteNote,
+  type TaskCollectionIncomplete,
+  type WorkSummaryData,
+  type WorkSummaryTask,
+} from '../kanban/summary';
 
 // ---------------------------------------------------------------------------
 // 失败归因：规则化归类（参考 kanban/failure-diagnosis.ts 的类目，但用确定性关键词，
@@ -79,6 +84,8 @@ export interface RetroModel {
   truncated: boolean;
   /** enrich 样本条数。 */
   sampleSize: number;
+  /** 部分项目任务采集失败，所有指标仅覆盖成功项目。 */
+  incomplete?: TaskCollectionIncomplete;
 }
 
 /** 本地星期几，1=周一…7=周日（与 weekly-brief 同口径；Date.getDay 是 0=周日）。 */
@@ -156,6 +163,7 @@ export function buildRetroModel(data: WorkSummaryData, now = new Date()): RetroM
     // total ≤ tasks.length 会漏报截断；旧采集结果缺 scopedTotal 时回退五状态全量和
     truncated: (data.scopedTotal ?? total) > data.tasks.length,
     sampleSize: data.tasks.length,
+    ...(data.incomplete ? { incomplete: data.incomplete } : {}),
   };
 }
 
@@ -218,7 +226,9 @@ export function renderRetroHtml(model: RetroModel): string {
   const failureBody = model.failedTotal
     ? failureSections || '<p class="empty">（清单样本未覆盖失败任务，见上方计数）</p>'
     : '<p class="empty">本范围内没有执行失败的任务。</p>';
+  const incompleteNote = taskCollectionIncompleteNote(model.incomplete);
   const notes = [
+    ...(incompleteNote ? [incompleteNote] : []),
     '完成率 = 已完成 ÷ 任务总数（含已取消）。',
     `「本周完成」口径：状态已完成且最后更新时间在本周（${model.weekRange}，按部署机器时区），按截断前全量统计，与周报同一口径；看板无「完成时间」字段，按最后更新时间近似。`,
     '失败归因是对失败摘要的关键词规则归类（确定性规则，未经模型判读）；无失败摘要的任务归入「其他」。',
@@ -301,6 +311,8 @@ export function buildRetroSummary(
     `吞吐：本周完成 ${model.doneThisWeek}（${model.weekRange}，按最后更新时间口径） · 累计完成 ${model.doneTotal}`,
     `改动统计：改动文件 ${model.diff.filesChanged} · +${model.diff.additions} 行 / -${model.diff.deletions} 行`,
   );
+  const incompleteNote = taskCollectionIncompleteNote(model.incomplete);
+  if (incompleteNote) lines.push(incompleteNote);
   if (model.failedTotal) {
     const classified = model.failureGroups.reduce((n, g) => n + g.tasks.length, 0);
     lines.push(

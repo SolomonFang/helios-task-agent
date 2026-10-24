@@ -4,16 +4,16 @@
  * 为什么存在：Windows 上 Node 原生的 execFile/spawn 不带 shell 无法启动 .cmd 壳
  * （npx / npm / lark-cli / ocr 都是 npm 全局 bin 的 .cmd shim），直接报 ENOENT。
  * cross-spawn 在 win32 下自动改走 cmd.exe 并正确转义参数，命令不存在时仍会
- * 模拟出 ENOENT 的 'error' 事件；POSIX 下行为与原生一致。
+ * 模拟出 ENOENT 的 'error' 事件；execFileCompat 在 POSIX 下另建独立进程组以便整树终止。
  *
  * 但 cross-spawn 只解决「起进程」，execFile/execFileSync 的上层语义（回调错误
  * 形状、timeout 杀进程、maxBuffer 截断、AbortSignal 中断）需要在这里补齐到与
  * Node 原生一致，调用方才能无差别替换。错误形状刻意对齐原生 execFile：
  * - 命令不存在 → error.code === 'ENOENT'，stdout 为空；
  * - 非零退出 → error.code 为退出码（数字），stdout/stderr 照常带回；
- * - timeout 触发 → error.killed === true、error.signal === 'SIGTERM'（调用方据此判超时）；
+ * - timeout 触发 → error.killed === true，error.signal 保留实际退出信号（调用方据此判超时）；
  * - maxBuffer 超限 → 同置 killed 模拟原生，另加 error.bufferExceeded 标记超出的流（与超时区分）；
- * - AbortSignal 触发 → 杀子进程并回调 AbortError（调用方自行查 signal.aborted）。
+ * - AbortSignal 触发 → 杀进程树并回调 AbortError（调用方自行查 signal.aborted）。
  */
 
 import { spawnSync, type ChildProcess, type ExecFileOptions, type SpawnOptions } from 'child_process';
@@ -74,6 +74,7 @@ export function execFileCompat(
     child = crossSpawn(cmd, args as string[], {
       cwd: options.cwd,
       env: options.env as NodeJS.ProcessEnv | undefined,
+      detached: process.platform !== 'win32',
       windowsHide: true,
     });
   } catch (err) {
@@ -82,24 +83,32 @@ export function execFileCompat(
     return undefined as unknown as ChildProcess;
   }
 
-  // 超时升级：killSignal（默认 SIGTERM）发出后给 2s 优雅退出窗口，仍未退出补 SIGKILL——
-  // 否则无视 SIGTERM 的子进程（如卡在不可中断 IO）会让 execFileCompat 永不回调
+  // timeout/abort/maxBuffer 共用同一条终止链：整棵树先 killSignal，2 秒后仍未 close 再整组 SIGKILL。
+  // 孙进程可能继承 stdout/stderr 并忽略 SIGTERM，只杀根进程会让 close 与回调永久悬住。
   let escalateTimer: ReturnType<typeof setTimeout> | null = null;
+  let terminating = false;
+  const terminate = () => {
+    if (terminating) return;
+    terminating = true;
+    if (child.pid !== undefined) killProcessTree(child.pid, killSignal);
+    else child.kill(killSignal);
+    escalateTimer = setTimeout(() => {
+      if (child.pid !== undefined) killProcessTree(child.pid, 'SIGKILL');
+      else child.kill('SIGKILL');
+    }, 2000);
+    escalateTimer.unref?.();
+  };
   const timer =
     options.timeout && options.timeout > 0
       ? setTimeout(() => {
           timedOut = true;
-          child.kill(killSignal);
-          escalateTimer = setTimeout(() => {
-            child.kill('SIGKILL');
-          }, 2000);
-          escalateTimer.unref?.();
+          terminate();
         }, options.timeout)
       : null;
 
   const onAbort = () => {
     aborted = true;
-    child.kill(killSignal);
+    terminate();
   };
   if (options.signal) {
     if (options.signal.aborted) onAbort();
@@ -110,14 +119,14 @@ export function execFileCompat(
     stdout += chunk.toString('utf8');
     if (!bufferExceeded && stdout.length > maxBuffer) {
       bufferExceeded = 'stdout';
-      child.kill(killSignal);
+      terminate();
     }
   });
   child.stderr?.on('data', (chunk: Buffer) => {
     stderr += chunk.toString('utf8');
     if (!bufferExceeded && stderr.length > maxBuffer) {
       bufferExceeded = 'stderr';
-      child.kill(killSignal);
+      terminate();
     }
   });
 

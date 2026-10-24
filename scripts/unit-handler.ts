@@ -85,12 +85,23 @@ function buttonValues(card: Record<string, unknown>): Array<Record<string, unkno
   return out;
 }
 
-/** 收集卡片的全部按钮元素（2.0：平铺在 body.elements）。 */
-function buttonsOf(card: Record<string, unknown>): Array<Record<string, unknown>> {
-  const elements = ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ?? []) as Array<
+/** 收集卡片正文元素与按钮（2.0：平铺在 body.elements）。 */
+function elementsOf(card: Record<string, unknown>): Array<Record<string, unknown>> {
+  return ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ?? []) as Array<
     Record<string, unknown>
   >;
-  return elements.filter((el) => el.tag === 'button');
+}
+
+function buttonsOf(card: Record<string, unknown>): Array<Record<string, unknown>> {
+  return elementsOf(card).filter((el) => el.tag === 'button');
+}
+
+function assertPrimaryButtonCount(card: Record<string, unknown>, expected: number): void {
+  assert.equal(
+    buttonsOf(card).filter((el) => el.type === 'primary_filled').length,
+    expected,
+    '每张卡至多一个 primary_filled，且主操作应符合卡片任务',
+  );
 }
 
 /**
@@ -148,8 +159,11 @@ class FakeChannel implements ChannelUnderTest {
   updateCardCalls = 0;
   /** 测试门控：命中 match 的 updateCard 先等 promise 放行（模拟在途更新延迟，测终态排空）。 */
   updateCardGate: { match: string; promise: Promise<void> } | null = null;
-  /** 模拟 notifyOpenId 按内容选择性失败（命中子串即抛错）。 */
+  updateTextCalls = 0;
+  updateTextGate: { match: string; promise: Promise<void> } | null = null;
+  /** 模拟 notifyOpenId / reply 按内容选择性失败（命中子串即抛错）。 */
   failNotifyIfIncludes: string | null = null;
+  failReplyIfIncludes: string | null = null;
   /** 模拟 sendText / updateText 按内容选择性失败（命中子串即抛错，占位/进度文案不受影响）。 */
   failSendIfIncludes: string | null = null;
   /** 同时匹配 updateText 的文本与 updateCard 的卡片拍平文本（结果卡片更新失败降级链用）。 */
@@ -160,6 +174,7 @@ class FakeChannel implements ChannelUnderTest {
   private messageSeq = 0;
 
   async reply(msg: InboundMessage, text: string): Promise<void> {
+    if (this.failReplyIfIncludes && text.includes(this.failReplyIfIncludes)) throw new Error('reply mock failure');
     this.replies.push({ sessionId: msg.sessionId, text });
   }
   async sendText(_chatId: string, text: string): Promise<string | undefined> {
@@ -169,6 +184,9 @@ class FakeChannel implements ChannelUnderTest {
     return `ph-${++this.messageSeq}`;
   }
   async updateText(_messageId: string, text: string): Promise<void> {
+    this.updateTextCalls++;
+    const gate = this.updateTextGate;
+    if (gate && text.includes(gate.match)) await gate.promise;
     if (this.failUpdateIfIncludes && text.includes(this.failUpdateIfIncludes)) throw new Error('updateText mock failure');
     this.updated.push(text);
   }
@@ -438,6 +456,12 @@ function setup(
   return { channel, router, confirmations, handlers, tmp, confirmPrompts };
 }
 
+function clickLatestRetry(f: Fixture): ReturnType<BotHandlers['onCardAction']> {
+  const value = buttonValues(f.channel.cards.at(-1)!.card).find((v) => v.hta_retry);
+  assert.ok(value?.diagnosisId, '测试应从真实诊断卡片读取 diagnosisId');
+  return f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value } } as FeishuCardAction);
+}
+
 let msgSeq = 0;
 /** 构造一条飞书入站消息（messageId 唯一，typing 回执断言用）。 */
 function mkMsg(senderId: string, text: string, extra: Partial<FeishuInboundMessage> = {}): FeishuInboundMessage {
@@ -603,6 +627,32 @@ async function main(): Promise<void> {
       assert.ok(reply.includes('图片下载失败'), `应给友好提示，实际：${reply}`);
       assert.ok(!reply.includes('ECONNREFUSED'), '不得外抛内部错误细节');
       assert.equal(llm.requestCount, base, '下载失败不得发 LLM 请求');
+      cleanup(f);
+    });
+
+    await checkAsync('handler：图片下载限制每用户一张、全局两张，超出时不继续下载', async () => {
+      let calls = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => {
+          calls++;
+          await gate;
+          return { data: Buffer.from('image'), mimeType: 'image/png' };
+        },
+      });
+      const first = f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_1' }));
+      await waitFor(() => calls === 1, '第一张开始下载');
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_same_user' }));
+      assert.equal(calls, 1, '同用户第二张不得并发下载');
+      const second = f.handlers.handle(mkMsg('u2', '', { messageType: 'image', imageKey: 'img_2' }));
+      await waitFor(() => calls === 2, '第二个用户开始下载');
+      await f.handlers.handle(mkMsg('u3', '', { messageType: 'image', imageKey: 'img_3' }));
+      assert.equal(calls, 2, '全局第三张不得并发下载');
+      assert.equal(f.channel.replies.filter((r) => r.text.includes('图片下载通道正忙')).length, 2);
+      release();
+      await Promise.all([first, second]);
       cleanup(f);
     });
 
@@ -815,6 +865,23 @@ async function main(): Promise<void> {
       cleanup(f);
     });
 
+    await checkAsync('handler：排队辅助回执失败仍入队，不丢用户消息', async () => {
+      const f = setup(llm.baseUrl);
+      llm.mode = 'hang';
+      const base = llm.requestCount;
+      const pA = f.handlers.handle(mkMsg('u1', '第一条'));
+      await waitFor(() => llm.requestCount === base + 1, '第一条进入 LLM');
+      f.channel.failReplyIfIncludes = '已收到并排队';
+      const pB = f.handlers.handle(mkMsg('u1', '第二条'));
+      await waitFor(() => f.channel.addedReactions.length >= 2, '第二条越过失败回执并入队');
+      assert.equal(llm.requestCount, base + 1, '第二条仍应等待第一条');
+      llm.mode = 'ok';
+      llm.release();
+      await Promise.all([pA, pB]);
+      assert.equal(llm.requestCount, base + 2, '辅助回执失败不得吞掉第二条消息');
+      cleanup(f);
+    });
+
     // ---------- /stop 中断当前轮次 ----------
     await checkAsync('handler：/stop 中断正在执行的轮次', async () => {
       const f = setup(llm.baseUrl);
@@ -1023,26 +1090,29 @@ async function main(): Promise<void> {
     });
 
     // ---------- 排队上限：满员拒收并提示 ----------
-    await checkAsync('handler：排队满 20 条后拒收并提示「排队消息已满」', async () => {
-      const f = setup(llm.baseUrl);
+    await checkAsync('handler：排队满 20 条后拒收并提示「排队消息已满」，图片不再下载', async () => {
+      let imageCalls = 0;
+      const f = setup(llm.baseUrl, undefined, {
+        visionEnabled: true,
+        imageFetcher: async () => {
+          imageCalls++;
+          return { data: Buffer.from('image'), mimeType: 'image/png' };
+        },
+      });
       llm.mode = 'hang';
-      const base = llm.requestCount; // 计数跨用例累计，取基线
+      const base = llm.requestCount;
       const pA = f.handlers.handle(mkMsg('u1', '长任务'));
       await waitFor(() => llm.requestCount === base + 1, '长任务进入 LLM');
       const queued: Promise<void>[] = [];
       for (let i = 0; i < 20; i++) queued.push(f.handlers.handle(mkMsg('u1', `排队${i}`)));
       await waitFor(() => f.router.queuedCount('u1') === 20, '20 条排队');
       await f.handlers.handle(mkMsg('u1', '第 21 条'));
-      assert.ok(
-        f.channel.replies.some((r) => r.text.includes('排队消息已满')),
-        '满员后应提示排队消息已满',
-      );
-      assert.ok(
-        f.channel.replies.some((r) => r.text.includes('/stop 中断当前任务并清空排队')),
-        '拒收文案应如实告知 /stop 会连带中断当前任务',
-      );
-      assert.equal(f.router.queuedCount('u1'), 20, '满员后不再入队');
-      await f.handlers.handle(mkMsg('u1', '/stop')); // 清场：中断长任务并丢弃排队
+      await f.handlers.handle(mkMsg('u1', '', { messageType: 'image', imageKey: 'img_full' }));
+      assert.ok(f.channel.replies.some((r) => r.text.includes('排队消息已满')));
+      assert.ok(f.channel.replies.some((r) => r.text.includes('/stop 中断当前任务并清空排队')));
+      assert.equal(imageCalls, 0, '队列满时必须在下载前拒收图片');
+      assert.equal(f.router.queuedCount('u1'), 20);
+      await f.handlers.handle(mkMsg('u1', '/stop'));
       llm.mode = 'ok';
       llm.release();
       await Promise.all([pA, ...queued]);
@@ -1063,7 +1133,7 @@ async function main(): Promise<void> {
       const kbUrl = `http://127.0.0.1:${(kanban.address() as AddressInfo).port}`;
       const f = setup(llm.baseUrl, kbUrl);
       const click = (attempt: string) =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: attempt, title: attempt } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: attempt, title: attempt } } });
       click('a1');
       click('a2');
       await waitFor(() => kanbanRequests >= 2, '两个审查进入进行中');
@@ -1101,7 +1171,7 @@ async function main(): Promise<void> {
       const kbUrl = `http://127.0.0.1:${(kanban.address() as AddressInfo).port}`;
       const f = setup(llm.baseUrl, kbUrl);
       try {
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'a1', title: 'a1' } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: 'a1', title: 'a1' } } });
         await waitFor(() => kanbanRequests >= 1, '审查进入进行中');
         await f.handlers.handle(mkMsg('u1', '/stop'));
         assert.ok(
@@ -1135,7 +1205,7 @@ async function main(): Promise<void> {
         diagnosisRunner: async () => ({ text: '诊断结论：配置缺失', attemptId: 'att-1' }),
       });
       const click1 = () =>
-        f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+        f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       click1();
       await waitFor(() => f1.channel.cards.length === 1, '诊断卡片推送');
       click1();
@@ -1152,7 +1222,7 @@ async function main(): Promise<void> {
         });
         f2.channel.failCard = true;
         const click2 = () =>
-          f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+          f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
         click2();
         await waitFor(() => f2.channel.notifies.some((n) => n.text.includes('要按诊断结论重试')), '文本降级推送');
         click2();
@@ -1176,7 +1246,7 @@ async function main(): Promise<void> {
         },
       });
       const click = () =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', title: '任务X' } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', title: '任务X' } } });
       click();
       await waitFor(() => f.channel.cards.length === 1, '首次诊断卡片推送');
       click(); // 之后再次失败点「AI 诊断」：不得谎称「已诊断过」
@@ -1201,7 +1271,7 @@ async function main(): Promise<void> {
       console.error = (...args: unknown[]) => errLogs.push(args.map(String).join(' '));
       try {
         const click = () =>
-          f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+          f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
         click();
         await waitFor(() => errLogs.some((m) => m.includes('降级文本推送也失败')), '双路推送均失败');
         assert.equal(calls, 1);
@@ -1229,10 +1299,10 @@ async function main(): Promise<void> {
           await gate;
         },
       });
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
       const clickRetry = () =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+        clickLatestRetry(f);
       clickRetry();
       clickRetry(); // 连点：第一次还挂在 follow-up 请求上，第二次必须被落键拦截
       releaseFollowUp();
@@ -1258,10 +1328,10 @@ async function main(): Promise<void> {
           throw new Error('执行记录已被看板清理，请到看板手动重新发起。');
         },
       });
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
       const clickRetry = () =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+        clickLatestRetry(f);
       clickRetry();
       await waitFor(() => f.channel.notifies.some((n) => n.text.includes('重试发起失败')), '重试失败回执');
       const fail = f.channel.notifies.find((n) => n.text.includes('重试发起失败'))!;
@@ -1301,7 +1371,7 @@ async function main(): Promise<void> {
           followUps.push(prompt);
         },
       });
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
       await f.handlers.handle(mkMsg('u1', '重试这个任务'));
       // 受理后应立即给回执（作业异步，结果随后推送），不得原地静默
@@ -1355,7 +1425,7 @@ async function main(): Promise<void> {
         `无审查记录时应如实告知，实际：${f.channel.replies.map((r) => r.text).join(' | ')}`,
       );
       // 先点一次「AI 审查」留下记录（受理成功即记录，文本分支据此定位）
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'a1', title: '任务X' } } });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: 'a1', title: '任务X' } } });
       await waitFor(() => reviewCalls === 1, '首次审查已发起');
       // 文本触发重新审查：受理回执 + 复用 tryStartAiReview 再跑一次
       await f.handlers.handle(mkMsg('u1', '重新审查这个任务'));
@@ -2014,6 +2084,68 @@ async function main(): Promise<void> {
       }
     });
 
+    // ---------- progress：文本更新按占位串行，所有终态前排空在途心跳且终态后禁止刷新 ----------
+    await checkAsync('progress：文本延迟心跳不得覆盖 deliverReply/finalize 终态', async () => {
+      const origErr = console.error;
+      console.error = () => {}; // 每条用例强制卡片创建失败以进入文本占位路径
+      try {
+        for (const kind of ['deliverReply', 'aborted', 'failed', 'failedNoDetail'] as const) {
+          const channel = new FakeChannel();
+          channel.failCardKit = true;
+          channel.failSendCard = true;
+          let releaseGate!: () => void;
+          channel.updateTextGate = { match: '已等待', promise: new Promise<void>((r) => (releaseGate = r)) };
+          const kit = createProgressKit({ channel, heartbeatMs: 30, hasPendingConfirm: () => null });
+          const msg = mkMsg('u1', 'x');
+          const id = await kit.sendPlaceholder(msg);
+          const activity = { lastEventAt: Date.now() - 1000 };
+          const stop = kit.startProgressHeartbeat(id, activity, 'u1');
+          try {
+            await waitFor(() => channel.updateTextCalls === 1, '文本心跳在途更新（被门控卡住）');
+            const report = kit.createProgressReporter(id, activity);
+            report({ type: 'think' }); // 排在被卡住的心跳之后，终态必须先排空这次旧更新
+            const expected =
+              kind === 'deliverReply'
+                ? '最终结果'
+                : kind === 'aborted'
+                  ? '已中断测试'
+                  : kind === 'failed'
+                    ? '⚠️ 处理失败，详见下方'
+                    : '⚠️ 处理失败，且失败详情也未能送达，请把刚才的问题再发一次。';
+            const p =
+              kind === 'deliverReply'
+                ? kit.deliverReply(msg, id, expected)
+                : kind === 'aborted'
+                  ? kit.finalizeAborted(id, msg, expected)
+                  : kind === 'failed'
+                    ? kit.finalizeFailed(id)
+                    : kit.finalizeFailedNoDetail(id);
+            report({ type: 'think' }); // 终态已开始：新进度不得再入链
+            await new Promise((r) => setTimeout(r, 60));
+            assert.equal(channel.updateTextCalls, 1, `${kind}：心跳未放行时后续更新与终态都必须等待`);
+            assert.ok(!channel.updated.includes(expected), `${kind}：在途旧更新未排空前不得写终态`);
+            releaseGate();
+            await p;
+            assert.deepEqual(
+              channel.updated.map((t) => (t.includes('已等待') ? 'heartbeat' : t.includes('思考中') ? 'think' : 'terminal')),
+              ['heartbeat', 'think', 'terminal'],
+              `${kind}：旧心跳、已排队进度、终态必须依次到达`,
+            );
+            assert.equal(channel.updated.at(-1), expected, `${kind}：最终文案必须最后写入`);
+            const settledCalls = channel.updateTextCalls;
+            activity.lastEventAt = Date.now() - 1000;
+            await new Promise((r) => setTimeout(r, 80));
+            assert.equal(channel.updateTextCalls, settledCalls, `${kind}：终态后心跳不得再更新`);
+          } finally {
+            releaseGate();
+            stop();
+          }
+        }
+      } finally {
+        console.error = origErr;
+      }
+    });
+
     // ---------- progress：结果卡更新与首段直发都失败时，终态卡为「投递失败」（不谎称「见下方」） ----------
     await checkAsync('progress：结果卡更新与首段直发都失败时终态卡为投递失败措辞', async () => {
       const channel = new FakeChannel();
@@ -2431,11 +2563,11 @@ async function main(): Promise<void> {
         followUpSender: async () => {},
       });
       const diagnose = () =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       diagnose();
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
       // 发起重试：诊断卡片原地置无按钮终态（重试按钮从此消失）
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+      clickLatestRetry(f);
       await waitFor(() => f.channel.notifies.some((n) => n.text.includes('已按诊断结论发起重试')), '重试发起回执');
       diagnose();
       await waitFor(() => f.channel.notifies.some((n) => n.text.includes('已诊断过')), '去重回执');
@@ -2460,7 +2592,7 @@ async function main(): Promise<void> {
       const click = () =>
         f.handlers.onCardAction({
           operator: { open_id: 'u1' },
-          action: { value: { hta_review: 'a1', title: '任务X', url: 'http://kb.local/t/1' } },
+          action: { value: { owner: 'u1', hta_review: 'a1', title: '任务X', url: 'http://kb.local/t/1' } },
         });
       const resp = click();
       assert.ok(resp?.toast?.content.includes('已开始'), `toast 应告知已开始，实际：${resp?.toast?.content}`);
@@ -2490,7 +2622,7 @@ async function main(): Promise<void> {
         },
       });
       const click = (attempt: string) =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: attempt, title: attempt } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: attempt, title: attempt } } });
       click('a1');
       click('a2');
       await waitFor(() => reviewCalls === 2, '两个审查进入进行中');
@@ -2519,7 +2651,7 @@ async function main(): Promise<void> {
         },
       });
       const click = (task: string) =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: task, title: task } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: task, title: task } } });
       click('t1');
       click('t2');
       // 开始文本通知已随刷屏治理移除：进行中判定改数诊断执行次数
@@ -2550,7 +2682,7 @@ async function main(): Promise<void> {
       const click = () =>
         f.handlers.onCardAction({
           operator: { open_id: 'u1' },
-          action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X', url: 'http://kb.local/t/1' } },
+          action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X', url: 'http://kb.local/t/1' } },
         });
       const resp = click();
       assert.ok(resp?.toast?.content.includes('已开始'), `toast 应告知已开始，实际：${resp?.toast?.content}`);
@@ -2593,14 +2725,14 @@ async function main(): Promise<void> {
         },
       });
       // 无诊断结论：只 toast 指引，不换卡
-      const noDiag = f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't9', title: '任务Y' } } });
+      const noDiag = f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't9', diagnosisId: 'missing', owner: 'u1', title: '任务Y' } } });
       assert.ok(noDiag?.toast?.content.includes('找不到诊断结论'), `实际：${noDiag?.toast?.content}`);
       assert.ok(!noDiag?.card, '无结论不得换卡');
       // 先完成一次诊断拿到结论
-      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f.channel.cards.length === 1, '诊断卡片推送');
       const clickRetry = () =>
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+        clickLatestRetry(f);
       const r1 = clickRetry();
       assert.ok(r1?.card?.data, '首次重试应换进行中卡片');
       assert.ok(r1?.toast?.content.includes('正在发起重试'), `实际：${r1?.toast?.content}`);
@@ -2628,9 +2760,9 @@ async function main(): Promise<void> {
           sentTo.push(attemptId);
         },
       });
-      f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f1.channel.cards.length === 1, '诊断卡片推送');
-      const resp1 = f1.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+      const resp1 = clickLatestRetry(f1);
       assert.ok(resp1?.card?.data, '受理后应换进行中卡片');
       await waitFor(() => f1.channel.notifies.some((n) => n.text.includes('已按诊断结论发起重试')), '补拉后重试回执');
       assert.deepEqual(sentTo, ['att-9'], 'follow-up 应发到补拉出的 attempt');
@@ -2645,9 +2777,9 @@ async function main(): Promise<void> {
           sentTo2.push(attemptId);
         },
       });
-      f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
+      f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 't1', attempt: 'a1', title: '任务X' } } });
       await waitFor(() => f2.channel.cards.length === 1, '诊断卡片推送');
-      f2.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 't1', title: '任务X' } } });
+      clickLatestRetry(f2);
       await waitFor(
         () => f2.channel.notifies.some((n) => n.text.includes('找不到可重试的执行记录')),
         '补拉为空应如实通知',
@@ -2666,6 +2798,12 @@ async function main(): Promise<void> {
       assert.ok(rt.includes('✓ 理解需求') && rt.includes('⏳ 创建任务'), `步骤轨迹，实际：${rt}`);
       assert.ok(rt.includes('已等待 3 秒'), `注脚应含等待秒数，实际：${rt}`);
       assert.equal(buttonValues(running)[0]?.hta_stop, 'card-9', '停止按钮应带轮次令牌（占位消息 id）');
+      assert.deepEqual(
+        elementsOf(running).filter((el) => el.element_id).map((el) => el.element_id),
+        ['hta_main', 'hta_stop'],
+        'CardKit 正文与停止按钮锚点必须保持不变',
+      );
+      assertPrimaryButtonCount(running, 0);
       // 停止是非破坏动作：default 样式（与确认卡「✖️ 取消」一致），不用 danger 红
       assert.equal((buttonsOf(running)[0] as { type?: string }).type, 'default', '进度卡停止按钮应为 default');
       // 流式会话预览文案：全角括号
@@ -2707,8 +2845,23 @@ async function main(): Promise<void> {
       const confirmReq: ConfirmRequest = { kind: 'kanban', summary: 's', detail: 'd', batchKey: 'k' };
       const confirmMerged = buildConfirmCard(confirmReq, 'cid', 120000, { stopToken: 'card-9' });
       const cv = buttonValues(confirmMerged);
-      assert.equal(cv.find((v) => 'hta_stop' in v)?.hta_stop, 'card-9', '确认卡停止按钮应带轮次令牌');
-      assert.ok(cv.some((v) => v.hta_confirm === 'cid' && v.decision === 'yes'), '确认按钮仍在');
+      assert.deepEqual(
+        cv,
+        [
+          { hta_confirm: 'cid', decision: 'yes' },
+          { hta_confirm: 'cid', decision: 'batch' },
+          { hta_confirm: 'cid', decision: 'no' },
+          { hta_stop: 'card-9' },
+        ],
+        '美化不得改变确认、免问、取消和停止的回调 value',
+      );
+      assertPrimaryButtonCount(confirmMerged, 1);
+      assert.equal(
+        elementsOf(confirmMerged).find((el) => el.element_id === 'hta_stop')?.tag,
+        'button',
+        '合并确认卡的 hta_stop 锚点必须保留',
+      );
+      assert.ok(cardText(confirmMerged).includes('```\nd\n```'), '确认卡必须保留完整命令详情');
       // 「✖️ 取消」（拒绝本次）与「⏹ 停止」（中断整个任务）并存时注脚点明区别
       assert.ok(cardText(confirmMerged).includes('「停止」会中断整个任务'), '停止按钮并存时注脚应区分取消与停止');
       const confirmSolo = buildConfirmCard(confirmReq, 'cid', 120000);
@@ -2727,6 +2880,8 @@ async function main(): Promise<void> {
       assert.equal(openUrl?.default_url, 'http://localhost:7964/x', '按钮应指向看板链接');
       assert.equal(openUrl?.pc_url, 'http://localhost:7964/x', 'open_url 全端兜底');
       assert.ok((urlBtn!.text as { content?: string })?.content?.includes('查看任务'), '按钮文案');
+      assert.equal(urlBtn!.type, 'default', '查看任务必须为次按钮');
+      assertPrimaryButtonCount(resultUrl, 0);
       assert.ok(cardText(resultUrl).includes('链接仅本机可达'), 'loopback 链接应带可达性注脚');
       assert.ok(buttonsOf(result).length === 0, '无 url 时结果卡不应有按钮');
       // 总用时：≥120 秒换算「N 分 N 秒」，小于 120 秒保持秒数
@@ -2755,11 +2910,22 @@ async function main(): Promise<void> {
       const deliverFailedText = cardText(buildProgressTerminalCard('deliverFailed'));
       assert.ok(!deliverFailedText.includes('见下方'));
       assert.ok(deliverFailedText.includes('请把刚才的问题再发一次'), `实际：${deliverFailedText}`);
-      // 进行中卡片：蓝头 + 标题 + 失败兜底说明；有 url 保留「查看任务」链接，无 url 无按钮
-      const job = buildJobProcessingCard('任务X', 'review', 'http://kb.local/t/1');
+      // 进行中卡片：短色头只放状态，长标题在正文加粗；结构为标题→正文→分隔线→次按钮→注脚
+      const longTitle = '超长任务标题'.repeat(12);
+      const job = buildJobProcessingCard(longTitle, 'review', 'http://kb.local/t/1');
       assert.equal((job.header as { template: string }).template, 'blue');
+      assert.ok(!(job.header as { title: { content: string } }).title.content.includes(longTitle), '长标题不得再塞进色头');
+      const jobElements = elementsOf(job);
+      assert.equal(jobElements[0]?.content, `**《${longTitle}》**`, '长标题应在正文首项加粗');
+      assert.deepEqual(
+        jobElements.map((el) => el.tag),
+        ['markdown', 'markdown', 'hr', 'button', 'markdown'],
+        '进行中卡片应保持标题、正文、分隔线、操作、注脚顺序',
+      );
+      assertPrimaryButtonCount(job, 0);
+      assert.equal(buttonsOf(job)[0]?.type, 'default', '查看任务必须为次按钮');
       const jt = cardText(job);
-      assert.ok(jt.includes('AI 审查进行中') && jt.includes('任务X'), `实际：${jt}`);
+      assert.ok(jt.includes('AI 审查进行中') && jt.includes(longTitle), `实际：${jt}`);
       assert.ok(jt.includes('以新消息推送'), '进行中卡片应如实说明结果以新消息推送（作业失败卡片不会自己再变）');
       assert.ok(jt.includes('机器人重启会中断本次作业（重启后会推送中断通知）'), '进行中卡片应如实说明重启中断与补通知');
       assert.ok(JSON.stringify(job).includes('http://kb.local/t/1'), '有 url 时应保留查看任务按钮');
@@ -2787,7 +2953,7 @@ async function main(): Promise<void> {
           aiReviewRunner: async () => '审查结论：无问题',
         });
         f.channel.failCard = true; // 卡片推送失败
-        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'a9', title: '任务X' } } });
+        f.handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: 'a9', title: '任务X' } } });
         await waitFor(() => f.channel.notifies.some((n) => n.text.includes('改为文本推送')), '降级文本推送');
         const degraded = f.channel.notifies.find((n) => n.text.includes('改为文本推送'))!;
         assert.ok(degraded.text.includes('AI 审查结果'), '降级推送应带审查结果');

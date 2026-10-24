@@ -271,9 +271,10 @@ export async function main(): Promise<void> {
   let currentCtl: AbortController | null = null;
   const spinner = new Spinner('思考中…');
   /** MCP 实例登记处：onCreate 在实例创建时（connect 发起前）即登记，45s 连接窗口内收到信号也能 close。 */
-  const cleanupRes: { mcp: KanbanMcp | null; reminderRunner: ReminderRunner | null } = {
+  const cleanupRes: { mcp: KanbanMcp | null; reminderRunner: ReminderRunner | null; historyStore: SessionHistoryStore | null } = {
     mcp: null,
     reminderRunner: null,
+    historyStore: null,
   };
 
   /**
@@ -309,6 +310,7 @@ export async function main(): Promise<void> {
     cleanup: async () => {
       spinner.stop();
       await cleanupRes.reminderRunner?.stop();
+      await cleanupRes.historyStore?.drain();
       await cleanupRes.mcp?.close();
       // 轮次后直接 /exit（或退出信号）时缓冲提醒尚未 flush，但已 markDelivered 落盘：
       // 退出前补一次展示，否则这批提醒永久丢失
@@ -411,10 +413,12 @@ export async function main(): Promise<void> {
   const confirmWrite: ConfirmFn = createCliConfirm(askWithAbort, spinner);
 
   const reminders = new ReminderStore();
+  const historyStore = new SessionHistoryStore();
+  cleanupRes.historyStore = historyStore;
   const session = new AgentSession(cfg, mcpOk ? mcp : null, mcpOk, {
     userId: 'local',
     confirm: confirmWrite,
-    historyStore: new SessionHistoryStore(),
+    historyStore,
     reminders,
   });
 

@@ -50,7 +50,7 @@ function envelopeData(json: unknown): unknown {
 
 /**
  * 组合调用方 signal 与超时兜底：任一触发即中断。
- * AbortSignal.any 需 Node 20.3+（engines 要求 >=20），这里手写等价组合：
+ * 这里手写组合并显式清理监听器：
  * 挂在调用方 signal 上的监听器随 ctl 触发（任一分支到点）即摘除，不会在
  * 调用方 signal 上累积滞留（waitForWorkspaceReady 以同一 turn 级 signal 高频轮询）。
  * 同样不能用 AbortSignal.any 的地方（如 failure-diagnosis）复用本函数，勿另写变体。

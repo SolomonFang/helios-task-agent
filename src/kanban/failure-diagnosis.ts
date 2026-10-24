@@ -197,7 +197,7 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
   const timeoutMs = opts.timeoutMs ?? DIAGNOSIS_TIMEOUT_MS;
   // 总时长兜底：OpenAI 客户端的 timeout 只是单次尝试（maxRetries:2 叠加最坏 3 倍），
   // 用超时兜底与调用方 signal 组合约束整段 complete（含全部重试）；
-  // AbortSignal.any 需 Node 20.3+（engines 只要求 >=20），复用 http.ts 的手写组合
+  // 复用 http.ts 的手写组合，任一到点/中断信号都会结束整段请求并清理监听器
   const turnSignal = combinedSignal(opts.signal, timeoutMs);
   const complete =
     opts.complete ??
@@ -241,8 +241,8 @@ export async function runFailureDiagnosis(opts: RunFailureDiagnosisOptions): Pro
 }
 
 /** 取任务最新 attempt id（重试时诊断结论缺 attemptId 的补拉；无 attempt 返回 undefined）。 */
-export async function latestAttemptId(kanbanUrl: string, taskId: string): Promise<string | undefined> {
-  return pickLatestAttempt(await apiGet(kanbanUrl, `/task-attempts?task_id=${taskId}`))?.id;
+export async function latestAttemptId(kanbanUrl: string, taskId: string, signal?: AbortSignal): Promise<string | undefined> {
+  return pickLatestAttempt(await apiGet(kanbanUrl, `/task-attempts?task_id=${taskId}`, { signal }))?.id;
 }
 
 /**
@@ -262,10 +262,11 @@ function followUpRequestError(err: unknown): Error {
  * 以诊断结论作为 follow-up 指令重启任务：定位 attempt 的最新会话后 POST follow-up。
  * 按钮点击本身就是用户显式授权（与审批/AI 审查按钮同一语义），不再走二次确认。
  */
-export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string, prompt: string): Promise<void> {
+export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string, prompt: string, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error('已中断');
   let raw: unknown;
   try {
-    raw = await apiGet(kanbanUrl, `/sessions?workspace_id=${encodeURIComponent(attemptId)}`);
+    raw = await apiGet(kanbanUrl, `/sessions?workspace_id=${encodeURIComponent(attemptId)}`, { signal });
   } catch (err) {
     throw followUpRequestError(err);
   }
@@ -284,8 +285,10 @@ export async function sendDiagnosisFollowUp(kanbanUrl: string, attemptId: string
   if (!sessionId) {
     throw new Error('找不到该任务的执行会话（可能已被看板清理），无法自动重试。请到看板手动重新发起该任务。');
   }
+  // GET 完成到 POST 之间也可能收到 /stop：写请求前必须再查，避免已取消仍发出重试。
+  if (signal?.aborted) throw new Error('已中断');
   try {
-    await apiPost(kanbanUrl, `/sessions/${encodeURIComponent(sessionId)}/follow-up`, { prompt });
+    await apiPost(kanbanUrl, `/sessions/${encodeURIComponent(sessionId)}/follow-up`, { prompt }, { signal });
   } catch (err) {
     throw followUpRequestError(err);
   }

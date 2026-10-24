@@ -27,7 +27,7 @@ npx helios-task-agent@latest
 
 ## 安装
 
-要求：Node.js ≥ 20，macOS / Linux / Windows。
+要求：Node.js ≥ 22，macOS / Linux / Windows。
 
 ```bash
 npm i -g helios-task-agent
@@ -43,7 +43,7 @@ helios-task-agent --version   # 查看版本
 
 **自动更新检查**：启动时会探测 npm 上的新版本（结果缓存 24 小时，离线自动跳过；跟随你 npm 配置的 registry 镜像），发现新版本会附变更记录（CHANGELOG）链接并请示是否立即更新。`HTA_UPDATE_CHECK=0` 关闭；手动更新：`npm i -g helios-task-agent@latest`。
 
-**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban@latest` 拉起（默认跟随最新版，`HELIOS_KANBAN_PACKAGE` 可覆盖为指定版本；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
+**helios-kanban 无需预装**：本机看板不可达时 agent 会自动 `npx -y helios-kanban@latest` 拉起（默认始终使用最新发布版本；需要固定版本时可用 `HELIOS_KANBAN_PACKAGE` 显式覆盖；监听地址默认 `127.0.0.1`）。可用 `HELIOS_KANBAN_URL` 指向已有实例，`HELIOS_KANBAN_AUTO_START=0` 关闭自动拉起。
 
 **飞书读取需另装 lark-cli**（不装则飞书任务/文档读取不可用，看板功能不受影响）：
 
@@ -87,7 +87,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 | 会话创建上限 | 单会话最多创建 **50** 个看板任务；超限需 `/clear` 后再建 |
 | 只读白名单 | `lark_cli`：list/get/search 等只读直接放行；写操作与未知命令进闸门；`api` 仅 GET 免确认；`update`（自更新）与夹带参数的 `--help` 按写操作处理 |
 | 防注入标记 | `lark_cli` / 看板工具（MCP、`hk_cli`）/ `repo_fs` 的读回内容，以及看板事件、AI 审查结果的会话注入，统一包裹 UNTRUSTED；其中「指令」无效。被骗发起写操作仍会被闸门拦下，且拒绝后禁止换工具重试同一操作 |
-| owner 认领 | `FEISHU_ALLOWED_OPEN_IDS` 留空时，首个私聊用户自动成为 owner 并写回 `.env`；其余用户拒绝（每人只提示一次） |
+| owner 认领 | `FEISHU_ALLOWED_OPEN_IDS` 留空时，启动终端显示一次性配对码；用户在私聊发送「配对码 <配对码>」才成为 owner 并写回 `.env`，普通首条私聊不能抢绑。重启换码；已配置白名单时行为不变 |
 | 来源查重 | 飞书链接 → 任务映射按用户分桶存 `synced-sources.json`；重复同步拦截。原任务已删则映射清理后可再同步；看板不可达时保守拦截 |
 | 审计日志 | 批准/拒绝/重复拦截（`blocked_dup`）/无闸门/执行结果等追加到 `audit.log`（JSONL） |
 | 工作区就绪 | start 时补齐仓库 `base_branch`；检测 setup 静默失败，避免 UI 无限转圈 |
@@ -96,7 +96,7 @@ npm i -g @larksuite/cli && lark-cli auth login
 
 约每 60 秒轮询看板（可调）。任务进入待审阅（`inreview`，附 diff 直链）/完成（附摘要）/取消、执行失败、新待审批 → 推送飞书并注入会话上下文，可直接回「这个怎么样 / 帮我审一下」。
 
-待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），结果要求简体中文输出，完整内容渲染为 HTML 报告（写入数据目录 `reviews/`，由 bot 内置静态服务托管），飞书只推报告链接（长结果不再截断），同时注入会话（可直接回「按审查意见修一下」）。
+待审阅卡片带两个按钮：「🔍 人工审查」打开看板 diff 视图；「🤖 AI 审查」调用 [open-code-review](https://github.com/alibaba/open-code-review)（`ocr`）审查该 attempt 的 diff（与看板 diff 视图同口径：merge-base(target)..attempt 分支），结果要求简体中文输出，完整内容渲染为 HTML 报告（写入数据目录 `reviews/`，由 bot 内置静态服务托管），飞书只推报告链接（长结果不再截断），同时注入会话（可直接回「按审查意见修一下」）。多仓任务会逐仓顺序审查并按仓库汇总；任一仓库失败则整体失败，不会只审首仓或把部分结果标成全部通过。
 
 失败卡片带「🔍 AI 诊断」按钮：采集该任务失败 attempt 的可用信息（任务描述/失败摘要/diff 统计，以看板实际能返回的为准）调模型生成中文诊断（失败原因归类 + 关键证据摘要 + 建议修复方向），推诊断结果卡片并注入会话；诊断卡片带「↻ 按诊断结论重试」按钮，点击即把诊断结论（失败原因 + 修复建议）作为跟进指令发给执行 Agent 重启任务（点击即显式授权，不再二次确认；重试发起后按钮原地置为终态）。诊断的模型配置与 AI 审查同一派生口径（`OCR_LLM_*` 逐项优先、缺项回退机器人模型配置），整体超时 6 分钟；模型不可用/超时会推送明确的中文失败提示。
 
@@ -204,11 +204,11 @@ digest_sections:        # 声明哪些 `## ` 章节注入系统提示词（大�
 |------|------|
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 必填（向导可写） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | bot 必填（向导可写） |
-| `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；**留空则首个私聊用户成为 owner**（先聊先得，机器人可被他人搜到时存在被抢占风险，建议显式配置） |
+| `FEISHU_ALLOWED_OPEN_IDS` | 可选 open_id 白名单；留空时须用启动终端显示的一次性配对码私聊绑定 owner，普通首聊无权限；重启换码 |
 | `HELIOS_KANBAN_URL` | 看板地址，默认 `http://localhost:7964` |
 | `HELIOS_KANBAN_AUTO_START` | 默认开；本机看板未就绪时自动拉起；`0` 关闭 |
-| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@latest --mcp` |
-| `HELIOS_KANBAN_PACKAGE` | 自动拉起 / MCP 默认的 helios-kanban 包规格，默认 `helios-kanban@latest` 跟随最新版，可改为指定版本 |
+| `HELIOS_KANBAN_MCP_COMMAND` / `HELIOS_KANBAN_MCP_ARGS` | MCP 启动命令，默认 `npx` + `-y helios-kanban@latest --mcp`；ARGS 可用 JSON 字符串数组保留参数内空格，也兼容旧空白分隔格式 |
+| `HELIOS_KANBAN_PACKAGE` | 自动拉起 / MCP 默认的 helios-kanban 包规格，默认 `helios-kanban@latest` 跟随最新版，可显式固定版本 |
 | `HELIOS_KANBAN_HOST` | 自动拉起看板的监听地址，默认 `127.0.0.1`（看板 Web/API 无鉴权，谨慎改为 `0.0.0.0`） |
 | `HELIOS_REPORT_HOST` | AI 审查报告静态服务的监听地址，默认 `127.0.0.1`（**不跟随** `HELIOS_KANBAN_HOST`；报告含代码 diff，确需对外暴露才改） |
 | `OCR_PACKAGE` | AI 审查在 `ocr` 未安装时 npx 拉取的包规格，默认钉版本 `@alibaba-group/open-code-review@1.8.0` |

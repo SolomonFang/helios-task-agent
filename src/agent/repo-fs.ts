@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { errMessage } from '../infra/err';
 import { truncate as truncateOutput } from './tools/shared';
+import { combinedSignal } from '../kanban/http';
 
 const MAX_GREP_HITS = 40;
 const MAX_LIST_ENTRIES = 200;
@@ -79,8 +80,7 @@ const ABORTED_TEXT = '⏹ 已中断（未完成的操作未执行，可继续对
 
 /** fetch 的超时与轮次中断（/stop、墙钟看门狗）合并：任一触发即掐断在途请求。 */
 function fetchSignal(signal?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(8000);
-  return signal ? AbortSignal.any([timeout, signal]) : timeout;
+  return combinedSignal(signal, 8000);
 }
 
 export async function fetchRepoPath(

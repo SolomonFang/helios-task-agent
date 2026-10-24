@@ -11,7 +11,7 @@ import { formatGeneratedAt, htmlStatCard, REPORT_CARDS_CSS } from './report-card
 import { writeFilePrivate, ensurePrivateDirSync } from '../infra/private-file';
 import { newReportToken, pruneOldReports, safeHttpUrl, sanitizeName } from './report-utils';
 import { TASK_STATUS_KEYS, isKnownStatus, statusLabel } from '../kanban/status';
-import type { WorkSummaryData, WorkSummaryTask } from '../kanban/summary';
+import { taskCollectionIncompleteNote, type WorkSummaryData, type WorkSummaryTask } from '../kanban/summary';
 
 // escapeHtml 已移到 report-page.ts（两个报告渲染器共用）；re-export 兼容既有调用方
 export { escapeHtml } from './report-page';
@@ -100,6 +100,8 @@ export function renderMarkdown(data: WorkSummaryData): string {
     '| --- | --- | --- | --- | --- | --- | --- | --- |',
     `| ${totals.done} | ${totals.inreview} | ${totals.inprogress} | ${totals.todo} | ${totals.cancelled} | ${totals.filesChanged} | +${totals.additions} | -${totals.deletions} |`,
   ];
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
+  if (incompleteNote) lines.push('', `> ${incompleteNote}`);
   const sampleNote = sampleStatsNote(data);
   if (sampleNote) lines.push('', `> ${sampleNote}`);
   lines.push('');
@@ -122,7 +124,9 @@ export function renderMarkdown(data: WorkSummaryData): string {
       lines.push('');
     }
   }
-  if (!data.tasks.length) lines.push('（该范围内没有匹配的任务）', '');
+  if (!data.tasks.length) {
+    lines.push(`（${data.incomplete ? '成功采集的项目中，' : ''}该范围内没有匹配的任务）`, '');
+  }
   const note = truncationNote(data);
   if (note) lines.push(`> ${note}`, '');
   return lines.join('\n');
@@ -193,8 +197,9 @@ export function renderHtml(data: WorkSummaryData): string {
   }
   const body = sections.length
     ? sections.join('\n')
-    : '<p class="empty">（该范围内没有匹配的任务）</p>';
+    : `<p class="empty">（${data.incomplete ? '成功采集的项目中，' : ''}该范围内没有匹配的任务）</p>`;
   const note = truncationNote(data);
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
   const sampleNote = sampleStatsNote(data);
   return renderReportPage({
     title: `工作总结 · ${escapeHtml(data.sinceLabel)}`,
@@ -213,7 +218,7 @@ export function renderHtml(data: WorkSummaryData): string {
     ${htmlStatCard(String(totals.filesChanged), '改动文件')}
     ${htmlStatCard(`+${totals.additions}`, '新增行', 'add')}
     ${htmlStatCard(`-${totals.deletions}`, '删除行', 'del')}
-  </section>${sampleNote ? `\n  <p class="trunc-note">${escapeHtml(sampleNote)}</p>` : ''}
+  </section>${incompleteNote ? `\n  <p class="trunc-note">${escapeHtml(incompleteNote)}</p>` : ''}${sampleNote ? `\n  <p class="trunc-note">${escapeHtml(sampleNote)}</p>` : ''}
   ${body}${note ? `\n  <p class="trunc-note">${escapeHtml(note)}</p>` : ''}`,
   });
 }
@@ -299,6 +304,8 @@ export function summarizeForChat(
       ` · 改动文件 ${totals.filesChanged} · +${totals.additions} 行 / -${totals.deletions} 行` +
       (sampleNote ? `（${sampleNote}）` : ''),
   );
+  const incompleteNote = taskCollectionIncompleteNote(data.incomplete);
+  if (incompleteNote) lines.push(incompleteNote);
   for (const t of data.tasks.slice(0, 5)) {
     lines.push(`· ${statusMeta(t.status).emoji} ${t.title || '（无标题）'}`);
   }

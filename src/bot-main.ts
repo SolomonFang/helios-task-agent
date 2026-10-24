@@ -12,11 +12,12 @@
 
 import readline from 'readline';
 import path from 'path';
+import { randomBytes } from 'crypto';
 import { currentConfig, ensureEnvLoaded, feishuBotConfig, isConfigured, isFeishuBotConfigured, userEnvPath, writeEnvFile } from './config/config';
 import { ensureBotConfig, ensureConfig, rebindFeishuBot } from './config/config-wizard';
 import { MemoryStore } from './agent/memory';
 import { defaultDataHome } from './infra/paths';
-import { FeishuChannel } from './channels/feishu';
+import { FeishuChannel, maskOpenId } from './channels/feishu';
 import { SessionRouter } from './agent/session-router';
 import { SessionHistoryStore } from './agent/session-store';
 import { stopKanbanChild, fetchHealth } from './kanban/kanban-ensure';
@@ -58,7 +59,7 @@ const BOT_HELP = `Helios Task Agent（飞书私聊）
 /skills   列出技能；install <路径> 安装（升级不丢失）；uninstall <名称> 卸载
 /memory   查看你的持久化记忆
 /clear    清空本对话历史（不清记忆）
-/stop     中断当前任务与进行中的 AI 审查/诊断（排队消息与待确认写操作一并取消）
+/stop     中断当前任务与进行中的 AI 审查/诊断/重试（排队消息与待确认写操作一并取消）
 /confirm  查看「免问授权」状态；/confirm revoke 或回复「恢复确认」撤销免问
 
 写操作安全闸门
@@ -176,6 +177,7 @@ interface BotCleanup {
   weeklyBrief: WeeklyBrief | null;
   reminderRunner: ReminderRunner | null;
   historyStore: SessionHistoryStore | null;
+  reviewJobs: { stopAll(): void } | null;
 }
 
 interface ConfirmAssembly {
@@ -303,14 +305,14 @@ function assembleConfirmations(channel: FeishuChannel): ConfirmAssembly {
 }
 
 /**
- * owner 认领钩子：白名单为空时首个私聊用户自动成为 owner，写回 .env（其余用户此后被拒）。
- * 写盘失败返回 false：channel 撤销内存放行（fail-closed），避免重启后任何人可再 claim。
+ * owner 认领钩子：配对码校验已由 channel 完成，这里只负责写回 .env 与欢迎消息。
+ * 写盘失败返回 false：channel 撤销内存放行（fail-closed），避免重启后未授权用户可用。
  */
 function attachOwnerClaimHandler(channel: FeishuChannel): void {
   channel.onOwnerClaim = (openId) => {
     try {
       writeEnvFile({ FEISHU_ALLOWED_OPEN_IDS: openId });
-      console.log(c.ok(`首个私聊用户已成为部署者并写入白名单：${openId}`));
+      console.log(c.ok(`配对成功，部署者已写入白名单：${maskOpenId(openId)}`));
     } catch (err) {
       const message = errMessage(err);
       console.error(`[owner] 白名单写入失败（fail-closed，本次绑定不生效）：${message}`);
@@ -444,7 +446,7 @@ function assembleWatcher(opts: {
   // （重投时 injectSystemNote 按事件 id 去重，不会因重试而重复注入）
   const notifyWatchOwner = async (event: WatchEvent, oid: string, eventId: string): Promise<void> => {
     const r = await sendCardWithTextFallback({
-      sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event)),
+      sendCard: () => channel.notifyCardOpenId(oid, buildWatchEventCard(event, oid)),
       sendText: () => channel.notifyOpenId(oid, event.text),
       cardFailLog: (m) => console.error(`[watch] 卡片推送失败(${oid.slice(0, 4)}…): ${m}，降级纯文本`),
       textFailLog: (m) => console.error(`[watch] 推送失败(${oid.slice(0, 4)}…): ${m}`),
@@ -554,6 +556,11 @@ function assembleBriefs(opts: { flags: RuntimeFlags; cfg: AgentConfig; channel: 
   }
 }
 
+/** ReminderRunner 的送达日志含正文前缀；bot 默认日志只保留状态与脱敏 uid。 */
+export function redactReminderLog(msg: string): string {
+  return msg.replace(/^(提醒已送达(?:但落盘失败)?（[^）]*）)[^：]*：.*$/, '$1：正文已脱敏');
+}
+
 /**
  * 定时提醒投递装配：tick 检查到期提醒，通过飞书私聊推送给设定人；已触发/已投递状态落盘，
  * 重启后到点未投的立即补投、已投的不重复；投递失败按 1→2→4…分钟指数退避（封顶 30 分钟）。
@@ -564,7 +571,7 @@ function assembleReminders(opts: { reminders: ReminderStore; channel: FeishuChan
     deliver: (openId, text) => opts.channel.notifyOpenId(openId, text),
     // 跨形态不串桶：'local' 是 CLI 形态的提醒，由 CLI 自己投递，bot 不投递也不标记
     deliverable: (uid) => uid !== 'local',
-    log: (msg) => console.log(c.gray(`[reminder] ${msg}`)),
+    log: (msg) => console.log(c.gray(`[reminder] ${redactReminderLog(msg)}`)),
   });
   opts.cleanup.reminderRunner = reminderRunner;
   reminderRunner.start();
@@ -587,7 +594,7 @@ async function main(): Promise<void> {
   // 信号处理尽早注册：向导/更新检查/看板拉起（最长 90s）/MCP 连接期间收到 SIGTERM
   // 走默认终止会让自动拉起的看板子进程成孤儿；这里保证已建立的资源都被清理。
   // 资源随着启动推进逐个登记进 cleanup，shutdown 只清理已登记的部分。
-  const cleanup: BotCleanup = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null };
+  const cleanup: BotCleanup = { channel: null, mcp: null, watcher: null, kanbanChild: null, supervisor: null, wsAlerter: null, reportServer: null, dailyBrief: null, weeklyBrief: null, reminderRunner: null, historyStore: null, reviewJobs: null };
   /**
    * 优雅退出（实现见 infra/process-lifecycle.ts）：exitCode 由触发路径决定——正常信号
    * （SIGINT/SIGTERM）传 0；uncaughtException 传 1（崩溃以 0 退出会被进程管理器当成干净停止）。
@@ -602,6 +609,8 @@ async function main(): Promise<void> {
       await cleanup.dailyBrief?.stop();
       await cleanup.weeklyBrief?.stop();
       await cleanup.reminderRunner?.stop();
+      // 队列外作业须在通道关闭前中断，让其收尾通知仍有机会投递。
+      cleanup.reviewJobs?.stopAll();
       // 会话历史 save 是 fire-and-forget：drain 等在途写落盘后再退出，避免丢最后一轮
       await cleanup.historyStore?.drain();
       cleanup.reportServer?.close();
@@ -654,6 +663,8 @@ async function main(): Promise<void> {
   // Refresh from env after wizard
   agentCfg = currentConfig();
   feishuCfg = feishuBotConfig();
+  // 仅存在内存与本地终端：每次未绑定启动生成新码，成功认领后白名单生效即一次性失效。
+  const ownerPairingCode = feishuCfg.allowedOpenIds.length ? '' : randomBytes(8).toString('hex');
 
   // npm 更新检查：发现新版本先请示（结果缓存 24h，离线静默；HTA_UPDATE_CHECK=0 关闭）
   if (!updateCheckDisabled() && process.stdin.isTTY === true) {
@@ -682,14 +693,11 @@ async function main(): Promise<void> {
     );
   }
   if (feishuCfg.allowedOpenIds.length) {
-    console.log(c.gray(`允许 open_id：${feishuCfg.allowedOpenIds.join('、')}`));
+    console.log(c.gray(`允许 open_id：${feishuCfg.allowedOpenIds.map(maskOpenId).join('、')}`));
   } else {
-    console.log(
-      c.warn(
-        '⚠️ 安全警告：未设置 FEISHU_ALLOWED_OPEN_IDS，首个私聊本机器人的用户将自动成为唯一部署者并写入白名单' +
-          `（先聊先得，机器人可被他人搜到时存在被抢占风险）；如需固定部署者，请先在 ${userEnvPath()} 中配置该白名单。`,
-      ),
-    );
+    console.log(c.warn('未设置 FEISHU_ALLOWED_OPEN_IDS：首次绑定必须使用以下本地一次性配对码，普通首条私聊不会获得权限。'));
+    console.log(c.strong(`owner 配对码：${ownerPairingCode}`));
+    console.log(c.gray(`请在飞书私聊发送「配对码 ${ownerPairingCode}」。重启后配对码会更换；也可预先在 ${userEnvPath()} 配置白名单。`));
   }
   const larkStatus = checkLarkCliStatus();
   // bot 无 banner，lark-cli 需完整告警文案；OCR 检查为 bot 特有（AI 审查功能依赖）
@@ -712,7 +720,7 @@ async function main(): Promise<void> {
   const { mcp, mcpOk } = await connectKanbanMcp(agentCfg, cleanup);
 
   const memory = new MemoryStore();
-  const channel = new FeishuChannel(feishuCfg);
+  const channel = new FeishuChannel(feishuCfg, { ownerPairingCode });
   cleanup.channel = channel;
 
   // 写操作确认装配（卡片确认 + 文本降级 + 超时拒绝 + 终态更新）
@@ -754,6 +762,7 @@ async function main(): Promise<void> {
     reviewJobsStatePath: path.join(defaultDataHome(), 'review-jobs.json'),
   });
   channel.onCardAction = handlers.onCardAction;
+  cleanup.reviewJobs = handlers;
 
   // 长连接断线告警（WsAlerter）：重连交给 SDK，断线期间消息由飞书侧补投。
   // 短时抖动（待机/唤醒反复断连）静默不刷屏；断开持续超过 15 分钟推一条提醒，

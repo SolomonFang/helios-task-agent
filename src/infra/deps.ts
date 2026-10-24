@@ -112,8 +112,8 @@ export const OCR_INSTALL_HINT = [
 export const MCP_FALLBACK_TEXT = '已自动切换为看板 HTTP 备用通道';
 
 /**
- * 运行时 npx 拉取的 helios-kanban 包规格：默认 @latest 跟随最新版，不钉死
- * （需钉版本时用 HELIOS_KANBAN_PACKAGE 覆盖，如 helios-kanban@x.y.z）。
+ * 运行时 npx 拉取的 helios-kanban 包规格：默认跟随 latest，始终使用最新发布版本；
+ * 需要固定版本时可用 HELIOS_KANBAN_PACKAGE 显式覆盖。
  * kanban-ensure.ts 的自动拉起与 config.ts 的 MCP stdio 默认参数都经 kanbanPackageSpec
  * 取本常量。
  */

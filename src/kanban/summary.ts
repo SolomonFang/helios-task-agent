@@ -1,7 +1,7 @@
 /**
  * Work-summary data collection: pulls kanban tasks (per iteration / today / all)
  * plus per-task attempt summaries and diff stats for the work_summary report.
- * Read-only; individual fetch failures never abort the whole collection.
+ * Read-only; partial project failures are reported as incomplete, total failure aborts collection.
  */
 
 import {
@@ -19,6 +19,17 @@ import { pickAttemptSummaryText, buildStatsLookup, type DiffStats } from './pars
 import { TASK_STATUS_KEYS } from './status';
 
 export type WorkSummaryScope = 'iteration' | 'today' | 'all';
+
+export interface TaskCollectionIncomplete {
+  projectsTotal: number;
+  projectsSucceeded: number;
+  projectsFailed: number;
+}
+
+export function taskCollectionIncompleteNote(incomplete: TaskCollectionIncomplete | undefined): string | null {
+  if (!incomplete) return null;
+  return `数据不完整：${incomplete.projectsTotal} 个项目中任务采集成功 ${incomplete.projectsSucceeded} 个、失败 ${incomplete.projectsFailed} 个；统计仅覆盖成功项目。`;
+}
 
 export interface WorkSummaryTask {
   id: string;
@@ -66,6 +77,8 @@ export interface WorkSummaryData {
   /** 截断前（MAX_TASKS 切片前）的范围内任务行数：totals 只计五个已知状态键，
    *  含未知状态任务时 total ≤ tasks.length，截断判定必须用本字段与 tasks.length 比较。 */
   scopedTotal?: number;
+  /** 部分项目任务采集失败；全部失败时采集直接抛错。 */
+  incomplete?: TaskCollectionIncomplete;
 }
 
 export interface CollectWorkSummaryOptions {
@@ -167,6 +180,7 @@ export function isWithinDate(updatedAt: string, date: string): boolean {
 interface CollectedRows {
   rows: Array<{ row: TaskRow; project: ProjectRef }>;
   statsLookup: Map<string, DiffStats>;
+  incomplete?: TaskCollectionIncomplete;
 }
 
 /** 拉取全部项目任务行 + 一次性 diff 统计表（collectWorkSummary 与 collectDailyData 共用）。 */
@@ -182,6 +196,8 @@ async function fetchTaskRows(kanbanUrl: string, projectId?: string): Promise<Col
   }
 
   const rows: Array<{ row: TaskRow; project: ProjectRef }> = [];
+  let projectsSucceeded = 0;
+  let projectsFailed = 0;
   for (const project of projects) {
     let list: TaskRow[];
     try {
@@ -189,12 +205,20 @@ async function fetchTaskRows(kanbanUrl: string, projectId?: string): Promise<Col
         `/tasks?project_id=${project.id}`,
         await apiGet(kanbanUrl, `/tasks?project_id=${project.id}`),
       );
+      projectsSucceeded++;
     } catch {
+      projectsFailed++;
       continue; // 单项目失败（网络错误或返回形状不符）不阻断其它项目
     }
     for (const row of list) rows.push({ row, project });
   }
-  return { rows, statsLookup };
+  if (projects.length && projectsSucceeded === 0) {
+    throw new Error(`${projects.length} 个项目任务均采集失败，无法生成可靠统计，请稍后重试`);
+  }
+  const incomplete = projectsFailed
+    ? { projectsTotal: projects.length, projectsSucceeded, projectsFailed }
+    : undefined;
+  return { rows, statsLookup, ...(incomplete ? { incomplete } : {}) };
 }
 
 /** 单任务 enrich：详情摘要 + 最新 attempt 的 diff 统计（原 collectWorkSummary 闭包提升，两处采集共用）。 */
@@ -268,7 +292,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
   const { kanbanUrl, scope } = opts;
   const iteration = (opts.iteration || '').trim();
 
-  const { rows, statsLookup } = await fetchTaskRows(kanbanUrl, opts.projectId);
+  const { rows, statsLookup, incomplete } = await fetchTaskRows(kanbanUrl, opts.projectId);
 
   const todayStart = startOfToday();
   const filtered = rows.filter(({ row }) => {
@@ -338,6 +362,7 @@ export async function collectWorkSummary(opts: CollectWorkSummaryOptions): Promi
     tasks,
     totals,
     scopedTotal: filtered.length,
+    ...(incomplete ? { incomplete } : {}),
   };
 }
 
@@ -389,6 +414,8 @@ export interface DailyReportData {
   tasks: WorkSummaryTask[];
   /** enrich 候选超出 MAX_TASKS 被截断（counts 仍为全量口径，清单与 diff 为样本口径）。 */
   truncated: boolean;
+  /** 部分项目任务采集失败；全部失败时采集直接抛错。 */
+  incomplete?: TaskCollectionIncomplete;
 }
 
 export async function collectDailyData(opts: CollectDailyOptions): Promise<DailyReportData> {
@@ -396,7 +423,7 @@ export async function collectDailyData(opts: CollectDailyOptions): Promise<Daily
   const iteration = (opts.iteration || '').trim();
   const date = (opts.date || '').trim() || localDate();
 
-  const { rows, statsLookup } = await fetchTaskRows(kanbanUrl, opts.projectId);
+  const { rows, statsLookup, incomplete } = await fetchTaskRows(kanbanUrl, opts.projectId);
 
   const scoped = rows.filter(
     ({ row }) => row.id && (!iteration || String(row.iteration ?? '') === iteration),
@@ -447,5 +474,6 @@ export async function collectDailyData(opts: CollectDailyOptions): Promise<Daily
     diff,
     tasks,
     truncated,
+    ...(incomplete ? { incomplete } : {}),
   };
 }

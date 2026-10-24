@@ -32,7 +32,7 @@ import { ConfirmationManager } from '../src/agent/confirm';
 import { MemoryStore } from '../src/agent/memory';
 import { McpSupervisor } from '../src/bot/supervisor';
 import type { KanbanMcp } from '../src/kanban/mcp';
-import type { FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
+import type { FeishuCardAction, FeishuChannel, FeishuInboundMessage } from '../src/channels/feishu';
 import type { AgentConfig } from '../src/types';
 import { check, checkAsync, finish, modeOk } from './testkit';
 
@@ -134,6 +134,20 @@ function buttonValues(card: Record<string, unknown>): Array<Record<string, unkno
     }
   }
   return out;
+}
+
+function cardElements(card: Record<string, unknown>): Array<Record<string, unknown>> {
+  return ((card.body as { elements?: Array<Record<string, unknown>> } | undefined)?.elements ?? []) as Array<
+    Record<string, unknown>
+  >;
+}
+
+function cardButtons(card: Record<string, unknown>): Array<Record<string, unknown>> {
+  return cardElements(card).filter((el) => el.tag === 'button');
+}
+
+function hasPrimaryCount(card: Record<string, unknown>, expected: number): boolean {
+  return cardButtons(card).filter((el) => el.type === 'primary_filled').length === expected;
 }
 
 async function main(): Promise<void> {
@@ -547,37 +561,111 @@ async function main(): Promise<void> {
     }
   });
 
+  await checkAsync('sendDiagnosisFollowUp：预先取消不发请求，POST 在途取消经 signal 中断', async () => {
+    let requests = 0;
+    let posts = 0;
+    const server = http.createServer((req, res) => {
+      requests++;
+      if (req.method === 'POST') {
+        posts++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"success":true,"data":');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ success: true, data: [{ id: 'sess-1', created_at: '2026-01-01' }] }));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const pre = new AbortController();
+      pre.abort();
+      await assert.rejects(() => sendDiagnosisFollowUp(base, 'att-1', 'p', pre.signal), /已中断/);
+      assert.equal(requests, 0, 'POST 前检查与入口检查必须挡住已取消请求');
+      const ctl = new AbortController();
+      const pending = sendDiagnosisFollowUp(base, 'att-1', 'p', ctl.signal);
+      await waitFor(() => posts === 1, 'POST 在途');
+      ctl.abort();
+      await assert.rejects(() => pending);
+      assert.equal(posts, 1, '已开始的 POST 只发送一次，不重试');
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   // ---------- buildDiagnosisCard：重试按钮与终态 ----------
-  check('buildDiagnosisCard：带「↻ 按诊断结论重试」按钮；settledAt 后为终态（有 url 时补「查看任务」入口）', (() => {
-    const card = buildDiagnosisCard('任务X', '一、…', 'task-1');
+  check('buildDiagnosisCard：重试唯一主按钮、长标题入正文、value 不变；settledAt 后回传按钮消失', (() => {
+    const title = '超长诊断任务标题'.repeat(10);
+    const card = buildDiagnosisCard(title, '一、…', 'task-1', {
+      diagnosisId: 'diag-1',
+      owner: 'u1',
+      url: 'http://kb.local/t/1',
+    });
     const vals = buttonValues(card);
-    if (vals.length !== 1 || vals[0]!.hta_retry !== 'task-1' || vals[0]!.title !== '任务X') return false;
+    assert.deepEqual(vals, [
+      {
+        hta_retry: 'task-1',
+        diagnosisId: 'diag-1',
+        owner: 'u1',
+        title: `${title.slice(0, 50)}…`,
+        url: 'http://kb.local/t/1',
+      },
+    ]);
     const header = (card.header as { title: { content: string } }).title.content;
-    if (!header.includes('AI 失败诊断')) return false;
+    if (!header.includes('AI 失败诊断') || header.includes(title)) return false;
+    if (cardElements(card)[0]?.content !== `**《${title}》**`) return false;
+    if (!hasPrimaryCount(card, 1)) return false;
+    assert.deepEqual(cardButtons(card).map((el) => el.type), ['primary_filled', 'default']);
     const settled = buildDiagnosisCard('任务X', '一、…', 'task-1', { settledAt: '2026-09-04 10:00:00' });
-    if (buttonValues(settled).length !== 0) return false; // 无 url 时终态无按钮
+    if (buttonValues(settled).length !== 0 || cardButtons(settled).length !== 0) return false; // 无 url 时终态无按钮
     const settledHeader = (settled.header as { title: { content: string } }).title.content;
     if (!settledHeader.includes('已按诊断结论重试')) return false;
-    // 有 url 的终态：补「📋 查看任务」跳转按钮（注脚所指看板有真实入口），回传按钮仍消失
+    // 有 url 的终态只保留次按钮，回传按钮仍消失
     const settledUrl = buildDiagnosisCard('任务X', '一、…', 'task-1', { settledAt: '2026-09-04 10:00:00', url: 'http://kb.local/t/1' });
     const flat = JSON.stringify(settledUrl);
     if (!flat.includes('📋 查看任务') || !flat.includes('http://kb.local/t/1')) return false;
-    return buttonValues(settledUrl).length === 0; // 跳转按钮是 open_url 行为，无回传值
+    return buttonValues(settledUrl).length === 0 && hasPrimaryCount(settledUrl, 0) && cardButtons(settledUrl)[0]?.type === 'default';
   })());
 
-  check('buildWatchEventCard：失败卡片带「🔍 AI 诊断」按钮（hta_diagnose + attempt + url）', (() => {
+  check('buildWatchEventCard：AI 诊断唯一主按钮、查看任务次按钮，长标题与 value 结构不变', (() => {
+    const title = '超长失败任务标题'.repeat(10);
     const card = buildWatchEventCard({
       kind: 'failed',
-      title: '任务X',
+      title,
       url: 'http://localhost:7964/x',
       taskId: 'task-1',
       attemptId: 'att-9',
       text: '…',
-    });
+    }, 'u1');
     const vals = buttonValues(card);
-    const diag = vals.find((v) => v.hta_diagnose);
-    // url 随按钮 value 带上：点击后换成的「进行中」卡片据此保留「查看任务」入口
-    return Boolean(diag && diag.hta_diagnose === 'task-1' && diag.attempt === 'att-9' && diag.url === 'http://localhost:7964/x');
+    assert.deepEqual(vals, [
+      {
+        hta_diagnose: 'task-1',
+        attempt: 'att-9',
+        title: `${title.slice(0, 50)}…`,
+        url: 'http://localhost:7964/x',
+        owner: 'u1',
+      },
+    ]);
+    const header = (card.header as { title: { content: string } }).title.content;
+    return (
+      !header.includes(title) &&
+      cardElements(card)[0]?.content === `**《${title}》**` &&
+      hasPrimaryCount(card, 1) &&
+      cardButtons(card).map((el) => el.type).join(',') === 'primary_filled,default'
+    );
+  })());
+
+  check('buildWatchEventCard：AI 审查为主按钮，查看任务为次按钮，owner payload 不变', (() => {
+    const card = buildWatchEventCard({
+      kind: 'review',
+      title: '任务X',
+      url: 'http://kb.local/t/1',
+      attemptId: 'att-1',
+      text: '…',
+    }, 'u1');
+    assert.deepEqual(buttonValues(card), [{ hta_review: 'att-1', title: '任务X', url: 'http://kb.local/t/1', owner: 'u1' }]);
+    return hasPrimaryCount(card, 1) && cardButtons(card).map((el) => el.type).join(',') === 'primary_filled,default';
   })());
 
   // ---------- handler 集成：hta_diagnose / hta_retry 路由、防重、follow-up 内容、失败路径 ----------
@@ -612,13 +700,13 @@ async function main(): Promise<void> {
       const clickDiagnose = () =>
         handlers.onCardAction({
           operator: { open_id: 'u1' },
-          action: { value: { hta_diagnose: 'task-1', attempt: 'att-2', title: '修复登录' } },
+          action: { value: { owner: 'u1', hta_diagnose: 'task-1', attempt: 'att-2', title: '修复登录' } },
         });
       const clickRetry = () =>
         handlers.onCardAction({
           operator: { open_id: 'u1' },
-          action: { value: { hta_retry: 'task-1', title: '修复登录' } },
-        });
+          action: { value: buttonValues(channel.cards[0]!.card).find((v) => v.hta_retry)! },
+        } as FeishuCardAction);
 
       clickDiagnose();
       await waitFor(() => channel.cards.length === 1, '诊断结果卡片');
@@ -682,10 +770,10 @@ async function main(): Promise<void> {
         },
       });
       // 先点重试（无诊断结论）：明确指引重新诊断，不沉默
-      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 'task-9', title: '任务Y' } } });
+      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_retry: 'task-9', diagnosisId: 'missing', owner: 'u1', title: '任务Y' } } });
       await waitFor(() => channel.notifies.some((n) => n.text.includes('找不到') && n.text.includes('诊断结论')), '无结论指引');
       // 诊断 LLM 失败：中文失败提示，不留沉默
-      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 'task-1', attempt: 'att-1', title: '任务X' } } });
+      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 'task-1', attempt: 'att-1', title: '任务X' } } });
       await waitFor(() => channel.notifies.some((n) => n.text.includes('⚠️ AI 诊断失败')), '诊断失败提示');
       const fail = channel.notifies.find((n) => n.text.includes('⚠️ AI 诊断失败'))!;
       assert.ok(fail.text.includes('AI 诊断超时（6 分钟）'), `失败原因应中文化：${fail.text}`);
@@ -857,10 +945,10 @@ async function main(): Promise<void> {
   });
 
   check('buildDiagnosisCard：LLM 输出最小中和（标签/删除线），截断注记给出路，注脚称「任务执行方」', (() => {
-    // 2.0：正文为首个 markdown 组件（content），注脚为 markdown + text_size:notation
+    // 2.0：首项为加粗任务标题，第二项为诊断正文，注脚为 markdown + text_size:notation
     type Card2 = { body: { elements: Array<{ tag: string; content?: string; text_size?: string }> } };
     const card = buildDiagnosisCard('任务X', '一、<font color="red">警告</font> ~~伪造~~ **保留加粗**', 'task-1') as Card2;
-    const body = card.body.elements[0]!.content ?? '';
+    const body = card.body.elements[1]!.content ?? '';
     const note = card.body.elements
       .filter((e) => e.tag === 'markdown' && e.text_size === 'notation')
       .map((n) => n.content || '')
@@ -869,7 +957,7 @@ async function main(): Promise<void> {
     if (!body.includes('＜font') || !body.includes('～～') || !body.includes('**保留加粗**')) return false;
     if (!note.includes('任务执行方') || note.includes('执行 Agent')) return false;
     const long = buildDiagnosisCard('任务X', 'x'.repeat(DIAGNOSIS_CARD_MAX_CHARS + 10), 'task-1') as Card2;
-    return (long.body.elements[0]!.content ?? '').includes('过长已截断，完整结论可直接追问');
+    return (long.body.elements[1]!.content ?? '').includes('过长已截断，完整结论可直接追问');
   })());
 
   check('buildWatchEventCard：失败注脚主推「AI 诊断」按钮；stale 注脚复用 WATCH_HINT_STALE', (() => {
@@ -942,13 +1030,15 @@ async function main(): Promise<void> {
         release = r;
       });
       const handlers = mkJobsHandlers(new FakeChannel(), tmp, statePath, { diagnosisRunner: async () => gate });
-      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
+      handlers.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
       await waitFor(() => fs.existsSync(statePath), '受理后落盘');
       const running = readJobsFile(statePath);
       assert.equal(running.length, 1);
       assert.equal(running[0]!.kind, 'diagnosis');
       assert.equal(running[0]!.openId, 'u1');
-      assert.equal(running[0]!.key, 'task-1');
+      assert.equal(typeof running[0]!.key, 'string', '作业键应为稳定 diagnosisId');
+      assert.notEqual(running[0]!.key, 'task-1');
+      assert.equal(running[0]!.taskId, 'task-1');
       assert.equal(running[0]!.title, '修复登录');
       release({ text: '诊断结论', attemptId: 'att-1' });
       await waitFor(() => readJobsFile(statePath).length === 0, '完结后摘除记录');
@@ -967,8 +1057,8 @@ async function main(): Promise<void> {
         diagnosisRunner: () => never,
         aiReviewRunner: () => never,
       });
-      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
-      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { hta_review: 'att-9', title: '任务X' } } });
+      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_diagnose: 'task-1', attempt: 'att-1', title: '修复登录' } } });
+      dead.onCardAction({ operator: { open_id: 'u1' }, action: { value: { owner: 'u1', hta_review: 'att-9', title: '任务X' } } });
       await waitFor(() => fs.existsSync(statePath) && readJobsFile(statePath).length === 2, '两条进行中记录落盘');
 
       // 重启：新实例加载遗留记录
@@ -1021,6 +1111,211 @@ async function main(): Promise<void> {
       assert.equal(channel2.notifies.length, 1, '恢复后应补投');
       assert.ok(channel2.notifies[0]!.text.includes('修复登录'));
       assert.equal(readJobsFile(statePath).length, 0, '补投成功后清档');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  const mkSecurityHandlers = (
+    channel: FakeChannel,
+    tmp: string,
+    extra: Partial<Pick<Parameters<typeof createBotHandlers>[0], 'diagnosisRunner' | 'followUpSender' | 'attemptIdFetcher' | 'aiReviewRunner'>> = {},
+  ) => {
+    const cfg = makeCfg('http://127.0.0.1:1');
+    const router = new SessionRouter(cfg, null, false, { memory: new MemoryStore(tmp) });
+    const confirmations = new ConfirmationManager(async () => undefined, { timeoutMs: 1000 });
+    const fakeMcp = { tools: [] } as unknown as KanbanMcp;
+    const supervisor = new McpSupervisor({ mcp: fakeMcp, initiallyAlive: false });
+    return createBotHandlers({
+      channel: channel as unknown as FeishuChannel,
+      router,
+      confirmations,
+      cfg,
+      mcp: fakeMcp,
+      supervisor,
+      reportServer: null,
+      helpText: 'HELP',
+      ...extra,
+    });
+  };
+  const clickValue = (handlers: ReturnType<typeof createBotHandlers>, openId: string, value: Record<string, unknown>) =>
+    handlers.onCardAction({ operator: { open_id: openId }, action: { value } } as FeishuCardAction);
+
+  await checkAsync('诊断归属：旧卡片只重试自己的 diagnosisId，跨用户与旧 payload 安全拒绝，文本取最近诊断', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-diag-owner-'));
+    const followUps: Array<{ attemptId: string; prompt: string }> = [];
+    try {
+      const channel = new FakeChannel();
+      const handlers = mkSecurityHandlers(channel, tmp, {
+        diagnosisRunner: async (opts) => ({
+          text: opts.taskId === 'task-1' && diagnosisCount++ === 0 ? '诊断 A' : '诊断 B',
+          attemptId: opts.taskId === 'task-1' && diagnosisCount === 1 ? 'att-A' : 'att-B',
+        }),
+        followUpSender: async (_url, attemptId, prompt) => {
+          followUps.push({ attemptId, prompt });
+        },
+      });
+      let diagnosisCount = 0;
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-A', owner: 'u1', title: '任务X' });
+      await waitFor(() => channel.cards.length === 1, '诊断 A 卡片');
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-B', owner: 'u1', title: '任务X' });
+      await waitFor(() => channel.cards.length === 2, '诊断 B 卡片');
+      const retryA = buttonValues(channel.cards[0]!.card).find((v) => v.hta_retry)!;
+      const retryB = buttonValues(channel.cards[1]!.card).find((v) => v.hta_retry)!;
+      assert.equal(typeof retryA.diagnosisId, 'string', '重试按钮必须携带稳定 diagnosisId');
+      assert.equal(retryA.owner, 'u1', '重试按钮必须绑定发起人');
+      assert.notEqual(retryA.diagnosisId, retryB.diagnosisId, '两次诊断必须有不同 diagnosisId');
+
+      const foreign = clickValue(handlers, 'u2', retryA);
+      assert.ok(foreign?.toast?.content.includes('只有发起人'), '其他白名单用户不得操作他人的诊断卡片');
+      assert.equal(followUps.length, 0, '跨用户点击不得读取或重试');
+      const legacy = { ...retryA };
+      delete legacy.diagnosisId;
+      const stale = clickValue(handlers, 'u1', legacy);
+      assert.ok(stale?.toast, '无 diagnosisId 的旧卡片必须有同步安全回执');
+      assert.equal(followUps.length, 0, '无归属旧卡片不得重试');
+
+      clickValue(handlers, 'u1', retryA);
+      await waitFor(() => followUps.length === 1, '旧诊断 A 重试');
+      assert.equal(followUps[0]!.attemptId, 'att-A', '旧诊断 A 不得读取最新 B 的 attemptId');
+      assert.ok(followUps[0]!.prompt.includes('诊断 A') && !followUps[0]!.prompt.includes('诊断 B'), '旧卡片不得读取最新诊断文本');
+      await handlers.handle(mkJobMsg('u1', '重试这个任务'));
+      await waitFor(() => followUps.length === 2, '文本重试最近诊断 B');
+      assert.equal(followUps[1]!.attemptId, 'att-B', '文本重试必须走该用户最近 diagnosisId');
+      assert.ok(followUps[1]!.prompt.includes('诊断 B'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('诊断/审查按钮归属：旧或无 owner、他人 owner 均拒绝，仅发卡对象可启动', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-job-owner-'));
+    let diagnoses = 0;
+    let reviews = 0;
+    try {
+      const channel = new FakeChannel();
+      const handlers = mkSecurityHandlers(channel, tmp, {
+        diagnosisRunner: async () => {
+          diagnoses++;
+          return { text: '诊断', attemptId: 'att-1' };
+        },
+        aiReviewRunner: async () => {
+          reviews++;
+          return '审查';
+        },
+      });
+      for (const owner of [undefined, 'u2']) {
+        clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-1', owner, title: '任务X' });
+        clickValue(handlers, 'u1', { hta_review: 'att-1', owner, title: '任务X' });
+      }
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(diagnoses, 0, '无归属或他人诊断按钮不得启动');
+      assert.equal(reviews, 0, '无归属或他人审查按钮不得启动');
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-1', owner: 'u1', title: '任务X' });
+      clickValue(handlers, 'u1', { hta_review: 'att-1', owner: 'u1', title: '任务X' });
+      await waitFor(() => diagnoses === 1 && reviews === 1, '仅归属用户可启动作业');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('/stop 中断重试：signal 贯穿 follow-up，计入回执；请求已发出时诚实提示不可撤回', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-retry-stop-'));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let retrySignal: AbortSignal | undefined;
+    let followUpStarted = false;
+    try {
+      const channel = new FakeChannel();
+      const handlers = mkSecurityHandlers(channel, tmp, {
+        diagnosisRunner: async () => ({ text: '诊断 A', attemptId: 'att-A' }),
+        followUpSender: async (_url, _attempt, _prompt, signal) => {
+          followUpStarted = true;
+          retrySignal = signal;
+          await gate;
+        },
+      });
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-A', owner: 'u1', title: '任务X' });
+      await waitFor(() => channel.cards.length === 1, '诊断卡片');
+      clickValue(handlers, 'u1', buttonValues(channel.cards[0]!.card).find((v) => v.hta_retry)!);
+      await waitFor(() => followUpStarted, 'follow-up 已发起');
+      await handlers.handle(mkJobMsg('u1', '/stop'));
+      assert.ok(retrySignal?.aborted, '/stop 必须中断重试 AbortController');
+      assert.ok(channel.replies.some((r) => r.text.includes('重试')), '/stop 回执必须计入重试');
+      release();
+      await waitFor(() => channel.notifies.some((n) => n.text.includes('无法撤回')), '已发出请求的诚实收尾');
+      assert.ok(!channel.notifies.some((n) => n.text.includes('重试发起失败')), '中断不得误报为普通失败');
+    } finally {
+      release();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('/stop 在 attemptId 补拉阶段中断重试，signal 生效且不再发送 follow-up', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-retry-fetch-stop-'));
+    let followUps = 0;
+    let fetchStarted = false;
+    let fetchSignal: AbortSignal | undefined;
+    try {
+      const channel = new FakeChannel();
+      const handlers = mkSecurityHandlers(channel, tmp, {
+        diagnosisRunner: async () => ({ text: '诊断 A' }),
+        attemptIdFetcher: async (_url, _taskId, signal) => {
+          fetchStarted = true;
+          fetchSignal = signal;
+          return new Promise<string | undefined>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          });
+        },
+        followUpSender: async () => {
+          followUps++;
+        },
+      });
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', owner: 'u1', title: '任务X' });
+      await waitFor(() => channel.cards.length === 1, '诊断卡片');
+      clickValue(handlers, 'u1', buttonValues(channel.cards[0]!.card).find((v) => v.hta_retry)!);
+      await waitFor(() => fetchStarted, 'attemptId 补拉开始');
+      await handlers.handle(mkJobMsg('u1', '/stop'));
+      assert.ok(fetchSignal?.aborted, '/stop 必须贯穿 latestAttemptId 的 signal');
+      await waitFor(() => channel.notifies.some((n) => n.text.includes('重试指令未发出')), '补拉阶段中断收尾');
+      assert.equal(followUps, 0, '补拉被中断后不得发送 follow-up');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('stopAll 中断全部用户的诊断/审查/重试作业', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hta-stop-all-'));
+    const signals: AbortSignal[] = [];
+    const never = new Promise<never>(() => {});
+    try {
+      const channel = new FakeChannel();
+      const handlers = mkSecurityHandlers(channel, tmp, {
+        diagnosisRunner: async (opts) => {
+          if (opts.taskId === 'task-1') {
+            signals.push(opts.signal!);
+            return never;
+          }
+          return { text: '诊断', attemptId: 'att-3' };
+        },
+        aiReviewRunner: async (opts) => {
+          signals.push(opts.signal!);
+          return never;
+        },
+        followUpSender: async (_url, _attempt, _prompt, signal) => {
+          signals.push(signal!);
+          return never;
+        },
+      });
+      clickValue(handlers, 'u1', { hta_diagnose: 'task-1', attempt: 'att-1', owner: 'u1', title: '任务1' });
+      clickValue(handlers, 'u2', { hta_review: 'att-2', owner: 'u2', title: '任务2' });
+      await waitFor(() => signals.length === 2, '两个用户作业启动');
+      clickValue(handlers, 'u2', { hta_diagnose: 'task-3', attempt: 'att-3', owner: 'u2', title: '任务3' });
+      await waitFor(() => channel.cards.length === 1, '用于重试的诊断卡片');
+      clickValue(handlers, 'u2', buttonValues(channel.cards[0]!.card).find((v) => v.hta_retry)!);
+      await waitFor(() => signals.length === 3, '重试作业启动');
+      handlers.stopAll();
+      assert.ok(signals.every((s) => s.aborted), 'stopAll 必须中断全部已登记控制器');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

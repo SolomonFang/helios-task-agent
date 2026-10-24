@@ -43,8 +43,7 @@ export function extractSourceUrls(text: string): string[] {
 
 /**
  * 组合调用方 signal 与 8s 超时兜底：任一触发即中断（与 kanban/http.ts 同思路；
- * AbortSignal.any 需 Node 20.3+，engines 只要求 >=20，故手写等价组合——ctl 触发时
- * 摘掉调用方 signal 上的监听器，不随高频调用滞留）。
+ * ctl 触发时摘掉调用方 signal 上的监听器，不随高频调用滞留）。
  */
 function combinedFetchSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
