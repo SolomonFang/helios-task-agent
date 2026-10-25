@@ -34,6 +34,20 @@ export async function checkAsync(name: string, fn: () => void | Promise<void>): 
   }
 }
 
+/** Windows 上子进程/杀软可能短暂占用目录；从根目录整体重试，避免递归删除到一半后漏出瞬时错误。 */
+export async function removeTree(root: string): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      await fs.promises.rm(root, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code || '') || attempt === 49) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 /**
  * 平台感知的假 CLI 写入：POSIX 写 <bin>/<name>（sh 脚本，0o755）；
  * win32 写 <bin>/<name>.cmd（@echo off 批处理，spawnCompat 经 PATHEXT 解析 .cmd shim）。

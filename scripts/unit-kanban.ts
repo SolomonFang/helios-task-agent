@@ -22,7 +22,7 @@ import { apiGet, fetchKanbanHealth, KanbanHttpError, taskPageUrl } from '../src/
 import { findOcrCommand, resolveReviewTarget, runAiReview } from '../src/kanban/ai-review';
 import { KanbanMcp } from '../src/kanban/mcp';
 import { checkLarkCli, checkLarkCliAsync } from '../src/infra/deps';
-import { checkAsync, finish, writeFakeCli } from './testkit';
+import { checkAsync, finish, removeTree, writeFakeCli } from './testkit';
 
 /** 进程组是否还有存活成员（与 kanban-ensure.treeAlive 同判定）。 */
 function groupAlive(pid: number): boolean {
@@ -563,7 +563,7 @@ async function main(): Promise<void> {
       assert.ok(!errorLogs.join('\n').includes('SECRET-REVIEW-OUTPUT'), `默认日志不得含审查输出：${errorLogs.join('\n')}`);
     } finally {
       await mock.close();
-      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      await removeTree(tmp);
     }
   });
 
