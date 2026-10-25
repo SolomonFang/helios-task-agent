@@ -563,7 +563,7 @@ async function main(): Promise<void> {
       assert.ok(!errorLogs.join('\n').includes('SECRET-REVIEW-OUTPUT'), `默认日志不得含审查输出：${errorLogs.join('\n')}`);
     } finally {
       await mock.close();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
