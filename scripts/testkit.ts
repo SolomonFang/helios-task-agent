@@ -36,14 +36,17 @@ export async function checkAsync(name: string, fn: () => void | Promise<void>): 
 
 /** Windows 上子进程/杀软可能短暂占用目录；从根目录整体重试，避免递归删除到一半后漏出瞬时错误。 */
 export async function removeTree(root: string): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt++) {
+  const deadline = Date.now() + (process.platform === 'win32' ? 30_000 : 5_000);
+  let retryDelay = 50;
+  while (true) {
     try {
       await fs.promises.rm(root, { recursive: true, force: true });
       return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code || '') || attempt === 49) throw err;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code || '') || Date.now() >= deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelay, deadline - Date.now())));
+      retryDelay = Math.min(retryDelay * 2, 1_000);
     }
   }
 }
