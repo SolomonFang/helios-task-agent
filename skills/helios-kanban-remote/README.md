@@ -2,7 +2,7 @@
 
 通过 REST API 远程控制正在运行的 [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) 实例：列/建/改任务、启停 coding agent、跟进对话、查状态、处理审批。
 
-面向能在本机执行 shell / HTTP 的聊天机器人（如手机上的 helios-task-agent、Cursor、Claude Code）。同一台机器上更推荐 MCP；本技能用于**远程**场景。
+**多端通用**：任何能执行 shell / HTTP 的 AI agent 都能用——桌面端（Claude Code、Cursor、Kimi Code、Codex 等）、手机端聊天机器人、服务器自动化，只要能访问 Kanban 服务即可。同一台机器上更推荐 MCP；本技能用于**远程 / 跨端**场景。
 
 ## 功能
 
@@ -77,7 +77,9 @@ helios-kanban-remote/
 
 ## MCP（同机）vs 本技能（远程）
 
-同机跑 Kanban 时优先 MCP，覆盖完整编排面。远程（手机 bot、另一台机器）用 `hk.mjs`。能力先上 MCP，再镜像到 CLI；不一致时以 [reference.md](reference.md) 的 REST API 为准。
+同机跑 Kanban 时优先 MCP，覆盖完整编排面。跨端 / 远程（手机 bot、另一台机器、服务器自动化）用 `hk.mjs`。能力先上 MCP，再镜像到 CLI；不一致时以 [reference.md](reference.md) 的 REST API 为准。
+
+继续历史会话时，先用 `list_workspace_sessions` 查询指定工作区的全部会话，再对选中的 `session_id` 调用 `follow_up_session`；会话仍在运行时改用 `queue_message`。完整步骤见 [SKILL.md](SKILL.md#continue-a-historical-conversation-through-mcp)。
 
 ```json
 {

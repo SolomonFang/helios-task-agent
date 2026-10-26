@@ -3,10 +3,11 @@ name: helios-kanban-remote
 description: >-
   Remote control Helios Kanban (helios-kanban) via REST API — list/create/update
   tasks, start/stop coding agents, follow-up, check status, handle approvals.
-  Use when the user wants to control kanban from phone/chat, mentions Helios
-  Kanban / helios-kanban / vibe-kanban remotely, or asks to create tasks, start
-  agents, or check progress on a running instance. If the skill is not installed
-  yet, read and follow INSTALL.md to self-install first.
+  Multi-end: works with desktop agents, phone chat bots, and server automation.
+  Use when the user wants to control kanban remotely, mentions Helios Kanban /
+  helios-kanban / vibe-kanban, or asks to create tasks, start agents, or check
+  progress on a running instance. If the skill is not installed yet, read and
+  follow INSTALL.md to self-install first.
 digest_sections:
   # 摘要上限 3500 字符（skills.ts DIGEST_MAX_LEN）：Complete lifecycle 与 Quick workflow
   # 高度重叠，不进摘要，需要时经 skill_doc 读全文
@@ -63,6 +64,7 @@ Control a running [Helios Kanban](https://github.com/SolomonFang/vibe-kanban) in
 | "有哪些分支" | `hk branches <repo_id> [--query develop]` |
 | "多仓启动" | `hk start <task_id> --repo <id1> --repo <id2>:develop` |
 | "有哪些 tag" | `hk tags` |
+| "基于 develop 启动" | `hk start <task_id> --branch develop` |
 | "新建并启动" | `hk create-and-start "标题"` |
 | "再跟它说一句…" | `hk follow-up <task_id> <prompt>`（运行中自动排队） |
 | "跑得怎么样了" | `hk status <task_id>` |
@@ -218,9 +220,27 @@ https://github.com/SolomonFang/helios-task-agent/blob/main/skills/helios-kanban-
 
 ## MCP (same machine) vs this skill (remote)
 
-- **Same host as the kanban server** → prefer the MCP server. It covers the full orchestration surface: project/task CRUD, `create_project`, `create_task_and_start`, `start/stop_workspace_session`, `follow_up_session`, `queue_message`, `get_task_status`, `list_approvals` / `respond_to_approval`, `list_branches`, `list_tags`. (Tool names belong to the upstream package and may drift as it evolves.)
-- **Remote (phone bot, another host)** → use `hk.mjs` over HTTP, as this skill documents.
+- **Same host as the kanban server** → prefer the MCP server. It covers the full orchestration surface: project/task CRUD, `create_project`, `create_task_and_start`, `start/stop_workspace_session`, `list_workspace_sessions`, `follow_up_session`, `queue_message`, `get_task_status`, `list_approvals` / `respond_to_approval`, `list_branches`, `list_tags`. (Tool names belong to the upstream package and may drift as it evolves.)
+- **Remote / any other end** (phone bot, another host, server automation) → use `hk.mjs` over HTTP, as this skill documents.
 - New capabilities land in the MCP server first; `hk.mjs` mirrors them for remote use. If the two drift, the REST API in [reference.md](reference.md) is the source of truth.
+
+### Continue a historical conversation through MCP
+
+When the user asks to continue an existing conversation rather than start a new task:
+
+1. Find the `workspace_id` with `get_task_status`, then call `list_workspace_sessions` with that ID. Sessions are returned most recently used first.
+2. Choose the requested historical `session_id`; do not assume it is the latest session.
+3. If that session is inactive, call `follow_up_session` with `session_id` and `prompt`. If it is still running, call `queue_message` with `session_id` and `message` instead.
+4. Omit `executor` and `variant` to reuse the session's executor. The server rejects executor changes for an existing session.
+
+```json
+{
+  "session_id": "123e4567-e89b-12d3-a456-426614174000",
+  "prompt": "Continue the previous task and summarise the remaining work."
+}
+```
+
+`follow_up_session` starts a new execution in the same workspace and preserves the selected conversation; it does not create a new task or session.
 
 ```json
 {
