@@ -483,34 +483,25 @@ async function main(): Promise<void> {
     fs.mkdirSync(bin, { recursive: true });
     execFileSync('git', ['init', repoA], { stdio: 'ignore' });
     execFileSync('git', ['init', repoB], { stdio: 'ignore' });
+    const ocrScript = path.join(tmp, 'ocr-stub.js');
+    fs.writeFileSync(ocrScript, [
+      "const fs = require('fs');",
+      'const args = process.argv.slice(2);',
+      "if (args[0] === 'version') { console.log('ocr-stub'); process.exit(0); }",
+      "if (args[0] === 'review') {",
+      `  fs.appendFileSync(${JSON.stringify(ocrLog)}, args.join(' ') + '\\n');`,
+      `  if (args[2] === ${JSON.stringify(repoB)} && fs.existsSync(${JSON.stringify(failB)})) {`,
+      "    console.error('SECRET-REVIEW-OUTPUT');",
+      '    process.exit(1);',
+      '  }',
+      "  console.log('[ocr] Summary: 1 file reviewed, 0 comment(s)');",
+      '  process.exit(0);',
+      '}',
+      'process.exit(1);',
+    ].join('\n'));
     writeFakeCli(bin, 'ocr', {
-      sh: [
-        'if [ "$1" = "version" ]; then echo ocr-stub; exit 0; fi',
-        'if [ "$1" = "review" ]; then',
-        `  echo "$@" >> '${ocrLog}'`,
-        `  case "$*" in *repo-b*) if [ -f '${failB}' ]; then echo SECRET-REVIEW-OUTPUT >&2; exit 1; fi ;; esac`,
-        '  echo "[ocr] Summary: 1 file reviewed, 0 comment(s)"',
-        '  exit 0',
-        'fi',
-        'exit 1',
-      ].join('\n'),
-      cmd: [
-        'if "%1"=="version" goto version',
-        'if "%1"=="review" goto review',
-        'exit /b 1',
-        ':version',
-        'echo ocr-stub',
-        'exit /b 0',
-        ':review',
-        `echo %* >> "${ocrLog}"`,
-        `if /i not "%~3"=="${repoB}" goto review_success`,
-        `if not exist "${failB}" goto review_success`,
-        'echo SECRET-REVIEW-OUTPUT 1>&2',
-        'exit /b 1',
-        ':review_success',
-        'echo [ocr] Summary: 1 file reviewed, 0 comment(s)',
-        'exit /b 0',
-      ].join('\r\n'),
+      sh: `"${process.execPath}" "${ocrScript}" "$@"`,
+      cmd: `"${process.execPath}" "${ocrScript}" %*`,
     });
     const mock = await contractMock((url) => {
       if (url === '/api/task-attempts/multi') {
