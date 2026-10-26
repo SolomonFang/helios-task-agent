@@ -381,7 +381,7 @@ async function main(): Promise<void> {
       if (prevPath === undefined) delete process.env.PATH;
       else process.env.PATH = prevPath;
       if (spawned) await stopKanbanChild(spawned);
-      fs.rmSync(bin, { recursive: true, force: true });
+      await removeTree(bin);
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
     }
@@ -503,7 +503,7 @@ async function main(): Promise<void> {
         'exit /b 0',
         ':review',
         `echo %* >> "${ocrLog}"`,
-        `if /i not "%CD%"=="${repoB}" goto review_success`,
+        `if /i not "%~3"=="${repoB}" goto review_success`,
         `if not exist "${failB}" goto review_success`,
         'echo SECRET-REVIEW-OUTPUT 1>&2',
         'exit /b 1',
